@@ -3502,12 +3502,31 @@ void createBloomResources(uint32_t outputWidth, uint32_t outputHeight)
 }
 
 // 录在显示变换之前（见上面那段口径说明）。strength = 0 时合成 pass 整屏早退。
+//
+// 闸门 ORION_BLOOM_SKIP_ZERO（默认开）：strength <= 0 时整条 Bloom 链
+// （prefilter + 4 级降采样 + 3 级升采样 + composite，共 9 个 dispatch）对最终像素
+// 贡献为 0（bloom_composite.comp 在 strength<=0 时直接 return，不改 sceneImage），
+// 入口直接返回、不录制这些 dispatch。强度每帧读 atomic，0→非 0 的那一帧正常进入并
+// 懒建资源，不做"上电只判一次"。Bloom 中间 mip 图只被本链内部 descriptor set 绑定，
+// 无其它 pass 采样（见 PostFx.cpp 内 g_bloomMips/g_bloom*Sets 的全部引用点）。
+// 回退：设 ORION_BLOOM_SKIP_ZERO=0 恢复照旧录制整条链。
 void recordBloom(VkCommandBuffer cmd)
 {
+    static const bool skipZeroBloom = []()
+    {
+        const char* raw = std::getenv("ORION_BLOOM_SKIP_ZERO");
+        return !(raw != nullptr && raw[0] == '0');
+    }();
+
     if(cmd == VK_NULL_HANDLE ||
        g_dlssOutputImage == VK_NULL_HANDLE ||
        g_dlssOutputWidth == 0u ||
        g_dlssOutputHeight == 0u)
+    {
+        return;
+    }
+
+    if(skipZeroBloom && g_postBloomStrength.load() <= 0.0f)
     {
         return;
     }

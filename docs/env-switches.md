@@ -76,6 +76,7 @@ Java 的 `-D` 传不进去（`build.gradle` 里的 `vmArg` 也到不了游戏 JV
 | `ORION_MV_LAYERS` | `1` | 位移段发给哪些层：`0` 全不发 / `1` 只 ENTITY / `2` 只 PARTICLE / `3` 两者（旧行为） |
 | `ORION_SL_FEATURES` | `all` | Streamline 特性子集（`all` 或逗号分隔的特性名） |
 | `ORION_AS_REFIT` | 关（看标记文件） | `1` = 进程内恒开 Section BLAS refit；不设则看 `<gameDir>/as_refit.on` 标记文件（**热切换**，只影响之后的重建） |
+| `ORION_BLOOM_SKIP_ZERO` | **开**（默认即新行为；与"闸门默认=旧行为"惯例不同，原因：strength=0 时 Bloom 对最终像素数学贡献为 0，composite shader 本就整屏早退，跳过链无画质代价） | Bloom 强度 `g_postBloomStrength <= 0` 时，`recordBloom` 入口直接返回，不录制 prefilter + 4 级降采样 + 3 级升采样 + composite 共 9 个 dispatch；强度每帧读 atomic，0→非 0 当帧正常录制并懒建资源。`0` = 恢复照旧录制整条链 |
 
 ## D. 实验特性（默认关，用于评估与采价）
 
