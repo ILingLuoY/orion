@@ -3313,7 +3313,22 @@ bool rebuildWorldGeometry(
         );
     }
 
-    constexpr bool updateTlas = false;
+    // 2026-11-15：TLAS MODE_UPDATE 快路闸门。
+    //   ORION_TLAS_UPDATE 默认 0 = 改动前行为：TLAS 恒 MODE_BUILD。
+    //   1 = 下方保守护栏全部通过时走 MODE_UPDATE、沿用同一 g_tlas；任一护栏
+    //       不满足一律回落 BUILD（首帧 / 重建后第一帧 / 容量扩容 / 实例数
+    //       变化 / BLAS 引用逐项不一致）。
+    // 回退：=0（或不设）即全部 BUILD，逐位旧行为；改完重启客户端生效。
+    static const bool s_tlasUpdateEnabled = []()
+    {
+        const char* raw = std::getenv("ORION_TLAS_UPDATE");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    // 已带 ALLOW_UPDATE_BIT 构建的 TLAS 句柄；句柄不同（首建 / park / 重建 /
+    // 销毁）一律不得 UPDATE —— 规范要求可更新形态必须在首次 BUILD 时带 flag。
+    static VkAccelerationStructureKHR s_tlasAllowUpdateHandle =
+        VK_NULL_HANDLE;
 
 
 
@@ -3373,6 +3388,8 @@ bool rebuildWorldGeometry(
             parkTlasInstances();
         }
 
+        tlasInstancesBufferRecreated = true;
+
         createBuffer(
             g_device,
             g_physicalDevice,
@@ -3430,8 +3447,14 @@ bool rebuildWorldGeometry(
     tlasBuildInfo.type =
         VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
 
+    // 仅闸门开时注入 ALLOW_UPDATE_BIT：这是一次性结构改动，影响该 TLAS 后续
+    // 能否走 UPDATE；闸门关时 flags 与改动前逐位一致。带 flag 的首次 BUILD
+    // 时间可能略增（驱动需预留可更新形态空间），属预期代价。
     tlasBuildInfo.flags =
-        VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+        (s_tlasUpdateEnabled
+            ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR
+            : 0);
 
     tlasBuildInfo.mode =
         VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
@@ -3523,6 +3546,11 @@ bool rebuildWorldGeometry(
             tlasSizes.accelerationStructureSize;
 
         tlasStorageRecreated = true;
+
+        // 新对象即将按上面的 flags 构建：仅闸门开时它才是可更新形态；
+        // 闸门关时句柄置空，后续帧一律回落 BUILD。
+        s_tlasAllowUpdateHandle =
+            s_tlasUpdateEnabled ? g_tlas : VK_NULL_HANDLE;
     }
 
 
@@ -3559,6 +3587,57 @@ bool rebuildWorldGeometry(
                 g_device,
                 g_tlasScratchBuffer
             );
+    }
+
+
+    // UPDATE 保守护栏：以下全部通过才允许 MODE_UPDATE，任一不满足回落 BUILD。
+    // 比较仅在闸门开时执行；关闸门零额外遍历。
+    bool tlasCanUpdate = false;
+    std::string tlasUpdateRejectReason = "gate off";
+    if(s_tlasUpdateEnabled)
+    {
+        if(tlasHandleAtEntry == VK_NULL_HANDLE)
+        {
+            tlasUpdateRejectReason = "first create";
+        }
+        else if(tlasStorageRecreated || tlasInstancesBufferRecreated)
+        {
+            tlasUpdateRejectReason = "storage/instance buffer recreated";
+        }
+        else if(s_tlasAllowUpdateHandle != g_tlas)
+        {
+            tlasUpdateRejectReason = "existing TLAS lacks ALLOW_UPDATE";
+        }
+        else if(s_tlasInstancesShadow.size() != instances.size())
+        {
+            // 规范：UPDATE 实例数必须与 src TLAS 构建时一致，不允许增删实例。
+            tlasUpdateRejectReason = "instance count changed";
+        }
+        else
+        {
+            // 保守项：规范对 UPDATE 下更换 BLAS 引用存在不确定性，逐项比对
+            // accelerationStructureReference，任一变化一律回落 BUILD，不赌。
+            bool referencesStable = true;
+
+            for(size_t i = 0u; i < instances.size(); ++i)
+            {
+                if(s_tlasInstancesShadow[i].accelerationStructureReference !=
+                   instances[i].accelerationStructureReference)
+                {
+                    referencesStable = false;
+                    break;
+                }
+            }
+
+            if(!referencesStable)
+            {
+                tlasUpdateRejectReason = "blas reference changed";
+            }
+            else
+            {
+                tlasCanUpdate = true;
+            }
+        }
     }
 
 
@@ -3848,6 +3927,8 @@ bool rebuildWorldGeometry(
     tlasBuildInfo.dstAccelerationStructure =
         g_tlas;
 
+    const bool updateTlas = tlasCanUpdate;
+
     tlasBuildInfo.mode =
         updateTlas
             ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR
@@ -3885,6 +3966,27 @@ bool rebuildWorldGeometry(
 
     if(!tlasInstancesUnchanged)
     {
+        // 闸门开时每 5 秒打一条 UPDATE/BUILD 选路与回落原因；关闸门不进这段。
+        if(s_tlasUpdateEnabled)
+        {
+            static std::chrono::steady_clock::time_point s_tlasUpdateLastPrint{};
+            static bool s_tlasUpdateLastValid = false;
+            const auto tlasUpdateNow = std::chrono::steady_clock::now();
+
+            if(!s_tlasUpdateLastValid ||
+               std::chrono::duration<float>(
+                   tlasUpdateNow - s_tlasUpdateLastPrint).count() > 5.0f)
+            {
+                s_tlasUpdateLastValid = true;
+                s_tlasUpdateLastPrint = tlasUpdateNow;
+
+                RTLogFlushed(std::string("[TLAS UPDATE] mode=") +
+                    (updateTlas ? "UPDATE" : "BUILD") +
+                    " reason=" + tlasUpdateRejectReason +
+                    " instances=" + std::to_string(instances.size()));
+            }
+        }
+
         cmdBuild(
             cmd,
             1,
