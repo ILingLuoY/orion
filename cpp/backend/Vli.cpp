@@ -5,6 +5,13 @@
 #include "OrionInternal.h"
 #include "TrackingHooks.h"
 
+// 距上次实际整幅清的帧数（UINT32_MAX = 从未清过 / 刚重建）。
+static uint32_t s_vliHistFramesSinceLastClear = UINT32_MAX;
+// 缓冲重建 / 首帧必须强制清，绕过合并窗口。
+static bool s_vliHistForceClear = true;
+// 实际 fill 次数（低频日志记账，非每帧打印）。
+static uint64_t s_vliHistActualClears = 0u;
+
 
 // Total bytes of the capacity-sized VLI/VPT pools, i.e. every buffer that
 // grows with the live page capacity.  Used by the allocation and growth logs so
@@ -218,6 +225,8 @@ void destroyVPTDirectHistoryBuffers()
     g_vptDirectHistoryHeight = 0u;
     g_vptDirectHistoryBytes = 0;
     g_vptDirectHistoryNeedsClear = false;
+    s_vliHistForceClear = true;
+    s_vliHistFramesSinceLastClear = UINT32_MAX;
 
     if(g_vptBestLightBuffer != VK_NULL_HANDLE)
     {
@@ -339,6 +348,9 @@ void createVPTDirectHistoryBuffers(uint32_t width, uint32_t height)
     g_vptDirectHistoryHeight = height;
     g_vptDirectHistoryBytes = historyBytes;
     g_vptDirectHistoryNeedsClear = true;
+    // 新缓冲内容未定义：下一帧必须强制整幅清，不参与合并窗口。
+    s_vliHistForceClear = true;
+    s_vliHistFramesSinceLastClear = UINT32_MAX;
 
     // 2026-11-02：per-tile best-light。一块 buffer 分两半（按
     // cam.historyReadIndex ping-pong），每 tile 一个 r32ui 打包键。
@@ -384,6 +396,48 @@ void createVPTDirectHistoryBuffers(uint32_t width, uint32_t height)
 }
 
 
+// =====================================================
+// 2026-11-15：VPT 直连历史整幅清空的合并窗口闸门
+//
+// 背景：table/source/emitter/alias/candidate/directory 任一类上传都会置
+// g_vptDirectHistoryNeedsClear，下一帧对两份 ping-pong 历史缓冲（64B/px，
+// 整幅可达数百 MB）各做一次 vkCmdFillBuffer，best-light tile 槽一并清。
+// 历史缓冲是屏幕空间逐像素、VLI 页是体素空间，两者没有映射表，无法做
+// 局部失效；这里只做"频率合并"，不缩小清空范围。
+//
+//   ORION_VLI_HIST_CLEAR_COALESCE=<n>
+//     默认 1 = 改动前行为：每一帧待清都立即整幅清两份 + best-light。
+//     n>1  ：距上次实际清空不足 n-1 帧的待清请求只保留标记顺延，
+//            实际 fill 频率压到约 1/n。
+//   代价（画质权衡，不是免费收益）：最多 n 帧的旧样本会被复用，快速移动 /
+//   放破坏方块时可能出现时域鬼影；所以默认必须保持旧行为。
+//   缓冲重建 / 首帧强制清，不参与合并。
+// 回退：不设该变量（或 =1）即逐位回到旧行为；改完重启客户端生效。
+// =====================================================
+uint32_t vliHistClearCoalesceFrames()
+{
+    static const uint32_t cached = []() -> uint32_t
+    {
+        const char* raw = std::getenv("ORION_VLI_HIST_CLEAR_COALESCE");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 1u;
+        }
+
+        const long parsed = std::atol(raw);
+
+        if(parsed <= 1)
+        {
+            return 1u;
+        }
+
+        return static_cast<uint32_t>(parsed > 64 ? 64 : parsed);
+    }();
+
+    return cached;
+}
+
 void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
 {
     if(
@@ -396,11 +450,24 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
         return;
     }
 
+    // 合并窗口判定：待清但距上次实际清空仍在窗口内时，本帧顺延（保留标记），
+    // 不整幅 fill；两份 ping-pong 与 best-light 同进同退，不漏清半区。
+    bool doClear = g_vptDirectHistoryNeedsClear;
+    if(doClear && !s_vliHistForceClear)
+    {
+        const uint32_t coalesce = vliHistClearCoalesceFrames();
+        if(coalesce > 1u &&
+           s_vliHistFramesSinceLastClear < coalesce - 1u)
+        {
+            doClear = false;
+        }
+    }
+
     VkBufferMemoryBarrier barriers[3]{};
     uint32_t barrierCount = 2u;
     for(uint32_t i = 0u; i < 2u; ++i)
     {
-        if(g_vptDirectHistoryNeedsClear)
+        if(doClear)
         {
             vkCmdFillBuffer(
                 cmd,
@@ -417,7 +484,7 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
         barriers[i].buffer = g_vptDirectHistoryBuffers[i];
         barriers[i].offset = 0;
         barriers[i].size = g_vptDirectHistoryBytes;
-        barriers[i].srcAccessMask = g_vptDirectHistoryNeedsClear
+        barriers[i].srcAccessMask = doClear
             ? VK_ACCESS_TRANSFER_WRITE_BIT
             : VK_ACCESS_SHADER_WRITE_BIT;
         barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -427,7 +494,7 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
     // 因此不需要每帧 fill —— 清了反而会把上一帧刚写的那半擦掉。
     if(g_vptBestLightBuffer != VK_NULL_HANDLE && g_vptBestLightBytes > 0)
     {
-        if(g_vptDirectHistoryNeedsClear)
+        if(doClear)
         {
             vkCmdFillBuffer(
                 cmd,
@@ -444,7 +511,7 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
         barriers[2].buffer = g_vptBestLightBuffer;
         barriers[2].offset = 0;
         barriers[2].size = g_vptBestLightBytes;
-        barriers[2].srcAccessMask = g_vptDirectHistoryNeedsClear
+        barriers[2].srcAccessMask = doClear
             ? VK_ACCESS_TRANSFER_WRITE_BIT
             : VK_ACCESS_SHADER_WRITE_BIT;
         barriers[2].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -453,7 +520,7 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
 
     vkCmdPipelineBarrier(
         cmd,
-        g_vptDirectHistoryNeedsClear
+        doClear
             ? VK_PIPELINE_STAGE_TRANSFER_BIT
             : VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -467,7 +534,31 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
         0,
         nullptr
     );
-    g_vptDirectHistoryNeedsClear = false;
+
+    if(doClear)
+    {
+        g_vptDirectHistoryNeedsClear = false;
+        s_vliHistActualClears += 1u;
+        s_vliHistFramesSinceLastClear = 0u;
+        s_vliHistForceClear = false;
+
+        const uint32_t coalesce = vliHistClearCoalesceFrames();
+        // 低频记账：仅合并窗口 >1 时每 64 次实际清空打一条；默认旧行为不打。
+        if(coalesce > 1u && (s_vliHistActualClears % 64u) == 0u)
+        {
+            std::stringstream ss;
+            ss << "[VLI HIST] clears=" << s_vliHistActualClears
+               << " bytesPerClear="
+               << (2ull * g_vptDirectHistoryBytes + g_vptBestLightBytes)
+               << " coalesce=" << coalesce;
+            RTLog(ss.str());
+        }
+    }
+    else if(s_vliHistFramesSinceLastClear != UINT32_MAX)
+    {
+        ++s_vliHistFramesSinceLastClear;
+    }
+    // 顺延分支：g_vptDirectHistoryNeedsClear 保持 true，下一帧再判。
 }
 bool rtDescriptorRingEnabledByEnv()
 #if 0

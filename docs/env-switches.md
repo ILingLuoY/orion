@@ -66,6 +66,7 @@ Java 的 `-D` 传不进去（`build.gradle` 里的 `vmArg` 也到不了游戏 JV
 |---|---|---|
 | `ORION_CAPTURE_TIME_GATE` | 开 | 几何捕获的"单次唤醒时间闸"；`0` 退回只受条数约束 |
 | `ORION_UPLOAD_RAW_MOVE_GATE` | 开 | `uploadChunk` 锁内拷贝外移；`0` 退回在 `g_chunkMutex` 内分配+拷贝 |
+| `ORION_VLI_HIST_CLEAR_COALESCE` | `1`（= 改动前行为） | VPT 直连历史整幅清空的合并窗口（帧）。`1` = 每次待清都立即整幅清两份 ping-pong + best-light（旧行为）；`N>1` = 距上次实际清空不足 N-1 帧的待清请求顺延到下一窗口，整幅 fill 频率压到约 1/N。代价（画质权衡）：最多 N 帧旧样本被复用，快速移动/放破坏方块时可能出现时域鬼影；缓冲重建/首帧强制清，不参与合并。回退：不设或 `=1` 即旧行为，重启生效 |
 | `ORION_REBUILD_FENCE_GATE` | 开 | Section 重建的 fence 闸 |
 | `ORION_LOCAL_LIGHT_REBUILD` | **关** | 本地光聚合缓冲（bindings 17/18）的每帧重建；`1` 打开 |
 | `ORION_SUNSHADOW_FAR` | 开 | 1024² 远场太阳阴影图的生产 pass |
