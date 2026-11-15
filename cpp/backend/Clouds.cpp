@@ -3745,48 +3745,88 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
            g_volumetricCloudResolvedImage != VK_NULL_HANDLE &&
            g_volumetricCloudDepthImage != VK_NULL_HANDLE)
         {
-            // 一次性清空 resolved + depth，防止下游读到上一帧云残留。
-            VkImageMemoryBarrier offBarriers[2]{};
+            // 一次性清空 resolved + depth，防止下游读到上一帧云残留。这处只在
+            // enabled→disabled 那一帧跑一次，不在热路径，src 放宽没有热路径成本。
+            // 规范要求 srcAccessMask 的每一位都被 srcStageMask 支持：TOP_OF_PIPE 是
+            // 纯执行阶段、不支持任何读写位。按 oldLayout 分两组提交，别一刀切：
+            //   非 UNDEFINED（有上一帧旧读）：src ALL_COMMANDS + SHADER_READ，读方可能
+            //   来自 RT/COMPUTE，stage 不确定，用 ALL_COMMANDS 覆盖；
+            //   UNDEFINED（无旧内容可读）：src TOP_OF_PIPE + access 0。
+            VkImageMemoryBarrier oldBarriers[2]{};
+            VkImageMemoryBarrier freshBarriers[2]{};
+            uint32_t oldCount = 0u;
+            uint32_t freshCount = 0u;
             for(uint32_t i = 0u; i < 2u; ++i)
             {
-                offBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                offBarriers[i].oldLayout = (i == 0u ? g_volumetricCloudResolvedLayout
-                                                    : g_volumetricCloudDepthLayout);
-                offBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                offBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                offBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                offBarriers[i].srcAccessMask =
-                    offBarriers[i].oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                const VkImage image =
+                    (i == 0u ? g_volumetricCloudResolvedImage
+                             : g_volumetricCloudDepthImage);
+                const VkImageLayout oldLayout =
+                    (i == 0u ? g_volumetricCloudResolvedLayout
+                             : g_volumetricCloudDepthLayout);
+                VkImageMemoryBarrier& b =
+                    (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                        ? freshBarriers[freshCount] : oldBarriers[oldCount]);
+                b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                b.oldLayout = oldLayout;
+                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.srcAccessMask =
+                    oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
                     ? 0u : VK_ACCESS_SHADER_READ_BIT;
-                offBarriers[i].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                offBarriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                offBarriers[i].subresourceRange.levelCount = 1u;
-                offBarriers[i].subresourceRange.layerCount = 1u;
+                b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.image = image;
+                b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                b.subresourceRange.levelCount = 1u;
+                b.subresourceRange.layerCount = 1u;
+                if(oldLayout == VK_IMAGE_LAYOUT_UNDEFINED) { ++freshCount; }
+                else { ++oldCount; }
             }
-            offBarriers[0].image = g_volumetricCloudResolvedImage;
-            offBarriers[1].image = g_volumetricCloudDepthImage;
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr,
-                2u, offBarriers);
+            if(oldCount > 0u)
+            {
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+                    oldCount, oldBarriers);
+            }
+            if(freshCount > 0u)
+            {
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+                    freshCount, freshBarriers);
+            }
 
+            const VkImageSubresourceRange emptyRange{
+                VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u };
             const VkClearColorValue emptyResolved{{0.0f, 0.0f, 0.0f, 1.0f}};
             vkCmdClearColorImage(cmd, g_volumetricCloudResolvedImage,
-                VK_IMAGE_LAYOUT_GENERAL, &emptyResolved, 1u,
-                &offBarriers[0].subresourceRange);
+                VK_IMAGE_LAYOUT_GENERAL, &emptyResolved, 1u, &emptyRange);
             const VkClearColorValue emptyDepth{{1000000.0f, 0.0f, 0.0f, 0.0f}};
             vkCmdClearColorImage(cmd, g_volumetricCloudDepthImage,
-                VK_IMAGE_LAYOUT_GENERAL, &emptyDepth, 1u,
-                &offBarriers[1].subresourceRange);
+                VK_IMAGE_LAYOUT_GENERAL, &emptyDepth, 1u, &emptyRange);
 
+            VkImageMemoryBarrier backBarriers[2]{};
             for(uint32_t i = 0u; i < 2u; ++i)
             {
-                offBarriers[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                offBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                backBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                backBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                backBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                backBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                backBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                backBarriers[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                backBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                backBarriers[i].image =
+                    (i == 0u ? g_volumetricCloudResolvedImage
+                             : g_volumetricCloudDepthImage);
+                backBarriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                backBarriers[i].subresourceRange.levelCount = 1u;
+                backBarriers[i].subresourceRange.layerCount = 1u;
             }
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
-                2u, offBarriers);
+                2u, backBarriers);
             g_volumetricCloudResolvedLayout = VK_IMAGE_LAYOUT_GENERAL;
             g_volumetricCloudDepthLayout = VK_IMAGE_LAYOUT_GENERAL;
             s_cloudClearedWhileOff = true;
