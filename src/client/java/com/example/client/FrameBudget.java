@@ -73,6 +73,105 @@ public final class FrameBudget {
     private static long afterRenderFrameNanos;
     private static double lastRenderFrameInnerMs;
     private static double lastPostRenderFrameMs;
+
+    // 2026-11-09：LevelRenderer.render 整段的墙钟。
+    // 病征（用户）：avgRenderMs 20~46ms，但 frameTail 只占 1~2ms、submit 0.7ms，
+    // 加起来对不上 ⇒ 时间在 level render 内部，而那里此前没有任何分段。
+    // 这一段包含我们的 per-frame JNI（recordFrameCommand / 实体捕获 / 区块上传）
+    // 与原版 Java 渲染，先用它把"是我们的"和"是原版的"分开，再逐层下切。
+    private static long levelRenderStartNanos;
+    private static double lastLevelRenderMs;
+    private static double sumLevelRenderMs;
+    private static double maxLevelRenderMs;
+
+    // 2026-11-09 第二刀：把 levelRender 拆成"我们的 JNI"与"原版渲染"。
+    //   captureHeadMs = LevelRenderer.render 的 HEAD 注入整块
+    //                   （VoxyLod.tick / DhBridge.tick / FarFieldGate / 实体与粒子
+    //                    捕获 / submitFrame / uploadVisibleSections）
+    //   recordFrameMs = NativeVulkan.recordFrameCommand（每帧录制全部 RT pass）
+    // 两者都是我们的，且都在 render 回调内；剩下的部分才接近"原版渲染"。
+    private static long captureHeadStartNanos;
+    private static double sumCaptureHeadMs;
+    private static double maxCaptureHeadMs;
+    private static long recordFrameStartNanos;
+    private static double sumRecordFrameMs;
+    private static double maxRecordFrameMs;
+
+    // 2026-11-09 第三刀：submitEntities 整段（含我们的实体模型捕获：逐模型
+    // beginModel/endModel → uploadEntityBatch JNI + 每帧顶点内容哈希）。
+    // levelRender − captureHead − submitEntities ≈ 区块/几何提交（更接近"原版"）。
+    private static long submitEntitiesStartNanos;
+    private static double sumSubmitEntitiesMs;
+    private static double maxSubmitEntitiesMs;
+
+    /** 2026-11-09：LevelRenderer.submitEntities HEAD。 */
+    public static void beginSubmitEntities() {
+        submitEntitiesStartNanos = System.nanoTime();
+        submitAllocBase = allocatedBytes();
+    }
+
+    /** 2026-11-09：LevelRenderer.submitEntities TAIL。 */
+    public static void endSubmitEntities() {
+        if (submitEntitiesStartNanos != 0L) {
+            final double ms =
+                    (System.nanoTime() - submitEntitiesStartNanos) / 1_000_000.0;
+            sumSubmitEntitiesMs += ms;
+            if (ms > maxSubmitEntitiesMs) {
+                maxSubmitEntitiesMs = ms;
+            }
+        }
+        if (submitEntitiesStartNanos != 0L)
+        {
+            sumSubmitAlloc += allocatedBytes() - submitAllocBase;
+        }
+        submitEntitiesStartNanos = 0L;
+    }
+
+    /** 2026-11-09：HEAD 注入块起点。 */
+    public static void beginCaptureHead() {
+        captureHeadStartNanos = System.nanoTime();
+        captureAllocBase = allocatedBytes();
+    }
+
+    /** 2026-11-09：HEAD 注入块终点。 */
+    public static void endCaptureHead() {
+        if (captureHeadStartNanos != 0L) {
+            final double ms =
+                    (System.nanoTime() - captureHeadStartNanos) / 1_000_000.0;
+            sumCaptureHeadMs += ms;
+            if (ms > maxCaptureHeadMs) {
+                maxCaptureHeadMs = ms;
+            }
+        }
+        if (captureHeadStartNanos != 0L)
+        {
+            sumCaptureAlloc += allocatedBytes() - captureAllocBase;
+        }
+        captureHeadStartNanos = 0L;
+    }
+
+    /** 2026-11-09：recordFrameCommand 起点。 */
+    public static void beginRecordFrame() {
+        recordFrameStartNanos = System.nanoTime();
+        recordAllocBase = allocatedBytes();
+    }
+
+    /** 2026-11-09：recordFrameCommand 终点。 */
+    public static void endRecordFrame() {
+        if (recordFrameStartNanos != 0L) {
+            final double ms =
+                    (System.nanoTime() - recordFrameStartNanos) / 1_000_000.0;
+            sumRecordFrameMs += ms;
+            if (ms > maxRecordFrameMs) {
+                maxRecordFrameMs = ms;
+            }
+        }
+        if (recordFrameStartNanos != 0L)
+        {
+            sumRecordAlloc += allocatedBytes() - recordAllocBase;
+        }
+        recordFrameStartNanos = 0L;
+    }
     private static double sumRenderFrameInnerMs;
     private static double sumPostRenderFrameMs;
 
@@ -411,6 +510,67 @@ public final class FrameBudget {
         }
     }
 
+    // ========================================================================
+    // 2026-11-11：按段计量"分配字节"。
+    //
+    // 背景：GC 日志显示 Young GC 一次就 845M->380M，随后触发 14 次
+    // Concurrent Mark Cycle（中位 124ms）抢渲染线程 CPU，表现为 100~270ms 长卡。
+    // JFR 在 D:\RTX 这个精简运行时里 dump 恒为 0 字节，jcmd attach 也被拒，
+    // 所以改用 JDK 自带的按线程分配计数器：精度到字节、开销极低、无需 attach。
+    // ========================================================================
+    // 注意：必须走 getThreadMXBean()。getOperatingSystemMXBean() 返回的是
+    // OperatingSystemMXBean，它**不实现** com.sun.management.ThreadMXBean，
+    // 转换会失败并退化成 0（第一版就是这么写错的，读数全 0.00）。
+    private static final com.sun.management.ThreadMXBean ALLOC_MX =
+            java.lang.management.ManagementFactory.getThreadMXBean()
+                    instanceof com.sun.management.ThreadMXBean
+                    ? (com.sun.management.ThreadMXBean)
+                        java.lang.management.ManagementFactory.getThreadMXBean()
+                    : null;
+
+    private static long allocatedBytes() {
+        if (ALLOC_MX == null) {
+            return 0L;
+        }
+        return ALLOC_MX.getThreadAllocatedBytes(Thread.currentThread().getId());
+    }
+
+    private static long levelAllocBase;
+    private static long captureAllocBase;
+    private static long recordAllocBase;
+    private static long submitAllocBase;
+    private static double sumLevelAlloc;
+    private static double sumCaptureAlloc;
+    private static double sumRecordAlloc;
+    private static double sumSubmitAlloc;
+
+    private static double lastLevelAlloc;
+    private static double lastRecordAlloc;
+
+    /** 2026-11-09：LevelRenderer.render HEAD。纯读时钟，不改任何行为。 */
+    public static void beginLevelRender() {
+        levelRenderStartNanos = System.nanoTime();
+        levelAllocBase = allocatedBytes();
+    }
+
+    /** 2026-11-09：LevelRenderer.render RETURN。 */
+    public static void endLevelRender() {
+        if (levelRenderStartNanos != 0L) {
+            final double ms =
+                    (System.nanoTime() - levelRenderStartNanos) / 1_000_000.0;
+            lastLevelRenderMs = ms;
+            sumLevelRenderMs += ms;
+            if (ms > maxLevelRenderMs) {
+                maxLevelRenderMs = ms;
+            }
+        }
+        if (levelRenderStartNanos != 0L)
+        {
+            sumLevelAlloc += allocatedBytes() - levelAllocBase;
+        }
+        levelRenderStartNanos = 0L;
+    }
+
     /**
      * 2026-10-22 A1：{@code VulkanCommandEncoder.submit} 开始。
      * 这一段是 {@code vkQueueSubmit} 与其伴随的 fence/信号量操作 ——
@@ -445,6 +605,9 @@ public final class FrameBudget {
                         + " avgRenderMs=" + round(avgRender)
                         + " avgOutsideMs=" + round(avgOutside)
                         + " maxRenderMs=" + round(maxRenderMs)
+                        // 2026-11-09：把渲染距离写进日志，让"改视距"的 A/B 可自动对齐。
+                        + " rd=" + net.minecraft.client.Minecraft.getInstance()
+                                .options.renderDistance().get()
                         + " renderPct=" + round(avgInterval <= 0.0
                                 ? 0.0
                                 : 100.0 * avgRender / avgInterval)
@@ -467,9 +630,23 @@ public final class FrameBudget {
                         + " postRenderFrameMs=" + round(sumPostRenderFrameMs / inv)
                         + " submitMs=" + round(sumSubmitMs / inv)
                         + " submitCount=" + sumSubmitCount
+                        + " levelRenderMs=" + round(sumLevelRenderMs / inv)
+                        + " maxLevelRenderMs=" + round(maxLevelRenderMs)
+                        + " captureHeadMs=" + round(sumCaptureHeadMs / inv)
+                        + " maxCaptureHeadMs=" + round(maxCaptureHeadMs)
+                        + " recordFrameMs=" + round(sumRecordFrameMs / inv)
+                        + " MB/f: level=" + round(sumLevelAlloc / inv / 1048576.0)
+                        + " record=" + round(sumRecordAlloc / inv / 1048576.0)
+                        + " capture=" + round(sumCaptureAlloc / inv / 1048576.0)
+                        + " submit=" + round(sumSubmitAlloc / inv / 1048576.0)
+                        + " maxRecordFrameMs=" + round(maxRecordFrameMs)
+                        + " submitEntitiesMs=" + round(sumSubmitEntitiesMs / inv)
+                        + " maxSubmitEntitiesMs=" + round(maxSubmitEntitiesMs)
                         + "  (= frameTail 拆两段 + 我们自己的 submit 墙钟；"
                         + "submit≈frameTail ⇒ 队列等待/帧节奏（减 GPU pass 才有 fps）；"
-                        + "两段都小 ⇒ 卡在原版 Java 侧)");
+                        + "levelRenderMs 覆盖 LevelRenderer.render 整段："
+                        + "它≈avgRenderMs ⇒ 卡在 level render 内（我们的 JNI + 原版）；"
+                        + "它远小于 avgRenderMs ⇒ 卡在 render 之外的帧内空档)");
         System.out.println(
                 "                [FRAME SIM] vanillaTickMs=" + round(sumVanillaTickMs / inv)
                         + "  (= simMs 里的原版 tick；"
@@ -542,6 +719,18 @@ public final class FrameBudget {
         sumPresentMs = 0.0;
         sumRenderFrameInnerMs = 0.0;
         sumPostRenderFrameMs = 0.0;
+        sumLevelRenderMs = 0.0;
+        maxLevelRenderMs = 0.0;
+        sumCaptureHeadMs = 0.0;
+        maxCaptureHeadMs = 0.0;
+        sumRecordFrameMs = 0.0;
+        sumLevelAlloc = 0.0;
+        sumCaptureAlloc = 0.0;
+        sumRecordAlloc = 0.0;
+        sumSubmitAlloc = 0.0;
+        maxRecordFrameMs = 0.0;
+        sumSubmitEntitiesMs = 0.0;
+        maxSubmitEntitiesMs = 0.0;
         sumSubmitMs = 0.0;
         sumSubmitCount = 0;
         maxRenderMs = 0.0;

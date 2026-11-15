@@ -13,6 +13,20 @@ layout(push_constant) uniform CloudCompositePush
 {
     float splitDistance;
     float mode;
+    // 2026-11-15：云 shoulder 的白点改为**与下游曝光同口径**。
+    //
+    // 旧实现：white = exp2(-currentEV) —— 等价于假设"曝光强度 = 1.0"。
+    // 但下游真正乘以的是 exp2(currentEV * exposureStrength)：
+    //   SDR: rr_sdr_post.comp 用 postPush.exposureStrength（默认 0.5）
+    //   HDR: rr_hdr_encode.comp 用常量 0.6
+    // ⇒ 白点与曝光差 exp2(±0.5 * EV)：EV 越负（画面越亮 / 抬头看天），
+    // 白点被放得越大，云被压到远高于实际显示白点的位置，整片云发白、
+    // 亮面/暗面层次被抹平 —— 这就是"云的受光很怪"。
+    //
+    // 现在：white = exp2(-currentEV * exposureStrength) * whiteScale，
+    // 白点乘上下游曝光后正好落在显示白点（HDR 是 4 倍参考白）。
+    float whiteScale;
+    float exposureStrength;
 } pc;
 layout(set = 0, binding = 3) uniform CameraProperties
 {
@@ -124,7 +138,24 @@ void main()
         : imageLoad(sceneOutputNear, pixel);
     ivec2 cloudSize = textureSize(cloudInput, 0);
     vec4 cloud = reconstructCloud(uv, cloudSize == size, cloudSize.x > size.x);
-    cloud.rgb = cloudShoulder(cloud.rgb, cloudWhite);
+
+    // currentEV 是本帧开始时 AeState 里的值（上一帧 adapt 的结果，1 帧延迟），
+    // 与 rr_sdr_post / rr_hdr_encode 使用同一套 exposureStrength 口径。
+#ifndef VPT_CLOUD_SHOULDER_AE_COUPLED
+#define VPT_CLOUD_SHOULDER_AE_COUPLED 1
+#endif
+
+#if VPT_CLOUD_SHOULDER_AE_COUPLED
+    float exposureStrength = clamp(pc.exposureStrength, 0.0, 1.0);
+    float displayWhite =
+        exp2(-currentEV * exposureStrength) * max(pc.whiteScale, 1.0e-3);
+#else
+    // 2026-11-15 之前的旧口径（把曝光强度当成 1.0）。EV 偏离 0 时云的
+    // 白点会与画面曝光差 exp2(0.5*EV)，层次被抹平。仅作 A/B 回退用。
+    float displayWhite = exp2(-currentEV) * max(pc.whiteScale, 1.0e-3);
+#endif
+
+    cloud.rgb = cloudShoulder(cloud.rgb, displayWhite);
     scene.rgb = scene.rgb * cloud.a + cloud.rgb;
     if(farPass)
     {

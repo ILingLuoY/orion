@@ -47,7 +47,28 @@ public final class FarFieldGate {
 
     private static final byte MISSING_UPLOADED = 2;
 
-    private static final ConcurrentHashMap<Long, Byte> STATES = new ConcurrentHashMap<>();
+    /**
+     * 2026-11-09：状态表按 {@link #SLICE_COUNT} 物理分片。
+     *
+     * <p>旧实现每帧把**整张表**迭代一遍，再用 {@code index % SLICE_COUNT} 过滤掉
+     * 7/8 的 entry —— 迭代成本 O(全表)，有效工作只有 1/8。分片后每帧只迭代一片，
+     * 每个 entry 的处理节奏（每 8 帧看一次）完全不变，迭代量降到 1/8。</p>
+     */
+    @SuppressWarnings("unchecked")
+    private static final ConcurrentHashMap<Long, Byte>[] STATES =
+            new ConcurrentHashMap[SLICE_COUNT];
+
+    static {
+        for (int i = 0; i < SLICE_COUNT; i++) {
+            STATES[i] = new ConcurrentHashMap<>();
+        }
+    }
+
+    private static ConcurrentHashMap<Long, Byte> shardOf(long sectionKey) {
+        // 取 64 位混合乘法的高 3 位。SectionPos.asLong 的低位是 y，
+        // 直接用 key & 7 会在平坦世界里严重倾斜。
+        return STATES[(int) ((sectionKey * 0x9E3779B97F4A7C15L) >>> 61)];
+    }
     private static volatile boolean lodProviding;
     private static volatile String lodProvider = "none";
     private static int observationLogCountdown = 1;
@@ -108,8 +129,10 @@ public final class FarFieldGate {
 
     private static int countSuppressed() {
         int count = 0;
-        for (Byte state : STATES.values()) {
-            if (state == SUPPRESSED) count++;
+        for (ConcurrentHashMap<Long, Byte> shard : STATES) {
+            for (Byte state : shard.values()) {
+                if (state == SUPPRESSED) count++;
+            }
         }
         return count;
     }
@@ -138,13 +161,18 @@ public final class FarFieldGate {
      * 新世界的 section 会重新编译并按正常路径重新登记。</p>
      */
     public static void clearWorldStates(String reason) {
-        final int before = STATES.size();
+        int before = 0;
+        for (ConcurrentHashMap<Long, Byte> shard : STATES) {
+            before += shard.size();
+        }
 
         if (before == 0) {
             return;
         }
 
-        STATES.clear();
+        for (ConcurrentHashMap<Long, Byte> shard : STATES) {
+            shard.clear();
+        }
         System.out.println("[FFG] world states cleared (" + reason
                 + "): size " + before + " -> 0");
     }
@@ -189,16 +217,47 @@ public final class FarFieldGate {
      * 表现为「空洞能看到横截面」，以及「64 格外看不到水面（近场水面被压掉、
      * LOD 还没有水）」。现在叠加逐位置覆盖判定，缺数据的位置保持近场渲染。</p>
      */
+    // 2026-11-11：**距离压制**（不依赖 LOD 源）。
+    //
+    // 背景：本机没有 Voxy/DH ⇒ takeoverActive() 恒 false ⇒ shouldSuppress 永远返回
+    // false ⇒ erased=0，766 个 section 全部由原版光栅提交。实测那一段是：
+    //   时间 15.5 ms、每帧分配 3.49 MB（我们自己的 capture/submit/record 都 ≈0.01），
+    // 分配又驱动 Young GC 与 14 次 Concurrent Mark Cycle（中位 124ms）抢渲染线程。
+    //
+    // 做法：超过 ORION_RASTER_CUT（单位=section，16 格）的 section 直接压制，
+    // 走既有的 SUPPRESSED → clearChunkLayers 通路（该状态是持久的，不会每帧重传）。
+    // 代价：远处会提前消失，靠雾遮；默认 0 = 关闭，行为与改动前完全一致。
+    private static final double RASTER_CUT_SECTIONS = readRasterCut();
+
+    private static double readRasterCut() {
+        final String raw = System.getenv("ORION_RASTER_CUT");
+        if (raw == null || raw.isEmpty()) return 0.0;
+        try {
+            final double v = Double.parseDouble(raw.trim());
+            return v <= 0.0 ? 0.0 : v;
+        } catch (NumberFormatException ex) {
+            return 0.0;
+        }
+    }
+
     public static boolean shouldSuppress(SectionPos pos) {
-        if (!takeoverActive()) return false;
-        if (!VoxyLodManager.coversSection(pos.x(), pos.z())) return false;
         Vec3 camera = VoxyCompat.cameraPosition(Minecraft.getInstance());
         if (camera == null) return false;
+
+        // 距离压制优先：没有 LOD 源时也能生效。
+        if (RASTER_CUT_SECTIONS > 0.0
+                && gridDistance(pos.x(), pos.z(), camera.x, camera.z) >= RASTER_CUT_SECTIONS) {
+            return true;
+        }
+
+        if (!takeoverActive()) return false;
+        if (!VoxyLodManager.coversSection(pos.x(), pos.z())) return false;
         return gridDistance(pos.x(), pos.z(), camera.x, camera.z) >= seamSections();
     }
 
     public static void recordState(SectionPos pos, boolean uploaded) {
-        STATES.put(pos.asLong(), uploaded ? UPLOADED : SUPPRESSED);
+        final long key = pos.asLong();
+        shardOf(key).put(key, uploaded ? UPLOADED : SUPPRESSED);
     }
 
     /** 渲染线程:LevelRenderer.render 头部每帧调用。 */
@@ -212,12 +271,10 @@ public final class FarFieldGate {
         Vec3 cam = camera.pos;
         int target = slice;
         slice = (slice + 1) % SLICE_COUNT;
-        int index = 0;
         int transitions = 0;
-        Iterator<Map.Entry<Long, Byte>> it = STATES.entrySet().iterator();
+        Iterator<Map.Entry<Long, Byte>> it = STATES[target].entrySet().iterator();
         while (it.hasNext() && transitions < MAX_TRANSITIONS_PER_FRAME) {
             Map.Entry<Long, Byte> entry = it.next();
-            if ((index++ % SLICE_COUNT) != target) continue;
             SectionPos pos = SectionPos.of(entry.getKey());
             byte state = entry.getValue();
             SectionRenderDispatcher.RenderSection section = viewArea.getRenderSectionAt(pos.origin());
@@ -308,8 +365,10 @@ public final class FarFieldGate {
      * 才能判定是"擦掉没补"、"从未编译"还是"LOD 数据缺失"。</p>
      */
     static void collectStates(Set<Long> uploaded, Set<Long> suppressed) {
-        for (Map.Entry<Long, Byte> entry : STATES.entrySet()) {
-            (entry.getValue() == SUPPRESSED ? suppressed : uploaded).add(entry.getKey());
+        for (ConcurrentHashMap<Long, Byte> shard : STATES) {
+            for (Map.Entry<Long, Byte> entry : shard.entrySet()) {
+                (entry.getValue() == SUPPRESSED ? suppressed : uploaded).add(entry.getKey());
+            }
         }
     }
 

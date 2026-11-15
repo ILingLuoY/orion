@@ -151,8 +151,15 @@ bool sparseLayeredActive(uvec2 pixelCoord, uint frameIdx, float samplingRate)
 }
 
 #ifndef SPARSE_ORDERED_BAYER
-// 1 = 有序抖动（**默认**，空间/时域都均匀）；0 = 蓝噪声独立抽签（旧行为）。
-#define SPARSE_ORDERED_BAYER 1
+// 1 = 有序抖动；0 = 蓝噪声独立抽签。
+//
+// 2026-11-08：默认改 0。**源码即真相**：此前部署用的是
+// `-DSPARSE_ORDERED_BAYER=0`（见 _deploy_stale_spv.py 的 EXTRA_FLAGS），
+// 而这里默认写 1 ⇒ 任何不走那条 flags 的构建路径（手搓 glslang、
+// _rebuild_rgen.py 之类）都会静默把掩码换成 Bayer 路径。这与
+// "Copy-Item 保留旧 mtime ⇒ 部署的仍是坏 SPV" 是同一类坑，故把默认值对齐部署值。
+// A/B 时用 -DSPARSE_ORDERED_BAYER=1 显式打开。
+#define SPARSE_ORDERED_BAYER 0
 #endif
 
 // Bayer 4x4（0..15）。任意 k 下，相邻的 k 个阈值在 4x4 块内尽量散开：

@@ -141,13 +141,17 @@ void main()
         highDistance = V3_EMPTY_DISTANCE;
     }
 
-    vec3 directLightColor = mix(vec3(0.46, 0.56, 1.00), v3SunColor(lightDirection), dayAmount);
+    // 2026-11-13：夜间色改调共享的 skyModelMoonColor（原来硬编码）。
+    vec3 directLightColor = mix(skyModelMoonColor(sunElevation), v3SunColor(lightDirection), dayAmount);
     float directLightEnergy = mix(V3_MOON_LIGHT_SCALE * elevationMagnitude,
         6.0, dayAmount) * clamp(cam.cloudParams5.z, 0.0, 3.0);
     float moonStrength = cam.cloudMoonParams.x >= 0.0 ? cam.cloudMoonParams.x : 1.0;
     float moonPhase = cam.cloudMoonParams.y >= 0.0 ? cam.cloudMoonParams.y : 1.0;
     float moonAmount = mix(1.0, moonStrength * clamp(moonPhase, 0.0, 1.0), 1.0 - dayAmount);
     vec3 sunColor = directLightColor * directLightEnergy * moonAmount;
+
+    // 2026-11-13：与地形同源的月相调光。
+    sunColor *= mix(1.0, skyModelMoonPhaseDim(cam.sssParams.z, 0.35), 1.0 - dayAmount);
 
     float daylight = mix(V3_NIGHT_AMBIENT, 1.0,
         smoothstep(-0.10, V3_DAYLIGHT_UPPER, sunElevation));
@@ -288,7 +292,9 @@ void main()
         cam.cloudParams7.x, cam.cloudParams7.y, cam.cloudParams7.z, cam.cloudParams7.w,
         cam.cloudParams8.x, cam.cloudParams8.y, cam.cloudParams8.z, cam.cloudParams8.w,
         cam.cloudParams9.x, cam.cloudParams9.y, cam.cloudParams9.z,
-        cam.fogExtrasParams.y, cam.fogExtrasParams.w, cam.fogExtrasParams.x);
+        cam.fogExtrasParams.y, cam.fogExtrasParams.w, cam.fogExtrasParams.x,
+        vec4(0.0),    // v3 是旧档：不做云隙光（没有 v5 那套 HP 云配置可用）
+        vec2(0.5));   // 也没有太阳可见性体积（VFOG_SUN_VOLUME 未定义）
 
     {
         float aerialStrength = clamp(cam.cloudAerialParams.x, 0.0, 2.0);

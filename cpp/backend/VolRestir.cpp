@@ -54,6 +54,298 @@ uint32_t volDiagMode()
     }();
     return cached;
 }
+// ===========================================================================
+// 2026-11-09：NEE 探针（ORION_VOL_NEE_PROBE=1）
+//
+// 病征：洞穴里体积光从头顶灌下来、并且看起来"无视遮挡"。
+// 静态排查已全部做完且都正常：SPIR-V 里确有 OpRayQueryInitializeKHR（mask 255）、
+// composite 用 sceneDepth 精确裁剪 march 距离、TLAS 的 ±160 光空间保底盒覆盖了
+// 体积光射程内的全部遮挡体。⇒ 剩下两种互斥的可能：
+//   (a) 遮挡射线真的被放行（TLAS 缺遮挡体 / 端点贴边漏过）；
+//   (b) 灯本来就和你同一片空气（那么"头顶没光源"是灯表内容问题，不是遮挡问题）。
+// 这两者的修法完全相反，所以在动渲染逻辑之前先把它们变成一个数字：
+//   [VOL NEE] cand=…/帧 lit=…/帧 (…%) above=…/帧 meanLum=…
+// 打开方式只需环境变量，shader 侧是一道 uniform 分支，关闭时逐字节等价。
+// ===========================================================================
+bool volNeeProbeEnabled()
+{
+    static const bool cached = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_VOL_NEE_PROBE");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return cached;
+}
+
+// 2026-11-09 P1：体积光合成的降分辨率倍率。
+//   1 = 全分辨率（旧行为），2 = 2×2 共享一次 march（默认）。
+// 依据：radiance 来自 froxel 体积，横向粒度 8 像素，逐像素重裁 scene depth 的
+// 精度基本浪费；2×2 后 march 次数降 4×，而 shader 侧用 2×2 内**最近**深度裁剪，
+// 所以不会把前景之后的雾画到前景前面（只会让轮廓背面少一点雾）。
+// A/B：ORION_VOL_COMPOSITE_DOWNSCALE=1 回到旧档，需重启客户端。
+uint32_t volCompositeDownscale()
+{
+    static const uint32_t cached = []() -> uint32_t
+    {
+        const char* raw = std::getenv("ORION_VOL_COMPOSITE_DOWNSCALE");
+        const int value = raw != nullptr ? std::atoi(raw) : 2;
+        return static_cast<uint32_t>(std::min(std::max(value, 1), 2));
+    }();
+    return cached;
+}
+
+namespace
+{
+    constexpr uint32_t VOL_NEE_PROBE_WORDS = 24u;
+    constexpr uint32_t VOL_NEE_PROBE_LOG_INTERVAL = 120u;
+
+    VkBuffer s_volNeeProbeBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory s_volNeeProbeMemory = VK_NULL_HANDLE;
+    uint32_t* s_volNeeProbeMapped = nullptr;
+
+    uint32_t s_volNeeProbeFrameCounter = 0u;
+    uint64_t s_volNeeAccCandidate = 0u;
+    uint64_t s_volNeeAccLit = 0u;
+    uint64_t s_volNeeAccAbove = 0u;
+    uint64_t s_volNeeAccLumMilli = 0u;
+    uint64_t s_volNeeAccReservoir = 0u;
+    uint64_t s_volNeeAccFroxel = 0u;
+    uint64_t s_volNeeAccAboveCandidate = 0u;
+    uint64_t s_volNeeAccUpTests = 0u;
+    uint64_t s_volNeeAccUpHits = 0u;
+    uint64_t s_volNeeAccUpHitPass = 0u;
+    uint64_t s_volNeeAccAsTests = 0u;
+    uint64_t s_volNeeAccAsHits = 0u;
+    uint32_t s_volNeeLastAsHitT = 0u;
+    uint64_t s_volNeeAccAsPlainHits = 0u;
+    uint32_t s_volNeeLastAsPlainT = 0u;
+    uint32_t s_volNeeLightCount = 0u;
+    uint32_t s_volNeeGridCapacity = 0u;
+
+    void destroyVolNeeProbeBuffer()
+    {
+        if(s_volNeeProbeMapped != nullptr && g_device != VK_NULL_HANDLE)
+        {
+            vkUnmapMemory(g_device, s_volNeeProbeMemory);
+        }
+        s_volNeeProbeMapped = nullptr;
+
+        if(s_volNeeProbeBuffer != VK_NULL_HANDLE && g_device != VK_NULL_HANDLE)
+        {
+            vkDestroyBuffer(g_device, s_volNeeProbeBuffer, nullptr);
+        }
+        s_volNeeProbeBuffer = VK_NULL_HANDLE;
+
+        if(s_volNeeProbeMemory != VK_NULL_HANDLE && g_device != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(g_device, s_volNeeProbeMemory, nullptr);
+        }
+        s_volNeeProbeMemory = VK_NULL_HANDLE;
+    }
+
+    bool ensureVolNeeProbeBuffer()
+    {
+        // 无条件分配 32 B：binding 23 的 descriptor 必须始终有效（shader 里它是
+        // 静态使用的资源），是否累加只由 push constant 的开关位决定。
+        if(s_volNeeProbeBuffer != VK_NULL_HANDLE)
+        {
+            return true;
+        }
+        if(g_device == VK_NULL_HANDLE || g_physicalDevice == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = VOL_NEE_PROBE_WORDS * sizeof(uint32_t);
+        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if(vkCreateBuffer(g_device, &info, nullptr, &s_volNeeProbeBuffer) != VK_SUCCESS)
+        {
+            RTLog("[VOL NEE] probe buffer create failed; probe disabled");
+            s_volNeeProbeBuffer = VK_NULL_HANDLE;
+            return false;
+        }
+
+        VkMemoryRequirements requirements{};
+        vkGetBufferMemoryRequirements(g_device, s_volNeeProbeBuffer, &requirements);
+
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = findMemoryType(g_physicalDevice,
+            requirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        if(vkAllocateMemory(g_device, &allocation, nullptr, &s_volNeeProbeMemory) != VK_SUCCESS)
+        {
+            RTLog("[VOL NEE] probe memory allocate failed; probe disabled");
+            destroyVolNeeProbeBuffer();
+            return false;
+        }
+
+        if(vkBindBufferMemory(g_device, s_volNeeProbeBuffer, s_volNeeProbeMemory, 0u) != VK_SUCCESS ||
+           vkMapMemory(g_device, s_volNeeProbeMemory, 0u, VK_WHOLE_SIZE, 0u,
+               reinterpret_cast<void**>(&s_volNeeProbeMapped)) != VK_SUCCESS)
+        {
+            RTLog("[VOL NEE] probe bind/map failed; probe disabled");
+            s_volNeeProbeMapped = nullptr;
+            destroyVolNeeProbeBuffer();
+            return false;
+        }
+
+        for(uint32_t i = 0u; i < VOL_NEE_PROBE_WORDS; ++i)
+        {
+            s_volNeeProbeMapped[i] = 0u;
+        }
+
+        RTLog("[VOL NEE] probe buffer ready (host visible, 32 B)");
+        return true;
+    }
+
+    // 读回上一帧的计数 → 累加 120 帧打一行 → 清零。
+    // 注：清零与 GPU 写入之间没有同步（探针专用、允许一个窗口内的少数误差），
+    // 但计数是单调累加的，窗口平均值不受影响。
+    void pollVolNeeProbe()
+    {
+        if(s_volNeeProbeMapped == nullptr)
+        {
+            return;
+        }
+
+        const uint32_t candidate = s_volNeeProbeMapped[0];
+        const uint32_t lit = s_volNeeProbeMapped[1];
+        const uint32_t litAbove = s_volNeeProbeMapped[2];
+        const uint32_t lumMilli = s_volNeeProbeMapped[3];
+        const uint32_t lightCount = s_volNeeProbeMapped[4];
+        const uint32_t gridCapacity = s_volNeeProbeMapped[5];
+        const uint32_t reservoirValid = s_volNeeProbeMapped[6];
+        const uint32_t froxelCount = s_volNeeProbeMapped[7];
+        const uint32_t candidateAbove = s_volNeeProbeMapped[8];
+        const uint32_t upTests = s_volNeeProbeMapped[9];
+        const uint32_t upHits = s_volNeeProbeMapped[10];
+        const uint32_t upHitPass = s_volNeeProbeMapped[11];
+        const uint32_t asTests = s_volNeeProbeMapped[12];
+        const uint32_t asHits = s_volNeeProbeMapped[13];
+        const uint32_t asHitT = s_volNeeProbeMapped[14];
+        const uint32_t asPlainHits = s_volNeeProbeMapped[15];
+        const uint32_t asPlainT = s_volNeeProbeMapped[16];
+
+        for(uint32_t i = 0u; i < VOL_NEE_PROBE_WORDS; ++i)
+        {
+            s_volNeeProbeMapped[i] = 0u;
+        }
+
+        s_volNeeAccCandidate += candidate;
+        s_volNeeAccLit += lit;
+        s_volNeeAccAbove += litAbove;
+        s_volNeeAccLumMilli += lumMilli;
+        s_volNeeAccReservoir += reservoirValid;
+        s_volNeeAccFroxel += froxelCount;
+        s_volNeeAccAboveCandidate += candidateAbove;
+        s_volNeeAccUpTests += upTests;
+        s_volNeeAccUpHits += upHits;
+        s_volNeeAccUpHitPass += upHitPass;
+        s_volNeeAccAsTests += asTests;
+        s_volNeeAccAsHits += asHits;
+
+        if(asHitT != 0u)
+        {
+            s_volNeeLastAsHitT = asHitT;
+        }
+
+        s_volNeeAccAsPlainHits += asPlainHits;
+
+        if(asPlainT != 0u)
+        {
+            s_volNeeLastAsPlainT = asPlainT;
+        }
+        s_volNeeLightCount = lightCount;
+        s_volNeeGridCapacity = gridCapacity;
+
+        if(++s_volNeeProbeFrameCounter < VOL_NEE_PROBE_LOG_INTERVAL)
+        {
+            return;
+        }
+
+        const double frames = static_cast<double>(VOL_NEE_PROBE_LOG_INTERVAL);
+        const double perFrameCandidate = static_cast<double>(s_volNeeAccCandidate) / frames;
+        const double perFrameLit = static_cast<double>(s_volNeeAccLit) / frames;
+        const double perFrameAbove = static_cast<double>(s_volNeeAccAbove) / frames;
+        const double meanLum = s_volNeeAccLit > 0u
+            ? static_cast<double>(s_volNeeAccLumMilli) /
+                static_cast<double>(s_volNeeAccLit)
+            : 0.0;
+        const double passRate = s_volNeeAccCandidate > 0u
+            ? 100.0 * static_cast<double>(s_volNeeAccLit) /
+                static_cast<double>(s_volNeeAccCandidate)
+            : 0.0;
+
+        // 相机位置（世界坐标，取整）：用于把日志行和"你在哪"对上 —— 同一局里
+        // 位置不同，cand/upHit 完全是两回事，不能跨地点比较。
+        int cameraPos[3] = { 0, 0, 0 };
+        if(g_cameraUboMapped != nullptr)
+        {
+            const CameraUBO* cameraUboForProbe =
+                static_cast<const CameraUBO*>(g_cameraUboMapped);
+            cameraPos[0] = static_cast<int>(cameraUboForProbe->viewInverse[12]);
+            cameraPos[1] = static_cast<int>(cameraUboForProbe->viewInverse[13]);
+            cameraPos[2] = static_cast<int>(cameraUboForProbe->viewInverse[14]);
+        }
+
+        RTLogFlushed(
+            std::string("[VOL NEE] cand=") + std::to_string(static_cast<uint32_t>(
+                perFrameCandidate + 0.5)) +
+            "/f lit=" + std::to_string(static_cast<uint32_t>(perFrameLit + 0.5)) +
+            "/f pass=" + std::to_string(static_cast<int>(passRate + 0.5)) + "%" +
+            " above4=" + std::to_string(static_cast<uint32_t>(perFrameAbove + 0.5)) +
+            "/f meanLum=" + std::to_string(meanLum * 0.001) +
+            " | tbl=" + std::to_string(s_volNeeLightCount) +
+            " cap=" + std::to_string(s_volNeeGridCapacity) +
+            " resv=" + std::to_string(static_cast<uint32_t>(
+                static_cast<double>(s_volNeeAccReservoir) / frames + 0.5)) +
+            "/f frox=" + std::to_string(static_cast<uint32_t>(
+                static_cast<double>(s_volNeeAccFroxel) / frames + 0.5)) + "/f" +
+            " aboveCand=" + std::to_string(static_cast<uint32_t>(
+                static_cast<double>(s_volNeeAccAboveCandidate) / frames + 0.5)) +
+            "/f abovePass=" + std::to_string(static_cast<int>(
+                (s_volNeeAccAboveCandidate > 0u
+                    ? 100.0 * static_cast<double>(s_volNeeAccAbove) /
+                        static_cast<double>(s_volNeeAccAboveCandidate)
+                    : 0.0) + 0.5)) + "%" +
+            " up=" + std::to_string(static_cast<uint32_t>(
+                static_cast<double>(s_volNeeAccUpTests) / frames + 0.5)) +
+            "/f upHit=" + std::to_string(static_cast<uint32_t>(
+                static_cast<double>(s_volNeeAccUpHits) / frames + 0.5)) +
+            "/f upHitPass=" + std::to_string(static_cast<uint32_t>(
+                static_cast<double>(s_volNeeAccUpHitPass) / frames + 0.5)) + "/f" +
+            " asT=" + std::to_string(s_volNeeAccAsTests) +
+            " asHit=" + std::to_string(s_volNeeAccAsHits) +
+            " asHitCm=" + std::to_string(s_volNeeLastAsHitT) +
+            " asPlain=" + std::to_string(s_volNeeAccAsPlainHits) +
+            "/" + std::to_string(s_volNeeLastAsPlainT) +
+            " pos=" + std::to_string(cameraPos[0]) +
+            "," + std::to_string(cameraPos[1]) +
+            "," + std::to_string(cameraPos[2]));
+
+        s_volNeeAccCandidate = 0u;
+        s_volNeeAccLit = 0u;
+        s_volNeeAccAbove = 0u;
+        s_volNeeAccLumMilli = 0u;
+        s_volNeeAccReservoir = 0u;
+        s_volNeeAccFroxel = 0u;
+        s_volNeeAccAboveCandidate = 0u;
+        s_volNeeAccUpTests = 0u;
+        s_volNeeAccUpHits = 0u;
+        s_volNeeAccUpHitPass = 0u;
+        s_volNeeAccAsTests = 0u;
+        s_volNeeAccAsHits = 0u;
+        s_volNeeAccAsPlainHits = 0u;
+        s_volNeeProbeFrameCounter = 0u;
+    }
+}
+
 void createVolumeRestir3DImage(
     uint32_t width,
     uint32_t height,
@@ -108,6 +400,8 @@ void destroyVolumeRestirResources()
     {
         vkDeviceWaitIdle(g_device);
     }
+
+    destroyVolNeeProbeBuffer();
 
     if(g_device != VK_NULL_HANDLE && g_volRadianceSampler != VK_NULL_HANDLE)
     {
@@ -832,11 +1126,15 @@ void createVolumeRestirOutputPipelines()
     {
         return;
     }
+    if(!ensureVolNeeProbeBuffer())
+    {
+        return;
+    }
 
     try
     {
         {
-            VkDescriptorSetLayoutBinding bindings[12]{};
+            VkDescriptorSetLayoutBinding bindings[13]{};
             bindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[1] = { 1u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
@@ -861,18 +1159,23 @@ void createVolumeRestirOutputPipelines()
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[11] = { 22u, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u,
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            // 23 = NEE 探针计数器（2026-11-09）。仅在 ORION_VOL_NEE_PROBE=1 时
+            // 绑到真实 buffer；否则绑一个 32 B 的哑 buffer（描述符必须始终有效，
+            // 而 shader 侧那道 uniform 分支为假时根本不会写它）。
+            bindings[12] = { 23u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{
                 VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
             };
-            layoutInfo.bindingCount = 12u;
+            layoutInfo.bindingCount = 13u;
             layoutInfo.pBindings = bindings;
             check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
                 &g_volRestirIntegrateSetLayout), "vol restir integrate set layout failed");
 
             VkDescriptorPoolSize poolSizes[4] = {
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
-                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u },
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3u },
                 { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8u },
                 { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u }
             };
@@ -940,8 +1243,13 @@ void createVolumeRestirOutputPipelines()
             tlasWrite.accelerationStructureCount = 1u;
             tlasWrite.pAccelerationStructures = &g_tlas;
 
-            VkWriteDescriptorSet writes[12]{};
-            for(uint32_t i = 0u; i < 12u; ++i)
+            VkDescriptorBufferInfo neeProbeInfo{};
+            neeProbeInfo.buffer = s_volNeeProbeBuffer;
+            neeProbeInfo.offset = 0u;
+            neeProbeInfo.range = VOL_NEE_PROBE_WORDS * sizeof(uint32_t);
+
+            VkWriteDescriptorSet writes[13]{};
+            for(uint32_t i = 0u; i < 13u; ++i)
             {
                 writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[i].dstSet = g_volRestirIntegrateSet;
@@ -969,6 +1277,9 @@ void createVolumeRestirOutputPipelines()
             writes[11].dstBinding = 22u;
             writes[11].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
             writes[11].pNext = &tlasWrite;
+            writes[12].dstBinding = 23u;
+            writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[12].pBufferInfo = &neeProbeInfo;
             writes[0].dstBinding = 0u;
             writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             writes[0].pBufferInfo = &cameraInfo;
@@ -985,7 +1296,7 @@ void createVolumeRestirOutputPipelines()
             writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             writes[4].pImageInfo = &radianceInfo;
 
-            vkGuardUpdate(12u, writes, "vol");
+            vkGuardUpdate(13u, writes, "vol");
 
             g_volRestirBoundIntegrateLightBuffer = g_localLightGpuBuffer;
             g_volRestirBoundIntegrateGridBuffer = g_localLightGridGpuBuffer;
@@ -1498,7 +1809,8 @@ void recordVolumeRestirIntegrate(VkCommandBuffer cmd)
     pushConstants.froxelSize[3] = static_cast<int32_t>(VOL_RESTIR_DOWNSCALE);
     pushConstants.volumeParams[0] = VOL_RESTIR_MAX_DISTANCE;
     pushConstants.volumeParams[1] = VOL_RESTIR_DEPTH_EXPONENT;
-    pushConstants.volumeParams[2] = 0.0f;
+    // z = NEE 探针开关（2026-11-09）。0 = 不累加，逐字节等价于改动前。
+    pushConstants.volumeParams[2] = volNeeProbeEnabled() ? 1.0f : 0.0f;
     pushConstants.volumeParams[3] = 0.0f;
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volRestirIntegratePipeline);
@@ -1614,6 +1926,76 @@ void recordVolumeRestirIntegrate(VkCommandBuffer cmd)
 
 // S4：屏幕积分，输出到 g_godRayTargetImage（随后由 god_ray_composite 做
 // scene * a + rgb）。**必须**排在旧体积光之后调用，否则会被它写的"中性值"覆盖。
+// 2026-11-14 TDR 根因修复②：ReSTIR 屏幕合成 set 的图像描述符跟踪。
+// [CLOUD ADAPT] 切档会重建 g_godRayTargetView（froxel 尺寸不变 ⇒ 本 set 不重建），
+// 所以必须在录制时比对并重写，与 g_sunVisTlasHandle / g_terrainHeightTlasHandle
+// 同一套约定。
+static VkImageView g_volCompBoundDepthView = VK_NULL_HANDLE;
+static VkImageView g_volCompBoundRadianceView = VK_NULL_HANDLE;
+static VkImageView g_volCompBoundOutputView = VK_NULL_HANDLE;
+
+static void refreshVolRestirCompositeViews()
+{
+    if(g_volRestirCompositeSet == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    if(g_volCompBoundDepthView == g_dlssDepthView &&
+       g_volCompBoundRadianceView == g_volRadianceView[0] &&
+       g_volCompBoundOutputView == g_godRayTargetView)
+    {
+        return;
+    }
+
+    if(g_dlssDepthView == VK_NULL_HANDLE ||
+       g_volRadianceView[0] == VK_NULL_HANDLE ||
+       g_godRayTargetView == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorImageInfo depthInfo{};
+    depthInfo.sampler = volDepthSampler();
+    depthInfo.imageView = g_dlssDepthView;
+    depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo radianceInfo{};
+    radianceInfo.sampler = volRadianceSampler();
+    radianceInfo.imageView = g_volRadianceView[0];
+    radianceInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo outputInfo{};
+    outputInfo.imageView = g_godRayTargetView;
+    outputInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[3]{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = g_volRestirCompositeSet;
+    writes[0].dstBinding = 1u;
+    writes[0].descriptorCount = 1u;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = &depthInfo;
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = g_volRestirCompositeSet;
+    writes[1].dstBinding = 2u;
+    writes[1].descriptorCount = 1u;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].pImageInfo = &radianceInfo;
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = g_volRestirCompositeSet;
+    writes[2].dstBinding = 3u;
+    writes[2].descriptorCount = 1u;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[2].pImageInfo = &outputInfo;
+
+    vkUpdateDescriptorSets(g_device, 3u, writes, 0u, nullptr);
+
+    g_volCompBoundDepthView = g_dlssDepthView;
+    g_volCompBoundRadianceView = g_volRadianceView[0];
+    g_volCompBoundOutputView = g_godRayTargetView;
+}
+
 void recordVolumeRestirScreenComposite(VkCommandBuffer cmd)
 {
     if(cmd == VK_NULL_HANDLE || volRestirEnabled() == 0u)
@@ -1684,16 +2066,25 @@ void recordVolumeRestirScreenComposite(VkCommandBuffer cmd)
     pushConstants.grid[0] = static_cast<int32_t>(g_volFroxelW);
     pushConstants.grid[1] = static_cast<int32_t>(g_volFroxelH);
     pushConstants.grid[2] = static_cast<int32_t>(VOL_RESTIR_DEPTH);
-    pushConstants.grid[3] = 0;
+    // grid.w = 每个线程负责的像素边长（1 = 旧行为，2 = 2×2 共享 march）。
+    const uint32_t compositeDownscale = volCompositeDownscale();
+    pushConstants.grid[3] = static_cast<int32_t>(compositeDownscale);
+
+    refreshVolRestirCompositeViews();
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volRestirCompositePipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
         g_volRestirCompositePipelineLayout, 0u, 1u, &g_volRestirCompositeSet, 0u, nullptr);
     vkCmdPushConstants(cmd, g_volRestirCompositePipelineLayout,
         VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(VolRestirCompositePushConstants), &pushConstants);
+
+    const uint32_t compositeWidth =
+        (g_godRayWidth + compositeDownscale - 1u) / compositeDownscale;
+    const uint32_t compositeHeight =
+        (g_godRayHeight + compositeDownscale - 1u) / compositeDownscale;
     vkCmdDispatch(cmd,
-        (g_godRayWidth + 7u) / 8u,
-        (g_godRayHeight + 7u) / 8u,
+        (compositeWidth + 7u) / 8u,
+        (compositeHeight + 7u) / 8u,
         1u);
 
     g_godRayTargetLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1706,6 +2097,9 @@ void recordVolumeRestir(VkCommandBuffer cmd, uint32_t renderWidth, uint32_t rend
     {
         return;
     }
+
+    // 上一帧 NEE 计数的读回与 [VOL NEE] 日志（仅 ORION_VOL_NEE_PROBE=1 时有数据）
+    pollVolNeeProbe();
 
     createVolumeRestirResources(renderWidth, renderHeight);
     createVolumeRestirPipeline();

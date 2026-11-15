@@ -2,6 +2,23 @@
 
 > 从 `cpp/VulkanCore.cpp` 搬出（原文）。结论已写回代码：
 > 键内容与融合调用在真实场景里没有可复现收益，生产 pin 回 mode 1。
+>
+> **2026-11-07 A/B 三套开关已就位**（默认全部等于改动前行为，只有编第二份 SPV 才变）：
+> - `SER_PROBE_SECONDARY_FLAGS=1` —— mode 6 探针的遍历改用 `secondaryTraverseFlags()`
+>   （与普通 trace 同 flags，含背面剔除）；默认 0 = 裸 `gl_RayFlagsNoneEXT`。
+> - `GI_RR_MAX_SURVIVAL=0.9` —— 给 RR 生存率加 Remix 的 `russianRouletteMaxContinueProbability`
+>   上限；默认 1.0 = 不加（亮路径完全不终止）。
+> - `GI_SER_HINT_SBT_BITS=0` —— mode 1 的键去掉重复的 SBT 2 位（位宽 4→2）；默认 1 = 保留。
+> 第二套产物由 `.tmp/build_ab_sets.py` 生成到 `.tmp/ab/{probe,rr,key}/`（11 个 rgen 变体各一份），
+> 拷进 `run/shaders` 即触发热重载；档位对比直接用 `ORION_SER_MODE=1|6`，无需重编。
+>
+> **2026-11-07 核对更正**：现网 pin **不是 mode 1，而是 mode 6**
+> （`cpp/backend/Perf.cpp` 的 `updatePerfL10SerPathToggles()` else 分支：
+> `g_perfL10SerMode = 6u`）。mode 6 = 各漏斗调用点按 mode 1 处理 + **水面
+> 反射 DISTANCE_ONLY 探针改走 rgen 侧 hitObject 查询**。注意后者是本文
+> 记录的 "pixel-unequal by construction" 臂（跳过 any-hit 过滤、且探针实际传
+> `gl_RayFlagsNoneEXT` 而对照路径带背面剔除），已经随 pin 进入生产。
+> 改动前的 pin 语义以代码为准，本文历史测量数据不变。
 
 ---
 

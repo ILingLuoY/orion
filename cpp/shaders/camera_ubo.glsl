@@ -145,3 +145,52 @@
     //         不用 UBO 是因为 UBO 在 updateCamera 里写，重尺寸那一帧会滞后）
     // 消费方：cpp/shaders/ss_hybrid.comp
     vec4 ssHybridParams;
+
+    // ── 派生矩阵 ──（2026-11-09 追加在末尾，理由同上：中间插入会平移）
+    // raygen 每个像素原本要跑 4 次 inverse(mat4)：inverse(viewInverse)、
+    // inverse(projInverse)、inverse(prevViewInverse*prevProjInverse)、
+    // inverse(viewInverse*projInverse)。四个都是帧常量，宿主每帧算好后
+    // 写在这里；列主序 [col*4 + row]，与 GLSL mat4 一致。
+    mat4 viewMatrix;        // = inverse(viewInverse)
+    mat4 projectionMatrix;  // = inverse(projInverse)
+    mat4 viewProj;          // = projectionMatrix * viewMatrix
+    mat4 prevViewProj;      // = inverse(prevProjInverse) * inverse(prevViewInverse)
+
+    // ── 本地光源档案表 ──（2026-11-09 追加在末尾，理由同上）
+    // 原本是 local_light_profile.glsl 里的四张 const 表；glslang 对"动态索引
+    // const 数组"会生成 indexable 局部数组（768 B/线程）⇒ 逐像素 local memory。
+    // 移到 UBO 后动态索引就是一次 OpAccessChain。
+    //   A：rgb = 发射色（已归一到峰值 1.0），a = lumens（emission=15 时的相对亮度）
+    //   B：x = 基础传播距离（格），y = pointLike（1 = 点状光源），zw = 保留（0）
+    vec4 localLightProfileA[32];
+    vec4 localLightProfileB[32];
+
+    // ── pomSecondaryParams ──（2026-11-09 追加在末尾，理由同上）
+    //   x = 次级射线（反射/水体/玻璃后）跳过 POM 的开关（1 = 跳过，出厂开）
+    //   y/z/w = 保留（写 0）
+    // 消费方：rgen_trace_state.glsl 的 secondaryRayPomSkipEnabled()，
+    //         rgen_glossy.glsl 播种 payload.state 的 bit17（GI_NO_POM）。
+    vec4 pomSecondaryParams;
+
+    // ── fogOpticsParams ──（2026-11-13 追加在末尾，不动既有偏移）
+    //   x = 平流雾的 curl 涡流强度（0 = 只整体平移，1 = 默认，2 = 剧烈翻滚）
+    //   y/z/w = 雾的波长相关透射权重（红/绿/蓝，1 = 不偏色；蓝>红 ⇒ 远处偏蓝）
+    // 消费方：volumetric_fog.glsl（rollingFogDensity 的涡流位移、雾散射的色偏）
+    vec4 fogOpticsParams;
+
+    // ── glassCausticParams ──（2026-11-13 追加在末尾，不动既有偏移）
+    //   2026-11-13（用户拍板）：玻璃光学焦散**整体回退**，该设置已删除
+    //   （UI/Config/JNI/atomic 全清）。字段保留占位以维持 CameraUBO 布局
+    //   不变；shader 侧消费宏（GLASS_CAUSTIC_LEVEL /
+    //   GLASS_VISIBILITY_COVERAGE_CAUSTIC）已置 0，无任何读者。
+    vec4 glassCausticParams;
+
+    // ── perfBandParams ──（2026-11-15 追加在末尾）
+    //   x = 「性能模式」的 RT 射程（区块，0 = 非性能模式）
+    //   y = 弹射分界（区块）：≤ y 用用户设定的弹射数，> y 只 1 弹（普通模式同样生效）
+    //   z = 性能模式开关（1 = 开）
+    //   w = 远场贴图降档起点（格，0 = 关）：material_resolve.glsl 起点起每
+    //       32 格抬 1 级 mip（封顶 +3），8 区块以外材质贴图慢慢降档
+    // 消费方：cpp/shaders/ss_hybrid.comp（距离分档）、rgen_main_body.glsl（弹射分档）、
+    //         material_resolve.glsl（远场贴图 mip）
+    vec4 perfBandParams;

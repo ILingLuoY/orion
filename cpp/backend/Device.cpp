@@ -80,7 +80,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
         std::vector<uint8_t> rgen;
         bool serRaygenLoaded = false;
         const bool serShaderRequested =
-            g_serEnabled.load() && g_serFeatureSupported && g_serHardwareReordering;
+            serShaderVariantWanted();
         if(serShaderRequested)
         {
             try
@@ -150,6 +150,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
                 return;
             }
 
+            // 2026-11-09 boot 后台编译：巨型管线冷编 8~20 分钟/条，同步建会把
+            // 渲染线程冻在 vkCreateRayTracingPipelinesKHR 里、窗口假死。改为把
+            // main→SBT→K1/K2 整段挪后台线程顺序编，主线程立刻继续 BLAS/TLAS/
+            // 描述符；RT 帧由 rtBootPipelinesReady() 门控（Frame.cpp
+            // "pipelinesCompiling" skip），编完自动放行。原同步建法保留在 #if 0
+            // （回滚 = 去掉本段 #if 0/#endif、删 launch 调用即可）。
+#if 0
             VkPipelineShaderStageCreateInfo
                 stages[6]{};
 
@@ -252,6 +259,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
                 pci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
             }
 
+            if(OrionPipelineStatsCaptureEnabled())
+            {
+                pci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+            }
+
             // 2026-11-02 P0（冷编分解）：走计时包装，参数（cache / deferredOperation=null
             // / 1 条 createInfo）与原调用逐位一致，只多一条 [PERF PIPE] kind=rt 日志。
             check(OrionCreateRayTracingPipelineTimed(
@@ -261,6 +273,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
                       rtPipelineCache,
                       &g_rayTracingPipeline),
                   "Failed to create RT pipeline");
+
+            OrionLogPipelineStats("main", g_rayTracingPipeline);
 
             // 2026-11-06：主 RT 管线创建成功后立刻同步写一次 64~256MB blob 会造出
             // 30~400ms 的一次性尖峰。改为交给 maybePersistSharedPipelineCache 的
@@ -272,6 +286,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
                 " group3=rt_test_translucent.rchit+rahit"
                 " group4=rt_test.rchit+rahit"
             );
+#endif
+
+            // 所有权移交：startRtBootPipelineCompile 拷走六个 module 句柄并把
+            // mods 置空，catch 与 catch 后的销毁循环即成 no-op。
+            startRtBootPipelineCompile(mods);
         }catch(...){
             for(auto m:mods)if(m)vkDestroyShaderModule(g_device,m,nullptr);
             throw;
@@ -292,8 +311,12 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
         std::cout<<"[RT] createTLAS"<<std::endl;
         createTLAS();
 
+        // 2026-11-09：SBT 创建挪进 boot 后台编译线程（依赖主管线完成），见
+        // RtPipelineAsync.cpp rtBootPipelineCompileWorker。
+#if 0
         std::cout<<"[RT] createRayTracingSBT"<<std::endl;
         createRayTracingSBT();
+#endif
 
         if(deviceInitMilestone("4-after-RT-core-BLAS-TLAS-SBT"))
         {

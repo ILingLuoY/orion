@@ -7,6 +7,22 @@
 
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jclass){
+    // 2026-11-09：boot 后台编译线程还在跑（冷编最长 20 分钟/条）时不能销毁
+    // device/缓存（编译中的 vkCreateRayTracingPipelinesKHR 在用），join 也会
+    // 把关闭流程冻同样久。MC 关窗即进程退出，进程终止硬杀编译线程的后果与
+    // LLVM OOM abort 相同（已实证无持久损伤，见 [[rgen-split-state]]），
+    // 编好的管线缓存条目由"每管线成功即落盘"保住。
+    if(rtBootCompileInFlight())
+    {
+        RTLogFlushed(
+            "[RT BOOT] cleanup skipped: pipeline compile still running, "
+            "leaving state to process exit");
+
+        rtBootDetachCompileThread();
+
+        return;
+    }
+
     stopGeometryCaptureWorker();
 
     if(g_device){
@@ -435,6 +451,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
         if(g_tlasInstanceMemory)vkFreeMemory(g_device,g_tlasInstanceMemory,nullptr);
         if(g_tlasInstancesBuffer)vkDestroyBuffer(g_device,g_tlasInstancesBuffer,nullptr);
         if(g_tlasInstancesMemory)vkFreeMemory(g_device,g_tlasInstancesMemory,nullptr);
+        // 2026-11-14：映射已随 VkDeviceMemory 销毁，留着旧地址会让看门狗的
+        // TLAS 实例表扫描读到死映射 AV（21:00 局实测 scan faulted）。
+        g_tlasInstancesAddress=0;
         if(g_tlasBuffer)vkDestroyBuffer(g_device,g_tlasBuffer,nullptr);
         if(g_tlasMemory)vkFreeMemory(g_device,g_tlasMemory,nullptr);
         if(g_blasScratchBuffer)vkDestroyBuffer(g_device,g_blasScratchBuffer,nullptr);

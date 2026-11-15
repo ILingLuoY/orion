@@ -633,7 +633,11 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setAtmosphereSet
        !std::isfinite(requestedScatterIntensity) || !std::isfinite(requestedOzoneStrength) ||
        requestedStarIntensity < 0.0f || requestedStarIntensity > 2.0f ||
        requestedSunTintStrength < 0.0f || requestedSunTintStrength > 1.0f ||
-       requestedScatterIntensity < 0.0f || requestedScatterIntensity > 2.0f ||
+       // 2026-11-07：上限 2→8。scatterIntensity 落在 skyParams1.z，被
+       // sky_atmosphere.comp:289 当**乘数**（radiance * z，之后再 clamp 0..8），
+       // record 与界面滑条都是 0..8，只有这里卡在 2 ⇒ 超过 2 时整条大气设置
+       // 静默不落地。
+       requestedScatterIntensity < 0.0f || requestedScatterIntensity > 8.0f ||
        requestedOzoneStrength < 0.0f || requestedOzoneStrength > 2.0f)
     {
         return JNI_FALSE;
@@ -776,6 +780,56 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setAuroraFlowSpe
 // 不作废历史 —— 唯一的例外是下面 setSSRRange 把 1..11 钳到 12，这是用户
 // 2026-11-02 的硬性约束：SSR 只在 > 12 区块的镜面命中上出现。
 // ============================================================================
+// 2026-11-15「性能模式」总开关：写 perfBandParams.z
+// （ss_hybrid.comp 按距离分档 + rgen 按距离分档弹射次数）。
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_example_vulkan_NativeVulkan_setPerformanceMode(
+    JNIEnv*,
+    jclass,
+    jboolean enabled)
+{
+    g_performanceMode.store(
+        enabled == JNI_TRUE ? 1u : 0u,
+        std::memory_order_relaxed);
+
+    {
+        std::stringstream ss;
+        ss << "[PERF MODE] enabled=" << (enabled == JNI_TRUE ? 1 : 0);
+        RTLog(ss.str());
+    }
+
+    return JNI_TRUE;
+}
+
+
+// 2026-11-15「性能模式」：设置 SSR 的区块下限（0 = 关/回落 12，8 = 性能模式）。
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_example_vulkan_NativeVulkan_setSsHybridFloor(
+    JNIEnv*,
+    jclass,
+    jfloat chunks)
+{
+    const float requested = static_cast<float>(chunks);
+
+    if(!std::isfinite(requested) || requested < 0.0f || requested > 64.0f)
+    {
+        return JNI_FALSE;
+    }
+
+    g_ssrFloorChunks.store(requested, std::memory_order_relaxed);
+
+    {
+        std::stringstream ss;
+        ss << "[SS HYBRID] ssrFloorChunks=" << requested;
+        RTLog(ss.str());
+    }
+
+    return JNI_TRUE;
+}
+
+
 extern "C"
 JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setSSPTRange(
     JNIEnv*,
@@ -1183,24 +1237,6 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_getCloudFadeFoll
 }
 
 extern "C"
-JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudPostRrComposite(
-    JNIEnv*,
-    jclass,
-    jboolean enabled)
-{
-    g_cloudPostRrComposite.store(enabled == JNI_TRUE);
-    return JNI_TRUE;
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_getCloudPostRrComposite(
-    JNIEnv*,
-    jclass)
-{
-    return g_cloudPostRrComposite.load() ? JNI_TRUE : JNI_FALSE;
-}
-
-extern "C"
 JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setWaterParams(
     JNIEnv* env, jclass, jfloatArray params)
 {
@@ -1296,11 +1332,9 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudLightPar
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    g_cloudSourceOdScale.store(values[0]);
-    g_cloudSourceCurvePow.store(values[1]);
-    g_cloudAoUpwardScale.store(values[2]);
-    g_cloudSunsetAmbientTint.store(
-        std::min(std::max(static_cast<float>(values[3]), 0.0f), 1.0f));
+    // 2026-11-07 死设置清理：cloudLightParams 在 cpp/shaders 里零读取，
+    // 四个 atomic 已删（Settings.cpp 的 populateCloudLightParams 写常量 0）。
+    // 保留入参校验，旧存档/旧调用传 NaN 时的行为不变。
 
     g_volumetricCloudHistoryNeedsClear.store(true);
     return JNI_TRUE;
@@ -1389,6 +1423,8 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudShapePar
     g_cloudBottomSmoothHeight.store(values[0]);
     g_cloudBottomSmoothPow.store(values[1]);
     g_cloudTwoTierThreshold.store(values[2]);
+    // 2026-11-13 审计 ⑤：第 4 分量原来是丢掉的。
+    g_cloudLightStepErosion.store(values[3]);
 
     g_volumetricCloudHistoryNeedsClear.store(true);
     return JNI_TRUE;
@@ -1442,8 +1478,10 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudAmbientP
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
+    // 2026-11-07：上限 3→4，与 volumetric_clouds_v5.comp:287-288 的
+    // clamp(cam.cloudAmbientParams.x, 0.1, 4.0) 以及界面滑条 0.1~4.0 对齐。
     g_cloudAmbientTopMul.store(
-        std::min(std::max(static_cast<float>(values[0]), 0.0f), 3.0f));
+        std::min(std::max(static_cast<float>(values[0]), 0.0f), 4.0f));
     g_cloudAmbientBottomMul.store(
         std::min(std::max(static_cast<float>(values[1]), 0.0f), 3.0f));
     g_cloudAmbientSunSide.store(
@@ -1466,14 +1504,8 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudSkyHuePa
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    g_cloudSkyHueCool.store(
-        std::min(std::max(static_cast<float>(values[0]), 0.0f), 1.0f));
-    g_cloudSkyHueEnergy.store(
-        std::min(std::max(static_cast<float>(values[1]), 0.0f), 1.0f));
-    g_cloudSkyDirStrength.store(
-        std::min(std::max(static_cast<float>(values[2]), 0.0f), 2.0f));
-    g_cloudAmbientUnify.store(
-        std::min(std::max(static_cast<float>(values[3]), 0.0f), 1.0f));
+    // 2026-11-07 死设置清理：cloudSkyHueParams 整块零读取（v5 云模型没有接这
+    // 四项），四个 atomic 已删，populateCloudSkyHueParams 写常量 0。
 
     g_volumetricCloudHistoryNeedsClear.store(true);
     return JNI_TRUE;
@@ -1536,12 +1568,9 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudLight2Pa
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    g_cloudSunPathReddening.store(
-        std::min(std::max(static_cast<float>(values[0]), 0.0f), 2.0f));
-    g_cloudAtmExtinction.store(
-        std::min(std::max(static_cast<float>(values[1]), 0.0f), 1.0f));
-    g_cloudPowderMode.store(
-        std::min(std::max(static_cast<float>(values[2]), 0.0f), 1.0f));
+    // 2026-11-07 死设置清理：cloudLightParams2 的 x/y/z 零读取，三个 atomic 已删。
+    // 注意"光粉强度"（g_cloudPowderStrength）是活的，但它走 cloudParams[23]，
+    // 不经这个块，见 populateCloudParams / setCloudPowderStrength。
 
     g_volumetricCloudHistoryNeedsClear.store(true);
     return JNI_TRUE;
@@ -1602,8 +1631,8 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setFogExtrasPara
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    g_fogDynamicLightStrength.store(
-        std::min(std::max(static_cast<float>(values[0]), 0.0f), 4.0f));
+    // 2026-11-07 死设置清理：雾内动态光强度恒为 0（见 populateFogExtrasParams），
+    // atomic 已删，values[0] 只做校验。
     g_fogGroundAnchorStrength.store(
         std::min(std::max(static_cast<float>(values[1]), 0.0f), 1.0f));
     g_fogSkyAmbientStrength.store(
@@ -1621,6 +1650,43 @@ extern "C"
 JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setFogGroundMistParams(
     JNIEnv* env, jclass, jfloatArray params)
 {
+    if(params == nullptr) return JNI_FALSE;
+    const jsize length = env->GetArrayLength(params);
+    if(length < 4) return JNI_FALSE;
+
+    jfloat values[5] = { 0.0f, 0.0f, 0.0f, 0.0f,
+        g_fogGroundMistSpeed.load() };
+    env->GetFloatArrayRegion(params, 0, 4, values);
+    // 2026-11-10：第 5 个元素 = 平流雾滚动速度（格/秒，可选；旧调用方只发 4 个，
+    // 此时沿用当前值，保持向后兼容）。
+    if(length >= 5)
+    {
+        env->GetFloatArrayRegion(params, 4, 1, values + 4);
+    }
+    for(int i = 0; i < 5; ++i)
+    {
+        if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
+    }
+    g_fogGroundMistEnabled.store(values[0] != 0.0f);
+    g_fogGroundMistHeight.store(
+        std::min(std::max(static_cast<float>(values[1]), 0.25f), 8.0f));
+    // 2026-11-12：量程 1.0 → 4.0。层厚压到半格后，1.5/格 的上限在掠射视线下
+    // 仍然偏淡，用户反馈"不够密"；4.0 对应 shader 里 6/格，足以压到不透明。
+    g_fogGroundMistExtinction.store(
+        std::min(std::max(static_cast<float>(values[2]), 0.0f), 4.0f));
+    g_fogGroundMistDistance.store(
+        std::min(std::max(static_cast<float>(values[3]), 8.0f), 96.0f));
+    g_fogGroundMistSpeed.store(
+        std::min(std::max(static_cast<float>(values[4]), 0.0f), 6.0f));
+
+    g_volumetricCloudHistoryNeedsClear.store(true);
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setFogOpticsParams(
+    JNIEnv* env, jclass, jfloatArray params)
+{
     if(params == nullptr || env->GetArrayLength(params) < 4) return JNI_FALSE;
     jfloat values[4];
     env->GetFloatArrayRegion(params, 0, 4, values);
@@ -1628,13 +1694,58 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setFogGroundMist
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    g_fogGroundMistEnabled.store(values[0] != 0.0f);
-    g_fogGroundMistHeight.store(
-        std::min(std::max(static_cast<float>(values[1]), 0.25f), 8.0f));
-    g_fogGroundMistExtinction.store(
+    // 2026-11-13：雾光学 [涡流强度, 红权重, 绿权重, 蓝权重] → fogOpticsParams
+    g_fogCurlStrength.store(
+        std::min(std::max(static_cast<float>(values[0]), 0.0f), 2.0f));
+    g_fogTintR.store(
+        std::min(std::max(static_cast<float>(values[1]), 0.5f), 1.5f));
+    g_fogTintG.store(
+        std::min(std::max(static_cast<float>(values[2]), 0.5f), 1.5f));
+    g_fogTintB.store(
+        std::min(std::max(static_cast<float>(values[3]), 0.5f), 1.5f));
+
+    return JNI_TRUE;
+}
+
+// 2026-11-13：玻璃光学焦散 JNI 已删除（用户要求整体回退焦散）。
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setRainRippleParams(
+    JNIEnv* env, jclass, jfloatArray params)
+{
+    if(params == nullptr || env->GetArrayLength(params) < 2) return JNI_FALSE;
+    jfloat values[2];
+    env->GetFloatArrayRegion(params, 0, 2, values);
+    for(int i = 0; i < 2; ++i)
+    {
+        if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
+    }
+    // 2026-11-11：雨波纹 [大小, 明显度] → godRayParams2.w 打包
+    g_rainRippleSize.store(
+        std::min(std::max(static_cast<float>(values[0]), 0.25f), 4.0f));
+    g_rainRippleStrength.store(
+        std::min(std::max(static_cast<float>(values[1]), 0.0f), 3.0f));
+
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudGapParams(
+    JNIEnv* env, jclass, jfloatArray params)
+{
+    if(params == nullptr || env->GetArrayLength(params) < 3) return JNI_FALSE;
+    jfloat values[3];
+    env->GetFloatArrayRegion(params, 0, 3, values);
+    for(int i = 0; i < 3; ++i)
+    {
+        if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
+    }
+    // 2026-11-11：云隙光三件套 → cloudParams4.y/.z/.w
+    g_cloudGapEnabled.store(values[0] != 0.0f);
+    g_cloudGapStrength.store(
+        std::min(std::max(static_cast<float>(values[1]), 0.0f), 4.0f));
+    g_cloudGapWidth.store(
         std::min(std::max(static_cast<float>(values[2]), 0.0f), 1.0f));
-    g_fogGroundMistDistance.store(
-        std::min(std::max(static_cast<float>(values[3]), 8.0f), 96.0f));
 
     g_volumetricCloudHistoryNeedsClear.store(true);
     return JNI_TRUE;
@@ -1651,14 +1762,9 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudTemporal
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    g_cloudSkyVisStrength.store(
-        std::min(std::max(static_cast<float>(values[0]), 0.0f), 1.0f));
-    g_cloudSkyVisSteps.store(
-        std::min(std::max(static_cast<float>(values[1]), 0.0f), 32.0f));
+    // 2026-11-07 死设置清理：只有 .z（时域阻尼）有消费者，x/y/w 三个 atomic 已删。
     g_cloudTemporalDamp.store(
         std::min(std::max(static_cast<float>(values[2]), 0.0f), 1.0f));
-    g_cloudBottomOcclusion.store(
-        std::min(std::max(static_cast<float>(values[3]), 0.0f), 1.0f));
 
     g_volumetricCloudHistoryNeedsClear.store(true);
     return JNI_TRUE;
@@ -1675,8 +1781,8 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudAerialPa
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    g_cloudAerialStrength.store(
-        std::min(std::max(static_cast<float>(values[0]), 0.0f), 2.0f));
+    // 2026-11-07 死设置清理：.x（云后大气透视）只在退役的 v3 云模型里有读取点
+    // （volumetric_clouds_v3.comp:294，需 cloud_v3.flag），atomic 已删，写常量 0。
     g_groundAerialStrength.store(
         std::min(std::max(static_cast<float>(values[1]), 0.0f), 2.0f));
     g_groundAerialOcclusion.store(
@@ -1732,7 +1838,11 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudSettings
        requestedQuality < 0 || requestedQuality > 2 ||
        requestedSize < 0.50f || requestedSize > 3.0f ||
        requestedDistribution < 0.0f || requestedDistribution > 1.0f ||
-       requestedBaseFeather < 0.03f || requestedBaseFeather > 0.30f ||
+       // 2026-11-07 修复：出厂默认 baseFeather = 0.33（RTXSettingsConfig
+       // DEFAULT_CLOUD_SETTINGS），record 与界面滑条都允许 0..0.33，只有这里是
+       // 0.03..0.30 ⇒ 出厂档每次应用都被拒（JNI_FALSE），整个体积云页的滑条
+       // 改完不落地、重开回旧值。三处已对齐到 0..0.33。
+       requestedBaseFeather < 0.0f || requestedBaseFeather > 0.33f ||
        requestedSunlightStrength < 0.0f || requestedSunlightStrength > 3.0f)
     {
         return JNI_FALSE;
@@ -1743,8 +1853,8 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudSettings
     g_cloudCoverage.store(requestedCoverage);
     g_cloudDensity.store(requestedDensity);
     g_cloudDetailStrength.store(requestedDetailStrength);
-    g_cloudWindSpeed.store(requestedWindSpeed);
-    g_cloudEvolution.store(requestedEvolution);
+    // 2026-11-07 死设置清理：云风速 / 云演化全仓零消费者（连 UBO lane 都没有），
+    // 两个 atomic 已删；requestedWindSpeed / requestedEvolution 只参与上面的范围校验。
     g_cloudQuality.store(static_cast<uint32_t>(requestedQuality));
     g_cloudSize.store(requestedSize);
     g_cloudDistribution.store(requestedDistribution);
@@ -2174,7 +2284,10 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setPerformanceSe
     jint waterReflectionInterval, jint glossyFullDistance, jint dynamicRtasInterval,
     jfloat rtSpp, jint volumetricRestir)
 {
-    if(aoNearSamples < 0 || aoNearSamples > 4 ||
+    // 2026-11-07：上限 5（5 = 关闭 RTAO 全链，见 rgen_main_body.glsl 的
+    // `int(cam.perfPrimary.x) >= 5`）。原来写 4 ⇒ 界面选「关」时这里返回
+    // JNI_FALSE，整组性能设置不落地。
+    if(aoNearSamples < 0 || aoNearSamples > 5 ||
        aoMidSamples < 0 || aoMidSamples > 2 ||
        giBounces < 0 || giBounces > 4 ||
        sunShadowSamples < 1 || sunShadowSamples > 2 ||

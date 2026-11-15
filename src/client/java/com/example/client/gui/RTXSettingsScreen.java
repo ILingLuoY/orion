@@ -2,6 +2,7 @@ package com.example.client.gui;
 
 import com.example.vulkan.NativeVulkan;
 
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.CycleButton;
 import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -184,10 +185,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float phiCompress;
     private float phiConeRatio;
 
-    private float lightSourceOdScale;
-    private float lightSourceCurvePow;
-    private float lightAoUpwardScale;
-    private float lightSunsetAmbientTint;
 
     private float shapeBottomSmoothHeight;
     private float shapeBottomSmoothPow;
@@ -204,10 +201,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float ambBottomMul;
     private float ambSunSide;
     private float ambHueFollow;
-    private float skyHueCool;
-    private float skyHueEnergy;
-    private float skyDirStrength;
-    private float ambientUnify;
     private float cloudGroundAlbedo;
     private float cloudGroundBounce;
     private float cloudSunlightResidual;
@@ -216,9 +209,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float ms2Octaves;
     private float ms2Attenuation;
     private float ms2Eccentricity;
-    private float l2SunPathReddening;
-    private float l2AtmosphereExtinction;
-    private float l2PowderMode;
     private float profileType;
     private float profileTypeSpread;
     private float wispyStrength;
@@ -237,7 +227,18 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float pendingFogGroundMistHeight;
     private float pendingFogGroundMistExtinction;
     private float pendingFogGroundMistDistance;
-    private float cloudAerialStrength;
+    private float pendingFogGroundMistSpeed;
+    private boolean pendingCloudGapEnabled;
+    private float pendingCloudGapStrength;
+    private float pendingCloudGapWidth;
+    private float pendingRainRippleSize;
+    private float pendingRainRippleStrength;
+    private float pendingFogCurlStrength;
+    private float pendingFogTintR;
+    private float pendingFogTintG;
+    private float pendingFogTintB;
+    // 2026-11-13：玻璃光学焦散设置已删除（用户要求整体回退焦散）
+    // 2026-11-07：cloudAerialStrength 随「云层大气透视」死设置一并移除
     private float groundAerialStrength;
     private float groundAerialOcclusion;
     private boolean msTwoTierStep;
@@ -353,8 +354,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
     private boolean pendingCloudFadeFollowsRrMode;
 
-    private boolean pendingCloudPostRrComposite;
-
     private int pendingCloudResFloorPercent;
     private float pendingCloudFarStepDensity;
 
@@ -381,6 +380,13 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private final List<AbstractWidget> optionRow =
             new ArrayList<>();
 
+    // 2026-11-13 紧凑预览：把设置压到底部条带，腾出画面实时对比效果。
+    // 用静态字段保存，重开界面/换页都保持；不写进存档（纯查看偏好）。
+    private static boolean compactPreview;
+
+    // 底部条带高度（像素）：约 4~5 行滑条，够调当前这一项。
+    private static final int COMPACT_STRIP_HEIGHT = 132;
+
     private static final int PAGE_HUB = -1;
     private static final int PAGE_UPSCALER = 0;
     private static final int PAGE_PERF = 1;
@@ -392,6 +398,9 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private static final int PAGE_MATERIAL = 7;
     private static final int PAGE_POST = 8;
     private static final int PAGE_COLORGRADE = 9;
+    // 2026-11-13 UI 审计：新增两页
+    private static final int PAGE_CELESTIAL = 10;
+    private static final int PAGE_CULL = 11;
 
     private int page = PAGE_HUB;
 
@@ -449,11 +458,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.pendingRtGlossy =
                 RTXSettingsConfig.isRTGlossyEnabled();
 
+        // 2026-11-07：改读存档（原来读 native，native 没有持久化 ⇒ 重启即回默认）
         this.pendingGiNearRate =
-                NativeVulkan.getGiNearRate();
+                RTXSettingsConfig.getGiNearRate();
 
         this.pendingGlossyRoughLod =
-                NativeVulkan.getGlossyRoughLod();
+                RTXSettingsConfig.isGlossyRoughLod();
 
         this.pendingTrueSubsurfaceScattering =
                 RTXSettingsConfig.isTrueSubsurfaceScattering();
@@ -518,15 +528,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.loadCloudSettings(clouds);
         this.loadCloudMsSettings(RTXSettingsConfig.getCloudMsSettings());
         this.loadCloudPhiSettings(RTXSettingsConfig.getCloudPhiSettings());
-        this.loadCloudLightSettings(RTXSettingsConfig.getCloudLightSettings());
         this.loadCloudShapeSettings(RTXSettingsConfig.getCloudShapeSettings());
         this.loadCloudMoonSettings(RTXSettingsConfig.getCloudMoonSettings());
         this.loadCloudShape2Settings(RTXSettingsConfig.getCloudShape2Settings());
         this.loadCloudAmbientSettings(RTXSettingsConfig.getCloudAmbientSettings());
-        this.loadCloudSkyHueSettings(RTXSettingsConfig.getCloudSkyHueSettings());
         this.loadCloudPhysicsSettings(RTXSettingsConfig.getCloudPhysicsSettings());
         this.loadCloudMs2Settings(RTXSettingsConfig.getCloudMs2Settings());
-        this.loadCloudLight2Settings(RTXSettingsConfig.getCloudLight2Settings());
         this.loadCloudProfileSettings(RTXSettingsConfig.getCloudProfileSettings());
         this.loadCloudDetailSettings(RTXSettingsConfig.getCloudDetailSettings());
         this.loadCloudTemporalSettings(RTXSettingsConfig.getCloudTemporalSettings());
@@ -539,6 +546,22 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.pendingFogGroundMistHeight = mist.height();
         this.pendingFogGroundMistExtinction = mist.extinction();
         this.pendingFogGroundMistDistance = mist.distance();
+        this.pendingFogGroundMistSpeed = mist.speed();
+        final RTXSettingsConfig.CloudGapSettings cloudGap =
+                RTXSettingsConfig.getCloudGapSettings();
+        this.pendingCloudGapEnabled = cloudGap.enabled();
+        this.pendingCloudGapStrength = cloudGap.strength();
+        this.pendingCloudGapWidth = cloudGap.width();
+        final RTXSettingsConfig.RainRippleSettings ripple =
+                RTXSettingsConfig.getRainRippleSettings();
+        this.pendingRainRippleSize = ripple.size();
+        this.pendingRainRippleStrength = ripple.strength();
+        final RTXSettingsConfig.FogOpticsSettings optics =
+                RTXSettingsConfig.getFogOpticsSettings();
+        this.pendingFogCurlStrength = optics.curlStrength();
+        this.pendingFogTintR = optics.tintR();
+        this.pendingFogTintG = optics.tintG();
+        this.pendingFogTintB = optics.tintB();
 
         this.loadCloudAerialSettings(RTXSettingsConfig.getCloudAerialSettings());
 
@@ -644,8 +667,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.pendingCloudFadeFollowsRrMode =
                 RTXSettingsConfig.isCloudFadeFollowsRrMode();
-        this.pendingCloudPostRrComposite =
-                RTXSettingsConfig.isCloudPostRrComposite();
         RTXSettingsConfig.PlaneCloudSettings planeCloud =
                 RTXSettingsConfig.getPlaneCloudSettings();
         this.pendingPlaneCloudEnabled = planeCloud.enabled();
@@ -680,6 +701,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     protected void addOptions() {
 
         this.optionRow.clear();
+
+        // 2026-11-13：每个页面（含主页）都先放一行「紧凑预览」开关。
+        // 先把 section 对齐当前页，否则 addOptionRow 会因为 section != page 直接丢弃。
+        this.section = this.page;
+        this.addOptionRow(compactToggleButton());
+        this.flushOptionRow();
 
         if(this.page == PAGE_HUB) {
             this.section = PAGE_HUB;
@@ -1055,12 +1082,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.section = PAGE_SKY;
 
-        this.addOptionRow(cloudSlider("太阳圆盘亮度", 0.0, 8.0, 0.01,
-                pendingSunDiskLuminance, "%.2f", value -> pendingSunDiskLuminance = (float) value));
-        this.addOptionRow(cloudSlider("太阳日冕强度", 0.0, 1.0, 0.01,
-                pendingSunHaloStrength, "%.2f", value -> pendingSunHaloStrength = (float) value));
-        this.addOptionRow(cloudSlider("太阳角直径（度）", 0.10, 2.00, 0.01,
-                pendingSunAngularDiameterDegrees, "%.2f", value -> pendingSunAngularDiameterDegrees = (float) value));
         this.addOptionRow(CycleButton.builder(
                         enabled -> Component.literal(enabled ? "开" : "关"),
                         this.pendingPhysicalSkyEnabled)
@@ -1079,18 +1100,13 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 pendingNightSkyAmbientScale, "%.2f", value -> pendingNightSkyAmbientScale = (float) value));
         this.addOptionRow(cloudSlider("雨天天空压暗", 0.0, 2.0, 0.05,
                 pendingRainSkyDimScale, "%.2f", value -> pendingRainSkyDimScale = (float) value));
+        // 2026-11-07 复核：范围保持 0~8 不变。该值落在 skyParams1.z，被
+        // sky_atmosphere.comp:289 当乘数用（之后才 clamp 0..8），8 是有效区间；
+        // 上一版我把滑条收到 2.0 是错的，已改为放开 JNI 的上限。
         this.addOptionRow(cloudSlider("大气散射强度", 0.0, 8.0, 0.05,
                 pendingScatterIntensity, "%.2f", value -> pendingScatterIntensity = (float) value));
         this.addOptionRow(cloudSlider("臭氧吸收强度", 0.0, 2.0, 0.05,
                 pendingOzoneStrength, "%.2f", value -> pendingOzoneStrength = (float) value));
-        this.addOptionRow(cloudSlider("星空亮度", 0.0, 2.0, 0.05,
-                pendingStarIntensity, "%.2f", value -> pendingStarIntensity = (float) value));
-        this.addOptionRow(cloudSlider("太阳透射染色", 0.0, 1.0, 0.01,
-                pendingSunTintStrength, "%.2f", value -> pendingSunTintStrength = (float) value));
-        this.addOptionRow(cloudSlider("极光亮度", 0.0, 3.0, 0.05,
-                pendingAuroraBrightness, "%.2f", value -> pendingAuroraBrightness = (float) value));
-        this.addOptionRow(cloudSlider("极光流动速度", 0.0, 4.0, 0.05,
-                pendingAuroraFlowSpeed, "%.2f", value -> pendingAuroraFlowSpeed = (float) value));
         this.flushOptionRow();
         this.section = PAGE_CLOUD;
 
@@ -1131,7 +1147,10 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.flushOptionRow();
 
         this.addSectionHeader("体积云 · 外形");
-        this.addOptionRow(cloudSlider("竖向拉伸（0扁片↔1高塔）", 0.0, 1.0, 0.01,
+        // 2026-11-07 修复：滑条原为 0.0~1.0，但 record 与 JNI 都只允许 <=0.50
+        // ⇒ 拖过 0.5 抛 IllegalArgumentException，整页（含后面的雾/雨/水/后处理）
+        // 全部不落地。上限收到 0.50 与下游对齐。
+        this.addOptionRow(cloudSlider("竖向拉伸（0扁片↔1高塔）", 0.0, 0.50, 0.01,
                 pendingCloudDetailStrength, "%.2f",
                 value -> pendingCloudDetailStrength = (float) value));
         this.addOptionRow(cloudSlider("边缘卷曲（0圆润↔1絮状）", 0.0, 0.33, 0.01,
@@ -1160,6 +1179,26 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 value -> pendingCloudSilver = (float) value));
         this.flushOptionRow();
 
+        // 2026-11-10：补上"有消费者但一直没有 UI 入口"的外形项。
+        // 依据（都 grep 过读取点）：cloudShapeParams.x/.y 在
+        // tyndall_cloud_field.glsl:162-165（云底软化高度/幂），
+        // cloudDetailParams.x/.y 在 :237-241（絮状强度/边缘宽度）。
+        // 同组的 cloudShapeParams.z（两级步进阈值）与 cloudMsParams2 四 lane
+        // 目前**没有任何着色器读取**，故不加滑条（避免再造死旋钮）。
+        this.addOptionRow(cloudSlider("云底软化高度", 0.0, 1.0, 0.02,
+                shapeBottomSmoothHeight, "%.2f",
+                value -> shapeBottomSmoothHeight = (float) value));
+        this.addOptionRow(cloudSlider("云底软化幂", 0.05, 8.0, 0.05,
+                shapeBottomSmoothPow, "%.2f",
+                value -> shapeBottomSmoothPow = (float) value));
+        this.addOptionRow(cloudSlider("絮状细节强度", 0.0, 2.0, 0.05,
+                wispyStrength, "%.2f",
+                value -> wispyStrength = (float) value));
+        this.addOptionRow(cloudSlider("絮状边缘宽度", 0.0, 1.0, 0.01,
+                wispyEdgeWidth, "%.2f",
+                value -> wispyEdgeWidth = (float) value));
+        this.flushOptionRow();
+
         this.addSectionHeader("体积云 · HP 全参数（v5）");
         float[] hpValues = RTXSettingsConfig.getCloudHpSettings().toParamArray();
         for(int hpIndex = 0; hpIndex < RTXSettingsConfig.CLOUD_HP_LABELS.length; ++hpIndex)
@@ -1182,10 +1221,21 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.flushOptionRow();
 
         this.addSectionHeader("体积云 · 步进（性能 / 画质）");
+        // 2026-11-07 复核更正：标签「光线步进」是**对的**，误名在字段一侧。
+        // pendingCloudSunReddening → g_cloudSunReddening → cloudParams[25]
+        // = cloudParams6.y，而 volumetric_clouds_v5.comp:159-162 正是把它当作
+        // `stepsOverride`（光线步数覆盖，>0.9 时 clamp 到 8..256）。
+        // 也就是说 "SunReddening" 这个名字是历史遗留，功能一直是步数。
         this.addOptionRow(cloudSlider("光线步进（0=跟随质量档）", 0.0, 160.0, 8.0,
                 pendingCloudSunReddening, "%.0f 步",
                 value -> pendingCloudSunReddening = (float) value));
         // 光步数着色器钳制在 [4,12]（锥形采样）；>12 的滑条段是死的。
+        // 2026-11-07 复核更正：同上，「阴影步进」也是**对的**。
+        // pendingCloudTopStretch → g_cloudTopStretch → cloudParams[26]
+        // = cloudParams6.z，volumetric_clouds_v5.comp:172-175 把它当作
+        // `shadowOverride`（阴影步数覆盖，>0.9 时 clamp 到 1..32）。
+        // "TopStretch" 是历史误名。注意 tyndall_cloud_field.glsl:138 仍把同一个
+        // lane 当"顶部拉伸"用 —— 那是旧路径，别按它理解。
         this.addOptionRow(cloudSlider("阴影步进（0=跟随质量档）", 0.0, 12.0, 1.0,
                 pendingCloudTopStretch, "%.0f 步",
                 value -> pendingCloudTopStretch = (float) value));
@@ -1204,14 +1254,24 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 pendingCloudSunlightStrength, "%.2f", value -> pendingCloudSunlightStrength = (float) value));
         // 云顶环境光倍率（cloudAmbientParams.x，≤0 回落 1.5）。此前通道下发但
         // 着色器从未读取；云底暂无独立通道（固定 0.15×天光近似）。
+        // 2026-11-07 复核：范围保持 0.1~4.0 不变 —— 着色器对
+        // cloudAmbientParams.x 的钳制就是 clamp(x, 0.1, 4.0)。上一版我把滑条
+        // 收到 3.0 是错的（那会砍掉 3~4 这段有效区间），改的是 record 与 JNI。
         this.addOptionRow(cloudSlider("云顶环境光倍率", 0.1, 4.0, 0.05,
                 ambTopMul, "%.2f", value -> ambTopMul = (float) value));
         this.addOptionRow(cloudSlider("天光强度", 0.0, 3.0, 0.05,
                 pendingPowderStrength, "%.2f", value -> pendingPowderStrength = (float) value));
-        this.addOptionRow(cloudSlider("月光强度", -1, 3, 0.05,
-                moonStrength, "%.2f", value -> moonStrength = (float)value));
-        this.addOptionRow(cloudSlider("月光相位", -1, 1, 0.05,
-                moonPhase, "%.2f", value -> moonPhase = (float)value));
+        this.flushOptionRow();
+
+        // 2026-11-10：地面反弹受光（cloudPhysicsParams.x/.y）。
+        // 这两条此前存档/JNI/原子量三层齐全、**没有任何着色器读取**，滑条也从没做过；
+        // volumetric_clouds_v5.comp 现已把 .x/.y 接进 core 的 ambientTerm
+        // （见 cloud_v5_core.glsl 的 CLOUD_GROUND_BOUNCE 段）。
+        // 另一个 lane（.z 自阴影残光 / .w 相位地板）目前仍无消费者，故不加滑条。
+        this.addOptionRow(cloudSlider("地面反照率", 0.0, 0.8, 0.01,
+                cloudGroundAlbedo, "%.2f", value -> cloudGroundAlbedo = (float) value));
+        this.addOptionRow(cloudSlider("地面反射强度", 0.0, 1.0, 0.01,
+                cloudGroundBounce, "%.2f", value -> cloudGroundBounce = (float) value));
         this.flushOptionRow();
 
         this.addSectionHeader("体积云 · 多次散射 / 能量");
@@ -1249,15 +1309,21 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                         (button, value) -> msMeanReproject = value));
         this.flushOptionRow();
 
-
-        this.addSectionHeader("大气透视");
-        this.addOptionRow(cloudSlider("云层大气透视", 0, 2, 0.05,
-                cloudAerialStrength, "%.2f", value -> cloudAerialStrength = (float) value));
-        this.addOptionRow(cloudSlider("地面大气透视强度", 0, 2, 0.05,
-                groundAerialStrength, "%.2f", value -> groundAerialStrength = (float) value));
-        this.addOptionRow(cloudSlider("地面遮挡衰减", 0, 1, 0.05,
-                groundAerialOcclusion, "%.2f", value -> groundAerialOcclusion = (float) value));
+        // 2026-11-10：cloudTemporalParams.z（时域阻尼）一直是**活**的
+        // （volumetric_cloud_resolve.comp:182 用它衰减 history），
+        // 但一直没有 UI 入口 —— 这里补上。同组另外三个 lane
+        // （天光可见性强度/步数、云底遮蔽）无消费者，已按死设置清理，故不加滑条。
+        this.addOptionRow(cloudSlider("时域阻尼强度", 0.0, 1.0, 0.01,
+                cloudTemporalDampStrength, "%.2f",
+                value -> cloudTemporalDampStrength = (float) value));
         this.flushOptionRow();
+
+
+        // 2026-11-07 死设置清理：「云层大气透视」滑条已移除 —— 它写的是
+        // CameraUBO.cloudAerialParams.x，唯一读取点是退役模型
+        // volumetric_clouds_v3.comp:294（需 cloud_v3.flag 才启用），默认 v5 档
+        // 下拖动没有任何效果。C++ 侧该 lane 已常量化写 0
+        // （Settings.cpp populateCloudAerialParams），atomic 与 JNI 写入已删。
 
         this.section = PAGE_FOG;
 
@@ -1288,23 +1354,63 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.addOptionRow(cloudSlider("太阳取样点（性能）", 1, 8, 1,
                 pendingFogSunSteps, "%.0f", value -> pendingFogSunSteps = (int) Math.round(value)));
 
-        // 2026-11-04：贴地薄雾（godRayParams1 四车道）。层厚/浓度在 shader 里有
-        // ×6 / ×0.05 的标定映射，GUI 值维持旧档范围。
+        // 2026-11-10：贴地薄雾 → 平流雾（rolling advection ground fog）。
+        // 参数仍是 godRayParams1 四车道 + godRayParams2.z 的速度；
+        // 层厚/浓度在 shader 里有 ×6 / ×0.05 的标定映射，GUI 值维持旧档范围。
         this.addOptionRow(CycleButton.builder(
                         enabled -> Component.literal(enabled ? "开" : "关"),
                         this.pendingFogGroundMistEnabled)
                 .withValues(false, true)
-                .create(Component.literal("贴地薄雾"),
+                .create(Component.literal("平流雾（雨天贴地滚动）"),
                         (button, enabled) -> this.pendingFogGroundMistEnabled = enabled));
-        this.addOptionRow(cloudSlider("薄雾层厚", 0.25, 8.0, 0.25,
+        this.addOptionRow(cloudSlider("平流雾层厚", 0.25, 8.0, 0.25,
                 pendingFogGroundMistHeight, "%.2f",
                 value -> pendingFogGroundMistHeight = (float) value));
-        this.addOptionRow(cloudSlider("薄雾浓度", 0.00, 1.00, 0.05,
+        // 2026-11-12：上限 1.00 → 4.00。半格厚的薄层需要更大消光才看得出来，
+        // 4.0 对应 shader 里 6/格，足以压到不透明。
+        // 2026-11-13：上限 4.00 → 2.00。σ=3/格 已经完全不透明，再高只会"变黑"
+        // （看到的是雾自己的颜色，而雨天环境光很暗）。
+        this.addOptionRow(cloudSlider("平流雾浓度（雨天）", 0.00, 2.00, 0.05,
                 pendingFogGroundMistExtinction, "%.2f",
                 value -> pendingFogGroundMistExtinction = (float) value));
-        this.addOptionRow(cloudSlider("薄雾作用距离（性能）", 8, 96, 2,
+        this.addOptionRow(cloudSlider("平流雾滚动速度", 0.0, 6.0, 0.25,
+                pendingFogGroundMistSpeed, "%.2f 格/秒",
+                value -> pendingFogGroundMistSpeed = (float) value));
+        this.addOptionRow(cloudSlider("平流雾作用距离（性能）", 8, 96, 2,
                 pendingFogGroundMistDistance, "%.0f 格",
                 value -> pendingFogGroundMistDistance = (float) value));
+        this.flushOptionRow();
+
+        // 2026-11-11：云隙光（云缝里漏下来的太阳光柱）。三根滑条对应
+        // cloudParams4.y/.z/.w —— 强度=云层光学厚度倍率，缝宽=洞的大小。
+        this.addOptionRow(CycleButton.builder(
+                        enabled -> Component.literal(enabled ? "开" : "关"),
+                        this.pendingCloudGapEnabled)
+                .withValues(false, true)
+                .create(Component.literal("云隙光（云缝漏光）"),
+                        (button, enabled) -> this.pendingCloudGapEnabled = enabled));
+        this.addOptionRow(cloudSlider("云隙光强度", 0.0, 4.0, 0.05,
+                pendingCloudGapStrength, "%.2f",
+                value -> pendingCloudGapStrength = (float) value));
+        this.addOptionRow(cloudSlider("云隙缝宽", 0.0, 1.0, 0.05,
+                pendingCloudGapWidth, "%.2f",
+                value -> pendingCloudGapWidth = (float) value));
+        this.flushOptionRow();
+
+
+        // 2026-11-13：雾光学（fogOpticsParams.x/yzw）
+        this.addOptionRow(cloudSlider("平流雾涡流强度", 0.0, 2.0, 0.05,
+                pendingFogCurlStrength, "%.2f",
+                value -> pendingFogCurlStrength = (float) value));
+        this.addOptionRow(cloudSlider("雾色偏 红", 0.5, 1.5, 0.05,
+                pendingFogTintR, "%.2f",
+                value -> pendingFogTintR = (float) value));
+        this.addOptionRow(cloudSlider("雾色偏 绿", 0.5, 1.5, 0.05,
+                pendingFogTintG, "%.2f",
+                value -> pendingFogTintG = (float) value));
+        this.addOptionRow(cloudSlider("雾色偏 蓝（远雾偏蓝）", 0.5, 1.5, 0.05,
+                pendingFogTintB, "%.2f",
+                value -> pendingFogTintB = (float) value));
         this.flushOptionRow();
 
         this.addOptionRow(CycleButton.builder(
@@ -1325,6 +1431,16 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.flushOptionRow();
 
         this.section = PAGE_RAIN;
+
+        // 2026-11-13 UI 审计：从"体积雾"页搬来（雨波纹属于降雨）
+        // 2026-11-11：雨波纹（水面 + 地面水洼共用同一个解析场）。
+        this.addOptionRow(cloudSlider("雨波纹大小", 0.25, 4.0, 0.05,
+                pendingRainRippleSize, "%.2f 倍",
+                value -> pendingRainRippleSize = (float) value));
+        this.addOptionRow(cloudSlider("雨波纹明显度", 0.0, 3.0, 0.05,
+                pendingRainRippleStrength, "%.2f 倍",
+                value -> pendingRainRippleStrength = (float) value));
+        this.flushOptionRow();
 
         this.addOptionRow(cloudSlider("雨线粗细", 1.0, 40.0, 0.1,
                 pendingRainWidth, "%.1f 毫米", value -> pendingRainWidth = (float) value));
@@ -1429,20 +1545,21 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.addOptionRow(cloudSlider("SSS相位g", 0.0, 0.95, 0.05,
                 waterSssPhaseG, "%.2f", value -> waterSssPhaseG = (float)value));
 
-        this.addOptionRow(cloudSlider("风源波纹尺度", 0.35, 3.0, 0.05,
-        waterWaveLengthScale, "%.2f 倍", value -> waterWaveLengthScale = (float)value));
-        this.addOptionRow(cloudSlider("波纹方向", 0.0, 355.0, 5.0,
-        waterWaveDirection, "%.0f 度", value -> waterWaveDirection = (float)value));
-        this.addOptionRow(cloudSlider("波纹幅度", 0.0, 2.0, 0.05,
-        waterWaveCrestSharpness, "%.2f 倍", value -> waterWaveCrestSharpness = (float)value));
-        this.addOptionRow(cloudSlider("波峰不规则度", 0.0, 2.0, 0.05,
-        waterWaveWarpStrength, "%.2f 倍", value -> waterWaveWarpStrength = (float)value));
+        // 2026-11-13 审计 ④：删除四个**死控件**（风源波纹尺度 / 波纹方向 /
+        // 波纹幅度 / 波峰不规则度）。它们写的是
+        //   g_waterWaveLengthScale / Direction / CrestSharpness / WarpStrength，
+        // 全仓**没有任何读取点** —— 旧波浪系统已被 FBM 波场取代，接线无从可接。
+        // 存档字段保留（不改保存格式），只是不再暴露入口。
         this.flushOptionRow();
 
         this.addOptionRow(cloudSlider("最长波长", 2.0, 8.0, 0.1,
         waterWaveAflScale, "%.1f 格", value -> waterWaveAflScale = (float)value));
-        this.addOptionRow(cloudSlider("波数", 1.0, 12.0, 1.0,
-        waterWaveAflLayers, "%.0f 根", value -> waterWaveAflLayers = (float)value));
+        // 2026-11-13 审计 ③：这个滑条原标"波数 1..12 根"，但着色器
+        // （water_wave_field.glsl:73）把它当 **drag（阻尼）** 用，JNI 又钳到
+        // 0..1.5 ⇒ 原来 7 以上全一样，默认 12 实际一直是 1.5。
+        // 改成与真实语义一致：0..1.5 的阻尼，默认 1.5（等价于旧的 12）。
+        this.addOptionRow(cloudSlider("波形阻尼", 0.0, 1.5, 0.05,
+        waterWaveAflLayers, "%.2f", value -> waterWaveAflLayers = (float)value));
         this.flushOptionRow();
 
         this.addOptionRow(CycleButton.builder(
@@ -1459,6 +1576,49 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         waterFftChoppiness, "%.2f", value -> waterFftChoppiness = (float)value));
         this.addOptionRow(cloudSlider("波浪细节", 0.0, 3.0, 0.05,
         waterFftDetail, "%.2f 倍", value -> waterFftDetail = (float)value));
+        this.flushOptionRow();
+
+        // =====================================================
+        // 2026-11-13 UI 审计：新增两页，把散落的/错页的控件归位。
+        // 只搬"明确错页"的项，不动其它布局。
+        // =====================================================
+        this.section = PAGE_CELESTIAL;
+
+        // 太阳与月亮的外观（原来混在"天空与大气"里，极光/月光还分散在别的页）
+        this.addOptionRow(cloudSlider("太阳圆盘亮度", 0.0, 8.0, 0.01,
+                pendingSunDiskLuminance, "%.2f", value -> pendingSunDiskLuminance = (float) value));
+        this.addOptionRow(cloudSlider("太阳日冕强度", 0.0, 1.0, 0.01,
+                pendingSunHaloStrength, "%.2f", value -> pendingSunHaloStrength = (float) value));
+        this.addOptionRow(cloudSlider("太阳角直径（度）", 0.10, 2.00, 0.01,
+                pendingSunAngularDiameterDegrees, "%.2f", value -> pendingSunAngularDiameterDegrees = (float) value));
+        this.addOptionRow(cloudSlider("太阳透射染色", 0.0, 1.0, 0.01,
+                pendingSunTintStrength, "%.2f", value -> pendingSunTintStrength = (float) value));
+        this.addOptionRow(cloudSlider("星空亮度", 0.0, 2.0, 0.05,
+                pendingStarIntensity, "%.2f", value -> pendingStarIntensity = (float) value));
+        this.addOptionRow(cloudSlider("极光亮度", 0.0, 3.0, 0.05,
+                pendingAuroraBrightness, "%.2f", value -> pendingAuroraBrightness = (float) value));
+        this.addOptionRow(cloudSlider("极光流动速度", 0.0, 4.0, 0.05,
+                pendingAuroraFlowSpeed, "%.2f", value -> pendingAuroraFlowSpeed = (float) value));
+        // 2026-11-13 审计 ②：范围收窄到 0..3（着色器是 >=0 ? 值 : 1.0，
+        // 负值段全部等价于"回出厂"，滑条没有意义）。
+        this.addOptionRow(cloudSlider("月光强度", 0.0, 3.0, 0.05,
+                moonStrength, "%.2f", value -> moonStrength = (float)value));
+        this.addOptionRow(cloudSlider("月光相位", 0.0, 1.0, 0.05,
+                moonPhase, "%.2f", value -> moonPhase = (float)value));
+        this.flushOptionRow();
+
+        this.section = PAGE_CULL;
+
+        // 剔除与分辨率（原来混在"后处理"页里，语义上属于光追性能）
+        this.addOptionRow(cloudSlider("TLAS剔除距离", 0, 320, 32,
+        postTlasCullDistance, "%.0f 格 (0=自适应)", value -> postTlasCullDistance = (int)(float)value));
+        this.addOptionRow(cloudSlider("TLAS视锥剔除边距", 0, 96, 8,
+        postTlasFrustumCullMargin, "%.0f 格 (0=关)", value -> postTlasFrustumCullMargin = (int)(float)value));
+        this.addOptionRow(cloudSlider("远云RR引导距离", 0, 20000, 250,
+        postRrFarCloudDistance, "%.0f 格 (0=关)", value -> postRrFarCloudDistance = (int)(float)value));
+        this.addOptionRow(cloudSlider("云分辨率下限", 0, 100, 5,
+        pendingCloudResFloorPercent, "%.0f%%输出 (0=关)",
+        value -> pendingCloudResFloorPercent = (int)(float)value));
         this.flushOptionRow();
 
         this.section = PAGE_POST;
@@ -1486,21 +1646,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.addOptionRow(cloudSlider("泛光强度", 0.0, 2.0, 0.05,
         postBloomStrength, "%.2f (0=关)", value -> postBloomStrength = (float)value));
-        this.addOptionRow(cloudSlider("TLAS剔除距离", 0, 320, 32,
-        postTlasCullDistance, "%.0f 格 (0=自适应)", value -> postTlasCullDistance = (int)(float)value));
-        this.addOptionRow(cloudSlider("TLAS视锥剔除边距", 0, 96, 8,
-        postTlasFrustumCullMargin, "%.0f 格 (0=关)", value -> postTlasFrustumCullMargin = (int)(float)value));
-        this.addOptionRow(cloudSlider("远云RR引导距离", 0, 20000, 250,
-        postRrFarCloudDistance, "%.0f 格 (0=关)", value -> postRrFarCloudDistance = (int)(float)value));
-        this.addOptionRow(cloudSlider("云分辨率下限", 0, 100, 5,
-        pendingCloudResFloorPercent, "%.0f%%输出 (0=关)",
-        value -> pendingCloudResFloorPercent = (int)(float)value));
-        this.addOptionRow(CycleButton.builder(
-                        enabled -> Component.literal(enabled ? "开" : "关"),
-                        this.pendingCloudPostRrComposite)
-                .withValues(false, true)
-                .create(Component.literal("远云脱离RR"),
-                        (button, enabled) -> this.pendingCloudPostRrComposite = enabled));
         this.flushOptionRow();
 
         this.flushOptionRow();
@@ -1578,6 +1723,14 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.addOptionRow(cloudSlider("镜面弹射层数", 1, 8, 1,
         postMirrorBounceCount, "%.0f 层", value -> postMirrorBounceCount = (int)(float)value));
+
+        // 2026-11-13 UI 审计：从"体积云"页搬来（地面材质的大气透视）
+        this.addSectionHeader("大气透视");
+        this.addOptionRow(cloudSlider("地面大气透视强度", 0, 2, 0.05,
+                groundAerialStrength, "%.2f", value -> groundAerialStrength = (float) value));
+        this.addOptionRow(cloudSlider("地面遮挡衰减", 0, 1, 0.05,
+                groundAerialOcclusion, "%.2f", value -> groundAerialOcclusion = (float) value));
+        this.flushOptionRow();
 
 
         AbstractSliderButton ambientBrightnessSlider =
@@ -2142,6 +2295,19 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     }
 
 
+    // 2026-11-07：applyPendingSettings 里每个 record 的紧凑构造器都会做范围校验，
+    // 一旦某个值越界就抛 IllegalArgumentException —— 而按钮回调没有 try/catch，
+    // 结果是"点了应用、界面没报错、设置却没保存"，下次打开又回到旧值
+    // （RTAO 关档 =5 就是这么暴露的）。这里兜一层：至少把异常打到 stderr 里，
+    // 而不是静默中断。
+    private void applyPendingSettingsSafe() {
+        try {
+            this.applyPendingSettings();
+        } catch (RuntimeException ex) {
+            System.err.println("[RTX CONFIG] apply aborted: " + ex);
+        }
+    }
+
     private void applyPendingSettings() {
 
         boolean allApplied =
@@ -2607,15 +2773,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                     RTXSettingsConfig.isCloudFadeFollowsRrMode();
             allApplied = false;
         }
-        if(!NativeVulkan.isLoaded() || NativeVulkan.setCloudPostRrComposite(
-                this.pendingCloudPostRrComposite)) {
-            RTXSettingsConfig.setCloudPostRrComposite(
-                    this.pendingCloudPostRrComposite);
-        } else {
-            this.pendingCloudPostRrComposite =
-                    RTXSettingsConfig.isCloudPostRrComposite();
-            allApplied = false;
-        }
         RTXSettingsConfig.CloudMsSettings updatedCloudMs =
                 new RTXSettingsConfig.CloudMsSettings(
                         msPhiIntensity, msPhiDepthPow, msPhiDepthBias, msOctaveStrength);
@@ -2645,15 +2802,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                         phiBoundaryConfidence, phiMsBuildScale, phiCompress, phiConeRatio);
         if(!NativeVulkan.isLoaded() || NativeVulkan.setCloudPhiParams(updatedCloudPhi.toParamArray())) {
             RTXSettingsConfig.setCloudPhiSettings(updatedCloudPhi);
-        } else {
-            allApplied = false;
-        }
-        RTXSettingsConfig.CloudLightSettings updatedCloudLight =
-                new RTXSettingsConfig.CloudLightSettings(
-                        lightSourceOdScale, lightSourceCurvePow, lightAoUpwardScale,
-                        lightSunsetAmbientTint);
-        if(!NativeVulkan.isLoaded() || NativeVulkan.setCloudLightParams(updatedCloudLight.toParamArray())) {
-            RTXSettingsConfig.setCloudLightSettings(updatedCloudLight);
         } else {
             allApplied = false;
         }
@@ -2689,14 +2837,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         } else {
             allApplied = false;
         }
-        RTXSettingsConfig.CloudSkyHueSettings updatedCloudSkyHue =
-                new RTXSettingsConfig.CloudSkyHueSettings(skyHueCool, skyHueEnergy,
-                        skyDirStrength, ambientUnify);
-        if(!NativeVulkan.isLoaded() || NativeVulkan.setCloudSkyHueParams(updatedCloudSkyHue.toParamArray())) {
-            RTXSettingsConfig.setCloudSkyHueSettings(updatedCloudSkyHue);
-        } else {
-            allApplied = false;
-        }
         RTXSettingsConfig.CloudPhysicsSettings updatedCloudPhysics =
                 new RTXSettingsConfig.CloudPhysicsSettings(cloudGroundAlbedo,
                         cloudGroundBounce, cloudSunlightResidual, cloudPhaseFloor);
@@ -2710,14 +2850,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                         ms2ScatterTint, ms2Octaves, ms2Attenuation, ms2Eccentricity);
         if(!NativeVulkan.isLoaded() || NativeVulkan.setCloudMs2Params(updatedCloudMs2.toParamArray())) {
             RTXSettingsConfig.setCloudMs2Settings(updatedCloudMs2);
-        } else {
-            allApplied = false;
-        }
-        RTXSettingsConfig.CloudLight2Settings updatedCloudLight2 =
-                new RTXSettingsConfig.CloudLight2Settings(
-                        l2SunPathReddening, l2AtmosphereExtinction, l2PowderMode);
-        if(!NativeVulkan.isLoaded() || NativeVulkan.setCloudLight2Params(updatedCloudLight2.toParamArray())) {
-            RTXSettingsConfig.setCloudLight2Settings(updatedCloudLight2);
         } else {
             allApplied = false;
         }
@@ -2802,7 +2934,8 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                         this.pendingFogGroundMistEnabled,
                         this.pendingFogGroundMistHeight,
                         this.pendingFogGroundMistExtinction,
-                        this.pendingFogGroundMistDistance
+                        this.pendingFogGroundMistDistance,
+                        this.pendingFogGroundMistSpeed
                 );
         if(!NativeVulkan.isLoaded() ||
                 NativeVulkan.setFogGroundMistParams(updatedFogGroundMist.toParamArray())) {
@@ -2811,9 +2944,50 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
             allApplied = false;
         }
 
+        RTXSettingsConfig.CloudGapSettings updatedCloudGap =
+                new RTXSettingsConfig.CloudGapSettings(
+                        this.pendingCloudGapEnabled,
+                        this.pendingCloudGapStrength,
+                        this.pendingCloudGapWidth
+                );
+        if(!NativeVulkan.isLoaded() ||
+                NativeVulkan.setCloudGapParams(updatedCloudGap.toParamArray())) {
+            RTXSettingsConfig.setCloudGapSettings(updatedCloudGap);
+        } else {
+            allApplied = false;
+        }
+
+        RTXSettingsConfig.RainRippleSettings updatedRipple =
+                new RTXSettingsConfig.RainRippleSettings(
+                        this.pendingRainRippleSize,
+                        this.pendingRainRippleStrength
+                );
+        if(!NativeVulkan.isLoaded() ||
+                NativeVulkan.setRainRippleParams(updatedRipple.toParamArray())) {
+            RTXSettingsConfig.setRainRippleSettings(updatedRipple);
+        } else {
+            allApplied = false;
+        }
+
+        RTXSettingsConfig.FogOpticsSettings updatedOptics =
+                new RTXSettingsConfig.FogOpticsSettings(
+                        this.pendingFogCurlStrength,
+                        this.pendingFogTintR,
+                        this.pendingFogTintG,
+                        this.pendingFogTintB
+                );
+        if(!NativeVulkan.isLoaded() ||
+                NativeVulkan.setFogOpticsParams(updatedOptics.toParamArray())) {
+            RTXSettingsConfig.setFogOpticsSettings(updatedOptics);
+        } else {
+            allApplied = false;
+        }
+
+        // 2026-11-13：玻璃光学焦散设置已删除（用户要求整体回退焦散）
+
         RTXSettingsConfig.CloudAerialSettings updatedCloudAerial =
                 new RTXSettingsConfig.CloudAerialSettings(
-                        cloudAerialStrength,
+                        0.0f, // 云层大气透视：死设置，已从界面与 C++ 侧移除
                         groundAerialStrength,
                         groundAerialOcclusion);
         if(!NativeVulkan.isLoaded() || NativeVulkan.setCloudAerialParams(updatedCloudAerial.toParamArray())) {
@@ -3006,6 +3180,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         }
 
         if(!NativeVulkan.isLoaded() || NativeVulkan.setCloudType(this.pendingCloudType)) {
+            // 2026-11-07：native 对旧出厂值 0.35 做了 0.35→0.8 的迁移
+            // （JniSettings.cpp 的 setCloudType），存档若继续存 0.35，界面读数
+            // 就和实际跑的 0.8 不一致。这里按 native 回读值落存档。
+            if(NativeVulkan.isLoaded()) {
+                this.pendingCloudType = NativeVulkan.getCloudType();
+            }
             RTXSettingsConfig.setCloudType(this.pendingCloudType);
         } else {
             allApplied = false;
@@ -3063,8 +3243,11 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
 
 
+        // 2026-11-07：补 !isLoaded() 逃逸 —— 原来 native 未就绪时 set 必然失败，
+        // 走失败分支把 pending 回滚成旧值，这一项等于永远不生效。
         if(
-                NativeVulkan.setNoDirectLightAmbient(
+                !NativeVulkan.isLoaded() ||
+                        NativeVulkan.setNoDirectLightAmbient(
                         this.pendingNoDirectLightAmbient
                 )
         )
@@ -3085,8 +3268,11 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
 
 
+        // 2026-11-07：补 !isLoaded() 逃逸 —— 原来 native 未就绪时 set 必然失败，
+        // 走失败分支把 pending 回滚成旧值，这一项等于永远不生效。
         if(
-                NativeVulkan.setPOMDepth(
+                !NativeVulkan.isLoaded() ||
+                        NativeVulkan.setPOMDepth(
                         this.pendingPOMDepth
                 )
         )
@@ -3105,8 +3291,11 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         }
 
 
+        // 2026-11-07：补 !isLoaded() 逃逸 —— 原来 native 未就绪时 set 必然失败，
+        // 走失败分支把 pending 回滚成旧值，这一项等于永远不生效。
         if(
-                NativeVulkan.setPOMSharp(
+                !NativeVulkan.isLoaded() ||
+                        NativeVulkan.setPOMSharp(
                         this.pendingPOMSharp
                 )
         )
@@ -3125,10 +3314,14 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         }
 
 
+        // 2026-11-07：原写法是 `if(!set(...)) { 把 pending 回滚成 native 旧值 }`，
+        // native 未就绪时 set 必然失败 ⇒ 这一项永远不生效。改成"只在 native
+        // 就绪且真的失败时才回滚"，成功则写进存档（此前它根本没有存档字段）。
         if(
-                !NativeVulkan.setGiNearRate(
-                        this.pendingGiNearRate
-                )
+                NativeVulkan.isLoaded() &&
+                        !NativeVulkan.setGiNearRate(
+                                this.pendingGiNearRate
+                        )
         )
         {
             this.pendingGiNearRate =
@@ -3137,11 +3330,17 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
             allApplied =
                     false;
         }
+        else
+        {
+            RTXSettingsConfig.setGiNearRate(this.pendingGiNearRate);
+        }
 
+        // 2026-11-07：同上，改成"只在 native 就绪且真失败时回滚"，成功写存档。
         if(
-                !NativeVulkan.setGlossyRoughLod(
-                        this.pendingGlossyRoughLod
-                )
+                NativeVulkan.isLoaded() &&
+                        !NativeVulkan.setGlossyRoughLod(
+                                this.pendingGlossyRoughLod
+                        )
         )
         {
             this.pendingGlossyRoughLod =
@@ -3149,6 +3348,10 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
             allApplied =
                     false;
+        }
+        else
+        {
+            RTXSettingsConfig.setGlossyRoughLod(this.pendingGlossyRoughLod);
         }
 
 
@@ -3178,8 +3381,11 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         }
 
 
+        // 2026-11-07：补 !isLoaded() 逃逸 —— 原来 native 未就绪时 set 必然失败，
+        // 走失败分支把 pending 回滚成旧值，这一项等于永远不生效。
         if(
-                NativeVulkan.setSSSMode(
+                !NativeVulkan.isLoaded() ||
+                        NativeVulkan.setSSSMode(
                         this.pendingTrueSubsurfaceScattering
                 )
         )
@@ -3198,8 +3404,11 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         }
 
 
+        // 2026-11-07：补 !isLoaded() 逃逸 —— 原来 native 未就绪时 set 必然失败，
+        // 走失败分支把 pending 回滚成旧值，这一项等于永远不生效。
         if(
-                NativeVulkan.setLocalLightMaxDistance(
+                !NativeVulkan.isLoaded() ||
+                        NativeVulkan.setLocalLightMaxDistance(
                         this.pendingLocalLightMaxDistance
                 )
         )
@@ -3218,8 +3427,11 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         }
 
 
+        // 2026-11-07：补 !isLoaded() 逃逸 —— 原来 native 未就绪时 set 必然失败，
+        // 走失败分支把 pending 回滚成旧值，这一项等于永远不生效。
         if(
-                NativeVulkan.setLocalLightIntensity(
+                !NativeVulkan.isLoaded() ||
+                        NativeVulkan.setLocalLightIntensity(
                         this.pendingLocalLightIntensity
                 )
         )
@@ -3374,13 +3586,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.phiConeRatio = phi.coneRatio();
     }
 
-    private void loadCloudLightSettings(RTXSettingsConfig.CloudLightSettings light) {
-        this.lightSourceOdScale = light.sourceOdScale();
-        this.lightSourceCurvePow = light.sourceCurvePow();
-        this.lightAoUpwardScale = light.aoUpwardScale();
-        this.lightSunsetAmbientTint = light.sunsetAmbientTint();
-    }
-
     private void loadCloudShapeSettings(RTXSettingsConfig.CloudShapeSettings shape) {
         this.shapeBottomSmoothHeight = shape.bottomSmoothHeight();
         this.shapeBottomSmoothPow = shape.bottomSmoothPow();
@@ -3406,13 +3611,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.ambHueFollow = ambient.hueFollow();
     }
 
-    private void loadCloudSkyHueSettings(RTXSettingsConfig.CloudSkyHueSettings skyHue) {
-        this.skyHueCool = skyHue.skyHueCool();
-        this.skyHueEnergy = skyHue.skyHueEnergy();
-        this.skyDirStrength = skyHue.skyDirStrength();
-        this.ambientUnify = skyHue.ambientUnify();
-    }
-
     private void loadCloudPhysicsSettings(RTXSettingsConfig.CloudPhysicsSettings physics) {
         this.cloudGroundAlbedo = physics.groundAlbedo();
         this.cloudGroundBounce = physics.groundBounce();
@@ -3425,12 +3623,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.ms2Octaves = ms2.octaves();
         this.ms2Attenuation = ms2.attenuation();
         this.ms2Eccentricity = ms2.eccentricity();
-    }
-
-    private void loadCloudLight2Settings(RTXSettingsConfig.CloudLight2Settings light2) {
-        this.l2SunPathReddening = light2.sunPathReddening();
-        this.l2AtmosphereExtinction = light2.atmosphereExtinction();
-        this.l2PowderMode = light2.powderMode();
     }
 
     private void loadCloudProfileSettings(RTXSettingsConfig.CloudProfileSettings profile) {
@@ -3460,7 +3652,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     }
 
     private void loadCloudAerialSettings(RTXSettingsConfig.CloudAerialSettings aerial) {
-        this.cloudAerialStrength = aerial.cloudAerialStrength();
         this.groundAerialStrength = aerial.groundAerialStrength();
         this.groundAerialOcclusion = aerial.groundAerialOcclusion();
     }
@@ -3606,6 +3797,96 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.waterSssStrength = sss.strength();
     }
 
+    /**
+     * 「紧凑预览」开关。开启后：世界继续模拟（isPauseScreen=false）+ 设置列表
+     * 压到屏幕底部条带 + 不再绘制原版全屏背景 ⇒ 调滑条时能直接看到画面变化，
+     * 类似多数游戏的画面设置界面。
+     */
+    private AbstractWidget compactToggleButton() {
+        return Button.builder(
+                        Component.literal(compactPreview ? "紧凑预览：开（按此关闭）" : "紧凑预览：关（按此开启）"),
+                        button -> {
+                            compactPreview = !compactPreview;
+                            button.setMessage(Component.literal(
+                                    compactPreview ? "紧凑预览：开（按此关闭）" : "紧凑预览：关（按此开启）"));
+                            this.rebuildWidgets();
+                        })
+                .bounds(0, 0, 150, 20)
+                .build();
+    }
+
+    /**
+     * 把设置列表压到底部条带。
+     *
+     * 用反射而不是直接调用：本机没有 fabric-loom 的 mapped jar 可以核对
+     * {@code AbstractSelectionList} 在这个版本里的方法名/签名。反射在方法缺失时
+     * 只会静默失败（界面退回整屏列表），不会让编译或运行崩掉。
+     */
+    private void applyCompactListBounds() {
+        if(this.list == null) {
+            return;
+        }
+
+        if(!compactPreview) {
+            return;
+        }
+
+        final int bottom = this.height - 28;
+        final int stripHeight = Math.max(60, Math.min(COMPACT_STRIP_HEIGHT, this.height - 80));
+        final int top = bottom - stripHeight;
+
+        try {
+            this.list.getClass()
+                    .getMethod("updateSizeAndPosition", int.class, int.class, int.class, int.class)
+                    .invoke(this.list, this.width, stripHeight, top, bottom);
+            return;
+        } catch (Throwable ignored) {
+            // 继续尝试下一种签名
+        }
+
+        try {
+            this.list.getClass()
+                    .getMethod("repositionEntries")
+                    .invoke(this.list);
+        } catch (Throwable ignored) {
+            // 该版本没有可用接口 ⇒ 保持原布局（不影响其它功能）
+        }
+    }
+
+    @Override
+    protected void init() {
+        super.init();
+        applyCompactListBounds();
+    }
+
+    /**
+     * 2026-11-13：紧凑预览时**不暂停世界**，这样滑条的效果能立刻看到。
+     * 普通整屏模式下保持原版行为（暂停）。
+     */
+    @Override
+    public boolean isPauseScreen() {
+        return !compactPreview;
+    }
+
+    /**
+     * 紧凑模式下不画原版的整屏背景（模糊/泥土纹理），只给底部条带铺一层
+     * 半透明底，其余整幅画面留给世界 —— 否则"腾出画面看效果"就无从谈起。
+     * 普通模式原样交给 super。
+     */
+    @Override
+    public void extractBackground(GuiGraphicsExtractor guiGraphics, int mouseX, int mouseY, float partialTick) {
+        if(!compactPreview) {
+            super.extractBackground(guiGraphics, mouseX, mouseY, partialTick);
+            return;
+        }
+
+        final int bottom = this.height - 28;
+        final int stripHeight = Math.max(60, Math.min(COMPACT_STRIP_HEIGHT, this.height - 80));
+        final int top = Math.max(0, bottom - stripHeight);
+
+        guiGraphics.fill(0, top - 6, this.width, this.height, 0x99000000);
+    }
+
     private void addOptionRow(AbstractWidget widget) {
         if(this.section != this.page) {
             return;
@@ -3699,7 +3980,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                                             "确认"
                                     ),
                                     button ->
-                                            this.applyPendingSettings()
+                                            this.applyPendingSettingsSafe()
                             )
                             .width(
                                     150
@@ -3728,7 +4009,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                                             "应用"
                                     ),
                                     button ->
-                                            this.applyPendingSettings()
+                                            this.applyPendingSettingsSafe()
                             )
                             .width(
                                     150
@@ -3782,6 +4063,8 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
 
     private void addHubButtons() {
+        // 2026-11-15：主页最上面放「性能模式」一键开关。
+        this.addOptionRow(this.performanceModeButton());
         this.addOptionRow(this.hubButton("超分与帧生成", PAGE_UPSCALER));
         this.addOptionRow(this.hubButton("光追性能", PAGE_PERF));
         this.addOptionRow(this.hubButton("天空与大气", PAGE_SKY));
@@ -3790,6 +4073,8 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.addOptionRow(this.hubButton("降雨", PAGE_RAIN));
         this.addOptionRow(this.hubButton("水面", PAGE_WATER));
         this.addOptionRow(this.hubButton("材质与画面", PAGE_MATERIAL));
+        this.addOptionRow(this.hubButton("天体与夜光", PAGE_CELESTIAL));
+        this.addOptionRow(this.hubButton("性能与剔除", PAGE_CULL));
         this.addOptionRow(this.hubButton("后处理", PAGE_POST));
         this.flushOptionRow();
     }
@@ -3800,6 +4085,63 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 Component.literal(label),
                 button -> this.openPage(target)
         ).width(150).build();
+    }
+
+
+    /**
+     * 2026-11-15「性能模式」一键开关。
+     *
+     * <p>语义：主光追只到 6 区块以内，6~8 区块交给 SSPT，8 区块以外交给 SSR。
+     * 落地为四项联动：</p>
+     * <ul>
+     *   <li>ssptRange = 8（SSPT 管到 8 区块）</li>
+     *   <li>ssrRange = 48（SSR 射程上限）</li>
+     *   <li>rtGlossyEnabled = false（RT 不再跑 GGX 反射射线）</li>
+     *   <li>ssHybridFloor = 8（SSR 的区块下限从 12 降到 8）</li>
+     * </ul>
+     * 关闭时四项回默认（SSPT/SSR 关、RT 光泽射线开、下限 12）。
+     */
+    private AbstractWidget performanceModeButton() {
+        return Button.builder(
+                        Component.literal(
+                                RTXSettingsConfig.isPerformanceMode()
+                                        ? "性能模式：开（按此关闭）"
+                                        : "性能模式：关（按此开启）"),
+                        button -> {
+                            final boolean next =
+                                    !RTXSettingsConfig.isPerformanceMode();
+
+                            RTXSettingsConfig.setPerformanceMode(next);
+
+                            if(NativeVulkan.isLoaded()) {
+                                final boolean ok =
+                                        NativeVulkan.setSSPTRange(
+                                                RTXSettingsConfig.getSsptRange())
+                                        && NativeVulkan.setSSRRange(
+                                                RTXSettingsConfig.getSsrRange())
+                                        && NativeVulkan.setRTGlossyEnabled(
+                                                RTXSettingsConfig.isRTGlossyEnabled())
+                                        && NativeVulkan.setSsHybridFloor(
+                                                next
+                                                        ? RTXSettingsConfig.PERF_MODE_SSR_FLOOR_CHUNKS
+                                                        : 12.0f)
+                                        && NativeVulkan.setPerformanceMode(next);
+
+                                if(!ok) {
+                                    System.err.println(
+                                            "[RTX] performance mode: native apply failed");
+                                }
+                            }
+
+                            button.setMessage(Component.literal(
+                                    RTXSettingsConfig.isPerformanceMode()
+                                            ? "性能模式：开（按此关闭）"
+                                            : "性能模式：关（按此开启）"));
+
+                            this.rebuildWidgets();
+                        })
+                .bounds(0, 0, 150, 20)
+                .build();
     }
 
 

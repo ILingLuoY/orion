@@ -1287,6 +1287,35 @@ if(cam.perfAblationStage.x == 27u)
 }
 
 // =====================================================
+// 2026-11-15 远场贴图降档（用户 2026-11-15 要求：8 区块以外材质贴图慢慢降档）。
+//
+// 自创参数（无参考实现）：
+//   起点 = cam.perfBandParams.w（单位**格**，默认 128 = 8 区块，对齐 GI 弹射
+//   分档；0 = 关）；起后每 32 格抬 1 级 mip，起点 +96 格处封顶 +3，再与
+//   pbrMaxLod 取 min（不跨 sprite、不串色 —— 与 ORION_SECONDARY_MIP_BIAS 同口径）。
+//   作用对象：pbrLod（normal/specular 采样）+ albedo 的两次采样（见下面
+//   useExactAlbedo / else 分支）。通道全部保留采样 ⇒ 不复现旧 ORION_MAT_FAR_LOD
+//   硬跳档的三个副作用（反射变钝 / 32→48 分层 / 远处光源方块不发光）。
+//   宿主：ORION_MAT_TEX_FAR_LOD（Settings.cpp，0 = 关）。
+//   兜底：图集若没有 mip 链（玩家把 Minecraft 的 mipmap 关到 0），
+//   textureLod 超 0 会被夹回 base level ⇒ 自动退化为无操作。
+//   口径注意：hitT 是**本条射线**的命中距离；次级射线（反射/GI）的命中
+//   离它的起点很近，所以本坡道实际只对主射线远场生效 —— 与
+//   orionMatFarLodFade 的既有口径一致。
+// =====================================================
+float matTexFarMipBias = 0.0;
+if(cam.perfBandParams.w > 0.5 && hitT > cam.perfBandParams.w)
+{
+    matTexFarMipBias =
+        min((hitT - cam.perfBandParams.w) * (1.0 / 32.0), 3.0);
+}
+
+pbrLod = min(pbrLod + matTexFarMipBias, pbrMaxLod);
+
+// albedo 原本恒 lod 0（精确纹素），只吃本坡道；同样夹在 pbrMaxLod。
+const float matTexAlbedoLod = min(matTexFarMipBias, pbrMaxLod);
+
+// =====================================================
 // POM eligibility
 //
 // Water materialId = 1:
@@ -1473,20 +1502,30 @@ if(useExactAlbedo)
     );
 
     // 2026-10-29 消融档 23「noAlbedoFetch」：albedo 采样的价格（texelFetch 分支）。
+    // 2026-11-15 远场降档：bias>0 时改走 textureLod（同纹素中心 UV；lod 0 下与
+    // texelFetch 逐位等价 —— 双线性/最近点采样在纹素中心都只取该纹素），
+    // lod>0 才开始混 mip。bias=0 走原 texelFetch，主路径行为不变。
     albedoColor =
         (cam.perfAblationStage.x == 23u)
             ? vec4(0.5, 0.5, 0.5, 1.0) * interpColor
-            : texelFetch(blockAtlas, albedoTexel, 0) * interpColor;
+            : (matTexAlbedoLod > 0.0
+                ? textureLod(
+                    blockAtlas,
+                    (vec2(albedoTexel) + vec2(0.5)) / vec2(albedoSize),
+                    matTexAlbedoLod
+                )
+                : texelFetch(blockAtlas, albedoTexel, 0)) * interpColor;
 }
 else
 {
     albedoColor =
         (cam.perfAblationStage.x == 23u)
             ? vec4(0.5, 0.5, 0.5, 1.0) * interpColor
+            // 2026-11-15 远场降档：lod 0 → matTexAlbedoLod（0 时逐位不变）。
             : textureLod(
                 blockAtlas,
                 materialSampleUV,
-                0.0
+                matTexAlbedoLod
             ) *
             interpColor;
 }

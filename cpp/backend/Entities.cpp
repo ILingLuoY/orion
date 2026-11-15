@@ -252,6 +252,129 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadEntityBatch(
     }
 }
 
+// 2026-11-12：实体层分桶（ORION_ENTITY_LAYER_BUCKETS，默认 1 = 逐位保持旧行为）。
+//
+// 一个桶 = 一个独立的 g_chunkMeshes 条目 = 一个独立 BLAS。按 textureSlot 取模分桶，
+// 这样"转动的那一件物品"只会脏自己那一桶。
+namespace
+{
+uint32_t entityLayerBuckets()
+{
+    static const uint32_t value = []()
+    {
+        const char* raw = std::getenv("ORION_ENTITY_LAYER_BUCKETS");
+        long parsed = raw ? std::strtol(raw, nullptr, 10) : 1L;
+
+        if(parsed < 1L)
+        {
+            parsed = 1L;
+        }
+        if(parsed > static_cast<long>(ENTITY_RT_LAYER_MAX_BUCKETS))
+        {
+            parsed = static_cast<long>(ENTITY_RT_LAYER_MAX_BUCKETS);
+        }
+
+        return static_cast<uint32_t>(parsed);
+    }();
+
+    return value;
+}
+
+// 返回 true = 至少一个桶变了（调用方需要置 g_entityRebuildRequested）。
+bool updateEntityLayerBucketed()
+{
+    const uint32_t buckets = entityLayerBuckets();
+
+    static std::vector<std::vector<Vertex>> sVerts(ENTITY_RT_LAYER_MAX_BUCKETS);
+    static std::vector<std::vector<float>> sMotion(ENTITY_RT_LAYER_MAX_BUCKETS);
+    static uint64_t sHash[ENTITY_RT_LAYER_MAX_BUCKETS] = {};
+    static bool sHashValid[ENTITY_RT_LAYER_MAX_BUCKETS] = {};
+    static size_t sCount[ENTITY_RT_LAYER_MAX_BUCKETS] = {};
+
+    for(uint32_t b = 0u; b < buckets; ++b)
+    {
+        sVerts[b].clear();
+        sMotion[b].clear();
+    }
+
+    const size_t count = g_entityFrameVertices.size();
+    const size_t motionCount = g_entityFrameMotion.size();
+
+    for(size_t i = 0u; i < count; ++i)
+    {
+        const Vertex& vertex = g_entityFrameVertices[i];
+        const int slot = static_cast<int>(vertex.pad2);
+        const uint32_t bucket = slot > 0
+            ? (static_cast<uint32_t>(slot) % buckets)
+            : (static_cast<uint32_t>(i) % buckets);
+
+        sVerts[bucket].push_back(vertex);
+
+        const size_t base = i * 3u;
+        if(base + 2u < motionCount)
+        {
+            sMotion[bucket].push_back(g_entityFrameMotion[base + 0u]);
+            sMotion[bucket].push_back(g_entityFrameMotion[base + 1u]);
+            sMotion[bucket].push_back(g_entityFrameMotion[base + 2u]);
+        }
+        else
+        {
+            sMotion[bucket].push_back(0.0f);
+            sMotion[bucket].push_back(0.0f);
+            sMotion[bucket].push_back(0.0f);
+        }
+    }
+
+    bool anyChanged = false;
+
+    for(uint32_t b = 0u; b < buckets; ++b)
+    {
+        const uint64_t key = entityRtBucketKey(b);
+        const uint64_t hash = hashVertexPayload(sVerts[b]);
+        const size_t size = sVerts[b].size();
+
+        const auto it = g_chunkMeshes.find(key);
+        const bool changed =
+            it == g_chunkMeshes.end()
+                ? size != 0u
+                : !(sHashValid[b] && sHash[b] == hash && sCount[b] == size &&
+                    it->second.size() == size);
+
+        if(changed)
+        {
+            anyChanged = true;
+
+            if(size == 0u)
+            {
+                if(it != g_chunkMeshes.end())
+                {
+                    g_chunkMeshes.erase(it);
+                }
+                sHashValid[b] = false;
+            }
+            else
+            {
+                std::vector<Vertex>& cached = g_chunkMeshes[key];
+                cached.swap(sVerts[b]);
+                sHash[b] = hash;
+                sHashValid[b] = true;
+                sCount[b] = size;
+            }
+        }
+
+        // motion 必须跟着桶一起发，否则 MV 会错层
+        const bool motionReset =
+            publishDynamicLayerMotion(key, sMotion[b], size, changed);
+        anyChanged = anyChanged || motionReset;
+    }
+
+    g_entityFrameVertices.clear();
+    g_entityFrameMotion.clear();
+
+    return anyChanged;
+}
+}  // namespace
+
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
     JNIEnv*,
@@ -266,25 +389,111 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
 
     g_entityFrameOpen = false;
 
+    // =====================================================
+    // 2026-11-12 实例化第 2 步的**自检**：ORION_ENTITY_INSTANCE_TEST=N（N>=2）。
+    //
+    // 用现有实体层几何做端到端验证：登记 N 组"单位矩阵 + 沿 X 每 2 格偏移"的实例变换，
+    // 实体应当被复制成 N 份。能复制 ⇒ 实例矩阵链路（C++ → TLAS → rchit 的
+    // gl_ObjectToWorldEXT）整条是通的；否则问题就定位在这一段。
+    // 默认不设 = 不注册 = 完全走原来的单实例单位矩阵路径。
+    // =====================================================
+    {
+        static const int sInstanceTestCopies = []()
+        {
+            const char* raw = std::getenv("ORION_ENTITY_INSTANCE_TEST");
+            int parsed = raw ? std::atoi(raw) : 0;
+
+            if(parsed < 0)
+            {
+                parsed = 0;
+            }
+            if(parsed > 8)
+            {
+                parsed = 8;
+            }
+
+            return parsed;
+        }();
+
+        if(sInstanceTestCopies >= 2)
+        {
+            std::vector<float>& transforms =
+                g_entityMeshInstances[ENTITY_RT_LAYER_KEY];
+
+            if(transforms.size() != static_cast<size_t>(sInstanceTestCopies) * 12u)
+            {
+                transforms.clear();
+                transforms.reserve(static_cast<size_t>(sInstanceTestCopies) * 12u);
+
+                for(int copy = 0; copy < sInstanceTestCopies; ++copy)
+                {
+                    const float offsetX = static_cast<float>(copy) * 2.0f;
+
+                    transforms.push_back(1.0f);
+                    transforms.push_back(0.0f);
+                    transforms.push_back(0.0f);
+                    transforms.push_back(offsetX);
+
+                    transforms.push_back(0.0f);
+                    transforms.push_back(1.0f);
+                    transforms.push_back(0.0f);
+                    transforms.push_back(0.0f);
+
+                    transforms.push_back(0.0f);
+                    transforms.push_back(0.0f);
+                    transforms.push_back(1.0f);
+                    transforms.push_back(0.0f);
+                }
+
+                // ⚠ 必须同时置 worldGeometryDirty：Frame.cpp 只在
+                // `g_worldGeometryDirty` 为真时才去看 entityRebuildRequested。
+                // 只置后者 ⇒ 静态场景（实体哈希不变）下永远不重建 ⇒ 实例永远不生效。
+                g_worldGeometryDirty.store(true, std::memory_order_release);
+                g_entityRebuildRequested.store(true, std::memory_order_release);
+                RTLog(
+                    "[INSTANCE TEST] entity layer x" +
+                    std::to_string(sInstanceTestCopies)
+                );
+            }
+
+            // 注册可能早于实体层几何出现（进世界头几帧），所以前若干帧持续置脏，
+            // 保证至少触发一次带实例的 TLAS 重建。仅自检路径。
+            static int sInstanceTestBootFrames = 0;
+            if(sInstanceTestBootFrames < 60)
+            {
+                ++sInstanceTestBootFrames;
+                g_worldGeometryDirty.store(true, std::memory_order_release);
+                g_entityRebuildRequested.store(true, std::memory_order_release);
+            }
+        }
+    }
+
     // #16 探针：帧间隔 24-93ms 而 recordFrameCommand 只 1-12ms，怀疑点在
     // Java→JNI 每帧全量 FNV。此计时只在超过 3ms 时打 [PERF L10 STALL]，
     // 不超 = 该嫌疑排除。
+    // 2026-11-12：分桶模式（>1）下实体层由 updateEntityLayerBucketed 全权处理：
+    // 它自己按桶算哈希、按桶更新 g_chunkMeshes、按桶发 motion，所以这里跳过整层哈希。
+    const bool useBuckets = entityLayerBuckets() > 1u;
+    const bool bucketChanged = useBuckets ? updateEntityLayerBucketed() : false;
+
     uint64_t entityFrameHash = 0u;
     uint64_t localPlayerFrameHash = 0u;
     uint64_t handFrameHash = 0u;
     PERF_L10_TIME_STALL("entityFrameVertexHash", {
-        entityFrameHash = hashVertexPayload(g_entityFrameVertices);
+        entityFrameHash = useBuckets ? 0u : hashVertexPayload(g_entityFrameVertices);
         localPlayerFrameHash = hashVertexPayload(g_localPlayerFrameVertices);
         handFrameHash = hashVertexPayload(g_handFrameVertices);
     });
 
     const auto currentEntity = g_chunkMeshes.find(ENTITY_RT_LAYER_KEY);
     const auto currentLocalPlayer = g_chunkMeshes.find(LOCAL_PLAYER_RT_LAYER_KEY);
-    const bool entityChanged = currentEntity == g_chunkMeshes.end()
-        ? !g_entityFrameVertices.empty()
-        : !(g_entityCachedHashValid &&
-            g_entityCachedHash == entityFrameHash &&
-            currentEntity->second.size() == g_entityFrameVertices.size());
+    const bool entityChanged = useBuckets
+        ? false
+        : (currentEntity == g_chunkMeshes.end()
+            ? !g_entityFrameVertices.empty()
+            : !(g_entityCachedHashValid &&
+                g_entityCachedHash == entityFrameHash &&
+                currentEntity->second.size() == g_entityFrameVertices.size()));
     const bool localPlayerChanged = currentLocalPlayer == g_chunkMeshes.end()
         ? !g_localPlayerFrameVertices.empty()
         : !(g_localPlayerCachedHashValid &&
@@ -335,8 +544,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
         }
     }
 
-    const bool entityMotionReset =
-        publishDynamicLayerMotion(
+    // 分桶模式下 motion 已由 updateEntityLayerBucketed 按桶发布
+    const bool entityMotionReset = useBuckets
+        ? false
+        : publishDynamicLayerMotion(
             ENTITY_RT_LAYER_KEY,
             g_entityFrameMotion,
             g_entityFrameVertices.size(),
@@ -351,6 +562,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
         );
 
     const bool changed =
+        bucketChanged ||
         entityChanged ||
         localPlayerChanged ||
         handChanged ||

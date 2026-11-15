@@ -44,7 +44,32 @@ public class RenderTypeFeatureRendererMixin {
     private void rtx$captureGenericGeometry(
             RenderType renderType,
             CallbackInfoReturnable<VertexConsumer> cir) {
+        // 2026-11-12 回归修复：这里是**每 quad 一次**的热路径（密集区一帧几十万次）。
+        // 之前无条件调用两次 System.nanoTime()（各约 25 ns）⇒ 光计时就 20~40 ms/帧，
+        // 而且不受任何开关控制 ⇒「原来不卡的地图也变卡了」。
+        // 现在开关关闭时一次 nanoTime 都不调（probeEnabled() 是静态 final，JIT 直接折叠）。
+        final boolean probe = com.example.client.LevelPhaseProbe.probeEnabled();
+
+        if (probe) {
+            EntityRtCapture.noteVertexBuilder(renderType, cir.getReturnValue());
+        }
+
+        final long captureStart = probe ? System.nanoTime() : 0L;
         EntityRtCapture.beginCustomSubmit(renderType);
+        if (probe && captureStart != 0L) {
+            com.example.client.LevelPhaseProbe.captureGenericAdd(System.nanoTime() - captureStart);
+        }
+    }
+
+    @Inject(method = "prepareGroup", at = @At("HEAD"))
+    private void rtx$itemPrepareHead(
+            FeatureFrameContext context,
+            List<?> submits,
+            boolean strictlyOrdered,
+            CallbackInfo ci) {
+        if ((Object) this instanceof net.minecraft.client.renderer.feature.ItemFeatureRenderer) {
+            com.example.client.LevelPhaseProbe.itemPrepHead();
+        }
     }
 
     @Inject(method = "prepareGroup", at = @At("RETURN"))
@@ -53,6 +78,15 @@ public class RenderTypeFeatureRendererMixin {
             List<?> submits,
             boolean strictlyOrdered,
             CallbackInfo ci) {
+        // 2026-11-11：Item / Custom / BlockModel / MovingBlock 四条链的捕获收尾都在这里，
+        // 单独计时才知道 Item 桶（5~15 ms）到底是不是我们自己的开销。
+        // 物品链的缓存收尾已下移到 ItemFeatureRendererMixin.buildGroup RETURN
+        // （必须在 buildGroup 内，因为 prepareGroup 取消会破坏 groups 下标对应关系）
+        if ((Object) this instanceof net.minecraft.client.renderer.feature.ItemFeatureRenderer) {
+            com.example.client.LevelPhaseProbe.itemPrepTail();
+        }
+        final long captureStart = System.nanoTime();
         EntityRtCapture.endCustomGroup();
+        com.example.client.LevelPhaseProbe.captureGenericAdd(System.nanoTime() - captureStart);
     }
 }

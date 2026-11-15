@@ -3109,6 +3109,22 @@ static bool evictFarthestVLIPageImpl(
 {
     outPageIndex = 0u;
 
+    // 2026-11-14：A/B 开关 —— 池满时「只忽略新段、绝不驱逐」。
+    // 依据：崩溃与「移动 / 调时间」强相关（都是 VLI 需求暴涨的路径），
+    // 且每次 [GPU HANG] 快照里 VLI 都是 capacity 满、freePages=0、
+    // governorEvicted>0。若本开关能消除崩溃，就锁定驱逐路径。
+    static const bool s_vliNoEvict = []
+    {
+        const char* raw = std::getenv("ORION_VLI_NO_EVICT");
+
+        return raw != nullptr && raw[0] == '1';
+    }();
+
+    if(s_vliNoEvict)
+    {
+        return false;
+    }
+
     if(g_vliSections.empty())
     {
         return false;
@@ -3266,6 +3282,33 @@ static bool evictFarthestVLIPageImpl(
 }
 
 // 保留原原型（OrionInternal.h），行为 = 不带距离闸（无条件淘汰最远页）。
+// 2026-11-14：卡死快照用的 VLI 状态（只读，持锁快速取一份）。
+void rtLogVliStateForHang()
+{
+    std::unique_lock<std::mutex> lock(g_vliMutex, std::try_to_lock);
+
+    if(!lock.owns_lock())
+    {
+        RTLogFlushed(
+            "[GPU HANG] vli mutex HELD another thread (hang inside VLI path)");
+        return;
+    }
+
+    RTLogFlushed(
+        "[GPU HANG] vli capacity=" + std::to_string(g_vliPageCapacity) +
+        " nextPage=" + std::to_string(g_vliNextPage) +
+        " livePages=" + std::to_string(g_vliSections.size()) +
+        " freePages=" + std::to_string(g_vliFreePages.size()) +
+        " pending=" + std::to_string(g_vliPendingSections.size()) +
+        " governorEvicted=" + std::to_string(g_vliGovernorEvictedPages) +
+        " governorIgnored=" + std::to_string(g_vliGovernorIgnoredSections) +
+        " limit=" + std::to_string(vliPageCapacityLimit()) +
+        " poolBytes=" + std::to_string(
+            static_cast<unsigned long long>(vliPoolBytesForCapacity(g_vliPageCapacity)))
+    );
+}
+
+
 bool evictFarthestVLIPageLocked(uint32_t& outPageIndex)
 {
     return evictFarthestVLIPageImpl(outPageIndex, false, 0, 0, 0);

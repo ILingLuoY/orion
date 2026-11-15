@@ -26,6 +26,34 @@ layout(r8,      set = 0, binding = 21) uniform writeonly image3D volShAgeOut;
 
 layout(set = 0, binding = 22) uniform accelerationStructureEXT sceneTlas;
 
+// 2026-11-09 NEE 探针。唯一作用是给 [VOL NEE] 日志提供分子/分母，不参与出图：
+// 累加整段被 `pc.volumeParams.z > 0.5` 这道 uniform 分支门控，关闭时（默认）
+// 与改动前逐字节等价。C++ 侧由 ORION_VOL_NEE_PROBE=1 打开。
+//   candidate  = 有灯、且在 rangeFade 射程内的 froxel 数
+//   lit        = 其中遮挡射线判为"可见"的 froxel 数
+//   litAbove   = 其中"灯比该 froxel 高 >= 4 格"的 froxel 数（头顶来光）
+//   lumMilli   = 可见样本 radiance 亮度 × 1000 的累加（判断亮度量级）
+layout(std430, set = 0, binding = 23) buffer VolNeeProbe
+{
+    uint candidate;
+    uint lit;
+    uint litAbove;
+    uint lumMilli;
+    uint lightCount;      // 本帧 shader 看到的灯表条数（fogLightBuffer.header.x）
+    uint gridCapacity;    // 本帧 shader 看到的网格哈希容量（fogLightGrid.words[2]）
+    uint reservoirValid;  // reservoir.lightIndex/sampleCount 非零的 froxel 数
+    uint froxelCount;     // 被遍历的 froxel 总数（分母自检）
+    uint candidateAbove;  // 在射程内、且"灯比该 froxel 高 >= 4 格"的 froxel 数
+    uint upTests;         // 向上竖直射线测试次数（灯在上方的样本）
+    uint upHits;          // 其中"上方确实有实体几何"的次数
+    uint upHitsNeePass;   // 其中"NEE 仍然放行"的次数 —— 大于 0 即穿岩
+    uint asTests;         // 每帧一次的"AS 可用性"自检次数
+    uint asHits;          // 其中命中的次数
+    uint asHitT;          // 最近一次命中的 t × 100（0 = 未命中/无数据）
+    uint asPlainHits;     // 同样的射线但**不带任何 rayFlags** 时的命中次数
+    uint asPlainT;        // 它的命中距离 × 100
+} neeProbe;
+
 layout(push_constant) uniform VolRestirIntegratePush
 {
     ivec4 froxelSize;
@@ -51,13 +79,26 @@ const float FOG_LIGHT_PHASE_SCALE = 0.62;
 const float FOG_LIGHT_PHASE_FLOOR = 0.02;
 const float FOG_LIGHT_PHASE_G = 0.40;
 
+// 2026-11-09 P4：双叶相位。
+// 单叶 HG(g=0.4) 的前向瓣在灯很近时峰会偏窄，表现为"光斑边缘一刀切、中间一团"。
+// 混入 25% 的后向瓣（g=-0.2）给近场补一层底光：两个瓣各自在球面积分为 1，
+// 按比例混合仍能量守恒，只是重新分配方向 —— 观感更"实"，成本 1 次 mix。
+const float FOG_LIGHT_PHASE_BACKWARD_G = -0.20;
+const float FOG_LIGHT_PHASE_BACKWARD_MIX = 0.25;
+
+float volRestirDualLobePhase(float cosine, float g)
+{
+    return mix(hgPhase(cosine, g), hgPhase(cosine, FOG_LIGHT_PHASE_BACKWARD_G),
+        FOG_LIGHT_PHASE_BACKWARD_MIX);
+}
+
 float volRestirLightPhase(vec3 toLight, vec3 viewDirection)
 {
     const float distanceToLight = max(length(toLight), 1.0e-4);
     const float cosine = dot(-toLight / distanceToLight, viewDirection);
 
     return FOG_LIGHT_PHASE_FLOOR +
-        FOG_LIGHT_PHASE_SCALE * hgPhase(cosine, FOG_LIGHT_PHASE_G);
+        FOG_LIGHT_PHASE_SCALE * volRestirDualLobePhase(cosine, FOG_LIGHT_PHASE_G);
 }
 
 // ---------------------------------------------------------------------------
@@ -176,11 +217,89 @@ void main()
     ivec3 restirSize = ivec3(imageSize(volReservoirIn));
     int restirDownscale = max(pc.froxelSize.w, 1);
 
+    const bool neeProbeOn = pc.volumeParams.z > 0.5;
+
+    if(neeProbeOn)
+    {
+        // 由 0 号线程把"shader 眼里的灯表"抄一份下来：tbl/cap 是 C++ 侧看不到的
+        // 事实（GPU buffer 可能和 CPU 计数不一致，网格也可能没建）。
+        if(all(equal(froxelCoord, ivec3(0))))
+        {
+            neeProbe.lightCount = fogLightBuffer.header.x;
+            neeProbe.gridCapacity = fogLightGrid.words[2];
+        }
+
+        atomicAdd(neeProbe.froxelCount, 1u);
+
+        // 每帧一次：从相机沿视野中心方向打一条 64 格的射线。洞穴/室内必然命中
+        // 墙或地面；它为 0 就说明这个 dispatch 里 sceneTlas 根本打不到东西
+        // （绑定/句柄问题），而不是"上方恰好没东西"。
+        if(all(equal(froxelCoord, ivec3(0))))
+        {
+            const vec3 camPos = cam.viewInverse[3].xyz;
+            const vec3 asDir = volRestirWorldDirection(vec2(0.5), vec2(pc.froxelSize.xy));
+
+            rayQueryEXT asQuery;
+            rayQueryInitializeEXT(
+                asQuery,
+                sceneTlas,
+                gl_RayFlagsTerminateOnFirstHitEXT |
+                    gl_RayFlagsSkipClosestHitShaderEXT,
+                0xFFu,
+                camPos,
+                0.05,
+                asDir,
+                64.0);
+            while(rayQueryProceedEXT(asQuery)) {}
+
+            atomicAdd(neeProbe.asTests, 1u);
+
+            if(rayQueryGetIntersectionTypeEXT(asQuery, true) !=
+               gl_RayQueryCommittedIntersectionNoneEXT)
+            {
+                atomicAdd(neeProbe.asHits, 1u);
+
+                neeProbe.asHitT = uint(clamp(
+                    rayQueryGetIntersectionTEXT(asQuery, true) * 100.0,
+                    0.0, 4.0e9));
+            }
+
+            // 同一条射线、**不带任何 rayFlags**：把"AS 里没东西"和
+            // "TerminateOnFirstHit 下 committed 位读不到"这两种情况分开。
+            rayQueryEXT plainQuery;
+            rayQueryInitializeEXT(
+                plainQuery,
+                sceneTlas,
+                0u,
+                0xFFu,
+                camPos,
+                0.05,
+                asDir,
+                64.0);
+            while(rayQueryProceedEXT(plainQuery)) {}
+
+            if(rayQueryGetIntersectionTypeEXT(plainQuery, true) !=
+               gl_RayQueryCommittedIntersectionNoneEXT)
+            {
+                atomicAdd(neeProbe.asPlainHits, 1u);
+
+                neeProbe.asPlainT = uint(clamp(
+                    rayQueryGetIntersectionTEXT(plainQuery, true) * 100.0,
+                    0.0, 4.0e9));
+            }
+        }
+    }
+
     ivec3 restirCoord = clamp(
         ivec3(froxelCoord.xy / restirDownscale, froxelCoord.z),
         ivec3(0), restirSize - ivec3(1));
 
     VolReservoir reservoir = volRestirUnpack(imageLoad(volReservoirIn, restirCoord));
+
+    if(neeProbeOn && reservoir.lightIndex != 0u && reservoir.sampleCount != 0u)
+    {
+        atomicAdd(neeProbe.reservoirValid, 1u);
+    }
 
     vec3 froxelCenter = volRestirFroxelCenter(
         froxelCoord, froxelSize, vec2(pc.froxelSize.xy), 1,
@@ -212,19 +331,87 @@ void main()
                 float rangeFade = vptLocalLightRangeFade(
                     distanceToLight, light.meta.x, emissionLevel);
 
-                if(rangeFade > 0.0 &&
-                   volRestirNeeVisible(froxelCenter, light.worldPosEmission.xyz,
-                       distanceToLight))
+                if(rangeFade > 0.0)
                 {
-                    float phase = volRestirLightPhase(toLight, viewDirection);
+                    // 2026-11-09：独立的"头顶有没有岩层"判定（探针专用）。
+                    // 从 froxel 竖直向上打 Δy 格：若命中，说明灯与 froxel 之间**确实
+                    // 隔着实体几何**；再看 NEE 是否仍然放行 —— 放行即穿岩，铁证。
+                    const float aboveDelta = light.worldPosEmission.y - froxelCenter.y;
+                    bool ceilingHits = false;
 
-                    // 2026-10-31：亮度按光源档案（×15 保持旧的 0..15 量级）。
-                    radiance = decodeLocalLightColor(light.meta.x) *
-                        localLightProfileBrightness(light.meta.x, emissionLevel) * 15.0 *
-                        attenuation * rangeFade * energyScale * phase;
+                    if(neeProbeOn && aboveDelta >= 1.0)
+                    {
+                        rayQueryEXT upQuery;
+                        rayQueryInitializeEXT(
+                            upQuery,
+                            sceneTlas,
+                            gl_RayFlagsTerminateOnFirstHitEXT |
+                                gl_RayFlagsSkipClosestHitShaderEXT,
+                            0xFFu,
+                            froxelCenter,
+                            0.05,
+                            vec3(0.0, 1.0, 0.0),
+                            aboveDelta);
+                        while(rayQueryProceedEXT(upQuery)) {}
 
-                    lightDir = normalize(toLight);
-                    hasLight = true;
+                        ceilingHits =
+                            rayQueryGetIntersectionTypeEXT(upQuery, true) !=
+                            gl_RayQueryCommittedIntersectionNoneEXT;
+
+                        atomicAdd(neeProbe.upTests, 1u);
+
+                        if(ceilingHits)
+                        {
+                            atomicAdd(neeProbe.upHits, 1u);
+                        }
+                    }
+
+                    if(neeProbeOn)
+                    {
+                        atomicAdd(neeProbe.candidate, 1u);
+
+                        // "头顶来光"这个子集的**分母**：有灯在射程内且灯在上方。
+                        // 与 litAbove（分子）相除即该子集的 NEE 放行率 —— 头顶岩层
+                        // 到底挡不挡得住，只看这一个比值。
+                        if(aboveDelta >= 4.0)
+                        {
+                            atomicAdd(neeProbe.candidateAbove, 1u);
+                        }
+                    }
+
+                    if(volRestirNeeVisible(froxelCenter, light.worldPosEmission.xyz,
+                           distanceToLight))
+                    {
+                        float phase = volRestirLightPhase(toLight, viewDirection);
+
+                        // 2026-10-31：亮度按光源档案（×15 保持旧的 0..15 量级）。
+                        radiance = decodeLocalLightColor(light.meta.x) *
+                            localLightProfileBrightness(light.meta.x, emissionLevel) * 15.0 *
+                            attenuation * rangeFade * energyScale * phase;
+
+                        lightDir = normalize(toLight);
+                        hasLight = true;
+
+                        if(neeProbeOn)
+                        {
+                            atomicAdd(neeProbe.lit, 1u);
+
+                            if(aboveDelta >= 4.0)
+                            {
+                                atomicAdd(neeProbe.litAbove, 1u);
+                            }
+
+                            if(ceilingHits)
+                            {
+                                // 头顶有实体岩层、NEE 却判可见 ⇒ 遮挡射线漏了。
+                                atomicAdd(neeProbe.upHitsNeePass, 1u);
+                            }
+
+                            atomicAdd(neeProbe.lumMilli, uint(clamp(
+                                dot(radiance, vec3(0.2126, 0.7152, 0.0722)) * 1000.0,
+                                0.0, 4.0e9)));
+                        }
+                    }
                 }
             }
         }

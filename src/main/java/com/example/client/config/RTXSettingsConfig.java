@@ -204,11 +204,42 @@ public final class RTXSettingsConfig {
     private static float ssptRange = 0.0f;
     private static float ssrRange = 0.0f;
 
+    // 2026-11-07：GI 近场采样档（0=全速 / 1=半速 / 2=四分之一）与
+    // "光泽采样按粗糙度降速"。这两项原来只存在于 native 的 atomic 里，
+    // Java 侧没有存档字段、启动也不恢复 ⇒ 本次会话有效、重启回默认。
+    private static int giNearRate = 0;
+    private static boolean glossyRoughLod = false;
+
+    public static synchronized int getGiNearRate() { return giNearRate; }
+    public static synchronized void setGiNearRate(int value) {
+        int clamped = Math.max(0, Math.min(2, value));
+        if(giNearRate != clamped) {
+            giNearRate = clamped;
+            markDirty();
+        }
+    }
+    public static synchronized boolean isGlossyRoughLod() { return glossyRoughLod; }
+    public static synchronized void setGlossyRoughLod(boolean value) {
+        if(glossyRoughLod != value) {
+            glossyRoughLod = value;
+            markDirty();
+        }
+    }
+
     // 2026-11-03：RT 光泽射线总开关（出厂 true = 保持旧行为）。
     // 关掉后 rgen 整段跳过 GGX 反射射线，镜面完全交给 SSR（>12 区块）/
     // SSPT（射程内）—— 这是"仅 SSPT + RTAO"配置的入口，也是唯一能真正
     // 省下镜面射线成本的开关。
     private static boolean rtGlossyEnabled = true;
+
+    // 2026-11-15「性能模式」：主光追只到 6 区块以内，6~8 区块交给 SSPT，
+    // 8 区块以外交给 SSR。打开时联动下面三项 + SSR 下限（原生侧
+    // CameraUBO.ssHybridParams.w），关闭时恢复默认。
+    public static final float PERF_MODE_SSPT_CHUNKS = 8.0f;
+    public static final float PERF_MODE_SSR_CHUNKS = 48.0f;
+    public static final float PERF_MODE_SSR_FLOOR_CHUNKS = 8.0f;
+
+    private static boolean performanceMode = false;
 
 
     private static float cloudSunReddening =
@@ -533,31 +564,12 @@ public final class RTXSettingsConfig {
     //   l2 = 环境 upward-AO 强度（1.0 = 物理值；0 = 不做天顶遮蔽）
     // 负值对 l0/l1 表示"回落到着色器编译期宏"（A/B 通道）；l2 用 >= 0 判定，
     // 所以 -1 是它的回落值。校验下界放 -1。
-    public record CloudLightSettings(
-            float sourceOdScale,
-            float sourceCurvePow,
-            float aoUpwardScale,
-            float sunsetAmbientTint) {
-        public CloudLightSettings {
-            if(!Float.isFinite(sourceOdScale) || sourceOdScale < -1 || sourceOdScale > 8 ||
-               !Float.isFinite(sourceCurvePow) || sourceCurvePow < -1 || sourceCurvePow > 8 ||
-               !Float.isFinite(aoUpwardScale) || aoUpwardScale < -1 || aoUpwardScale > 8 ||
-               !Float.isFinite(sunsetAmbientTint) || sunsetAmbientTint < 0 || sunsetAmbientTint > 1)
-                throw new IllegalArgumentException("Invalid cloud light settings");
-        }
-
-        public float[] toParamArray() {
-            return new float[] {
-                sourceOdScale, sourceCurvePow, aoUpwardScale, sunsetAmbientTint };
-        }
-    }
-    private static CloudLightSettings cloudLightSettings = new CloudLightSettings(
-            1.0f, 1.0f, 1.0f, 0.6f);
-    public static synchronized CloudLightSettings getCloudLightSettings() { return cloudLightSettings; }
-    public static synchronized void setCloudLightSettings(CloudLightSettings settings) {
-        cloudLightSettings = java.util.Objects.requireNonNull(settings);
-        markDirty();
-    }
+    // 2026-11-07 死设置清理：本组参数已整组移除。
+    // 原因：v3→v4→v5 云模型迁移后，它们在 cpp/shaders 里零读取
+    // （CameraUBO 只剩声明），UI 控件更早已不存在 ⇒ 存档/JNI/atomic 三层
+    // 全是死的。C++ 侧对应 lane 已常量化写 0
+    // （cpp/backend/Settings.cpp），atomic 与 JNI 写入已删。
+    // 旧存档里的同名 key 会被 Gson 直接忽略（未知字段）。
 
  // 平面云。9 个分量对应 CameraUBO.highCloudParams
     // 的前 9 个 lane（偏移 944）与 high_cloud_field.glsl 末尾的 sampleHighCloud()。
@@ -716,7 +728,10 @@ public final class RTXSettingsConfig {
             float sunSideStrength,
             float hueFollow) {
         public CloudAmbientSettings {
-            if(!Float.isFinite(topMultiplier) || topMultiplier < 0 || topMultiplier > 3 ||
+            // 2026-11-07 复核：上限从 3 放到 4 —— 着色器侧
+            // volumetric_clouds_v5.comp:287-288 对 cloudAmbientParams.x 的钳制是
+            // clamp(x, 0.1, 4.0)，界面滑条也是 0.1~4.0，只有这里和 JNI 卡在 3。
+            if(!Float.isFinite(topMultiplier) || topMultiplier < 0 || topMultiplier > 4 ||
                !Float.isFinite(bottomMultiplier) || bottomMultiplier < 0 || bottomMultiplier > 3 ||
                !Float.isFinite(sunSideStrength) || sunSideStrength < 0 || sunSideStrength > 2 ||
                !Float.isFinite(hueFollow) || hueFollow < 0 || hueFollow > 1)
@@ -759,30 +774,12 @@ public final class RTXSettingsConfig {
     //     ⚠ 强度 1 时「地面环境倍率」失效（由反照率取代，这是统一的目的）。
     //     ⚠ 不接管「云底遮蔽强度」：那条竖直消光口径（0.02/步 × 638 格）尚未裁定，
     //       绑在一起会顺手把云内打成全黑。
-    public record CloudSkyHueSettings(
-            float skyHueCool,
-            float skyHueEnergy,
-            float skyDirStrength,
-            float ambientUnify) {
-        public CloudSkyHueSettings {
-            if(!Float.isFinite(skyHueCool) || skyHueCool < 0 || skyHueCool > 1 ||
-               !Float.isFinite(skyHueEnergy) || skyHueEnergy < 0 || skyHueEnergy > 1 ||
-               !Float.isFinite(skyDirStrength) || skyDirStrength < 0 || skyDirStrength > 2 ||
-               !Float.isFinite(ambientUnify) || ambientUnify < 0 || ambientUnify > 1)
-                throw new IllegalArgumentException("Invalid cloud sky hue settings");
-        }
-
-        public float[] toParamArray() {
-            return new float[] { skyHueCool, skyHueEnergy, skyDirStrength, ambientUnify };
-        }
-    }
-    private static CloudSkyHueSettings cloudSkyHueSettings = new CloudSkyHueSettings(
-            0.65f, 0.50f, 0.0f, 0.0f);
-    public static synchronized CloudSkyHueSettings getCloudSkyHueSettings() { return cloudSkyHueSettings; }
-    public static synchronized void setCloudSkyHueSettings(CloudSkyHueSettings settings) {
-        cloudSkyHueSettings = java.util.Objects.requireNonNull(settings);
-        markDirty();
-    }
+    // 2026-11-07 死设置清理：本组参数已整组移除。
+    // 原因：v3→v4→v5 云模型迁移后，它们在 cpp/shaders 里零读取
+    // （CameraUBO 只剩声明），UI 控件更早已不存在 ⇒ 存档/JNI/atomic 三层
+    // 全是死的。C++ 侧对应 lane 已常量化写 0
+    // （cpp/backend/Settings.cpp），atomic 与 JNI 写入已删。
+    // 旧存档里的同名 key 会被 Gson 直接忽略（未知字段）。
 
     // 2026-10-15 云地面反射与视觉回退参数（CameraUBO.cloudPhysicsParams，偏移 1488）。
     // x groundAlbedo：均匀地面 Lambert 反照率 [0,0.8]（出厂 0.20）。
@@ -860,28 +857,12 @@ public final class RTXSettingsConfig {
     // 一直把光步粉末（cloudParams5.w 的 cloudPowderStrength）写进
     // cloudLightParams2.w，本设置存进原子量后从未被读取 —— 一次也没生效过
     // 的死设置。着色阶段粉末跟随云粉状暗边（单一旋钮，两个消费点同值）。
-    public record CloudLight2Settings(
-            float sunPathReddening,
-            float atmosphereExtinction,
-            float powderMode) {
-        public CloudLight2Settings {
-            if(!Float.isFinite(sunPathReddening) || sunPathReddening < 0 || sunPathReddening > 2 ||
-               !Float.isFinite(atmosphereExtinction) || atmosphereExtinction < 0 || atmosphereExtinction > 1 ||
-               !Float.isFinite(powderMode) || powderMode < 0 || powderMode > 1)
-                throw new IllegalArgumentException("Invalid cloud light2 settings");
-        }
-
-        public float[] toParamArray() {
-            return new float[] { sunPathReddening, atmosphereExtinction, powderMode, 0.0f };
-        }
-    }
-    private static CloudLight2Settings cloudLight2Settings = new CloudLight2Settings(
-            0.6f, 1.0f, 1.0f);
-    public static synchronized CloudLight2Settings getCloudLight2Settings() { return cloudLight2Settings; }
-    public static synchronized void setCloudLight2Settings(CloudLight2Settings settings) {
-        cloudLight2Settings = java.util.Objects.requireNonNull(settings);
-        markDirty();
-    }
+    // 2026-11-07 死设置清理：本组参数已整组移除。
+    // 原因：v3→v4→v5 云模型迁移后，它们在 cpp/shaders 里零读取
+    // （CameraUBO 只剩声明），UI 控件更早已不存在 ⇒ 存档/JNI/atomic 三层
+    // 全是死的。C++ 侧对应 lane 已常量化写 0
+    // （cpp/backend/Settings.cpp），atomic 与 JNI 写入已删。
+    // 旧存档里的同名 key 会被 Gson 直接忽略（未知字段）。
 
     // #3 剖面云型（CameraUBO.cloudProfileParams，**密度场共享**）。参考
     // _CloudLutTexture 的 Cu/Tcu/Cb 三型剖面 + 径向距离项；云型只**相对**缩放既有
@@ -998,11 +979,13 @@ public final class RTXSettingsConfig {
             boolean enabled,
             float height,
             float extinction,
-            float distance) {
+            float distance,
+            float speed) {
         public FogGroundMistSettings {
             if(!Float.isFinite(height) || height < 0.25f || height > 8.0f ||
-               !Float.isFinite(extinction) || extinction < 0.0f || extinction > 1.0f ||
-               !Float.isFinite(distance) || distance < 8.0f || distance > 96.0f)
+               !Float.isFinite(extinction) || extinction < 0.0f || extinction > 4.0f ||
+               !Float.isFinite(distance) || distance < 8.0f || distance > 96.0f ||
+               !Float.isFinite(speed) || speed < 0.0f || speed > 6.0f)
                 throw new IllegalArgumentException("Invalid fog ground mist settings");
         }
 
@@ -1011,11 +994,13 @@ public final class RTXSettingsConfig {
                     enabled ? 1.0f : 0.0f,
                     height,
                     extinction,
-                    distance };
+                    distance,
+                    speed };
         }
     }
+    // 2026-11-12：默认浓度 0.15 → 0.60（层厚已从 6 格改成半格，旧默认几乎看不见）。
     private static FogGroundMistSettings fogGroundMistSettings = new FogGroundMistSettings(
-            true, 1.0f, 0.15f, 48.0f);
+            true, 1.0f, 0.60f, 48.0f, 1.35f);
     public static synchronized FogGroundMistSettings getFogGroundMistSettings() {
         return fogGroundMistSettings;
     }
@@ -1023,6 +1008,80 @@ public final class RTXSettingsConfig {
         fogGroundMistSettings = java.util.Objects.requireNonNull(settings);
         markDirty();
     }
+
+    // 2026-11-11：云隙光（crepuscular rays）。落在 cloudParams4.y/.z/.w 三条空车道。
+    //   strength = 云层光学厚度倍率（0 = 云完全不挡光，1 = 默认，>1 = 云更暗）
+    //   width    = 缝宽偏置（越大云缝越大、光柱越粗越多）
+    public record CloudGapSettings(boolean enabled, float strength, float width) {
+        public CloudGapSettings {
+            if(!Float.isFinite(strength) || strength < 0.0f || strength > 4.0f ||
+               !Float.isFinite(width) || width < 0.0f || width > 1.0f)
+                throw new IllegalArgumentException("Invalid cloud gap settings");
+        }
+
+        public float[] toParamArray() {
+            return new float[] { enabled ? 1.0f : 0.0f, strength, width };
+        }
+    }
+    private static CloudGapSettings cloudGapSettings = new CloudGapSettings(true, 1.0f, 0.5f);
+    public static synchronized CloudGapSettings getCloudGapSettings() {
+        return cloudGapSettings;
+    }
+    public static synchronized void setCloudGapSettings(CloudGapSettings settings) {
+        cloudGapSettings = java.util.Objects.requireNonNull(settings);
+        markDirty();
+    }
+
+    // 2026-11-11：雨波纹（水面 + 地面水洼共用同一个解析场）。
+    //   size     = 波纹大小倍率（同时缩放格子与扩张速度，波形个数不变）
+    //   strength = 明显度（梯度幅度倍率）
+    public record RainRippleSettings(float size, float strength) {
+        public RainRippleSettings {
+            if(!Float.isFinite(size) || size < 0.25f || size > 4.0f ||
+               !Float.isFinite(strength) || strength < 0.0f || strength > 3.0f)
+                throw new IllegalArgumentException("Invalid rain ripple settings");
+        }
+
+        public float[] toParamArray() {
+            return new float[] { size, strength };
+        }
+    }
+    private static RainRippleSettings rainRippleSettings = new RainRippleSettings(1.0f, 1.0f);
+    public static synchronized RainRippleSettings getRainRippleSettings() {
+        return rainRippleSettings;
+    }
+    public static synchronized void setRainRippleSettings(RainRippleSettings settings) {
+        rainRippleSettings = java.util.Objects.requireNonNull(settings);
+        markDirty();
+    }
+
+    // 2026-11-13：雾光学（fogOpticsParams.x/yzw）。
+    //   curlStrength = 平流雾涡流强度（0 = 只整体平移，2 = 剧烈翻滚）
+    //   tintR/G/B    = 太阳散射的波长权重（蓝 > 红 ⇒ 远处偏蓝，模拟蓝光衰减慢）
+    public record FogOpticsSettings(float curlStrength, float tintR, float tintG, float tintB) {
+        public FogOpticsSettings {
+            if(!Float.isFinite(curlStrength) || curlStrength < 0.0f || curlStrength > 2.0f ||
+               !Float.isFinite(tintR) || tintR < 0.5f || tintR > 1.5f ||
+               !Float.isFinite(tintG) || tintG < 0.5f || tintG > 1.5f ||
+               !Float.isFinite(tintB) || tintB < 0.5f || tintB > 1.5f)
+                throw new IllegalArgumentException("Invalid fog optics settings");
+        }
+
+        public float[] toParamArray() {
+            return new float[] { curlStrength, tintR, tintG, tintB };
+        }
+    }
+    private static FogOpticsSettings fogOpticsSettings =
+            new FogOpticsSettings(1.0f, 1.0f, 1.0f, 1.0f);
+    public static synchronized FogOpticsSettings getFogOpticsSettings() {
+        return fogOpticsSettings;
+    }
+    public static synchronized void setFogOpticsSettings(FogOpticsSettings settings) {
+        fogOpticsSettings = java.util.Objects.requireNonNull(settings);
+        markDirty();
+    }
+
+    // 2026-11-13：玻璃光学焦散设置已删除（用户要求整体回退焦散）。
 
  // 2026-10-10 **#3 天光自遮挡 / #4 时域速度抑制**
     //（CameraUBO.cloudTemporalParams，偏移 1392）。三项**出厂 0 = 关 ⇒ 逐位旧档**。
@@ -1572,8 +1631,17 @@ public final class RTXSettingsConfig {
     public static final int FG_BASE_LIMIT_AUTO = -1;
     public static final int FG_BASE_LIMIT_OFF = 0;
 
+    // 2026-11-15：默认改为关闭限帧。
+    // 实测（707×376 同场景，[SL FRAME SPLIT]）：
+    //   限帧 240Hz（预算 4.17ms）→ sleep 6.0~8.7ms，帧间隔 15.8~19.7ms（≈60fps）
+    //   限帧 60Hz （预算 16.67ms）→ sleep 7.7~10.2ms，帧间隔 16.6~16.9ms（≈60fps）
+    //   关闭限帧                → sleep 0.04ms，   帧间隔 5.6ms（177fps，GPU 仅 3.4ms）
+    // 即只要限帧不是 0，帧率就被压到 ~60fps（240Hz 档甚至睡得比预算还多）。
+    // PCL 标记已核对过：每帧 0→5 顺序正确、同一线程，排除标记错位；
+    // slGetNewFrameToken 也仅 0.001ms。属限帧路径在 FG/VRR 组合下的异常行为，
+    // 因此在拿到正确修复前默认不自带限帧（Reflex 低延迟模式仍开启）。
     private static int fgBaseFrameLimit =
-            FG_BASE_LIMIT_AUTO;
+            FG_BASE_LIMIT_OFF;
 
     private static boolean entityArmorMetal =
             false;
@@ -1581,8 +1649,10 @@ public final class RTXSettingsConfig {
     private static boolean cloudFadeFollowsRrMode =
             true;
 
-    private static boolean cloudPostRrComposite =
-            true;
+    // 2026-11-13 退役：cloudPostRrComposite（"远云脱离RR"）。开启档把云合成写进
+    // RR 的输入图（post-RR 合成 mode 恒为 0，目标错误），关回旧档时污染持久
+    // 历史导致黑屏；开关、JNI、C++ atomic 与 post-RR 合成路径已全部删除，
+    // 云固定走 RR 之前的旧合成档。旧存档里的同名 key 会被 Gson 直接忽略。
 
     private static int cloudResFloorPercent =
             100;
@@ -1798,19 +1868,6 @@ public final class RTXSettingsConfig {
     ) {
         if (cloudFadeFollowsRrMode != enabled) {
             cloudFadeFollowsRrMode = enabled;
-            markDirty();
-        }
-    }
-
-    public static synchronized boolean isCloudPostRrComposite() {
-        return cloudPostRrComposite;
-    }
-
-    public static synchronized void setCloudPostRrComposite(
-            boolean enabled
-    ) {
-        if (cloudPostRrComposite != enabled) {
-            cloudPostRrComposite = enabled;
             markDirty();
         }
     }
@@ -2528,6 +2585,35 @@ public final class RTXSettingsConfig {
         }
     }
 
+    /** 2026-11-15「性能模式」：6~8 区块 SSPT、8 区块外 SSR（射程内仍 RT）。 */
+    public static synchronized boolean isPerformanceMode() {
+        return performanceMode;
+    }
+
+    /**
+     * 切换「性能模式」。这里只改自己这一项 + 联动那三项的值（走各自的
+     * setter，保证落盘与原生侧同步）；原生调用的失败处理在调用方（设置界面）。
+     */
+    public static synchronized void setPerformanceMode(boolean value) {
+        if(performanceMode == value) {
+            return;
+        }
+
+        performanceMode = value;
+
+        if(value) {
+            setSsptRange(PERF_MODE_SSPT_CHUNKS);
+            setSsrRange(PERF_MODE_SSR_CHUNKS);
+            setRTGlossyEnabled(false);
+        } else {
+            setSsptRange(0.0f);
+            setSsrRange(0.0f);
+            setRTGlossyEnabled(true);
+        }
+
+        markDirty();
+    }
+
     public static synchronized float getAuroraFlowSpeed() {
         return auroraFlowSpeed;
     }
@@ -3004,9 +3090,6 @@ public final class RTXSettingsConfig {
                 cloudFadeFollowsRrMode =
                         true;
 
-                cloudPostRrComposite =
-                        true;
-
                 cloudResFloorPercent =
                         0;
 
@@ -3281,6 +3364,10 @@ public final class RTXSettingsConfig {
                 // 硬性约束与 native 侧同口径
                 ssrRange = 12.0f;
             }
+            giNearRate = data.giNearRate == null
+                    ? 0
+                    : Math.max(0, Math.min(2, data.giNearRate));
+            glossyRoughLod = data.glossyRoughLod != null && data.glossyRoughLod;
 
             // 2026-11-03：RT 光泽射线开关，缺省 = 开（旧行为）
             if(data.rtGlossyEnabled != null) {
@@ -3288,6 +3375,9 @@ public final class RTXSettingsConfig {
             } else {
                 rtGlossyEnabled = true;
             }
+
+            // 2026-11-15「性能模式」，缺省 = 关
+            performanceMode = data.performanceMode != null && data.performanceMode;
 
             cloudSunForwardScattering =
                     validCloudSetting(data.cloudSunForwardScattering, 1.0f, 0.0f, 1.0f, 0.05f);
@@ -3315,11 +3405,6 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.cloudPhiMsBuildScale, 1.0f, -1, 8, 0.05f),
                         validCloudSetting(data.cloudPhiCompress, 1.5f, -1, 8, 0.25f),
                         validCloudSetting(data.cloudPhiConeRatio, 2.0f, -1, 6, 0.25f));
-                cloudLightSettings = new CloudLightSettings(
-                        validCloudSetting(data.cloudSourceOdScale, 1.0f, -1, 8, 0.05f),
-                        validCloudSetting(data.cloudSourceCurvePow, 1.0f, -1, 8, 0.05f),
-                        validCloudSetting(data.cloudAoUpwardScale, 1.0f, -1, 8, 0.05f),
-                        validCloudSetting(data.cloudSunsetAmbientTint, 0.6f, 0, 1, 0.05f));
                 cloudShapeSettings = new CloudShapeSettings(
                         validCloudSetting(data.cloudBottomSmoothHeight, 0.22f, 0, 1, 0.02f),
                         validCloudSetting(data.cloudBottomSmoothPow, 1.0f, 0.05f, 8, 0.05f),
@@ -3338,11 +3423,6 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.cloudAmbientBottomMul, 1.0f, 0, 3, 0.05f),
                         validCloudSetting(data.cloudAmbientSunSide, 0.35f, 0, 2, 0.05f),
                         validCloudSetting(data.cloudAmbientHueFollow, 1.0f, 0, 1, 0.05f));
-                cloudSkyHueSettings = new CloudSkyHueSettings(
-                        validCloudSetting(data.cloudSkyHueCool, 0.65f, 0, 1, 0.05f),
-                        validCloudSetting(data.cloudSkyHueEnergy, 0.50f, 0, 1, 0.05f),
-                        validCloudSetting(data.cloudSkyDirStrength, 0.0f, 0, 2, 0.05f),
-                        validCloudSetting(data.cloudAmbientUnify, 0.0f, 0, 1, 0.05f));
                 cloudPhysicsSettings = new CloudPhysicsSettings(
                         validCloudSetting(data.cloudGroundAlbedo, 0.20f, 0, 0.8f, 0.05f),
                         validCloudSetting(data.cloudGroundBounce, 1.0f, 0, 1, 0.05f),
@@ -3353,10 +3433,6 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.cloudMsOctaves, 2.0f, 1, 3, 1.0f),
                         validCloudSetting(data.cloudMsAttenuation, 0.5f, 0, 1, 0.05f),
                         validCloudSetting(data.cloudMsEccentricity, 0.5f, 0, 1, 0.05f));
-                cloudLight2Settings = new CloudLight2Settings(
-                        validCloudSetting(data.cloudSunPathReddening, 0.6f, 0, 2, 0.05f),
-                        validCloudSetting(data.cloudAtmosphereExtinction, 1.0f, 0, 1, 0.05f),
-                        validCloudSetting(data.cloudPowderMode, 1.0f, 0, 1, 1.0f));
                 cloudProfileSettings = new CloudProfileSettings(
                         validCloudSetting(data.cloudProfileType, 0.25f, 0, 1, 0.05f),
                         validCloudSetting(data.cloudProfileTypeSpread, 0.0f, 0, 1, 0.05f));
@@ -3375,9 +3451,31 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.fogGroundMistHeight,
                                 fogGroundMistSettings.height(), 0.25f, 8.0f, 0.25f),
                         validCloudSetting(data.fogGroundMistExtinction,
-                                fogGroundMistSettings.extinction(), 0.0f, 1.0f, 0.05f),
+                                fogGroundMistSettings.extinction(), 0.0f, 4.0f, 0.05f),
                         validCloudSetting(data.fogGroundMistDistance,
-                                fogGroundMistSettings.distance(), 8.0f, 96.0f, 2.0f));
+                                fogGroundMistSettings.distance(), 8.0f, 96.0f, 2.0f),
+                        validCloudSetting(data.fogGroundMistSpeed,
+                                fogGroundMistSettings.speed(), 0.0f, 6.0f, 0.25f));
+                        cloudGapSettings = new CloudGapSettings(
+                                data.cloudGapEnabled == null || data.cloudGapEnabled,
+                                validCloudSetting(data.cloudGapStrength,
+                                        cloudGapSettings.strength(), 0.0f, 4.0f, 0.05f),
+                                validCloudSetting(data.cloudGapWidth,
+                                        cloudGapSettings.width(), 0.0f, 1.0f, 0.05f));
+                                rainRippleSettings = new RainRippleSettings(
+                                        validCloudSetting(data.rainRippleSize,
+                                                rainRippleSettings.size(), 0.25f, 4.0f, 0.05f),
+                                        validCloudSetting(data.rainRippleStrength,
+                                                rainRippleSettings.strength(), 0.0f, 3.0f, 0.05f));
+                                fogOpticsSettings = new FogOpticsSettings(
+                                        validCloudSetting(data.fogCurlStrength,
+                                                fogOpticsSettings.curlStrength(), 0.0f, 2.0f, 0.05f),
+                                        validCloudSetting(data.fogTintR,
+                                                fogOpticsSettings.tintR(), 0.5f, 1.5f, 0.05f),
+                                        validCloudSetting(data.fogTintG,
+                                                fogOpticsSettings.tintG(), 0.5f, 1.5f, 0.05f),
+                                        validCloudSetting(data.fogTintB,
+                                                fogOpticsSettings.tintB(), 0.5f, 1.5f, 0.05f));
                 cloudTemporalSettings = new CloudTemporalSettings(
                         validCloudSetting(data.cloudSkyVisibilityStrength, 0.0f, 0, 1, 0.05f),
                         validCloudSetting(data.cloudSkyVisibilitySteps, 0.0f, 0, 32, 1.0f),
@@ -3429,7 +3527,8 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.waterWaveWarpStrength, 1.0f, 0, 2, 0.05f));
                 waterWaveAflSettings = new WaterWaveAflSettings(
                         validCloudSetting(data.waterWaveAflScale, 3.5f, 2, 8, 0.1f),
-                        validCloudSetting(data.waterWaveAflLayers, 12.0f, 1, 12, 1.0f));
+                        // 2026-11-13 审计 ③：默认 12 一直被 JNI 钳成 1.5，这里直接写真实语义值。
+                        validCloudSetting(data.waterWaveAflLayers, 1.5f, 0.0f, 1.5f, 0.05f));
                 waterFftSettings = new WaterFftSettings(
                         data.waterFftEnabled == null || data.waterFftEnabled,
                         validCloudSetting(data.waterFftAmplitude, 1.0f, 0, 3, 0.05f),
@@ -3564,9 +3663,6 @@ public final class RTXSettingsConfig {
             cloudFadeFollowsRrMode =
                     data.cloudFadeFollowsRrMode == null || data.cloudFadeFollowsRrMode;
 
-            cloudPostRrComposite =
-                    data.cloudPostRrComposite == null || data.cloudPostRrComposite;
-
             cloudResFloorPercent =
                     data.cloudResFloorPercent == null
                             ? 0
@@ -3615,7 +3711,8 @@ public final class RTXSettingsConfig {
 
             performanceSettings =
                     new PerformanceSettings(
-                            validSetting(data.aoNearSamples, 1, 0, 4),
+                            // 2026-11-07：上限 5 保留「关闭 RTAO」档，别在这里把它压回 4
+                            validSetting(data.aoNearSamples, 1, 0, 5),
                             validSetting(data.aoMidSamples, 1, 0, 2),
                             validSetting(data.giBounces, 1, 0, 4),
                             validSetting(data.sunShadowSamples, 2, 1, 2),
@@ -3768,9 +3865,6 @@ public final class RTXSettingsConfig {
                     false;
 
             cloudFadeFollowsRrMode =
-                    true;
-
-            cloudPostRrComposite =
                     true;
 
             cloudResFloorPercent =
@@ -3945,7 +4039,10 @@ public final class RTXSettingsConfig {
             data.auroraFlowSpeed = auroraFlowSpeed;
             data.ssptRange = ssptRange;
             data.ssrRange = ssrRange;
+            data.giNearRate = giNearRate;
+            data.glossyRoughLod = glossyRoughLod;
             data.rtGlossyEnabled = rtGlossyEnabled;
+            data.performanceMode = performanceMode;
 
             data.cloudModelVersion = CLOUD_MODEL_VERSION;
             data.waterWaveVersion = WATER_WAVE_VERSION;
@@ -3968,10 +4065,6 @@ public final class RTXSettingsConfig {
             data.cloudPhiMsBuildScale = cloudPhiSettings.msBuildScale();
             data.cloudPhiCompress = cloudPhiSettings.compress();
             data.cloudPhiConeRatio = cloudPhiSettings.coneRatio();
-            data.cloudSourceOdScale = cloudLightSettings.sourceOdScale();
-            data.cloudSourceCurvePow = cloudLightSettings.sourceCurvePow();
-            data.cloudAoUpwardScale = cloudLightSettings.aoUpwardScale();
-            data.cloudSunsetAmbientTint = cloudLightSettings.sunsetAmbientTint();
             data.cloudBottomSmoothHeight = cloudShapeSettings.bottomSmoothHeight();
             data.cloudBottomSmoothPow = cloudShapeSettings.bottomSmoothPow();
             data.cloudTwoTierThreshold = cloudShapeSettings.twoTierThreshold();
@@ -3985,10 +4078,6 @@ public final class RTXSettingsConfig {
             data.cloudAmbientBottomMul = cloudAmbientSettings.bottomMultiplier();
             data.cloudAmbientSunSide = cloudAmbientSettings.sunSideStrength();
             data.cloudAmbientHueFollow = cloudAmbientSettings.hueFollow();
-            data.cloudSkyHueCool = cloudSkyHueSettings.skyHueCool();
-            data.cloudSkyHueEnergy = cloudSkyHueSettings.skyHueEnergy();
-            data.cloudSkyDirStrength = cloudSkyHueSettings.skyDirStrength();
-            data.cloudAmbientUnify = cloudSkyHueSettings.ambientUnify();
             data.cloudGroundAlbedo = cloudPhysicsSettings.groundAlbedo();
             data.cloudGroundBounce = cloudPhysicsSettings.groundBounce();
             data.cloudSunlightResidual = cloudPhysicsSettings.sunlightResidual();
@@ -3997,9 +4086,6 @@ public final class RTXSettingsConfig {
             data.cloudMsOctaves = cloudMs2Settings.octaves();
             data.cloudMsAttenuation = cloudMs2Settings.attenuation();
             data.cloudMsEccentricity = cloudMs2Settings.eccentricity();
-            data.cloudSunPathReddening = cloudLight2Settings.sunPathReddening();
-            data.cloudAtmosphereExtinction = cloudLight2Settings.atmosphereExtinction();
-            data.cloudPowderMode = cloudLight2Settings.powderMode();
             data.cloudProfileType = cloudProfileSettings.cloudType();
             data.cloudProfileTypeSpread = cloudProfileSettings.typeSpread();
             data.cloudWispyStrength = cloudDetailSettings.wispyStrength();
@@ -4014,6 +4100,16 @@ public final class RTXSettingsConfig {
             data.fogGroundMistHeight = fogGroundMistSettings.height();
             data.fogGroundMistExtinction = fogGroundMistSettings.extinction();
             data.fogGroundMistDistance = fogGroundMistSettings.distance();
+            data.fogGroundMistSpeed = fogGroundMistSettings.speed();
+        data.cloudGapEnabled = cloudGapSettings.enabled();
+        data.cloudGapStrength = cloudGapSettings.strength();
+        data.cloudGapWidth = cloudGapSettings.width();
+        data.rainRippleSize = rainRippleSettings.size();
+        data.rainRippleStrength = rainRippleSettings.strength();
+        data.fogCurlStrength = fogOpticsSettings.curlStrength();
+        data.fogTintR = fogOpticsSettings.tintR();
+        data.fogTintG = fogOpticsSettings.tintG();
+        data.fogTintB = fogOpticsSettings.tintB();
             data.cloudSkyVisibilityStrength = cloudTemporalSettings.skyVisibilityStrength();
             data.cloudSkyVisibilitySteps = cloudTemporalSettings.skyVisibilitySteps();
             data.cloudTemporalDampStrength = cloudTemporalSettings.temporalDampStrength();
@@ -4121,9 +4217,6 @@ public final class RTXSettingsConfig {
 
             data.cloudFadeFollowsRrMode =
                     cloudFadeFollowsRrMode;
-
-            data.cloudPostRrComposite =
-                    cloudPostRrComposite;
 
             data.cloudResFloorPercent =
                     cloudResFloorPercent;
@@ -4340,8 +4433,14 @@ public final class RTXSettingsConfig {
         // 2026-11-02 屏幕空间降级链（区块；0 = 关）
         Float ssptRange;
         Float ssrRange;
+        // 2026-11-07：GI 近场采样档 / 光泽采样降速（此前无存档字段）
+        Integer giNearRate;
+        Boolean glossyRoughLod;
         // 2026-11-03 RT 光泽射线总开关（null = 缺省开）
         Boolean rtGlossyEnabled;
+
+        // 2026-11-15「性能模式」
+        Boolean performanceMode;
 
         Integer cloudModelVersion;
         Integer waterWaveVersion;
@@ -4366,10 +4465,6 @@ public final class RTXSettingsConfig {
         Float cloudPhiMsBuildScale;
         Float cloudPhiCompress;
         Float cloudPhiConeRatio;
-        Float cloudSourceOdScale;
-        Float cloudSourceCurvePow;
-        Float cloudAoUpwardScale;
-        Float cloudSunsetAmbientTint;
         Float cloudBottomSmoothHeight;
         Float cloudLightErosion;
         Float cloudBottomSmoothPow;
@@ -4383,10 +4478,6 @@ public final class RTXSettingsConfig {
         Float cloudAmbientBottomMul;
         Float cloudAmbientSunSide;
         Float cloudAmbientHueFollow;
-        Float cloudSkyHueCool;
-        Float cloudSkyHueEnergy;
-        Float cloudSkyDirStrength;
-        Float cloudAmbientUnify;
         Float cloudGroundAlbedo;
         Float cloudGroundBounce;
         Float cloudSunlightResidual;
@@ -4395,9 +4486,6 @@ public final class RTXSettingsConfig {
         Float cloudMsOctaves;
         Float cloudMsAttenuation;
         Float cloudMsEccentricity;
-        Float cloudSunPathReddening;
-        Float cloudAtmosphereExtinction;
-        Float cloudPowderMode;
         Float cloudProfileType;
         Float cloudProfileTypeSpread;
         Float cloudWispyStrength;
@@ -4495,6 +4583,16 @@ public final class RTXSettingsConfig {
         Float fogGroundMistHeight;
         Float fogGroundMistExtinction;
         Float fogGroundMistDistance;
+        Float fogGroundMistSpeed;
+        Boolean cloudGapEnabled;
+        Float cloudGapStrength;
+        Float cloudGapWidth;
+        Float rainRippleSize;
+        Float rainRippleStrength;
+        Float fogCurlStrength;
+        Float fogTintR;
+        Float fogTintG;
+        Float fogTintB;
 
         Float fogRayleighStrength;
         Float fogRayleighScaleHeight;
@@ -4530,9 +4628,6 @@ public final class RTXSettingsConfig {
                 null;
 
         Boolean cloudFadeFollowsRrMode =
-                null;
-
-        Boolean cloudPostRrComposite =
                 null;
 
         Integer cloudResFloorPercent =
@@ -4637,7 +4732,13 @@ public final class RTXSettingsConfig {
             int volumetricRestir
     ) {
         public PerformanceSettings {
-            if(aoNearSamples < 0 || aoNearSamples > 4 ||
+            // 2026-11-07 修复：aoNearSamples 的合法上限是 **5**，不是 4。
+            // 5 是 2026-10-27 加的「关闭 RTAO」档（见 cpp/shaders/rgen_main_body.glsl
+            // 的 `if(int(cam.perfPrimary.x) >= 5) aoSamples = 0;`），界面下拉里也有 5，
+            // 但原来这里（以及 JNI 与存档读取）都只认 0..4 ⇒ 选 5 时构造直接抛
+            // IllegalArgumentException，applyPendingSettings 在第一个 record 上就中断，
+            // 存档不更新 ⇒ 重新打开设置又变回旧值。三处已同步放宽到 5。
+            if(aoNearSamples < 0 || aoNearSamples > 5 ||
                     aoMidSamples < 0 || aoMidSamples > 2 ||
                     giBounces < 0 || giBounces > 4 ||
                     sunShadowSamples < 1 || sunShadowSamples > 2 ||

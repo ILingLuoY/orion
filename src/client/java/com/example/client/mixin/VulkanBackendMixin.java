@@ -36,6 +36,7 @@ import org.lwjgl.vulkan.EXTRayTracingInvocationReorder;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT;
 
 import org.lwjgl.vulkan.VkPhysicalDeviceFaultFeaturesEXT;
+import org.lwjgl.vulkan.VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryPriorityFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceShaderClockFeaturesKHR;
@@ -596,6 +597,31 @@ public class VulkanBackendMixin {
                         "shaderStorageImageWriteWithoutFormat"
                 )
         );
+
+        // 2026-11-10：动态下标访问 sampler2D 数组（不是完整的 descriptor indexing）。
+        //
+        // ⚠ 已**默认关闭**。实测：加上这一位后，四台 RTPSO 里 main 那条冷编
+        // 11.3 分钟后返回 result=-3（VK_ERROR_INITIALIZATION_FAILED），且
+        // createDevice 日志里 "[Mixin] Injected Vulkan features" 打印了 3 次
+        // （设备创建重试）⇒ 该特性很可能没有被真正接受，而使用动态下标的
+        // SPIR-V 需要它，于是 RTPSO 创建失败、客户端 0xC0000409 退出。
+        // 现状：shader 侧 ORION_ATLAS_DYNAMIC_INDEX=0，走原来的 64 路 switch。
+        // 若要重新验证：ORION_ATLAS_DYNINDEX=1 + 重编 SPV（-DORION_ATLAS_DYNAMIC_INDEX=1）。
+        final boolean wantDynamicAtlasIndex =
+                "1".equals(System.getenv("ORION_ATLAS_DYNINDEX"));
+        if (wantDynamicAtlasIndex) {
+            vulkanFeatures.add(
+                    new VulkanFeature(
+                            VK10_FEATURES_STRUCT,
+                            "shaderSampledImageArrayDynamicIndexing"
+                    )
+            );
+
+            System.err.println(
+                    "[ATLAS-DYNINDEX] requested shaderSampledImageArrayDynamicIndexing=1"
+                            + " (sampler2D[64] dynamic indexing for entity atlases)"
+            );
+        }
 
 
         System.err.println(
@@ -1214,6 +1240,16 @@ public class VulkanBackendMixin {
                 VkPhysicalDeviceFaultFeaturesEXT.class,
                 new String[]{"deviceFault"},
                 new long[]{VkPhysicalDeviceFaultFeaturesEXT.DEVICEFAULT}
+        );
+
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_KHR_pipeline_executable_properties",
+                VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR.class,
+                new String[]{"pipelineExecutableInfo"},
+                new long[]{VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR.PIPELINEEXECUTABLEINFO}
         );
 
         rtx$addPlainExtension(

@@ -1561,8 +1561,7 @@ if(
 // overwrite POM information.
 // =====================================================
 
-payload.pomSelfShadow =
-    clamp(
+payload.pomSelfShadow = clamp(
         pomSelfShadow,
         0.0,
         1.0
@@ -1571,8 +1570,7 @@ payload.pomSelfShadow =
 // 2026-10-05 高度场微遮蔽（#12）/微结构反射遮蔽（#44）：POM 命中点越深，
 // 环境光/GI/间接反射越少（静态、不随光方向；直射已由上面的方向 march 负责）。
 // 0.5 系数 = 满深度 texel 保留 50% 环境量；非 POM 面由各写点给 1.0。
-payload.pomMicroOcclusion =
-    clamp(
+payload.pomMicroOcclusion = clamp(
         1.0 - parallaxHit.depth01 * 0.5,
         0.5,
         1.0
@@ -1591,8 +1589,7 @@ payload.pomMicroOcclusion =
 // 与 Remix-MC 的 ATLAS_TRANSLUCENT_BLEND = textureTimesVertexColor() 逐字一致
 // （_ref/rtx-remix-minecraft/.../texture/BlockTextureManager.java:64）。
 // 旧写法只取 atlasSpriteSample.a，漏了顶点色 alpha。
-payload.glassAlpha =
-    (
+payload.glassAlpha = (
         materialId > 1.5 &&
         materialId < 2.5
     )
@@ -1671,11 +1668,29 @@ if(t12IsGlass)
     // albedo (the camera glass path consumes it only as the tint and the RR
     // guide pins rrDiffuseAlbedo to 0 for a pane), so overriding it here changes
     // the filter and nothing else.
+    // 2026-11-13（用户报"折射里能看到玻璃自己的淡蓝色图案"）：清玻璃的透射
+    // 滤镜原先原样用 sprite.rgb（glassPaneTransmissionColor 的 faceShade 档 =
+    // sprite × vertex），**不吃 sprite 的 alpha**。清玻璃 sprite 的心部/条纹
+    // 纹素 alpha=0~0.5 而 RGB 是淡蓝色，texelFetch 精确取样后这份淡蓝图案被
+    // 整张乘进透射 ⇒ "折射里看到玻璃自己的贴图"。原版语义里 alpha=0 的纹素
+    // 不遮挡也不染色 ⇒ 按**每纹素 alpha** 把 sprite 折进白底：
+    //   filter = mix(1, sprite.rgb, sprite.a) × 面明暗。
+    // alpha=0 心部 → 白（无染色，原版观感）；边框/条纹 → 按 alpha 部分染色。
+    // 染色玻璃（非 faceShade）保持 glassPaneTransmissionColor 原样（dye 只算
+    // 一次的既有口径不变）。A/B：-DVPT_GLASS_CLEAR_FILTER_ALPHA=0 回旧档。
+#ifndef VPT_GLASS_CLEAR_FILTER_ALPHA
+#define VPT_GLASS_CLEAR_FILTER_ALPHA 1
+#endif
     payload.albedoPacked = packAlbedoUnorm(
-        glassPaneTransmissionColor(
-            atlasSpriteSample.rgb,
-            interpColor.rgb
-        ));
+        (VPT_GLASS_CLEAR_FILTER_ALPHA != 0 &&
+            materialId < 2.05 &&
+            glassVertexFactorIsFaceShade(interpColor.rgb))
+            ? mix(vec3(1.0), atlasSpriteSample.rgb, atlasSpriteSample.a) *
+              interpColor.rgb
+            : glassPaneTransmissionColor(
+                atlasSpriteSample.rgb,
+                interpColor.rgb
+            ));
 
     // =====================================================
     // Glass camera-side classification
@@ -1749,8 +1764,7 @@ else
 payload.roughness =
     roughness;
 
-payload.f0Metal =
-    f0Metal;
+payload.f0Metal = f0Metal;
 // 地狱传送门的自发光。注意 t12IsGlass 现在**包含**传送门（它要玻璃族的锐利面），
 // 所以这里必须先判 t12IsPortal，否则会走进"玻璃清零"那一支 ⇒ 门不发光。
 payload.emission =

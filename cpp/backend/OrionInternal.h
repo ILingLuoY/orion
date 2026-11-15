@@ -49,6 +49,8 @@
 #include <sstream>
 #include <chrono>
 #include <thread>
+#include <memory>
+#include <span>
 #include <condition_variable>
 #include <thread>
 #include <condition_variable>
@@ -198,7 +200,10 @@ inline constexpr uint32_t PERF_L10_ABLATION_ALT_MAX = 16u;
 
 
 inline constexpr uint64_t PERF_L10_ABLATION_FRAMES_PER_STAGE = 120u;
-inline constexpr uint32_t PERF_L10_ABLATION_STAGE_COUNT = 36u;
+// 2026-11-07：36/37/38 = SER 探针 flags / RR 生存率 0.9 上限 / SER 键精简。
+// 三档都是"一局内可消融"的 A/B 臂 —— 加档必须同步
+// rt_test.rgen 里 perfL10Stage() 的 clamp（当前 0..38）与下面的名字表。
+inline constexpr uint32_t PERF_L10_ABLATION_STAGE_COUNT = 39u;
 inline constexpr bool PERF_L10_ENABLE_SECTION_REBUILD_LOGS = false;
 inline constexpr bool PERF_L10_ENABLE_LIGHT_REFRESH_LOGS = false;
 inline constexpr uint32_t PERF_L10_GPU_TIMESTAMP_RING_SIZE = 12u;
@@ -213,8 +218,10 @@ enum PerfL10GpuBoundary : uint32_t
     PERF_L10_GPU_B_SETUP,
     PERF_L10_GPU_B_WSIM,
     PERF_L10_GPU_B_WFFT,
-    PERF_L10_GPU_B_WCAUS,
-    PERF_L10_GPU_B_CAUS,
+    // 2026-11-09：WCAUS / CAUS 两个边界已删除 —— 它们之间的两个分支
+    // （recordWaterFoam 的 #if 0 块、kWATER_CAUSTIC_PASS_ENABLED 恒 false 的
+    // 水焦散 pass）都不录任何 GPU 命令，scope 恒 0，只剩 timestamp 开销。
+    // 现在 WFFT scope 直接覆盖 recordWaterCausticMap。
     PERF_L10_GPU_B_CLOUDPIPE,
     PERF_L10_GPU_B_RTPIPE,
     PERF_L10_GPU_B_SFAR,
@@ -242,8 +249,6 @@ inline constexpr const char* PERF_L10_GPU_SCOPE_NAMES[PERF_L10_GPU_SCOPE_COUNT] 
     "setup",
     "wsim",
     "wfft",
-    "wcaus",
-    "caus",
     "cloudpipe",
     "rtpipe",
     "sfar",
@@ -550,6 +555,43 @@ struct CameraUBO {
     //       镜面命中才允许被 SSR 接手，判据在 ss_hybrid.comp 里逐像素成立）
     //   z/w = 保留，写 0
     float ssHybridParams[4];
+
+    // ── 2026-11-09 派生矩阵（追加在末尾；中间插入会平移全部已读偏移）──
+    // raygen 每个像素原本要跑 4 次 mat4 inverse()：inverse(viewInverse)、
+    // inverse(projInverse)、inverse(prevViewInverse*prevProjInverse)、
+    // inverse(viewInverse*projInverse)。这四个都是**帧常量**，改为宿主每帧
+    // 算一次（orionInvertMat4 / orionMulMat4，见 Frame.cpp）。存储沿用 GLSL
+    // 列主序：元素 [col*4 + row]。
+    float viewMatrix[16];        // = inverse(viewInverse)
+    float projectionMatrix[16];  // = inverse(projInverse)
+    float viewProj[16];          // = projectionMatrix * viewMatrix
+    float prevViewProj[16];      // = inverse(prevProjInverse) * inverse(prevViewInverse)
+
+    // ── 2026-11-09 本地光源档案表（32 档，原 local_light_profile.glsl 的 const 表）──
+    // 见 cpp/shaders/camera_ubo.glsl 同名数组：glslang 对"动态索引 const 数组"
+    // 会生成 indexable 局部数组（768 B/线程），移到 UBO 后不再有那块局部存储。
+    float localLightProfileA[128];  // 32 x (rgb, lumens)
+    float localLightProfileB[128];  // 32 x (range, pointLike, 0, 0)
+
+    // ── 2026-11-09 次级射线 POM 开关 ──
+    // x = 1 ⇒ 反射/水体/玻璃后的命中跳过 POM（沿用既有的 state bit 17 早退路径）
+    float pomSecondaryParams[4];
+
+    // ── 2026-11-13 雾光学 ──
+    // x = 平流雾 curl 涡流强度；y/z/w = 雾的波长相关透射权重（r/g/b）
+    float fogOpticsParams[4];
+
+    // ── 2026-11-13 玻璃光学焦散（已退役）──
+    // 2026-11-13（用户拍板）：焦散整体回退，UI/Config/JNI/atomic 全部删除；
+    // 本字段保留占位以维持 CameraUBO 布局与 sizeof 3088 不变，无任何读者。
+    float glassCausticParams[4];
+
+    // ── 2026-11-15「性能模式」分档参数（追加在末尾，与 camera_ubo.glsl 顺序一致）
+    //   x = RT 射程（区块，0 = 非性能模式）
+    //   y = 弹射分界（区块）
+    //   z = 性能模式开关（1 = 开）
+    //   w = 远场贴图降档起点（格，0 = 关；material_resolve.glsl 的距离 mip 坡道）
+    float perfBandParams[4];
 };
 static_assert(offsetof(CameraUBO, cloudParams) == 448,
     "cloudParams must stay at offset 448: shaders place it right after weatherParams");
@@ -720,9 +762,35 @@ static_assert(offsetof(CameraUBO, ssHybridParams) == 1744,
     "2026-11-02 screen-space degradation chain (lane x = SSPT range in chunks "
     "0..12, lane y = SSR range ceiling in chunks, hard floor 12) is read by "
     "cpp/shaders/ss_hybrid.comp through the shared camera_ubo.glsl block");
-static_assert(sizeof(CameraUBO) == 1760,
+static_assert(offsetof(CameraUBO, viewMatrix) == 1760,
+    "viewMatrix must start at 1760, immediately after ssHybridParams: "
+    "2026-11-09 derived matrices (viewMatrix / projectionMatrix / viewProj / "
+    "prevViewProj) are appended at the tail so that no earlier offset moves");
+static_assert(offsetof(CameraUBO, localLightProfileA) == 2016,
+    "localLightProfileA must start at 2016, immediately after prevViewProj: "
+    "2026-11-09 the local-light profile tables moved from a dynamically indexed "
+    "GLSL const array (768 B/thread of local memory) into the UBO");
+static_assert(offsetof(CameraUBO, pomSecondaryParams) == 3040,
+    "pomSecondaryParams must start at 3040, immediately after localLightProfileB: "
+    "2026-11-09 the secondary-ray POM skip switch (lane x) is appended at the tail");
+static_assert(offsetof(CameraUBO, glassCausticParams) == 3072,
+    "glassCausticParams must start at 3072, immediately after fogOpticsParams: "
+    "2026-11-13 the glass optical caustics switch (lane x) is appended at the tail; "
+    "rgen_water_sun.glsl / rt_test.rahit / rt_test_translucent.rahit read it via "
+    "camera_ubo.glsl");
+static_assert(offsetof(CameraUBO, perfBandParams) == 3088,
+    "perfBandParams must start at 3088, immediately after glassCausticParams: "
+    "2026-11-15 the 'performance mode' distance bands (RT range / bounce split) "
+    "are appended at the tail; ss_hybrid.comp and rgen_main_body.glsl read it");
+static_assert(sizeof(CameraUBO) == 3104,
     "CameraUBO size must match the std140 size of the shaders' CameraProperties "
-    "block (1712 -> 1728 when 2026-10-26 sparseParams (direct-light mode + "
+    "block (3040 -> 3056 when 2026-11-09 pomSecondaryParams was appended; "
+    "2016 -> 3040 when the 32-entry local-light profile tables "
+    "(2 x vec4[32]) were appended at the tail; 1760 -> 2016 when the four derived "
+    "matrices "
+    "(viewMatrix / projectionMatrix / viewProj / prevViewProj, 4 x mat4) were "
+    "appended at the tail to remove four per-pixel inverse(mat4) in raygen; "
+    "1712 -> 1728 when 2026-10-26 sparseParams (direct-light mode + "
     "sparse rendering rate) was appended at the tail; 1600 -> 1712 when "
     "2026-10-25 hpShapeA..hpMiscA (HPVolumeCloud v5 full parameter tail block) "
     "were appended at the tail; 1520 -> 1536 when 2026-10-19 sssParams "
@@ -781,6 +849,9 @@ inline constexpr uint32_t kCloudAtrousIterations = 4u;
 inline constexpr uint32_t VOL_RESTIR_DEPTH = 64u;
 inline constexpr uint32_t VOL_FROXEL_DOWNSCALE = 8u;
 inline constexpr uint32_t VOL_RESTIR_DOWNSCALE = 4u;
+// 2026-11-15：体积雾 froxel 重构（密度 3D + 屏幕合成）。
+inline constexpr uint32_t FOG_FROXEL_DEPTH = 64u;
+inline constexpr uint32_t FOG_FROXEL_DOWNSCALE = 4u;
 // 2026-11-04：16 -> 32。
 //
 // 病灶（用户报"ReSTIR 体积光穿墙"）：composite 只有 16 步，却要跨
@@ -813,7 +884,10 @@ inline constexpr uint32_t SUN_SHADOW_FAR_RESOLUTION = 1024u;
 inline constexpr uint32_t SUN_SHADOW_FAR_WORKGROUP_SIZE = 8u;
 inline constexpr float SUN_SHADOW_FAR_EXTENT_XY = 384.0f;
 inline constexpr float SUN_SHADOW_FAR_EXTENT_Z = 384.0f;
-inline constexpr uint32_t TERRAIN_HEIGHT_RESOLUTION = 512u;
+// 2026-11-09：512 -> 128（纹素 1 格 -> 4 格）。这张图的唯一消费者是
+// volumetric_fog 的贴地雾高度，是低频量；而它是每帧 262144 条 ray query。
+// 与 cpp/shaders/terrain_height.glsl 的同名常量必须同步。
+inline constexpr uint32_t TERRAIN_HEIGHT_RESOLUTION = 128u;
 inline constexpr uint32_t TERRAIN_HEIGHT_WORKGROUP_SIZE = 8u;
 inline constexpr float TERRAIN_HEIGHT_EMPTY_SENTINEL = -1.0e30f;
 
@@ -1038,6 +1112,14 @@ struct RtxSectionBuildBufferSlot
 struct SectionRetirementSlot
 {
     bool occupied = false;
+
+    // 2026-11-14：本槽挂进来的帧号。释放必须额外满足"至少 3 帧龄"——
+    // 光追命令是录进**引擎**的 command buffer、由引擎的队列提交的，我们自己
+    // 那条围栏只能证明"我们的提交完成"，管不住引擎在飞的帧。
+    // 实测证据：崩溃帧（[GPU HANG] heartbeat stalled frame=1347）与
+    // freed[-1]/[-2]（tag=sectionBLAS/sectionVB, frame=1347）是同一帧 ⇒
+    // 释放后引擎仍在飞的那帧在追踪已释放的 AS ⇒ GPU 挂死。
+    uint64_t retireFrameSerial = 0u;
     std::vector<RTSectionAS> sections;
     VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
     VkBuffer tlasBuffer = VK_NULL_HANDLE;
@@ -1054,7 +1136,7 @@ struct SectionRetirementSlot
 };
 
 
-inline constexpr uint32_t SECTION_RETIREMENT_RING_SIZE = 3u;
+inline constexpr uint32_t SECTION_RETIREMENT_RING_SIZE = 2048u;
 
 
 inline constexpr bool kNrdLocalDiEnabled = false;
@@ -1065,6 +1147,28 @@ inline constexpr bool kNrdLocalDiEnabled = false;
 inline constexpr float AE_DEFAULT_KEY_EV = -2.4739f;
 inline constexpr uint32_t AE_HISTOGRAM_BIN_COUNT = 256u;
 inline constexpr float AE_HDR_CLOUD_WHITE_SCALE = 4.0f;
+
+// 2026-11-15：自动曝光 v2 的宿主侧常量。
+// 直方图 log2 范围从 [-10, 6] 扩到 [-12, 8]（0.00024 … 256）。旧范围的上界只有
+// 64，物理天空/云的辐射经常直接越界堆进最后一个 bin —— 也就是"云根本没有被
+// 测光"，只贡献了一个恒定饱和值。扩范围的同时配合百分位修剪排除太阳。
+inline constexpr float AE_LOG2_MIN = -12.0f;
+inline constexpr float AE_LOG2_MAX = 8.0f;
+// 中心加权强度（0 = 全画面均匀，1 = 强中心）；对应 UE 的 Exposure Metering Mask。
+inline constexpr float AE_DEFAULT_CENTER_WEIGHT = 0.35f;
+// 无云天空像素权重（防止抬头看天时整屏被压暗）。
+inline constexpr float AE_DEFAULT_SKY_WEIGHT = 0.25f;
+// 云像素权重（云是场景主要亮源之一，必须参与测光）。
+inline constexpr float AE_DEFAULT_CLOUD_WEIGHT = 1.0f;
+// 线性段→指数段的切换距离（EV）；UE: r.EyeAdaptation.ExponentialTransitionDistance。
+inline constexpr float AE_DEFAULT_TRANSITION_EV = 1.5f;
+// 反投影深度 <= 该值视为"没有几何命中"（reversed-Z）。
+inline constexpr float AE_SKY_DEPTH_EPS = 1.0e-6f;
+// HDR 显示路径的自动曝光强度。必须与 rr_hdr_encode.comp 的
+// AE_EXPOSURE_STRENGTH 一致（SDR 用 UI 可调的 g_postExposureStrength）。
+inline constexpr float AE_HDR_EXPOSURE_STRENGTH = 0.6f;
+
+// 必须与 rr_ae_adapt.comp 的 AeParams 逐字节一致。
 struct AePushConstants
 {
     float dtSec;
@@ -1075,9 +1179,35 @@ struct AePushConstants
     float adaptDownRate;
     float trimLow;
     float trimHigh;
-    int32_t enabled;
+    float logMin;
+    float logMax;
     float displayWhiteScale;
+    float transitionDistance;
+    int32_t enabled;
+    int32_t pad0;
 };
+
+// 必须与 rr_ae_histogram.comp 的 AeHistogramParams 逐字节一致。
+struct AeHistogramPushConstants
+{
+    float logMin;
+    float logMax;
+    float centerWeight;
+    float skyWeight;
+    float cloudWeight;
+    float skyDepthEps;
+};
+
+extern float g_aeCenterWeight;
+extern float g_aeSkyWeight;
+extern float g_aeCloudWeight;
+extern float g_aeTransitionEv;
+
+// 云合成 shoulder 的现场旋钮（见 State.cpp 的说明）。
+//   g_cloudShoulderStrength < 0 → 跟随下游曝光强度
+//   g_cloudShoulderScale   != 1 → 整体提亮/压暗云
+extern float g_cloudShoulderStrength;
+extern float g_cloudShoulderScale;
 
 // 必须与 glass_alpha_blend.comp / glass_alpha_finish.comp 的
 // push_constant 块**逐字节一致**（64 B）。
@@ -1146,6 +1276,14 @@ struct CloudCompositePush
 {
     float splitDistance;
     float mode;
+    // 2026-11-15：云 shoulder 白点 = exp2(-currentEV * exposureStrength) *
+    // whiteScale。exposureStrength 必须与下游曝光一致：
+    //   SDR → g_postExposureStrength（rr_sdr_post.comp 的 postPush.exposureStrength）
+    //   HDR → 0.6（rr_hdr_encode.comp 的 AE_EXPOSURE_STRENGTH 常量）
+    // 两者任何一个改了口径，这里都要跟着改，否则云的亮度会与画面曝光脱节。
+    // 必须与 volumetric_cloud_composite.comp 的 CloudCompositePush 逐字节一致。
+    float whiteScale;
+    float exposureStrength;
 };
 typedef sl::Result (*PFN_slInit)(const sl::Preferences&,uint64_t);
 typedef sl::Result (*PFN_slGetFeatureFunction)(
@@ -1508,6 +1646,29 @@ inline constexpr uint64_t ENTITY_RT_LAYER_KEY =
     (5ull << 60ull) | ENTITY_RT_SPATIAL_KEY;
 inline constexpr uint64_t LOCAL_PLAYER_RT_LAYER_KEY =
     (6ull << 60ull) | ENTITY_RT_SPATIAL_KEY;
+
+// 2026-11-12：实体层**分桶**（判等/重建按子层切分）。
+//
+// 动因：整层是一个大 mesh，只要有一件物品在自转（pose 每帧变）⇒ 整层 107 MB 顶点
+// 全部重传 + BLAS 重建。分桶后只有变化的那一桶重建。
+// 桶 0 的键**必须**等于原来的 ENTITY_RT_LAYER_KEY，保证 ORION_ENTITY_LAYER_BUCKETS=1
+// （默认）时行为逐位不变。
+inline constexpr uint64_t ENTITY_RT_LAYER_INDEX = 5ull;
+inline constexpr uint32_t ENTITY_RT_LAYER_MAX_BUCKETS = 16u;
+
+inline bool isEntityRtLayerKey(uint64_t key)
+{
+    return (key >> 60ull) == ENTITY_RT_LAYER_INDEX;
+}
+
+inline uint64_t entityRtBucketKey(uint32_t bucket)
+{
+    // 注意不能用加法：ENTITY_RT_SPATIAL_KEY 低位全是 1，+1 会进位到 layer index。
+    return bucket == 0u
+        ? ENTITY_RT_LAYER_KEY
+        : ((ENTITY_RT_LAYER_INDEX << 60ull) |
+           (ENTITY_RT_SPATIAL_KEY - static_cast<uint64_t>(bucket)));
+}
 // 2026-11-03：第一人称手部层（见 SECTION_AS_CLASS_HAND 处的说明）。
 inline constexpr uint64_t HAND_RT_LAYER_KEY =
     (8ull << 60ull) | ENTITY_RT_SPATIAL_KEY;
@@ -1595,6 +1756,80 @@ struct SectionGeometrySplit
     std::vector<SectionVertex> waterPacked;
 };
 
+// 2026-11-07i：捕获结果的帧级 arena 视图。
+//
+// SectionGeometrySplit 现在只做"捕获期间的临时缓冲"：填完立刻 commit 到
+// arena（一次 memcpy），split 随即还池。于是 split 的持有窗口从"整个
+// rebuildWorldGeometry"缩短成"一次捕获"，池的稳态大小不再被峰值并发钉死。
+//
+// arena 分块分配（每块 4MB，段不跨块），块的地址稳定 ⇒ 这里可以安全地存
+// 裸指针 span，build/staging 期间不会有 realloc 让 span 悬垂。
+struct CaptureArenaSegment
+{
+    // 2026-11-07j：arena 复位代数。commit 时记下，消费时校验 ——
+    // 若与当前代数不同，说明这块内存已经被复位后的新段覆盖，
+    // 该段的数据不可信（表现为"某片区块空白"或几何错位）。
+    uint64_t arenaEpoch = 0u;
+
+    std::span<const Vertex> opaque;
+    std::span<const Vertex> ommCutout;
+    std::span<const Vertex> alpha;
+    std::span<const Vertex> water;
+    std::span<const Vertex> entity;
+    std::span<const Vertex> localPlayer;
+    std::span<const Vertex> particle;
+
+    std::span<const float> entityMotion;
+    std::span<const float> localPlayerMotion;
+    std::span<const float> particleMotion;
+
+    std::span<const SectionVertex> opaquePacked;
+    std::span<const SectionVertex> ommCutoutPacked;
+    std::span<const SectionVertex> alphaPacked;
+    std::span<const SectionVertex> waterPacked;
+
+    OmmCutoutInput ommInput;
+    bool hasOmmInput = false;
+
+    bool empty() const
+    {
+        return opaque.empty() &&
+            ommCutout.empty() &&
+            alpha.empty() &&
+            water.empty() &&
+            entity.empty() &&
+            localPlayer.empty() &&
+            particle.empty();
+    }
+
+    size_t vertexCount() const
+    {
+        return opaque.size() + ommCutout.size() + alpha.size() +
+            water.size() + entity.size() + localPlayer.size() +
+            particle.size();
+    }
+};
+
+// 把 split 的内容搬进 arena（调用方随后即可 returnSectionSplitToPool）。
+CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split);
+
+// 写者计数：捕获线程 append + 入队的整段期间持有，避免 arena 在别人
+// 还在写/还没入队时被复位。
+void captureArenaBeginWrite();
+void captureArenaEndWrite();
+// 只有在"无写者且队列无在途段"时才会真正复位；返回是否复位。
+bool captureArenaTryReset(size_t inFlightSegments);
+
+extern uint64_t g_captureArenaSegments;
+extern uint64_t g_captureArenaBytes;
+extern uint64_t g_captureArenaResets;
+extern uint64_t g_captureArenaChunks;
+extern uint64_t g_captureArenaSkipResets;
+// 当前 arena 代数（每复位一次 +1）。
+extern uint64_t g_captureArenaEpoch;
+// 消费时发现"代数已过期"的段数：>0 即证明复位覆盖了在途段。
+extern uint64_t g_captureArenaStaleSegments;
+
 // 2026-11-06r：SectionGeometrySplit 的缓冲池。
 //
 // 捕获线程持 g_chunkMutex 填 split（最多 16K 顶点 / 几百 KB），每段都新建
@@ -1602,7 +1837,25 @@ struct SectionGeometrySplit
 // capHoldMs 单段就到 8.4~9.4ms。
 // split 在消费端只被读，所以用完可以连同容量回收复用。
 SectionGeometrySplit takeSectionSplitFromPool();
+// 池空时返回 false（不冷分配）；捕获线程用它做"等下一轮唤醒"。
+bool tryTakeSectionSplitFromPool(SectionGeometrySplit& out);
 void returnSectionSplitToPool(SectionGeometrySplit&& split);
+
+// 2026-11-07g：split 池的命中统计与捕获扩容的分桶统计（诊断）。
+// 注意：日志里的 poolHit/poolMiss 是 SectionMemory 显存池，与本池无关。
+extern uint64_t g_sectionSplitPoolTakeHits;
+extern uint64_t g_sectionSplitPoolTakeMisses;
+extern uint64_t g_sectionSplitPoolReturns;
+extern uint64_t g_sectionSplitPoolReturnRejects;
+extern uint64_t g_sectionSplitPoolReturnDrops;
+extern uint64_t g_sectionSplitPoolSize;
+extern uint64_t g_sectionSplitPoolStarveSkips;
+// 0 opaque / 1 alpha / 2 water / 3 ommCutout /
+// 4 entity / 5 localPlayer / 6 particle / 7 other
+extern uint64_t g_captureGrowBucketCount[8];
+extern uint64_t g_captureGrowBucketBytes[8];
+extern uint64_t g_captureGrowFromEmpty;
+extern uint64_t g_captureGrowFromSmall;
 
 // =======================================================================
 // 2026-10-08 几何捕获线程（BLAS 异步化·第一步）。
@@ -1623,7 +1876,8 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split);
 struct CapturedSectionUpdate
 {
     uint64_t spatialKey = 0u;
-    SectionGeometrySplit split;
+    // 2026-11-07i：队列里携带的是 arena 视图（split 已在捕获点还池）。
+    CaptureArenaSegment segment;
 };
 
 // 2026-10-31：捕获批大小**保持 4**（曾试过 8，已回退）。
@@ -2184,9 +2438,15 @@ struct BrunetonLutImage {
     VkImageView sampledView = VK_NULL_HANDLE;
     VkImageView storageView = VK_NULL_HANDLE;
 };
-inline constexpr uint32_t WATER_FFT_RESOLUTION = 256u;
-static_assert(WATER_FFT_RESOLUTION == 256u, "shader WATER_FFT_N is 256");
-inline constexpr uint32_t WATER_FFT_LOG2 = 8u;
+// 2026-11-15：256 -> 512。k 映射（waterFftWaveVector）的波数步长固定为
+// K_SPAN/1024，与 N 无关 ⇒ N 加倍后 Nyquist 加倍：涌浪最小波长 2.6 -> 1.3 格、
+// 细节瓦片（32 格）0.65 -> 0.32 格 —— 用户要求"再加些细的法线"的落实点，
+// 水面近看的微法线/闪光直接受益，焦散雅可比（消费同一张斜率图）同步受益。
+// 成本：FFT 链 30Hz × ~40 dispatch（256²=65k texel -> 512²=262k，+2 趟蝶形），
+// 每秒 ~3.2 亿 texel-op 量级，对帧时间可忽略。斜率图 mip 9 -> 10（512 -> 1）。
+inline constexpr uint32_t WATER_FFT_RESOLUTION = 512u;
+static_assert(WATER_FFT_RESOLUTION == 512u, "shader WATER_FFT_N is 512");
+inline constexpr uint32_t WATER_FFT_LOG2 = 9u;
 inline constexpr uint32_t WATER_FFT_LOCAL_SIZE = 8u;
 inline constexpr uint32_t WATER_FFT_SLOPE_MIPS = WATER_FFT_LOG2 + 1u;
 inline constexpr uint32_t WATER_FFT_STATE_LAYERS = 4u;
@@ -2219,15 +2479,19 @@ static_assert(sizeof(WaterFftPushConstants) == 64u,
     "WaterFftPushConstants must match the std430 layout of the GLSL push block");
 inline constexpr bool kWATER_FFT_PASSES_ENABLED = true;
 
-// 2026-11-01 重构：顶点拉伸光栅 -> 逐 texel compute。分辨率 1024 -> 512
-// （texel 数 1/4），mip 11 -> 7（512 -> 8）。
-inline constexpr uint32_t WATER_CAUSTIC_MAP_RESOLUTION = 512u;
+// 2026-11-01 重构：顶点拉伸光栅 -> 逐 texel compute（当时为省成本把分辨率
+// 1024 -> 512，mip 11 -> 7）。
+// 2026-11-15 回滚到 1024：tile 周期 128 格下，512 的纹素 = 0.25 格，焦散
+// 细网特征（~0.2-0.4 格）在这个尺度上直接糊掉 —— 用户实测"焦散还是糊"。
+// 1024 -> 纹素 0.125 格，与 FFT 细节波的尺度匹配。mip 7 -> 8（1024 -> 8）。
+// 内存：1024²×2 层×8 mip RGBA16F ≈ 21 MB（512 时 ≈ 5 MB）。
+inline constexpr uint32_t WATER_CAUSTIC_MAP_RESOLUTION = 1024u;
 inline constexpr uint32_t WATER_CAUSTIC_MAP_GRID = 256u;
-inline constexpr uint32_t WATER_CAUSTIC_MAP_MIPS = 7u;
-static_assert(WATER_CAUSTIC_MAP_RESOLUTION == 512u,
+inline constexpr uint32_t WATER_CAUSTIC_MAP_MIPS = 8u;
+static_assert(WATER_CAUSTIC_MAP_RESOLUTION == 1024u,
     "water_caustic_map.comp 的 CAUSTIC_RESOLUTION 必须与这里一致");
 static_assert((WATER_CAUSTIC_MAP_RESOLUTION >> (WATER_CAUSTIC_MAP_MIPS - 1u)) == 8u,
-    "WATER_CAUSTIC_MAP_MIPS must run 512 -> 8");
+    "WATER_CAUSTIC_MAP_MIPS must run 1024 -> 8");
 static_assert(WATER_CAUSTIC_MAP_GRID == 256u,
     "water_caustic_map.vert 的 GRID 是 256（旧路径常量，仅留档）");
 inline constexpr float WATER_CAUSTIC_MAP_REFERENCE_DEPTH = 1.0f;
@@ -2341,6 +2605,8 @@ VkResult OrionCreateRayTracingPipelineTimed(
     VkPipelineCache pipelineCache,
     VkPipeline* pPipelines
 );
+void OrionLogPipelineStats(const char* label, VkPipeline pipeline);
+bool OrionPipelineStatsCaptureEnabled();
 void RTXTerminateHandler();
 void RTXMarkPhase(const char* name);
 std::string RTXHex(uint64_t value);
@@ -2360,6 +2626,10 @@ void DeleteStalePipelineCaches();
 VkPipelineCache getSharedPipelineCache();
 void persistSharedPipelineCache();
 void maybePersistSharedPipelineCache();
+// 2026-11-08：每条 RT 管线创建成功后立刻同步落盘。原落盘点只有"帧 60 去抖"
+// 与"正常退出"，巨型管线冷编阶段的 OOM/abort 崩溃发生在两者之前 —— 编好的
+// 条目全部丢失，跨启动推进只能依赖驱动内部缓存。
+void PersistSharedPipelineCacheNow();
 void releaseSharedPipelineCache();
 uint32_t perfL10AblationRequestedStage();
 bool perfL10AblationEnabled();
@@ -2427,12 +2697,21 @@ bool giHalfRotateEnabled();
 int giNearRateLevel();
 bool glossyRoughLodEnabled();
 bool giNoPomEnabled();
+bool giVisibilityGateEnabled();
+bool matSecondaryMinimalEnabled();
+float matFarLodDistance();
+float matTexFarLodDistance();
+bool glossyRrEnabled();
+bool glossyStepLodEnabled();
+bool pomSecondarySkipEnabled();
 bool giTemporalEnabled();
 int directLightMode();
 int sparseRatePercent();
 int rtxdiReuseInactiveEnabled();
 bool giHalfEnabled();
 bool k1k2SplitEnabled();
+bool serRequireReorderHint();
+bool serShaderVariantWanted();
 bool rrTransparencyHintEnabled();
 bool ResolveSLVulkanProxies();
 VkResult FGDeviceWaitIdle(
@@ -2631,6 +2910,8 @@ void updateSDRPostDescriptor();
 void createHDRPostPipeline();
 void createAeStateBuffers();
 void createAutoExposurePipeline();
+// 2026-11-15：把深度与云 resolve 绑到测光直方图（视图变化时才重写）。
+void updateAeHistogramMeteringBindings();
 void createHDREncodePipeline();
 void updateHDREncodeDescriptor();
 void createHDR10OutputImage(uint32_t width, uint32_t height);
@@ -2752,7 +3033,8 @@ size_t geometryCapturePerWake();
 bool captureTimeGateEnabled();
 void geometryAppendSectionVertices(
     std::vector<Vertex>& destination,
-    const std::vector<Vertex>& source
+    const std::vector<Vertex>& source,
+    int bucket = -1
 );
 void geometryAppendSectionMotion(
     std::vector<float>& destination,
@@ -2896,10 +3178,10 @@ bool sectionUsesIndexedGeometry(
 VkDeviceSize createSectionBLAS(
     RTSectionAS& section,
     uint64_t sectionKey,
-    const std::vector<Vertex>& vertices,
+    std::span<const Vertex> vertices,
     bool opaqueGeometry,
     const OmmCutoutInput* ommInput,
-    const std::vector<float>* vertexMotion = nullptr,
+    std::span<const float> vertexMotion = {},
     bool allowUpdate = false
 );
 void recordSectionBLASBuild(
@@ -2960,6 +3242,8 @@ void updateGiHalfRayDescriptor();
 void createGiHalfImage(uint32_t width, uint32_t height);
 void createGiTemporalImages(uint32_t width, uint32_t height);
 void prepareGiTemporalHistoryImages(VkCommandBuffer cmd);
+void createGlossyHistoryImage(uint32_t width, uint32_t height);
+void prepareGlossyHistoryImage(VkCommandBuffer cmd);
 void prepareGlassAlphaBlendImages(VkCommandBuffer cmd);
 void createGlassBlueNoiseBuffer();
 void destroySparseActiveMaskImage();
@@ -3250,6 +3534,16 @@ bool sunShadowSignatureChanged(
     float builtCenter[3]
 );
 void recordSunShadowMap(VkCommandBuffer cmd);
+// 2026-11-11 太阳可见度屏幕空间滤波（软影 A 方案，形态 1）。
+// 实现见 Shadow.cpp 的同名段落；ORION_SUNVIS=1 才生效，默认关。
+bool sunVisEnabled();
+float sunVisAperture();
+float sunVisMaxRadius();
+float sunVisDepthTolerance();
+void createSunVisResources(
+    uint32_t width,
+    uint32_t height);
+void recordSunVisFilter(VkCommandBuffer cmd);
 void destroySunShadowResources();
 bool sunShadowFarEnabled();
 bool localLightRebuildEnabled();
@@ -3269,13 +3563,11 @@ bool volumetricCloudBindingsMatchCurrentSizes(
 VkSampler volDepthSampler();
 void createVolumetricCloudResources(uint32_t width, uint32_t height);
 void createVolumetricCloudPipeline(uint32_t width, uint32_t height);
-void setCloudCompositeTarget(VkImageView target);
 uint64_t cloudSpvStampOf(const char* relative);
 uint64_t cloudSpvStampAll();
 void hotReloadVolumetricCloudPipelines();
 void maybeHotReloadVolumetricCloudShaders();
 void recordVolumetricClouds(VkCommandBuffer cmd);
-void recordCloudComposite(VkCommandBuffer cmd);
 uint32_t volRestirEnabled();
 uint32_t volDiagMode();
 void createVolumeRestir3DImage(
@@ -3303,6 +3595,39 @@ void recordVolumeRestirIntegrate(VkCommandBuffer cmd);
 void recordVolumeRestirScreenComposite(VkCommandBuffer cmd);
 void recordVolumeRestir(VkCommandBuffer cmd, uint32_t renderWidth, uint32_t renderHeight);
 void logDeviceFaultDiagnostics(const char* where);
+
+// 2026-11-14：NV diagnostic checkpoint 埋点（tag 必须是静态字符串）。
+// 设备挂死后 logDeviceFaultDiagnostics 会打回 GPU 最后走到的标记。
+void rtCheckpoint(VkCommandBuffer cmd, const char* tag);
+
+// =====================================================
+// 2026-11-14：GPU 卡死探针（看门狗 + 已释放显存地址环形记录）。
+//
+// 症状：5s VK semaphore 超时（换存档、单手/双手、任何场景都复现），
+// 说明 GPU 端有工作永远不完成 —— 最典型是命令里引用了已释放的显存。
+// 设备由引擎创建，我们开不了 VK_EXT_device_fault，所以自己做：
+//   · rtHangHeartbeatTick()  每帧一次（recordFrameCommand 开头）；
+//   · rtGpuFreedRangeNote()  每释放一块 GPU 显存就记一条（地址/大小/标签/帧号）；
+//   · 看门狗线程在「心跳 3 秒不动」时把最后 12 条释放记录 + 显存/VLI/几何状态
+//     写进 rt_debug.log，并顺手调一次 logDeviceFaultDiagnostics（扩展启用时
+//     会带驱动给的地址）。
+// 全部只读/只记录，不改变任何渲染行为。
+// =====================================================
+void rtHangHeartbeatTick();
+
+// 2026-11-14：当前帧录制的阶段（卡死看门狗打印它）。
+//   0=帧外  1=进入 recordFrameCommand  2=几何重建前  3=几何重建后
+//   4=TLAS/SBT 之后  5=提交之后
+extern std::atomic<int> g_rtFramePhase;
+
+// 2026-11-14：卡死快照里追加 VLI 页池状态（Vli.cpp 的全局量是文件内 static，
+// 只能由 Vli.cpp 自己打印）。
+void rtLogVliStateForHang();
+void rtGpuFreedRangeNote(
+    uint64_t address,
+    uint64_t bytes,
+    const char* tag
+);
 void destroyVolumetricCloudResources();
 void updateSkyAtmosphereStarMapDescriptor();
 void updateSkyAtmosphereEndSkyAtlasDescriptor();
@@ -3391,6 +3716,14 @@ bool asyncRtPipelineRebuildSupported();
 bool beginAsyncRtPipelineRebuild(const char* reason);
 bool asyncRtPipelineRebuildActive();
 void pollAsyncRtPipelineRebuild();
+
+// 2026-11-09：boot 巨型管线后台编译。Device.cpp 的 main→SBT→K1/K2 整段挪到
+// 后台线程；Frame.cpp 用 rtBootPipelinesReady() 门控 RT 帧；Cleanup 在编译
+// 未完成时必须跳过原生释放（rtBootCompileInFlight）。
+void startRtBootPipelineCompile(VkShaderModule (&mods)[6]);
+bool rtBootPipelinesReady();
+bool rtBootCompileInFlight();
+void rtBootDetachCompileThread();
 jobjectArray
 FGMakeJavaStringArray(
     JNIEnv* env,
@@ -3541,11 +3874,16 @@ inline constexpr const char* const RT_PIPELINE_SPV_FILES[] = {
     // 2026-11-05 设备丢失二分变体（ORION_K2_VARIANT 门控加载，仅诊断用）
     "shaders\\rt_test_k2_nocall.rgen.spv",
     "shaders\\rt_test_k2_inline.rgen.spv",
-    // ③ K2-D/K2-I 直射/间接拆分（默认加载，ORION_K2_SPLIT=0 回退）
+    // ③ K2-D/K2-I 直射/间接拆分（ORION_K2_SPLIT=0 回退档，仍要落盘）
     "shaders\\rt_test_k2d.rgen.spv",
     "shaders\\rt_test_k2d_ser.rgen.spv",
     "shaders\\rt_test_k2i.rgen.spv",
     "shaders\\rt_test_k2i_ser.rgen.spv",
+    // ④ K2-D 再拆分：K2-SUN/K2-LOC（默认加载，ORION_K2_SPLIT2=0 回退 ③）
+    "shaders\\rt_test_k2sun.rgen.spv",
+    "shaders\\rt_test_k2sun_ser.rgen.spv",
+    "shaders\\rt_test_k2loc.rgen.spv",
+    "shaders\\rt_test_k2loc_ser.rgen.spv",
     // D1：材质层 callable（gen_material_callable.py 从 rt_test.rchit 生成）
     "shaders\\rt_test_material.spv",
     "shaders\\rt_test.rchit.spv",
@@ -3613,7 +3951,11 @@ inline constexpr const char* const PERF_L10_ABLATION_STAGE_NAMES
     "glossyBudgetOff",
     "emissiveFetch",
     "voxelDdaGi",
-    "glossyTMax192"
+    "glossyTMax192",
+    // 2026-11-07 SER / RR 的 A/B 臂
+    "serProbeFlags2",
+    "rrCap09",
+    "serKeyMin"
 };
 extern uint32_t g_perfL10AblationStage;
 extern VkQueryPool g_perfL10GpuTimestampPool;
@@ -3779,6 +4121,21 @@ extern VkImage g_volumetricCloudHistoryDepthImage;
 extern VkDeviceMemory g_volumetricCloudHistoryDepthMemory;
 extern VkImageView g_volumetricCloudHistoryDepthView;
 extern VkSampler g_volumetricCloudSampler;
+// 2026-11-15：体积雾 froxel 重构的资源。
+extern VkImage g_fogFroxelDensityImage;
+extern VkDeviceMemory g_fogFroxelDensityMemory;
+extern VkImageView g_fogFroxelDensityView;
+extern VkImage g_fogScreenColorImage;
+extern VkDeviceMemory g_fogScreenColorMemory;
+extern VkImageView g_fogScreenColorView;
+extern VkImage g_fogScreenDistImage;
+extern VkDeviceMemory g_fogScreenDistMemory;
+extern VkImageView g_fogScreenDistView;
+extern VkPipeline g_fogFroxelDensityPipeline;
+extern VkPipelineLayout g_fogFroxelDensityPipelineLayout;
+extern VkPipeline g_fogFroxelCompositePipeline;
+extern VkPipelineLayout g_fogFroxelCompositePipelineLayout;
+void recordFogFroxelPasses(VkCommandBuffer cmd);
 extern VkImageLayout g_volumetricCloudLayout;
 extern VkImageLayout g_volumetricCloudHistoryLayout;
 extern VkImageLayout g_volumetricCloudResolvedLayout;
@@ -3798,7 +4155,6 @@ extern VkDescriptorPool g_volumetricCloudDescriptorPool;
 extern VkDescriptorSet g_volumetricCloudRenderSet;
 extern VkDescriptorSet g_volumetricCloudResolveSet;
 extern VkDescriptorSet g_volumetricCloudCompositeSet;
-extern VkImageView g_volumetricCloudCompositeTargetView;
 extern VkPipelineLayout g_volumetricCloudRenderPipelineLayout;
 extern VkPipelineLayout g_volumetricCloudResolvePipelineLayout;
 extern VkPipelineLayout g_volumetricCloudCompositePipelineLayout;
@@ -4263,6 +4619,15 @@ extern uint32_t g_giTemporalHistoryWidth;
 extern uint32_t g_giTemporalHistoryHeight;
 extern bool g_giTemporalHistoryNeedsClear;
 
+// 2026-11-14：稀疏反射的时域历史（binding 92）。
+extern VkImage g_glossyHistoryImage;
+extern VkDeviceMemory g_glossyHistoryMemory;
+extern VkImageView g_glossyHistoryView;
+extern VkImageLayout g_glossyHistoryLayout;
+extern uint32_t g_glossyHistoryWidth;
+extern uint32_t g_glossyHistoryHeight;
+extern bool g_glossyHistoryNeedsClear;
+
 
 extern VkImage g_alphaBlendGbufferImage;
 extern VkDeviceMemory g_alphaBlendGbufferMemory;
@@ -4588,8 +4953,11 @@ extern std::atomic<float> g_cloudThickness;
 extern std::atomic<float> g_cloudCoverage;
 extern std::atomic<float> g_cloudDensity;
 extern std::atomic<float> g_cloudDetailStrength;
-extern std::atomic<float> g_cloudWindSpeed;
-extern std::atomic<float> g_cloudEvolution;
+extern std::atomic<float> g_ssrFloorChunks;
+extern std::atomic<float> g_perfRtBandChunks;
+extern std::atomic<float> g_perfBounceBandChunks;
+extern std::atomic<uint32_t> g_performanceMode;
+
 extern std::atomic<uint32_t> g_cloudQuality;
 extern std::atomic<float> g_cloudSize;
 extern std::atomic<float> g_cloudDistribution;
@@ -4612,7 +4980,6 @@ extern std::atomic<float> g_planeCloudOctaves;
 extern std::atomic<float> g_planeCloudFadeDistance;
 extern std::atomic<float> g_planeCloudBrightness;
 extern std::atomic<uint32_t> g_cloudResFloorPercent;
-extern std::atomic<bool> g_cloudPostRrComposite;
 extern std::atomic<float> g_cloudFarStepDensity;
 extern std::atomic<bool> g_cloudFadeFollowsRrMode;
 extern std::atomic<float> g_cloudTwoTierStep;
@@ -4656,13 +5023,10 @@ extern std::atomic<float> g_cloudPhiBoundaryConfidence;
 extern std::atomic<float> g_cloudPhiMsBuildScale;
 extern std::atomic<float> g_cloudPhiCompress;
 extern std::atomic<float> g_cloudPhiConeRatio;
-extern std::atomic<float> g_cloudSourceOdScale;
-extern std::atomic<float> g_cloudSourceCurvePow;
-extern std::atomic<float> g_cloudAoUpwardScale;
-extern std::atomic<float> g_cloudSunsetAmbientTint;
 extern std::atomic<float> g_cloudBottomSmoothHeight;
 extern std::atomic<float> g_cloudBottomSmoothPow;
 extern std::atomic<float> g_cloudTwoTierThreshold;
+extern std::atomic<float> g_cloudLightStepErosion;
 extern std::atomic<float> g_cloudMoonStrength;
 extern std::atomic<float> g_cloudMoonPhase;
 extern std::atomic<float> g_cloudDetailScale;
@@ -4672,10 +5036,6 @@ extern std::atomic<float> g_cloudAmbientTopMul;
 extern std::atomic<float> g_cloudAmbientBottomMul;
 extern std::atomic<float> g_cloudAmbientSunSide;
 extern std::atomic<float> g_cloudAmbientHueFollow;
-extern std::atomic<float> g_cloudSkyHueCool;
-extern std::atomic<float> g_cloudSkyHueEnergy;
-extern std::atomic<float> g_cloudSkyDirStrength;
-extern std::atomic<float> g_cloudAmbientUnify;
 extern std::atomic<float> g_cloudGroundAlbedo;
 extern std::atomic<float> g_cloudGroundBounce;
 extern std::atomic<float> g_cloudSunlightResidual;
@@ -4684,10 +5044,6 @@ extern std::atomic<float> g_cloudScatterTint;
 extern std::atomic<float> g_cloudMsOctaves;
 extern std::atomic<float> g_cloudMsAttenuation;
 extern std::atomic<float> g_cloudMsEccentricity;
-extern std::atomic<float> g_cloudSunPathReddening;
-extern std::atomic<float> g_cloudAtmExtinction;
-extern std::atomic<float> g_cloudPowderMode;
-extern std::atomic<float> g_fogDynamicLightStrength;
 extern std::atomic<float> g_fogGroundAnchorStrength;
 extern std::atomic<float> g_fogSkyAmbientStrength;
 extern std::atomic<float> g_fogTemporalJitterStrength;
@@ -4695,11 +5051,7 @@ extern std::atomic<bool> g_cloudFogLightDescriptorsReady;
 extern VkDescriptorSet g_cloudFogLightSetBound;
 extern VkBuffer g_cloudFogLightListBound;
 extern VkBuffer g_cloudFogLightGridBound;
-extern std::atomic<float> g_cloudSkyVisStrength;
-extern std::atomic<float> g_cloudSkyVisSteps;
 extern std::atomic<float> g_cloudTemporalDamp;
-extern std::atomic<float> g_cloudBottomOcclusion;
-extern std::atomic<float> g_cloudAerialStrength;
 extern std::atomic<float> g_groundAerialStrength;
 extern std::atomic<float> g_groundAerialOcclusion;
 extern std::atomic<float> g_cloudProfileType;
@@ -4765,8 +5117,27 @@ extern std::atomic<bool> g_fogGroundMistEnabled;
 extern std::atomic<float> g_fogGroundMistHeight;
 extern std::atomic<float> g_fogGroundMistExtinction;
 extern std::atomic<float> g_fogGroundMistDistance;
+// 2026-11-10：平流雾滚动速度（格/秒），UI 下发到 godRayParams2.z。
+extern std::atomic<float> g_fogGroundMistSpeed;
+
+// 2026-11-13：湿度时间包络（godRayParams0.z）。
+extern std::atomic<float> g_fogWetnessEnvelope;
+
+// 2026-11-13：雾光学（fogOpticsParams.x/yzw）。
+extern std::atomic<float> g_fogCurlStrength;
+extern std::atomic<float> g_fogTintR;
+extern std::atomic<float> g_fogTintG;
+extern std::atomic<float> g_fogTintB;
+
+// 2026-11-11：雨波纹（godRayParams2.w 打包：size + strength*8）。
+extern std::atomic<float> g_rainRippleSize;
+extern std::atomic<float> g_rainRippleStrength;
+
+// 2026-11-11：云隙光三件套（cloudParams4.y/.z/.w）。
+extern std::atomic<bool> g_cloudGapEnabled;
+extern std::atomic<float> g_cloudGapStrength;
+extern std::atomic<float> g_cloudGapWidth;
 // 2026-10-31：g_fogWisp* 四项随"雨天地面雾浪"整链删除（用户实测无效果）。
-extern std::atomic<float> g_fogRainMediumMix;
 extern float g_cloudWorldAnchorX;
 extern float g_cloudWorldAnchorZ;
 extern float g_cloudWorldAnchorDimension;
@@ -5043,6 +5414,18 @@ extern float g_dynamicCaptureCameraZ;
 extern bool g_entityFrameOpen;
 extern bool g_particleFrameOpen;
 extern std::atomic<bool> g_entityRebuildRequested;
+
+// =====================================================
+// 2026-11-12 实例化第 2 步：**每实例变换**。
+//
+// 键 = g_chunkMeshes 的 mesh key（实体层桶键），值 = N 组 3×4 **行主序**矩阵
+// （12 个 float：m00 m01 m02 m03 / m10 m11 m12 m13 / m20 m21 m22 m23）。
+// 非空时 TLAS 对这条 mesh 发 N 个实例（各自带变换），不再发 1 个单位矩阵实例。
+//
+// 第 1 步已在命中着色器里接了 gl_ObjectToWorldEXT，所以顶点可以是模型局部空间。
+// 未设变换时矩阵全为单位 ⇒ 与改造前逐位一致。
+// =====================================================
+extern std::unordered_map<uint64_t, std::vector<float>> g_entityMeshInstances;
 extern uint64_t g_lastDynamicRTASUpdateFrame;
 extern bool g_dynamicRTASUpdatePending;
 extern uint64_t g_lastLocalPlayerASUpdateFrame;
@@ -5298,6 +5681,17 @@ extern uint64_t g_sectionASCreateCalls;
 extern uint64_t g_sectionASRetireCalls;
 extern double g_sectionASCreateMs;
 extern double g_sectionASRetireMs;
+
+// 2026-11-12：createSectionBLAS 内部分段计时（最后一次调用的值，仅供诊断日志）。
+extern double g_sectionBuildBufMs;
+extern double g_sectionBuildVkBufMs;
+extern double g_sectionBuildPrepMs;
+extern double g_sectionBuildOmmMs;
+extern double g_sectionBuildReqMs;
+extern double g_sectionBuildSizesMs;
+extern double g_sectionBuildMemMs;
+extern double g_sectionBuildAsMs;
+extern double g_sectionBuildAddrMs;
 extern uint64_t g_sectionASRebuildSameTris;
 extern uint64_t g_sectionASRefitCandidateHits;
 extern uint64_t g_sectionASRefitHits;
@@ -5378,6 +5772,17 @@ extern VkStridedDeviceAddressRegionKHR g_k2iRaygenRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2iMissRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2iHitRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2iCallableRegion;
+// ④ K2-D 再拆分（默认开，ORION_K2_SPLIT2=0 回退 ③ 两腿）：K2-SUN + K2-LOC
+extern VkPipeline g_k2sunPipeline;
+extern VkPipeline g_k2locPipeline;
+extern VkStridedDeviceAddressRegionKHR g_k2sunRaygenRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2sunMissRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2sunHitRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2sunCallableRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locRaygenRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locMissRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locHitRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locCallableRegion;
 // ③ K2-D→K2-I 直射级交接图（binding 89，rgba32f，全分辨率）
 extern VkImage g_k2DirectImage;
 extern VkDeviceMemory g_k2DirectMemory;
@@ -5410,6 +5815,8 @@ void createK2DirectImage(uint32_t width, uint32_t height);
 void destroyK2DirectImage();
 // ③ K2-D/K2-I 再拆分（默认开，ORION_K2_SPLIT=0 回退）：K1→K2D(直射)→K2I(间接) 三发
 bool k2DirectIndirectSplitEnabled();
+// ④ K2-D 再拆分（默认开，ORION_K2_SPLIT2=0 回退 ③ 两腿）：K1→K2SUN→K2LOC→K2I 四发
+bool k2ThreeSplitEnabled();
 // 返回 true 表示 K1→K2 两发已录完并已重新绑定主管线；false 表示回退单发主管线
 bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 

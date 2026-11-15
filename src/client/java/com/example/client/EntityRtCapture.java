@@ -25,6 +25,7 @@ import net.minecraft.client.model.Model;
 import net.minecraft.client.renderer.blockentity.BeaconRenderer;
 import net.minecraft.client.renderer.blockentity.state.BeaconRenderState;
 import net.minecraft.client.renderer.entity.state.AvatarRenderState;
+import net.minecraft.client.renderer.feature.ItemFeatureRenderer;
 import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
 import net.minecraft.client.renderer.rendertype.RenderSetup;
 import net.minecraft.client.renderer.rendertype.RenderType;
@@ -63,8 +64,22 @@ public final class EntityRtCapture {
     private static final int[] frameTextureClasses = new int[MAX_TEXTURE_SLOTS];
     private static int captureFrameSerial;
     private static final int SLOT_EVICTION_GRACE_FRAMES = 3;
-    private static final float ENTITY_COPLANAR_LAYER_STEP = 0.002f;
+    // 2026-11-15：层间距对齐 Caustica 的 ORDER_OFFSET = 2e-4（原 0.002 会让 16 层图案悬空 3cm）。
+    private static final float ENTITY_COPLANAR_LAYER_STEP = 2.0e-4f;
     private static final float ENTITY_COPLANAR_LAYER_MAX = 0.02f;
+    // 2026-11-15：同一次 submit 内，同一面旗帜的所有图案层共用同一个 Pose；按"同 Pose 第几次
+    // banner_pattern 提交"还原原版 order（底色层 1、其后每层 +1）。每帧 beginFrame 清零。
+    private static final java.util.HashMap<Long, Integer> bannerPatternLayerRanks = new java.util.HashMap<>();
+    // 2026-11-15：短格式顶点（地图）的拼接状态。逐顶点热路径要求零分配，
+    // 且区块网格构建线程也会调 BufferBuilder 的短格式 setter，所以必须按线程隔离。
+    private static final int POSITION_ONLY_MAX_VERTICES = 8192;
+    private static boolean positionOnlyOverflowLogged;
+    private static final ThreadLocal<ShortVertex> shortVertex =
+            ThreadLocal.withInitial(ShortVertex::new);
+    // 短格式顶点"半截状态"是否存在的保守前置过滤：全格式 addVertex 是全场最热的路径，
+    // 不能为了丢一个残留状态就付一次 ThreadLocal.get()（和 ActiveBatchSlot.current 同理，
+    // 只作普通字段读写；跨线程读到过期 true 最多让对方多做一次空操作）。
+    private static boolean shortVertexPendingFlag;
     private static final long[] publishedEntityViews = new long[MAX_TEXTURE_SLOTS];
     private static final long[] publishedEntitySamplers = new long[MAX_TEXTURE_SLOTS];
     private static final boolean[] slotTexturePublished = new boolean[MAX_TEXTURE_SLOTS];
@@ -76,7 +91,58 @@ public final class EntityRtCapture {
     private static final long[] publishedEntitySpecularSamplers = new long[MAX_TEXTURE_SLOTS];
     private static final boolean[] entityPbrSettled = new boolean[MAX_TEXTURE_SLOTS];
     private static boolean entityPbrNativeAvailable = true;
-    private static final ThreadLocal<ActiveBatch> activeBatch = new ThreadLocal<>();
+    // 2026-11-09：包一层，只为在"没有任何捕获窗口打开"时用一个 volatile 标志短路。
+    // BufferBuilderMixin 对**每一个**顶点都调 captureVertex，而绝大多数顶点
+    // （地形/天空/UI 等非实体几何）与 RT 实体捕获无关，之前每个顶点都要付一次
+    // ThreadLocal.get()（ThreadLocalMap 哈希查表 + 首次建表）。
+    // 语义不变：标志只是"可能有人开着窗口"的保守前置过滤，真正有没有批次仍由
+    // ThreadLocal 决定；其它线程读到过期 false 时本来 get() 也是 null。
+    private static final ActiveBatchSlot activeBatch = new ActiveBatchSlot();
+    private static volatile boolean anyActiveBatch;
+
+    private static final class ActiveBatchSlot {
+        private final ThreadLocal<ActiveBatch> local = new ThreadLocal<>();
+
+        /**
+         * 2026-11-11：渲染线程的当前批次直读镜像。
+         *
+         * <p>实体捕获全部发生在渲染线程（{@code prepareModel} / RenderType 通用链），
+         * 所以逐顶点热路径不必走 {@code ThreadLocal.get()}（哈希查表）。
+         * {@link #captureVertex} 先看 {@code anyActiveBatch} 这个 volatile 门，
+         * 命中后再读这个普通静态字段 —— 语义与原来一致（其它线程看到的批次永远为 null）。
+         */
+        private static ActiveBatch current;
+
+        /**
+         * {@link #current} 的归属线程。
+         *
+         * <p>⚠ 2026-11-11 教训：区块网格构建的**工作线程也会调
+         * {@code captureVertex}**。只放一个全局静态镜像时，它们会看到渲染线程正开着的
+         * 批次并往里塞顶点，把 {@code pendingQuadVertexCount} 顶过 4 ⇒
+         * {@code ArrayIndexOutOfBoundsException: Index 20 out of bounds for length 20}
+         * （崩溃报告 {@code crash-2026-11-11_20.47.52-client.txt}）。
+         * 所以镜像必须带归属校验，不匹配就走原来的 ThreadLocal（对工作线程为 null）。
+         */
+        private static Thread owner;
+
+        ActiveBatch get() {
+            return local.get();
+        }
+
+        void set(ActiveBatch batch) {
+            local.set(batch);
+            current = batch;
+            owner = batch == null ? null : Thread.currentThread();
+            anyActiveBatch = batch != null;
+        }
+
+        void remove() {
+            local.remove();
+            current = null;
+            owner = null;
+            anyActiveBatch = false;
+        }
+    }
     private static final ThreadLocal<ActiveBatch> reusableBatch =
             ThreadLocal.withInitial(ActiveBatch::new);
     private static final Set<Object> localPlayerProxyStates =
@@ -223,6 +289,9 @@ public final class EntityRtCapture {
         entityFrameOpen = true;
         textBatchSlot = 0;
         captureFrameActive = true;
+        bannerPatternLayerRanks.clear();
+        // 上一帧若在某条短格式顶点中途结束（异常/取消），残留的 pending 会串到本帧的批次里。
+        cancelShortVertex();
 
         textPerfFrame = isDiagnosticFrame();
         lastGlyphRenderType = null;
@@ -255,7 +324,7 @@ public final class EntityRtCapture {
         entityFrameOpen = false;
         flushTextBatch();
 
-        if (textPerfFrame && (textGlyphs != 0 || textUploads != 0)) {
+        if (LOG_TEXT_PERF && textPerfFrame && (textGlyphs != 0 || textUploads != 0)) {
             System.out.println(
                     "[TEXT PERF]"
                             + " glyphs=" + textGlyphs
@@ -871,6 +940,8 @@ public final class EntityRtCapture {
     private static void beginModel(
             ModelFeatureRenderer.Submit<?> submit,
             boolean localPlayerProxy) {
+        if (!CAPTURE_ENABLED) return;
+        ++modelSubmitCount;
         if (activeBatch.get() != null) throw new IllegalStateException("Nested entity model capture");
         Identifier texture = resolveSampler0(submit.renderType());
         if (handPhase) {
@@ -914,16 +985,15 @@ public final class EntityRtCapture {
             batch.diagHand = handBatch;
             // 2026-11-04：见 ActivaBatch.uvMapping 处的说明。
             batch.uvMapping = submit.uvMapping();
-            // 2026-11-04：旗帜图案层沿法线外移固定两步。
-            // 依据实测（[RTX-BANNER]）：batch 内 hits=0 ⇒ 没有重复质心，
-            // 所以 rank 就等于这里给的 boost，不会被 seenBefore 干扰。
-            final boolean bannerBoost = isBannerPattern(submit.renderType());
-            batch.coplanarLayerBoost = bannerBoost ? 2 : 0;
-            if (bannerBoost) {
-                customDiagLog("banner_boost2",
+            // 2026-11-15：旗帜图案层按 Caustica 的 order 递增层序（不再是固定 +2）。
+            // 同一面旗帜的底布（非 banner_pattern）为 0，底色层为 1，其后每层 +1；
+            // batching 会把每层拆成独立批次，所以 rank 必须跨批次累积（见 nextBannerLayerRank）。
+            final boolean bannerPattern = isBannerPattern(submit.renderType());
+            batch.coplanarLayerBoost = bannerPattern ? nextBannerLayerRank(submit.pose()) : 0;
+            if (bannerPattern) {
+                customDiagLog("banner_rank" + batch.coplanarLayerBoost,
                         renderTypeName(submit.renderType()), texture);
             }
-            // 旗帜图案层整体外移一个 rank（见 bannerLayerBoost）。
             activeBatch.set(batch);
             resolveBatchMotion(batch, submit);
         }
@@ -1096,23 +1166,22 @@ public final class EntityRtCapture {
     }
 
     /**
-     * 2026-11-04：UV 重映射**默认开启**（结论修正）。
+     * 2026-11-15：UV 重映射**默认关闭**。
      *
-     * 实测三种状态的差别正好卡在"映射几次"上：
-     *   关闭   ⇒ UV = ModelPart 0..1 ⇒ 落在图集透明区 ⇒ cutout 整片丢弃 ⇒ **完全没有图案**
-     *             （用户观察：底色对、图案消失）
-     *   一次   ⇒ 落在图案 sprite 上 ⇒ 正确
-     *   两次   ⇒ 压到 sprite 一角 ⇒ 错乱
-     * 所以 captureVertex 里那一次是**必要的**，上一轮"双重映射"的判断是错的。
+     * <p>26.3 的 {@code ModelFeatureRenderer.renderModel} 在把 buffer 交给 ModelPart 之前，
+     * 已经用 {@code submit.uvMapping().wrap(buffer)}（{@code SpriteCoordinateExpander}）
+     * 映射过一遍，连 full-path {@code addVertex(FFFIFFIIFFF)} 的 u/v 也在内部映射
+     * （见 SpriteCoordinateExpander#addVertex）。所以 captureVertex 里再映射一次就是
+     * **第二次**，会压到 sprite 一角，正是旗帜图案/箱子/告示牌贴图错乱的原因。
      *
-     * A/B：-DORION_ENTITY_UV_REMAP=0 关闭（复现"没有图案"）。
+     * <p>captureVertex 里那一支只保留作诊断：-DORION_ENTITY_UV_REMAP=1 可复现双重映射。
      */
     private static final boolean UV_REMAP_ENABLED = resolveUvRemapEnabled();
 
     private static boolean resolveUvRemapEnabled() {
         String raw = System.getProperty("orion.entityUvRemap");
         if (raw == null) raw = System.getenv("ORION_ENTITY_UV_REMAP");
-        if (raw == null) return true;
+        if (raw == null) return false;
         return !"0".equalsIgnoreCase(raw.trim());
     }
 
@@ -1205,6 +1274,8 @@ public final class EntityRtCapture {
         }
 
         long motionPointer = 0L;
+        final long motionStartNanos =
+                com.example.client.LevelPhaseProbe.enabled() ? System.nanoTime() : 0L;
         if (batch.vertexCount > 0) {
             final int motionFloats = batch.vertexCount * 3;
             final boolean useVertexHistory = batch.vertexHistoryIsPreviousFrame(motionFloats);
@@ -1252,6 +1323,11 @@ public final class EntityRtCapture {
                     motionPointer = MemoryUtil.memAddress(motion);
                 }
             }
+        }
+
+        if (motionStartNanos != 0L) {
+            com.example.client.LevelPhaseProbe.captureMotionAdd(
+                    System.nanoTime() - motionStartNanos);
         }
 
         // 2026-11-04 诊断：旗帜批次的几何事实。
@@ -1311,12 +1387,19 @@ public final class EntityRtCapture {
                 if (v < vMin) vMin = v;
                 if (v > vMax) vMax = v;
             }
-            System.err.println("[RTX-HANDUV] slot=" + batch.textureSlot
-                    + " vertices=" + batch.vertexCount
-                    + " u=[" + uMin + "," + uMax + "]"
-                    + " v=[" + vMin + "," + vMax + "]"
-                    + " texture=" + frameTextureLabels[
-                        Math.min(Math.max(batch.textureSlot - 1, 0), MAX_TEXTURE_SLOTS - 1)]);
+            // 2026-11-11：默认**关闭**。这行每帧要打几十~上百条（766 个 section 的多层
+            // 批次各一条），每条都做 String 拼接 + 一次 frameTextureLabels 查表，
+            // 一局下来日志能到 30 MB。GC 日志显示年轻代一次就 845M->380M，
+            // 随后触发 14 次 Concurrent Mark Cycle（中位 124ms）抢渲染线程 CPU —— 
+            // 这是"走/站都卡"最可疑的分配源。需要时：ORION_LOG_HANDUV=1。
+            if (LOG_HANDUV) {
+                System.err.println("[RTX-HANDUV] slot=" + batch.textureSlot
+                        + " vertices=" + batch.vertexCount
+                        + " u=[" + uMin + "," + uMax + "]"
+                        + " v=[" + vMin + "," + vMax + "]"
+                        + " texture=" + frameTextureLabels[
+                            Math.min(Math.max(batch.textureSlot - 1, 0), MAX_TEXTURE_SLOTS - 1)]);
+            }
         }
 
         // 2026-11-03 回退：曾把第一人称手部批次打到独立的 RT 层（pad1 = 2.0），
@@ -1324,26 +1407,151 @@ public final class EntityRtCapture {
         // 实测第一视角贴图错乱 —— 该层的顶点上传路径没有接通，instance 指向无效的
         // 顶点地址，读到的贴图槽是垃圾。整项已回退（rgen 的 cullMask 也已还原为
         // 0xff / 0x01）；native 侧新增的 HAND 层定义保留为死代码，不影响运行。
+        final long uploadJniStartNanos =
+                com.example.client.LevelPhaseProbe.enabled() ? System.nanoTime() : 0L;
         NativeVulkan.uploadEntityBatch(batch.textureSlot, MemoryUtil.memAddress(batch.buffer), batch.vertexCount, BYTES_PER_VERTEX, motionPointer);
+        if (uploadJniStartNanos != 0L) {
+            com.example.client.LevelPhaseProbe.captureJniAdd(
+                    System.nanoTime() - uploadJniStartNanos);
+        }
     }
 
     /**
-     * 短格式 {@code addVertex(FFF)} 的顶点入口（由 {@code BufferBuilderMixin} 的第二个
-     * 钩子调用）。**只在"投影 UV 批次"里捕获** —— 那一档（末地传送门）的 UV 本来就在
-     * {@link #captureVertex} 里按顶点位置合成，颜色用不透明白即可；其余几何走短格式时
-     * 不带 UV/颜色，通用捕获会让它们带着错值进来，所以刻意放行条件收得很紧。
+     * 2026-11-15：短格式顶点的捕获入口（由 {@code BufferBuilderMixin} 的短格式钩子调用）。
+     *
+     * <p>背景：{@code MapRenderer} 用 {@code submitCustomGeometry} + 短格式
+     * {@code addVertex(x,y,z).setColor(-1).setUv(u,v).setLight(light)} 写地图与装饰图标，
+     * 全格式钩子 {@code addVertex(FFFIFFIIFFF)V} 一个顶点都收不到 ⇒ 地图（含物品展示框里
+     * 的地图）在 RT 世界里完全不显形。短格式的 setter 没有一并上报的 "当前值"，
+     * 所以这里按调用顺序拼一个顶点：{@code addVertex} 开始、{@code setColor}/{@code setUv}
+     * 填字段、{@code setUv} 结束时提交（地图的调用顺序固定为 color → uv → light）。
+     *
+     * <p>只对 {@link ActiveBatch#positionOnlyCapture} 的批次生效（目前只有地图），
+     * 避免把其它短格式几何（GUI/全屏特效/末地门）误收进来 —— 后者顶点数没有上界，
+     * 曾经把驱动直接打崩（{@code hs_err_pid45160.log}）。这里再加
+     * {@link #POSITION_ONLY_MAX_VERTICES} 的硬上限兜底。
      */
-    public static void capturePositionOnlyVertex(float x, float y, float z) {
-        final ActiveBatch batch = activeBatch.get();
-        if (batch == null || !batch.projectiveUv) {
+    public static void beginShortVertex(float x, float y, float z) {
+        if (!anyActiveBatch) {
             return;
         }
-        captureVertex(x, y, z, 0xFFFFFFFF, 0.0f, 0.0f);
+        final ActiveBatch batch = currentCaptureBatch();
+        if (batch == null || !batch.positionOnlyCapture) {
+            return;
+        }
+        flushShortVertex();
+        final ShortVertex vertex = shortVertex.get();
+        vertex.x = x;
+        vertex.y = y;
+        vertex.z = z;
+        vertex.u = 0.0f;
+        vertex.v = 0.0f;
+        vertex.color = 0xFFFFFFFF;
+        vertex.pending = true;
+        shortVertexPendingFlag = true;
+    }
+
+    public static void setShortVertexColor(int color) {
+        if (!shortVertexPendingFlag) {
+            return;
+        }
+        final ShortVertex vertex = shortVertexPending();
+        if (vertex == null) {
+            return;
+        }
+        vertex.color = color;
+    }
+
+    public static void setShortVertexUv(float u, float v) {
+        if (!shortVertexPendingFlag) {
+            return;
+        }
+        final ShortVertex vertex = shortVertexPending();
+        if (vertex == null) {
+            return;
+        }
+        vertex.u = u;
+        vertex.v = v;
+        flushShortVertex();
+    }
+
+    /** 全格式顶点进来时说明这段几何不走短路径，丢弃半截状态，避免串味。 */
+    public static void cancelShortVertex() {
+        if (!shortVertexPendingFlag) {
+            return;
+        }
+        shortVertexPendingFlag = false;
+        shortVertex.get().pending = false;
+    }
+
+    private static ShortVertex shortVertexPending() {
+        final ActiveBatch batch = currentCaptureBatch();
+        if (batch == null || !batch.positionOnlyCapture) {
+            return null;
+        }
+        final ShortVertex vertex = shortVertex.get();
+        return vertex.pending ? vertex : null;
+    }
+
+    private static void flushShortVertex() {
+        if (!shortVertexPendingFlag) {
+            return;
+        }
+        final ShortVertex vertex = shortVertex.get();
+        if (!vertex.pending) {
+            return;
+        }
+        vertex.pending = false;
+        shortVertexPendingFlag = false;
+        final ActiveBatch batch = currentCaptureBatch();
+        if (batch == null || !batch.positionOnlyCapture) {
+            return;
+        }
+        if (batch.vertexCount + batch.pendingQuadVertexCount >= POSITION_ONLY_MAX_VERTICES) {
+            if (!positionOnlyOverflowLogged) {
+                positionOnlyOverflowLogged = true;
+                System.err.println("[RTX-ENTITY] short-path capture overflow, drop: type"
+                        + " slot=" + batch.textureSlot + " texture="
+                        + frameTextureLabels[Math.min(Math.max(batch.textureSlot - 1, 0),
+                                MAX_TEXTURE_SLOTS - 1)]);
+            }
+            return;
+        }
+        captureVertex(vertex.x, vertex.y, vertex.z, vertex.color, vertex.u, vertex.v);
+    }
+
+    /** 短格式顶点在"接到 setter 之前"的暂存区，见 {@link #beginShortVertex}。 */
+    private static final class ShortVertex {
+        private float x, y, z, u, v;
+        private int color = 0xFFFFFFFF;
+        private boolean pending;
+    }
+
+    /**
+     * 当前线程正在捕获的批次。
+     *
+     * <p>热路径：直读渲染线程镜像（带归属线程校验），避开 {@code ThreadLocal.get()} 的哈希查表；
+     * 工作线程（区块网格构建）读镜像会因归属不符而回落到自己的 ThreadLocal（通常为 null）。
+     */
+    private static ActiveBatch currentCaptureBatch() {
+        final ActiveBatch batch =
+                ActiveBatchSlot.owner == Thread.currentThread()
+                        ? ActiveBatchSlot.current
+                        : null;
+        return batch != null ? batch : activeBatch.get();
     }
 
     public static void captureVertex(float x, float y, float z, int color, float u, float v) {
-        ActiveBatch batch = activeBatch.get();
+        // 2026-11-11：命中 group 缓存 ⇒ 本组顶点已由回放灌入，逐顶点转换整段跳过
+        if (skipGroupCapture) {
+            return;
+        }
+        if (!anyActiveBatch) {
+            return;
+        }
+        ActiveBatch batch = currentCaptureBatch();
         if (batch == null) return;
+        ++capturedVertexCount;
         if (handPhase && handTransformMode != 0) {
             final float rx;
             final float ry;
@@ -1747,17 +1955,528 @@ public final class EntityRtCapture {
         return 0;
     }
 
+    // 2026-11-11：命中上一次的槽位先做一次校验式快查。
+    //
+    // 病征：本方法挂在 FrontendRenderPass.setUniform 上，每绑定一次 Sampler0 就走一遍
+    // **线性扫描**（最多 127 个槽 × String.equals），而 766 个 section × 多层意味着
+    // 每帧上千次调用。这部分开销藏在原版区块提交那 15.5 ms 里，账上一直算作"原版"。
+    //
+    // 做法：记住上一次命中的槽位，先比对那一格；只有不匹配才回落到线性扫描。
+    // 缓存命中时只做 1 次字符串比较（≈O(1)）。不用 HashMap，是为了**自校验**：
+    // 槽位被重新分配时，frameTextureLabels[slot-1] 的内容会变，比较自然失败，
+    // 不会读到一个已经指向别处的陈旧槽。
+    private static int lastBoundSlot = 0;
+
+    // 2026-11-11：A/B 开关。默认开（走快查）；ORION_TEXBOUND_CACHE=0 时逐位回到
+    // 原来的线性扫描，用于在同一场景里把这条的收益单独量出来。
+    private static final boolean TEXBOUND_FAST_PATH =
+            !"0".equals(System.getenv("ORION_TEXBOUND_CACHE"));
+
+    // 2026-11-11：逐帧诊断日志的总闸，**默认全关**。
+    // 这两组日志每帧会产生几十~上百个 String（拼接 + 查表），
+    // 是当前年轻代分配速率偏高（845M->380M 一次回收）的可疑来源之一。
+    // 需要排障时：ORION_LOG_HANDUV=1 / ORION_LOG_TEXTPERF=1。
+    private static final boolean LOG_HANDUV =
+            "1".equals(System.getenv("ORION_LOG_HANDUV"));
+    private static final boolean LOG_TEXT_PERF =
+            "1".equals(System.getenv("ORION_LOG_TEXTPERF"));
+
     public static void onTextureBound(String textureLabel, long imageView, long sampler) {
+        final int cached = lastBoundSlot;
+        if (TEXBOUND_FAST_PATH
+                && cached > 0 && cached <= frameTextureSlotCount
+                && textureLabel.equals(frameTextureLabels[cached - 1])) {
+            publishTextureHandle(cached, imageView, sampler);
+            return;
+        }
+
         for (int index = 0; index < frameTextureSlotCount; ++index) {
             if (frameTextureLabels[index].equals(textureLabel)) {
+                lastBoundSlot = index + 1;
                 publishTextureHandle(index + 1, imageView, sampler);
                 return;
             }
         }
     }
 
+    /**
+     * 2026-11-11：上一次命中的槽位（快查用，-1 = 无）。
+     *
+     * <p>病征：{@code slotFor} 是**每个实体模型**都要走一遍的线性扫描
+     * （最多 127 槽 × {@code Identifier.equals}）。实体多的场景一帧几百个模型 ⇒
+     * 实测 {@code [LEVEL PHASES FEAT]} 里 {@code ours(capture)} 约 20 ms，其中约 9 ms
+     * 落在这里（{@code uploadBatch} 的运动矢量只要 0.6 ms、JNI 1.0 ms）。
+     *
+     * <p>做法与 {@link #slotForLabel} 相同：先比上一次命中的那一格，不匹配才回落线性扫描。
+     * 槽位被重新分配时那一格的内容会变，比较自然失败 ⇒ **自校验**，
+     * 不会读到一个已经指向别处的陈旧槽。
+     */
+    private static int lastSlotForIndex = -1;
+
+    /**
+     * 2026-11-11：实体/物品捕获总开关，{@code ORION_ENTITY_CAPTURE=0} 关闭。
+     *
+     * <p>只用于 A/B：关掉后 RT 世界里不再有实体与物品（画面会缺东西），
+     * 目的是把「{@code Item}/{@code Entity Model} 桶里的时间到底有多少是我们的」
+     * 量出来 —— 因为我们那个 {@code VertexConsumer} 包装是在**原版写顶点的循环里**
+     * 逐顶点跑的，它的开销会被算进「原版」那一栏，只看 {@code ours(capture)} 会低估。
+     */
+    private static final boolean CAPTURE_ENABLED =
+            !"0".equals(System.getenv("ORION_ENTITY_CAPTURE"));
+
+    /** 逐顶点捕获计数（诊断用：算出 ns/顶点，判断热路径还剩多少优化空间）。 */
+    private static long capturedVertexCount;
+
+    /** 本窗口内的「提交次数」：Item/Custom/BlockModel 通用链 vs 实体模型链。 */
+    private static long genericSubmitCount;
+    private static long modelSubmitCount;
+
+    /** 由 {@code LevelPhaseProbe} 在窗口末尾取走并清零。 */
+    public static long takeCapturedVertexCount() {
+        final long v = capturedVertexCount;
+        capturedVertexCount = 0L;
+        return v;
+    }
+
+    public static long takeGenericSubmitCount() {
+        final long v = genericSubmitCount;
+        genericSubmitCount = 0L;
+        return v;
+    }
+
+    public static long takeModelSubmitCount() {
+        final long v = modelSubmitCount;
+        modelSubmitCount = 0L;
+        return v;
+    }
+
+    // ── 2026-11-11：物品几何缓存的命中率探针（只统计，不改行为） ──
+    private static final java.util.HashSet<Long> itemKeyCache = new java.util.HashSet<>();
+    private static long itemKeyHits;
+    private static long itemKeyTotal;
+    private static final java.util.HashSet<Long> itemKeysThisWindow = new java.util.HashSet<>();
+
+    /**
+     * 键 = {@code ItemFeatureRenderer.Submit} 的全部渲染输入。
+     *
+     * <p>注意 {@code tintLayers} 是 {@code int[]}，record 自动生成的 {@code hashCode}
+     * 对数组取的是**identity**，不能直接用 ⇒ 这里逐项混入内容。
+     */
+    public static void noteItemSubmitKey(final ItemFeatureRenderer.Submit submit) {
+        if (!LevelPhaseProbe.enabled() || submit == null) {
+            return;
+        }
+
+        long key = 1125899906842597L;
+
+        final com.mojang.blaze3d.vertex.PoseStack.Pose pose = submit.pose();
+        key = key * 31 + (pose == null ? 0 : pose.pose().hashCode());
+        key = key * 31 + submit.displayContext().ordinal();
+        key = key * 31 + submit.lightCoords();
+        key = key * 31 + submit.overlayCoords();
+        key = key * 31 + submit.outlineColor();
+
+        final int[] tint = submit.tintLayers();
+        key = key * 31 + (tint == null ? 0 : java.util.Arrays.hashCode(tint));
+
+        final java.util.List<?> quads = submit.quads();
+        key = key * 31 + (quads == null ? 0 : quads.size());
+        // 列表本身若每帧新建，identity 会变 ⇒ 命中率会掉到 0，届时改按元素哈希
+        key = key * 31 + (quads == null ? 0 : System.identityHashCode(quads));
+        key = key * 31 + submit.foilType().ordinal();
+
+        ++itemKeyTotal;
+        itemKeysThisWindow.add(key);
+        if (!itemKeyCache.add(key)) {
+            ++itemKeyHits;
+        }
+    }
+
+    public static long takeItemKeyTotal() {
+        final long v = itemKeyTotal;
+        itemKeyTotal = 0L;
+        return v;
+    }
+
+    public static long takeItemKeyHits() {
+        final long v = itemKeyHits;
+        itemKeyHits = 0L;
+        return v;
+    }
+
+    public static long takeItemKeyDistinct() {
+        final long v = itemKeysThisWindow.size();
+        itemKeysThisWindow.clear();
+        if (itemKeyCache.size() > 200_000) {
+            itemKeyCache.clear();
+        }
+        return v;
+    }
+
+    // ── 2026-11-11：缓存粒度探针。getVertexBuilder 每帧 65 万次，要看这 65 万次
+    //    到底散落在多少个 RenderType / 多少个 group consumer 上 —— 决定缓存按什么粒度做。
+    private static long vbCalls;
+    private static final java.util.HashSet<Long> vbRenderTypes = new java.util.HashSet<>();
+    private static final java.util.HashSet<Long> vbConsumers = new java.util.HashSet<>();
+
+    public static void noteVertexBuilder(final Object renderType, final Object consumer) {
+        if (!LevelPhaseProbe.enabled()) {
+            return;
+        }
+        ++vbCalls;
+        if (renderType != null) {
+            vbRenderTypes.add((long) System.identityHashCode(renderType));
+        }
+        if (consumer != null) {
+            vbConsumers.add((long) System.identityHashCode(consumer));
+        }
+    }
+
+    public static long takeVbCalls() {
+        final long v = vbCalls;
+        vbCalls = 0L;
+        return v;
+    }
+
+    public static long takeVbRenderTypes() {
+        final long v = vbRenderTypes.size();
+        vbRenderTypes.clear();
+        return v;
+    }
+
+    public static long takeVbConsumers() {
+        final long v = vbConsumers.size();
+        vbConsumers.clear();
+        return v;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2026-11-11：**group 级几何缓存（第一阶段）**
+    //
+    // 依据（§12.12.2 实测）：一帧 64 万次 getVertexBuilder 只落在 25 个 group 上，
+    // 每 group 约 2.5 万次 ⇒ 缓存的正确粒度是 group，不是 submit / renderType。
+    //
+    // 做法：在 RenderTypeFeatureRenderer.prepareGroup 的 HEAD 用
+    // (submit 列表 identity, size) 做键。
+    //   · 命中 ⇒ 本组不跑逐顶点转换（captureVertex 直接返回），
+    //            flush 前把上一帧捕获的顶点块整块灌回批次；
+    //   · 未命中 ⇒ 正常转换，flush 前把本组顶点块拷进缓存。
+    //
+    // 安全阀（错了会缺几何/串贴图，全部走"废掉该键 + 本帧不复用"，下一帧自动回到未命中）：
+    //   · 只在 ItemFeatureRenderer 的 group 上启用；
+    //   · 只缓存 uvMapping==null 且非 projectiveUv 的批次（否则 UV 语义不止是顶点数据）；
+    //   · 回放前校验 textureSlot 一致、缓冲容量足够。
+    //
+    // 开关：ORION_ITEM_CACHE=1（默认关）。
+    // ═══════════════════════════════════════════════════════════════════
+    private static final boolean GROUP_CACHE_ENABLED =
+            "1".equals(System.getenv("ORION_ITEM_CACHE"));
+
+    private static final java.util.HashMap<Long, GroupGeom> groupCache =
+            new java.util.HashMap<>();
+
+    /**
+     * 缓存硬上限。一个 group 可能是十几万顶点 × 48 B ≈ 数 MB，
+     * 若键不稳定（submit 列表每帧新建 ⇒ identity 变）会**无界增长**：
+     * 2026-11-11 第一版就这样把堆打爆了（{@code OutOfMemoryError: Java heap space}）。
+     */
+    private static final long GROUP_CACHE_MAX_BYTES = 256L << 20;
+    private static final int GROUP_CACHE_MAX_ENTRIES = 96;
+
+    private static long groupCacheBytes;
+
+    private static long pendingGroupKey;
+    private static GroupGeom pendingGroupEntry;
+    private static boolean skipGroupCapture;
+    private static long groupCacheHits;
+    private static long groupCacheMisses;
+    private static long groupCacheInvalidated;
+
+    private static final class GroupGeom {
+        /**
+         * 贴图标识（不是槽位号）。槽位会被 {@code slotFor} 的 LRU 重排，
+         * 所以命中时要用它重新取一次槽位，不能直接复用旧槽号。
+         */
+        net.minecraft.resources.Identifier texture;
+        int textureSlot;
+        int vertexCount;
+        byte[] bytes;
+    }
+
+    /**
+     * 命中后自建批次回放（第二阶段）。
+     *
+     * <p>命中时会 cancel 掉原版 {@code prepareGroup}，于是 vanilla 不再调
+     * {@code getVertexBuilder}、不会开批次 ⇒ 必须自己 {@code acquireBatch} 一个。
+     *
+     * @return true = 已回放并上传完毕（调用方应 cancel 原版方法）
+     */
+    private static boolean replayStandalone(final GroupGeom entry) {
+        final int bytes = entry.vertexCount * BYTES_PER_VERTEX;
+        if (bytes <= 0 || entry.texture == null) {
+            return false;
+        }
+
+        // 重新解析槽位：既保证贴图还在，也顺手更新 lastSeen（防止 LRU 把我们淘汰）
+        final int slot = slotFor(entry.texture);
+        if (slot <= 0) {
+            return false;
+        }
+
+        final ActiveBatch batch = acquireBatch(slot, false, false);
+        if (batch.buffer.capacity() < bytes) {
+            return false;
+        }
+
+        // 缓存里已经是最终顶点字节（共面偏移等都已应用），不要再走 emit
+        batch.coplanarLayering = false;
+        batch.buffer.clear();
+        batch.buffer.put(entry.bytes, 0, bytes);
+        batch.vertexCount = entry.vertexCount;
+
+        activeBatch.set(batch);
+        try {
+            endModel();          // → uploadBatch → NativeVulkan.uploadEntityBatch
+        } finally {
+            activeBatch.remove();
+        }
+        return true;
+    }
+
+    /**
+     * 为物品 group 的 submit 列表算一个**语义**键。
+     *
+     * <p>不能用 {@code List.hashCode()}：{@code ItemFeatureRenderer.Submit} 虽是 record，
+     * 但 {@code pose}（{@code PoseStack.Pose}）、{@code tintLayers}（{@code int[]}）、
+     * {@code quads}（{@code List}）走的都是 identity 哈希 ⇒ 每帧都变（实测命中 0/142）。
+     *
+     * <p>这里只混入**真正决定几何**的量：pose 矩阵分量（JOML 的 hashCode 是数值的）、
+     * displayContext、light/overlay/outline、tint 内容、quad 数量与首个 BakedQuad 的
+     * identity（BakedQuad 来自模型，跨帧稳定），外加 foil。
+     *
+     * @return 0 表示不可缓存（列表为空或元素类型不符）。
+     */
+    public static long itemGroupKey(final java.util.List<?> submits) {
+        if (submits == null || submits.isEmpty()) {
+            return 0L;
+        }
+
+        noteItemSubmitCount(submits.size());
+
+        long key = 0xcbf29ce484222325L;
+        for (int i = 0; i < submits.size(); ++i) {
+            final Object raw = submits.get(i);
+            if (!(raw instanceof ItemFeatureRenderer.Submit submit)) {
+                return 0L;
+            }
+
+            long h = 1125899906842597L;
+            final com.mojang.blaze3d.vertex.PoseStack.Pose pose = submit.pose();
+            final org.joml.Matrix4f matrix = pose == null ? null : pose.pose();
+            h = h * 31 + (matrix == null ? 0 : matrix.hashCode());
+
+            // 第 0 步探针：平移分量去重 ⇒ 有多少个**不同位置**
+            if (LevelPhaseProbe.enabled() && matrix != null) {
+                long t = (long) Float.floatToIntBits(matrix.m30()) * 31L
+                        + Float.floatToIntBits(matrix.m31());
+                t = t * 31L + Float.floatToIntBits(matrix.m32());
+                itemPoseSet.add(t);
+            }
+            h = h * 31 + submit.displayContext().ordinal();
+            h = h * 31 + submit.lightCoords();
+            h = h * 31 + submit.overlayCoords();
+            h = h * 31 + submit.outlineColor();
+
+            final int[] tint = submit.tintLayers();
+            h = h * 31 + (tint == null ? 0 : java.util.Arrays.hashCode(tint));
+
+            final java.util.List<?> quads = submit.quads();
+            final int quadCount = quads == null ? 0 : quads.size();
+            h = h * 31 + quadCount;
+            // BakedQuad 是模型的稳定对象；取首个 identity + 数量即可区分不同物品
+            final int modelHash = quadCount == 0 ? 0 : System.identityHashCode(quads.get(0));
+            h = h * 31 + modelHash;
+
+            // 第 0 步探针：模型种类去重 ⇒ 有多少种**不同的模型数据**
+            if (LevelPhaseProbe.enabled()) {
+                itemModelSet.add((long) modelHash * 31L + quadCount);
+            }
+
+            h = h * 31 + submit.foilType().ordinal();
+
+            key = (key ^ h) * 0x100000001b3L;
+        }
+        return key;
+    }
+
+    /**
+     * {@code prepareGroup} HEAD：命中则**当场回放并返回 true**（调用方要 cancel 原版），
+     * 未命中返回 false（正常转换，等 RETURN 时登记）。
+     */
+    public static boolean beginGroup(final long key) {
+        if (!GROUP_CACHE_ENABLED) {
+            skipGroupCapture = false;
+            pendingGroupEntry = null;
+            return false;
+        }
+
+        pendingGroupKey = key;
+        pendingGroupEntry = null;
+        skipGroupCapture = false;
+
+        final GroupGeom entry = groupCache.get(key);
+        if (entry == null) {
+            ++groupCacheMisses;
+            return false;
+        }
+
+        if (replayStandalone(entry)) {
+            ++groupCacheHits;
+            return true;
+        }
+
+        // 回放失败（贴图没了 / 容量不够）⇒ 废掉这个键，本帧回落到正常路径
+        groupCache.remove(key);
+        groupCacheBytes -= (long) entry.vertexCount * BYTES_PER_VERTEX;
+        ++groupCacheInvalidated;
+        return false;
+    }
+
+    /**
+     * {@code prepareGroup} RETURN：回放或登记本组顶点块，然后照常 flush。
+     * 替代原来的 {@code endCustomGroup()}（后者只做 flush）。
+     */
+    public static void finishGroup() {
+        if (GROUP_CACHE_ENABLED) {
+            final ActiveBatch batch = ActiveBatchSlot.current != null
+                    ? ActiveBatchSlot.current
+                    : activeBatch.get();
+
+            if (batch != null && batch.uvMapping == null && !batch.projectiveUv
+                    && batch.vertexCount > 0
+                    && batch.buffer.capacity() >= batch.vertexCount * BYTES_PER_VERTEX) {
+                final int bytes = batch.vertexCount * BYTES_PER_VERTEX;
+
+                // 单个 group 超过 8 MB 就不进缓存（否则一进来就顶满）。
+                // ⚠ 这里绝对不能 return —— 后面还有 endCustomGroup()，提前返回会把
+                //    整个批次吞掉（批次不 flush ⇒ 本帧几何丢失且批次悬挂）。
+                final boolean cacheable = bytes <= (8 << 20);
+
+                while (cacheable && (groupCacheBytes + bytes > GROUP_CACHE_MAX_BYTES
+                        || groupCache.size() >= GROUP_CACHE_MAX_ENTRIES)) {
+                    if (groupCache.isEmpty()) {
+                        break;
+                    }
+                    // 键不稳定时这是唯一的止血手段（否则无界增长 → OOM）
+                    groupCache.clear();
+                    groupCacheBytes = 0L;
+                }
+
+                final net.minecraft.resources.Identifier texture = customRenderType == null
+                        ? null
+                        : resolveSampler0(customRenderType);
+
+                if (cacheable && texture != null) {
+                    final GroupGeom entry = new GroupGeom();
+                    entry.texture = texture;
+                    entry.textureSlot = batch.textureSlot;
+                    entry.vertexCount = batch.vertexCount;
+                    entry.bytes = new byte[bytes];
+                    final java.nio.ByteBuffer view = batch.buffer.duplicate();
+                    view.clear();
+                    view.get(entry.bytes, 0, bytes);
+
+                    final GroupGeom old = groupCache.put(pendingGroupKey, entry);
+                    if (old != null) {
+                        groupCacheBytes -= (long) old.vertexCount * BYTES_PER_VERTEX;
+                    }
+                    groupCacheBytes += bytes;
+                }
+            }
+
+            pendingGroupEntry = null;
+            skipGroupCapture = false;
+        }
+        endCustomGroup();
+    }
+
+    /**
+     * 2026-11-12：本窗口内物品 group 里**实际有多少个 Submit 对象**（= 多少件东西）。
+     *
+     * <p>这个数决定方向：
+     * <ul>
+     *   <li>若 ≈ 数千件 × 每件一两百 quad ⇒ 是"东西本来就多"，只能靠 instancing / LOD；</li>
+     *   <li>若只有几十件却有几十万 quad ⇒ 是"同一件被重复提交"，那才是 bug，得去查提交侧。</li>
+     * </ul>
+     */
+    private static long itemSubmitObjects;
+
+    public static void noteItemSubmitCount(final int count) {
+        if (LevelPhaseProbe.enabled() && count > 0) {
+            itemSubmitObjects += count;
+        }
+    }
+
+    public static long takeItemSubmitObjects() {
+        final long v = itemSubmitObjects;
+        itemSubmitObjects = 0L;
+        return v;
+    }
+
+    // ── 2026-11-12 第 0 步：实例化是否有意义 ──
+    // 需要区分两种可能：
+    //   a) 250 件物品在 250 个不同位置、只有 4 种模型 ⇒ 实例化收益最大（1 模型 1 BLAS + N 实例）
+    //   b) 它们其实集中在少数几个位置 ⇒ 实例化没意义，应放弃这条路线
+    private static final java.util.HashSet<Long> itemPoseSet = new java.util.HashSet<>();
+    private static final java.util.HashSet<Long> itemModelSet = new java.util.HashSet<>();
+
+    public static long takeItemPoseDistinct() {
+        final long v = itemPoseSet.size();
+        itemPoseSet.clear();
+        return v;
+    }
+
+    public static long takeItemModelDistinct() {
+        final long v = itemModelSet.size();
+        itemModelSet.clear();
+        return v;
+    }
+
+    public static long takeGroupCacheHits() {
+        final long v = groupCacheHits;
+        groupCacheHits = 0L;
+        return v;
+    }
+
+    public static long takeGroupCacheMisses() {
+        final long v = groupCacheMisses;
+        groupCacheMisses = 0L;
+        return v;
+    }
+
+    public static long takeGroupCacheInvalidated() {
+        final long v = groupCacheInvalidated;
+        groupCacheInvalidated = 0L;
+        return v;
+    }
+
     private static int slotFor(Identifier texture) {
         if (texture == null) return 0;
+
+        final int cached = lastSlotForIndex;
+        if (cached >= 0 && cached < frameTextureSlotCount
+                && texture.equals(frameTextureSlots[cached])) {
+            slotLastSeenFrame[cached] = captureFrameSerial;
+            assignTextureClass(cached, texture);
+            if (!slotTexturePublished[cached]) {
+                publishTexture(cached + 1, texture);
+            }
+            if (!entityPbrSettled[cached]) {
+                publishEntityPbrTexture(cached + 1, texture);
+            }
+            return cached + 1;
+        }
+
         for (int index = 0; index < frameTextureSlotCount; ++index) {
             if (texture.equals(frameTextureSlots[index])) {
                 slotLastSeenFrame[index] = captureFrameSerial;
@@ -1768,6 +2487,7 @@ public final class EntityRtCapture {
                 if (!entityPbrSettled[index]) {
                     publishEntityPbrTexture(index + 1, texture);
                 }
+                lastSlotForIndex = index;
                 return index + 1;
             }
         }
@@ -1806,6 +2526,7 @@ public final class EntityRtCapture {
         if (victim == frameTextureSlotCount) ++frameTextureSlotCount;
         entityPbrSettled[victim] = false;
         publishTexture(victim + 1, texture);
+        lastSlotForIndex = victim;
         return victim + 1;
     }
 
@@ -2047,6 +2768,10 @@ public final class EntityRtCapture {
 
     /** 由 {@code RenderTypeFeatureRendererMixin} 在 getVertexBuilder 返回时调用。 */
     public static void beginCustomSubmit(RenderType renderType) {
+        if (!CAPTURE_ENABLED) {
+            return;
+        }
+        ++genericSubmitCount;
         if (activeBatch.get() != null) {
             return;
         }
@@ -2084,9 +2809,13 @@ public final class EntityRtCapture {
         ActiveBatch customBatch = acquireBatch(textureSlot, false,
                 endPortal || isEmissiveGeometry(texture));
         customBatch.projectiveUv = endPortal;
-        // 2026-11-04：旗帜图案层沿法线外移固定两步（理由见 beginModel 处）。
-        customBatch.coplanarLayerBoost = isBannerPattern(renderType) ? 2 : 0;
-        // 2026-11-04：旗帜图案层整体外移一个 rank（见 bannerLayerBoost）。
+        // 2026-11-15：地图（含物品展示框里的地图）与装饰图标走短格式 addVertex(FFF)，
+        // 必须显式打开短路径捕获，见 beginShortVertex。判据用贴图路径而不是 RenderType
+        // 名字：地图是动态贴图 minecraft:map/<id>，装饰是 map_decorations 图集。
+        customBatch.positionOnlyCapture = isMapGeometry(texture);
+        if (customBatch.positionOnlyCapture) {
+            customDiagLog("map_short", typeName, texture);
+        }
         // 2026-11-03 诊断：第一人称下这条 custom 路径就是"手持物品"（RenderTypeFeatureRendererMixin
         // 的注释第 28 行：Item → 物品展示框里的物品、掉落物、第一人称手持物品）。
         // 打上标记后 uploadBatch 会顺带打印它的 vertexCount 与 UV 范围。
@@ -2103,6 +2832,9 @@ public final class EntityRtCapture {
 
     /** 由 {@code RenderTypeFeatureRendererMixin} 在 prepareGroup 收尾时调用。 */
     public static void endCustomGroup() {
+        if (!CAPTURE_ENABLED) {
+            return;
+        }
         flushCustomBatch();
     }
 
@@ -2151,6 +2883,22 @@ public final class EntityRtCapture {
         return typeName != null && typeName.contains("screen_effect");
     }
 
+    /**
+     * 2026-11-15：这批 custom 几何是不是地图（地图本体或装饰图标）。
+     *
+     * <p>地图贴图是 {@code minecraft:map/<id>}（{@code MapTextureManager} 直接把
+     * {@code Identifier} 注册成动态贴图，路径里没有 {@code textures/} 前缀）；装饰图标
+     * 来自 {@code textures/atlas/map_decorations.png}。两者都用短格式写顶点，见
+     * {@link #beginShortVertex}。
+     */
+    private static boolean isMapGeometry(Identifier texture) {
+        if (texture == null) {
+            return false;
+        }
+        final String path = texture.getPath();
+        return path.startsWith("map/") || path.contains("map_decorations");
+    }
+
     /** RenderType 的构造名（26.3 字段 {@code name}，经 {@code RenderTypeAccessor} 读）。 */
     private static String renderTypeName(RenderType renderType) {
         return ((RenderTypeAccessor) (Object) renderType).rtx$getName();
@@ -2186,18 +2934,6 @@ public final class EntityRtCapture {
      * 看 RenderPipeline 的 location。命中后本批次整体外移一个 rank
      * （见 {@link ActiveBatch#coplanarLayerBoost}）。</p>
      */
-    /**
-     * 2026-11-04：这批几何是不是旗帜（底布或图案层）。
-     *
-     * <p>旗帜的 6 个 quad 是"3 个方向 × 正反两面"，**正反两面顶点位置完全相同**，
-     * 于是 {@code applyCoplanarLayerOffset} 的质心键必然重复、会把正反两面互相推开，
-     * 每帧都在破坏几何（实测 coplanarHits 累计到十万级）。所以对旗帜整批禁用该机制，
-     * 层序交给 alpha cutout 的 any-hit 穿透（图案的透明纹素被丢弃后自然落到下层）。</p>
-     */
-    private static boolean isBannerTexture(Identifier texture) {
-        return texture != null && texture.getPath().contains("banner");
-    }
-
     private static boolean isBannerPattern(RenderType renderType) {
         if (renderType == null) {
             return false;
@@ -2214,24 +2950,43 @@ public final class EntityRtCapture {
     }
 
     /**
-     * 2026-11-04：旗帜图案层的层序提升量。
+     * 2026-11-15：还原原版 order 的层序（对应 Caustica 的 {@code pendingOrder + 1}）。
      *
-     * <p>两条判据取或：</p>
-     * <ol>
-     *   <li>{@link #isBannerPattern}：看 RenderPipeline 的 location（与 Caustica 同口径）；</li>
-     *   <li><b>纹理名兜底</b>：{@code banner_patterns.png}。实测日志里图案层就是这个纹理，
-     *       而 pipeline 的 location 字符串一旦命名不同，第一条会静默返回 false ⇒
-     *       boost 恒 0 ⇒ 图案层与底布完全重合 ⇒ BVH 随机挑，图案时有时无。</li>
-     * </ol>
-     * <p>底布走的是方块图集里的白布（不同纹理槽），这里不动它，所以相对偏移正好一层。</p>
+     * <p>26.3 的 order 已经不再是"提交时的一个字段"，而是按 order 值分桶成多个
+     * {@code SubmitNodeCollection}，feature 阶段拿不到单个 submit 的 order。好在同一面
+     * 旗帜的底色层与每个图案层共用**同一个 PoseStack.Pose**（BannerRenderer#submitPatterns
+     * 中间没有 push/pop），且按 order 升序处理，所以用"同一 Pose 第几次 banner_pattern
+     * 提交"即可还原：底色层 = 1，第 i 层图案 = i + 2。底布不是 banner_pattern，rank = 0。</p>
+     *
+     * <p>返回 1 起步而不是 0：底布 rank 0 已经占掉"贴着模型"的那一层，图案层必须逐层外移
+     * 一个 STEP，否则底色层会和底布重新共面。</p>
      */
-    // 2026-11-04：旗帜层序的多次尝试（固定 rank、按质心分组、全局递增）**全部无效**，
-    // 相关代码已删除，回到共面层序的原始实现（applyCoplanarLayerOffset 只用提交顺序）。
-    // 结论记录：问题不在"层序 rank"这一层，需要先拿到以下事实再动手 ——
-    //   · 同一面旗帜的底布与图案层，各自批次的 vertexCount / quad 数
-    //   · applyCoplanarLayerOffset 在那两个批次里是否真的被调用（duplicates 是否 > 0）
-    //   · 图案层相对底布的偏移方向（几何法线朝向是否与"朝观察者"一致）
-    // 这三个只要有一个不成立，"沿法线外移"就永远推不出去。
+    private static int nextBannerLayerRank(final PoseStack.Pose pose) {
+        final Matrix4f matrix = pose == null ? null : pose.pose();
+        long hash = 0xcbf29ce484222325L;
+        if (matrix != null) {
+            hash = hash * 31L + Float.floatToIntBits(matrix.m00());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m01());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m02());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m03());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m10());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m11());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m12());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m13());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m20());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m21());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m22());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m23());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m30());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m31());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m32());
+            hash = hash * 31L + Float.floatToIntBits(matrix.m33());
+        }
+        final Integer previous = bannerPatternLayerRanks.get(hash);
+        final int rank = previous == null ? 0 : previous;
+        bannerPatternLayerRanks.put(hash, rank + 1);
+        return rank + 1;
+    }
 
     private static Identifier resolveSampler(RenderType renderType, String samplerName) {
         RenderSetup setup = ((RenderTypeAccessor) (Object) renderType).rtx$getState();
@@ -2253,9 +3008,8 @@ public final class EntityRtCapture {
         // 2026-11-03 诊断：这批是不是第一人称手部（state=Unit）。每次 beginModel 重设，
         // 不需要在 reset() 里清（避免漏一条路径就串味）。
         private boolean diagHand;
-        // 2026-11-04：旗帜图案层的额外层序偏移。
-        // ⚠ 多次尝试（固定 rank / 按质心分组 / 全局递增）全部无效，现恒为 0。
-        // 保留字段只为将来有证据后再启用。
+        // 2026-11-15：旗帜图案层的层序（1 = 底色层，2.. = 图案层；底布为 0）。
+        // 由 nextBannerLayerRank 按"同一 Pose 的提交次数"给出，见 beginModel。
         private int coplanarLayerBoost;
         // 2026-11-04 诊断：本批次里 applyCoplanarLayerOffset 真正命中重复质心的次数。
         // 0 ⇒ 共面判定从未触发（那才是旗帜修不好的根因）；>0 ⇒ 偏移发生了但没起作用（方向问题）。
@@ -2269,6 +3023,10 @@ public final class EntityRtCapture {
         
 
         private boolean projectiveUv;
+        // 2026-11-15：允许从短格式 addVertex(FFF)/setColor/setUv 收顶点。
+        // 只对地图（含物品展示框里的地图）打开：其它短格式几何顶点数无上界，
+        // 全量捕获曾把驱动打崩（见 beginShortVertex 的说明）。
+        private boolean positionOnlyCapture;
         private float minX = Float.MAX_VALUE;
         private float minY = Float.MAX_VALUE;
         private float minZ = Float.MAX_VALUE;
@@ -2300,6 +3058,7 @@ public final class EntityRtCapture {
             this.localPlayerProxy = localPlayerProxy;
             this.emissive = emissive;
             this.projectiveUv = false;
+            this.positionOnlyCapture = false;
             this.coplanarLayering = false;
             this.coplanarHits = 0;
             this.minX = this.minY = this.minZ = Float.MAX_VALUE;
@@ -2431,12 +3190,15 @@ public final class EntityRtCapture {
                 ++coplanarHits;
             }
 
-            // 2026-11-04：rank = 提交顺序 + 旗帜图案层的提升量。
-            // 提升量由 bannerLayerBoost 给出（本帧第几个 banner 图案层）。
-            // 注意：多面旗帜会共享这个计数器而累加，所以 ENTITY_COPLANAR_LAYER_MAX
-            // 必须够大 —— 0.02 在 rank ≥ 10 时会把各层压到同一点（实测 14 层），
-            // 表现为"前几面旗帜正确、后面全错"。
-            final int rank = seenBefore + coplanarLayerBoost;
+            // 2026-11-15：rank 的两种来源。
+            //   · 旗帜图案层（coplanarLayerBoost > 0）：整批统一用该层的 order 序号，
+            //     不再叠加本批内的 seenBefore —— 原版一个 submit 只有一个 order，
+            //     同层的正反两面本就该在同一深度；若把背面再推一步，会正好撞上
+            //     下一层图案的正面。rank = 1 是底色层，2.. 是图案层，层间距
+            //     ENTITY_COPLANAR_LAYER_STEP = 2e-4（与 Caustica 的 ORDER_OFFSET 一致），
+            //     ENTITY_COPLANAR_LAYER_MAX = 0.02 对应 100 层，远大于原版 20 层上限。
+            //   · 其余几何：沿用"同批次内质心重复次数"，先画的不动、后画的依次前移。
+            final int rank = coplanarLayerBoost > 0 ? coplanarLayerBoost : seenBefore;
             if (rank == 0 || length < 1.0e-6f) {
                 return;
             }

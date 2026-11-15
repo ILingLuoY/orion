@@ -938,6 +938,34 @@ bool SetCurrentPCLMarker(
         );
 
 
+    // 2026-11-15：标记时序探针。Reflex 限帧器每帧白睡 2.6~4.6ms（预算 4.17ms
+    // 而实际帧 10ms），怀疑"标记落错帧/错线程"⇒ Reflex 算错剩余预算。
+    // 每 60 帧打一组：marker / 帧号 / 线程 —— 用来核对 Simulation→Submit→Present
+    // 的顺序与归属是否一致。只读，不改行为。
+    {
+        static std::atomic<uint32_t> s_pclMarkLogBudget{0u};
+
+        const uint32_t frameForLog =
+            static_cast<uint32_t>(g_currentSLFrameIndex);
+
+        if((frameForLog % 60u) == 0u)
+        {
+            DWORD tid = 0u;
+#ifdef _WIN32
+            tid = GetCurrentThreadId();
+#endif
+            RTLogFlushed(
+                "[PCL MARK] marker=" + std::to_string(
+                    static_cast<unsigned int>(marker)) +
+                " frame=" + std::to_string(frameForLog) +
+                " tid=" + std::to_string(static_cast<unsigned long>(tid)) +
+                " result=" + std::to_string(static_cast<int>(result)));
+        }
+
+        (void)s_pclMarkLogBudget;
+    }
+
+
     if(result != sl::Result::eOk)
     {
         fprintf(
@@ -1251,11 +1279,23 @@ bool BeginStreamlineFrame()
         nullptr;
 
 
+    // 2026-11-14：分离 GetNewFrameToken 与 ReflexSleep 的耗时。实测
+    // [FRAME JNI HEAD] beginStreamlineMs 稳定 5.2~5.9ms/帧（≈frameLimitUs
+    // 6060us），吃掉总帧时 1/3；这里把两次调用分别计时，确认是取令牌阻塞
+    // 还是 Reflex 限帧器在睡（或等围栏）。
+    const std::chrono::steady_clock::time_point slTokenStart =
+        std::chrono::steady_clock::now();
+
     sl::Result tokenResult =
         g_slGetNewFrameToken(
             frameToken,
             &frameIndex
         );
+
+    const double slTokenMs =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - slTokenStart
+        ).count();
 
 
     if(tokenResult != sl::Result::eOk ||
@@ -1293,10 +1333,59 @@ bool BeginStreamlineFrame()
         true;
 
 
+    const std::chrono::steady_clock::time_point slSleepStart =
+        std::chrono::steady_clock::now();
+
     sl::Result sleepResult =
         g_slReflexSleep(
             *g_currentSLFrameToken
         );
+
+    const double slSleepMs =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - slSleepStart
+        ).count();
+
+    // 每 60 帧一条：tokenMs = 取帧令牌；sleepMs = Reflex 限帧器/围栏等待。
+    {
+        static uint64_t slSplitFrames = 0u;
+        static double slSplitTokenSumMs = 0.0;
+        static double slSplitSleepSumMs = 0.0;
+        static double slSplitTokenMaxMs = 0.0;
+        static double slSplitSleepMaxMs = 0.0;
+
+        ++slSplitFrames;
+        slSplitTokenSumMs += slTokenMs;
+        slSplitSleepSumMs += slSleepMs;
+
+        if(slTokenMs > slSplitTokenMaxMs) { slSplitTokenMaxMs = slTokenMs; }
+        if(slSleepMs > slSplitSleepMaxMs) { slSplitSleepMaxMs = slSleepMs; }
+
+        if((slSplitFrames % 60u) == 0u)
+        {
+            RTLogFlushed(
+                "[SL FRAME SPLIT] n=" + std::to_string(slSplitFrames) +
+                " tokenAvgMs=" + std::to_string(slSplitTokenSumMs / 60.0) +
+                " tokenMaxMs=" + std::to_string(slSplitTokenMaxMs) +
+                " sleepAvgMs=" + std::to_string(slSplitSleepSumMs / 60.0) +
+                " sleepMaxMs=" + std::to_string(slSplitSleepMaxMs) +
+                " frameLimitUs=" + std::to_string(
+                    ResolveFgBaseFrameLimitHz() == 0u
+                        ? 0u
+                        : static_cast<uint32_t>(
+                              1000000.0 /
+                              static_cast<double>(ResolveFgBaseFrameLimitHz())
+                          )
+                ) +
+                " limitHz=" + std::to_string(ResolveFgBaseFrameLimitHz())
+            );
+
+            slSplitTokenSumMs = 0.0;
+            slSplitSleepSumMs = 0.0;
+            slSplitTokenMaxMs = 0.0;
+            slSplitSleepMaxMs = 0.0;
+        }
+    }
 
 
     if(sleepResult != sl::Result::eOk)

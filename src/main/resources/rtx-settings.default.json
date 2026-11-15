@@ -248,7 +248,6 @@
   "slDevPlugins": false,
   "entityArmorMetal": true,
   "cloudFadeFollowsRrMode": false,
-  "cloudPostRrComposite": false,
   "cloudResFloorPercent": 0,
   "cloudFarStepDensity": 0.28,
   "giRoulette": 1,

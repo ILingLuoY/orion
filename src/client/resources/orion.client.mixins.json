@@ -13,6 +13,17 @@
 		"VulkanRenderPassAccessor",
 		"SpriteContentsAccessor",
 		"LevelRendererMixin",
+		"ChunkSectionsToRenderMixin",
+		"ChunkSectionsDrawIndirectMixin",
+		"ChunkSectionsDrawSeparateMixin",
+		"FeaturePreparedFrameTakeoverMixin",
+		"FeatureRenderDispatcherProbeMixin",
+		"ItemFeatureRendererSubmitMixin",
+		"ItemFeatureRendererMixin",
+		"RenderTypeGroupProbeMixin",
+		"SubmitNodeStoragePhaseMixin",
+		"StagedVertexBufferPhaseMixin",
+		"PreparedGroupPhaseMixin",
 		"WeatherEffectRendererMixin",
 		"CameraFovMixin",
 		"SectionCompilerMixin",
@@ -59,7 +70,13 @@
 		"EntityRenderStateMixin",
 		"EntityRenderDispatcherMixin",
 		"SoundManagerMixin",
-		"MouseHandlerMixin"
+		"MouseHandlerMixin",
+		"MultiPlayerGameModeProbeMixin",
+		"ClientPacketListenerProbeMixin",
+		"SectionRenderDispatcherProbeMixin",
+		"LevelExtractorProbeMixin",
+		"SectionUpdateRenderStateProbeMixin",
+		"ClientLevelProbeMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

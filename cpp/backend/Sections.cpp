@@ -1750,8 +1750,27 @@ void destroySectionMemoryPool()
 
 
 // 剔除了提交逻辑，仅完成内存分配与 AS 对象句柄创建
-void destroySectionAS(RTSectionAS& section)
+static void destroySectionASImmediate(RTSectionAS& section)
 {
+    // 2026-11-14：A/B 开关 —— 只记录不真释放（会泄漏，仅供实验）。
+    // 目的：如果「永不释放」能消除 5s 信号量超时，就确认崩溃是
+    // 「释放了 GPU 仍在使用的 section 显存」，否则彻底排除这条方向。
+    static const bool s_noSectionFree = []
+    {
+        const char* raw = std::getenv("ORION_NO_SECTION_FREE");
+
+        return raw != nullptr && raw[0] == '1';
+    }();
+
+    if(s_noSectionFree)
+    {
+        rtGpuFreedRangeNote(
+            section.blasAddress, section.blasBytes, "sectionBLAS(skipped)");
+
+        section = {};
+        return;
+    }
+
     auto destroyAS =
         getDestroyAccelerationStructure();
 
@@ -1789,6 +1808,16 @@ void destroySectionAS(RTSectionAS& section)
     }
 
 
+    // 2026-11-14：释放前记录地址，供卡死看门狗回放（见 OrionInternal.h）。
+    rtGpuFreedRangeNote(section.vertexAddress, section.vertexBytes, "sectionVB");
+    rtGpuFreedRangeNote(section.blasAddress, section.blasBytes, "sectionBLAS");
+    rtGpuFreedRangeNote(
+        section.ommDataAddress, 0u, "ommData");
+    rtGpuFreedRangeNote(
+        section.ommTriangleAddress, 0u, "ommTriangle");
+    rtGpuFreedRangeNote(
+        section.ommScratchAddress, 0u, "ommScratch");
+
     if(section.vertexBuffer != VK_NULL_HANDLE)
     {
         vkDestroyBuffer(
@@ -1816,6 +1845,126 @@ void destroySectionAS(RTSectionAS& section)
 }
 
 
+// =====================================================
+// 2026-11-14：Section AS 延迟释放（崩溃修复）。
+//
+// 症状：进世界 20~30 分钟后随机崩，5s VK semaphore 超时，pass 名为
+// "Item in hand"（同样位置已发生 5 次）。含义是 GPU 提交后 5s 未完成 ⇒
+// 挂死，最典型的原因就是提交里引用了**已被释放**的 AS / micromap 显存。
+//
+// 本工程的退休槽系统（retireSectionAS + releaseRetirementSlot）是有围栏
+// 证明的，但 destroySectionAS 是即时释放。只要有一条路径在 GPU 未完成时
+// 走到即时销毁，就会产生上述挂死。这里把「无法证明 GPU 已完成」的销毁
+// 一律挂到延迟表，等退休槽围栏 signal（证明队列已推进）后再真正释放：
+//   · flushPendingSectionDestroys(false)：仅在本次 reap 至少释放了一个槽
+//     （围栏 signal ⇒ 该提交之前的所有工作都已完成）且条目已过 2 帧时释放；
+//   · flushPendingSectionDestroys(true)：队列已知 idle 时无条件释放。
+// 表上限 512，超出即强制 vkQueueWaitIdle 后整批释放（有界、不会无限挂）。
+// 诊断：每 60 帧打一行 [RT RETIRE]，出现即说明打断了即时释放。
+// =====================================================
+namespace
+{
+    struct PendingSectionDestroy
+    {
+        RTSectionAS section;
+        uint64_t frameSerial = 0u;
+    };
+
+    std::vector<PendingSectionDestroy> g_pendingSectionDestroy;
+    uint64_t g_pendingSectionDestroyDeferred = 0u;
+    uint64_t g_pendingSectionDestroyFlushed = 0u;
+
+    bool pendingSectionDestroyHasGpuResources(const RTSectionAS& section)
+    {
+        return section.blas != VK_NULL_HANDLE ||
+               section.blasBuffer != VK_NULL_HANDLE ||
+               section.vertexBuffer != VK_NULL_HANDLE ||
+               section.opacityMicromap != VK_NULL_HANDLE ||
+               section.hasSectionMemoryChunk;
+    }
+
+    void flushPendingSectionDestroys(bool force)
+    {
+        if(g_pendingSectionDestroy.empty())
+        {
+            return;
+        }
+
+        const uint64_t nowSerial = g_perfL10FrameSerial;
+        size_t writeIndex = 0u;
+        uint64_t flushed = 0u;
+
+        for(size_t i = 0u; i < g_pendingSectionDestroy.size(); ++i)
+        {
+            PendingSectionDestroy& entry = g_pendingSectionDestroy[i];
+
+            // 2 帧余量：条目最早在 2 帧前的提交里被引用，而 force=false 的
+            // 调用点在「退休槽围栏已 signal」之后 ⇒ 那次提交已完成。
+            // 2026-11-14：2 → 3 帧，与退休槽的 kRetirementMinFrameAge 对齐。
+            const bool oldEnough =
+                nowSerial >= entry.frameSerial + 3u;
+
+            if(force || oldEnough)
+            {
+                destroySectionASImmediate(entry.section);
+                ++flushed;
+            }
+            else if(writeIndex != i)
+            {
+                g_pendingSectionDestroy[writeIndex] = std::move(entry);
+                ++writeIndex;
+            }
+            else
+            {
+                ++writeIndex;
+            }
+        }
+
+        g_pendingSectionDestroy.resize(writeIndex);
+        g_pendingSectionDestroyFlushed += flushed;
+
+        if(flushed > 0u && (nowSerial % 60u) == 0u)
+        {
+            RTLogFlushed(
+                "[RT RETIRE] deferred=" +
+                std::to_string(g_pendingSectionDestroyDeferred) +
+                " flushed=" + std::to_string(g_pendingSectionDestroyFlushed) +
+                " pending=" + std::to_string(g_pendingSectionDestroy.size()) +
+                " force=" + std::string(force ? "1" : "0")
+            );
+        }
+    }
+}
+
+
+void destroySectionAS(RTSectionAS& section)
+{
+    if(!pendingSectionDestroyHasGpuResources(section))
+    {
+        destroySectionASImmediate(section);
+        return;
+    }
+
+    g_pendingSectionDestroy.push_back(
+        PendingSectionDestroy{std::move(section), g_perfL10FrameSerial}
+    );
+
+    section = {};
+
+    ++g_pendingSectionDestroyDeferred;
+
+    if(g_pendingSectionDestroy.size() > 512u)
+    {
+        PERF_L10_TIME_STALL("pendingDestroyQueueIdle", check(
+            vkQueueWaitIdle(g_queue),
+            "wait RT queue before pending Section destroy flush failed"
+        ));
+
+        flushPendingSectionDestroys(true);
+    }
+}
+
+
 // Moves a replaced Section AS out of the live map and into the retirement
 // slot.  The resources stay alive until the rebuild drains the queue; freeing
 // them earlier would release memory the GPU may still be traversing.
@@ -1826,6 +1975,9 @@ void retireSectionAS(RTSectionAS& section)
     );
 
     section = {};
+
+    g_sectionRetirement->retireFrameSerial =
+        g_perfL10FrameSerial;
 
     g_sectionRetirement->occupied = true;
 }
@@ -1973,7 +2125,9 @@ void releaseRetirementSlot(
         section.hasVertexAddressSlot = false;
         section.vertexAddressSlot = 0u;
 
-        destroySectionAS(section);
+        // 2026-11-14：退休槽的围栏已 signal（releaseRetirementSlot 的调用
+        // 前提就是 GPU 已完成），这里保持即时销毁。
+        destroySectionASImmediate(section);
     }
 
     slot.sections.clear();
@@ -2006,6 +2160,8 @@ void reapSignaledRetirements()
         return;
     }
 
+    bool anyRetirementReleased = false;
+
     for(
         uint32_t i = 0u;
         i < SECTION_RETIREMENT_RING_SIZE;
@@ -2013,6 +2169,18 @@ void reapSignaledRetirements()
     )
     {
         if(!g_sectionRetirementRing[i].fencePending)
+        {
+            continue;
+        }
+
+        // 2026-11-14：除了围栏 signal，还要求该槽已退休满 3 帧。
+        // 依据：[GPU HANG] 快照显示释放与挂死发生在同一帧，说明只靠我们的
+        // 围栏不够 —— 引擎自己的 command buffer 还在飞。
+        constexpr uint64_t kRetirementMinFrameAge = 8u;
+
+        if(g_perfL10FrameSerial <
+           g_sectionRetirementRing[i].retireFrameSerial +
+               kRetirementMinFrameAge)
         {
             continue;
         }
@@ -2027,7 +2195,16 @@ void reapSignaledRetirements()
             releaseRetirementSlot(
                 i
             );
+
+            anyRetirementReleased = true;
         }
+    }
+
+    // 2026-11-14：有围栏 signal ⇒ 该提交之前的所有 GPU 工作都已完成，可以
+    // 安全释放延迟表里的旧段（见 destroySectionAS 处注释）。
+    if(anyRetirementReleased)
+    {
+        flushPendingSectionDestroys(false);
     }
 }
 
@@ -2046,6 +2223,9 @@ void releaseAllRetirementSlots()
             i
         );
     }
+
+    // 2026-11-14：调用点的前提是队列已 idle ⇒ 延迟表可整体释放。
+    flushPendingSectionDestroys(true);
 }
 
 
@@ -2384,13 +2564,41 @@ bool sectionUsesIndexedGeometry(
 VkDeviceSize createSectionBLAS(
     RTSectionAS& section,
     uint64_t sectionKey,
-    const std::vector<Vertex>& vertices,
+    std::span<const Vertex> vertices,
     bool opaqueGeometry,
     const OmmCutoutInput* ommInput,
-    const std::vector<float>* vertexMotion ,
+    std::span<const float> vertexMotion ,
     bool allowUpdate )
 {
     RTXMarkPhase("geometry:blas");
+
+    // 2026-11-12：内部分段计时（只计时）。单段实测 1.7~3.0ms 全记在 createMs 里，
+    // 这里把 buffer 创建 / buildSizes / 显存分配+bind / createAS / deviceAddress
+    // 拆开，供 [RT SECTION SLOW] 归因。
+    g_sectionBuildBufMs = 0.0;
+    g_sectionBuildVkBufMs = 0.0;
+    g_sectionBuildPrepMs = 0.0;
+    g_sectionBuildOmmMs = 0.0;
+    g_sectionBuildReqMs = 0.0;
+    g_sectionBuildSizesMs = 0.0;
+    g_sectionBuildMemMs = 0.0;
+    g_sectionBuildAsMs = 0.0;
+    g_sectionBuildAddrMs = 0.0;
+
+    auto sectionBuildPhaseStart = std::chrono::steady_clock::now();
+
+    const auto sectionBuildPhaseLap = [&sectionBuildPhaseStart]() -> double
+    {
+        const std::chrono::steady_clock::time_point lapNow =
+            std::chrono::steady_clock::now();
+
+        const double lapMs = std::chrono::duration<double, std::milli>(
+            lapNow - sectionBuildPhaseStart).count();
+
+        sectionBuildPhaseStart = lapNow;
+
+        return lapMs;
+    };
 
     g_rtxDetailSectionKey.store(sectionKey, std::memory_order_relaxed);
     g_rtxDetailSectionVerts.store(
@@ -2460,7 +2668,7 @@ VkDeviceSize createSectionBLAS(
         ) *
         static_cast<VkDeviceSize>(sectionVertexStride);
 
-    if(vertexMotion != nullptr && !vertexMotion->empty())
+    if(!vertexMotion.empty())
     {
         section.vertexMotionOffset =
             section.vertexBytes;
@@ -2479,7 +2687,15 @@ VkDeviceSize createSectionBLAS(
 
     if(!opaqueGeometry && ommInput)
     {
+        const std::chrono::steady_clock::time_point ommStart =
+            std::chrono::steady_clock::now();
+
         createSectionOpacityMicromap(section, *ommInput);
+
+        g_sectionBuildOmmMs +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - ommStart
+            ).count();
     }
 
 
@@ -2500,6 +2716,8 @@ VkDeviceSize createSectionBLAS(
         VK_SHARING_MODE_EXCLUSIVE;
 
 
+    g_sectionBuildPrepMs += sectionBuildPhaseLap();  // 函数开头 → vkCreateBuffer 之前（含 OMM）
+
     check(
         vkCreateBuffer(
             g_device,
@@ -2510,14 +2728,22 @@ VkDeviceSize createSectionBLAS(
         "create Section vertex buffer failed"
     );
 
+    g_sectionBuildVkBufMs += sectionBuildPhaseLap();
+
 
     VkMemoryRequirements vertexRequirements{};
+
+    (void)sectionBuildPhaseLap();  // 丢弃：从 vkGetBufferMemoryRequirements 开始计
 
     vkGetBufferMemoryRequirements(
         g_device,
         section.vertexBuffer,
         &vertexRequirements
     );
+
+    g_sectionBuildReqMs += sectionBuildPhaseLap();
+    g_sectionBuildBufMs =
+        g_sectionBuildVkBufMs + g_sectionBuildReqMs;
 
 
     VkAccelerationStructureGeometryTrianglesDataKHR triangles{
@@ -2637,6 +2863,8 @@ VkDeviceSize createSectionBLAS(
         &primitiveCount,
         &sizesInfo
     );
+
+    g_sectionBuildSizesMs += sectionBuildPhaseLap();
 
 
     VkBufferCreateInfo blasBufferInfo{
@@ -2792,6 +3020,8 @@ VkDeviceSize createSectionBLAS(
         "bind Section BLAS buffer memory failed"
     );
 
+    g_sectionBuildMemMs += sectionBuildPhaseLap();
+
 
     section.blasMemory =
         VK_NULL_HANDLE;
@@ -2830,6 +3060,8 @@ VkDeviceSize createSectionBLAS(
         "create Section BLAS failed"
     );
 
+    g_sectionBuildAsMs += sectionBuildPhaseLap();
+
 
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{
         VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR
@@ -2844,6 +3076,8 @@ VkDeviceSize createSectionBLAS(
             g_device,
             &addressInfo
         );
+
+    g_sectionBuildAddrMs += sectionBuildPhaseLap();
 
     section.buildScratchSize =
         sizesInfo.buildScratchSize;

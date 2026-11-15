@@ -351,6 +351,34 @@ uint32_t perfL10SerLadderValue()
 
 void updatePerfL10SerPathToggles()
 {
+    // 2026-11-07 A/B 入口：ORION_SER_MODE=0/1/4/5/6 直接钉住 SER 档位，
+    // 不用改代码、不用重编（0 = 关 SER 路径，等同于对照基线）。
+    // 与 ORION_SER_LADDER 的区别：那个是同局内轮换，这个是一局固定一档，
+    // 适合"两台机器/两次启动"的干净对比。
+    static const int serModeEnvPinned = []()
+    {
+        const char* raw = std::getenv("ORION_SER_MODE");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return -1;
+        }
+
+        return std::atoi(raw);
+    }();
+
+    if(serModeEnvPinned >= 0)
+    {
+        const uint32_t pinned = static_cast<uint32_t>(serModeEnvPinned);
+        g_perfL10RtaoSkipToggle = 1u;
+        g_perfL10SerMode = pinned;
+        g_perfL10SerPathsPhase = pinned;
+        g_perfL10SerRadToggle = pinned;
+        g_perfL10SerVisToggle = 0u;
+        g_perfL10SerPrimToggle = 1u;
+        return;
+    }
+
     if(perfL10SerLadderEnabled())
     {
         const uint32_t serLadderValue = perfL10SerLadderValue();

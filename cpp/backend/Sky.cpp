@@ -953,10 +953,116 @@ void createSkyAtmospherePipeline()
     updateSkyRayDescriptors();
     RTLog("[SKY] atmosphere single-scattering pipeline created");
 }
+// ============================================================================
+// 2026-11-13 天空 LUT 脏标记（性能）
+//
+// 改动前：sky_atmosphere.comp 每帧无条件重写 256x128 LUT（32x16 工作组），
+// 即使太阳方向、天气、参数一个都没变。而太阳方向只由 historyParamsPadding1
+// 决定（sky_model_common.glsl:6-12 的 sunDirection()），参数全在 UBO 里 ⇒
+// 这个 pass 的输入完全可哈希。
+//
+// 判据见 skyLutNeedsRebuild()。两处刻意保守：
+//   1) 极光 / 雨 / 雷暴在响应时**每帧重建**（LUT 里唯二的随时间动画项是
+//      evaluateAurora 与 lightningFlashEnvelope），所以不会冻结动画；
+//   2) 连续跳过超过 SKY_LUT_MAX_STALE_FRAMES 兜底重建一次，就算漏了某个
+//      动画输入，最坏也只是降帧率刷新，不会永久冻结。
+// ============================================================================
+namespace
+{
+// 太阳相位允许的漂移（相位 1.0 = 一整天）。MC 一天 20 分钟 ⇒ 3.2e-4 约 0.4 秒。
+constexpr float SKY_LUT_PHASE_EPS = 3.2e-4f;
+
+// 兜底刷新间隔（帧）
+constexpr uint32_t SKY_LUT_MAX_STALE_FRAMES = 6u;
+
+bool g_skyLutValid = false;
+float g_skyLutPhase = 0.0f;
+uint64_t g_skyLutParamHash = 0ull;
+uint32_t g_skyLutStaleFrames = 0u;
+
+uint64_t skyLutParamHash(const CameraUBO* ubo)
+{
+    uint64_t hash = 1469598103934665603ull;
+
+    const auto fold = [&hash](const void* data, size_t size)
+    {
+        const unsigned char* bytes = static_cast<const unsigned char*>(data);
+
+        for(size_t i = 0; i < size; ++i)
+        {
+            hash ^= static_cast<uint64_t>(bytes[i]);
+            hash *= 1099511628211ull;
+        }
+    };
+
+    fold(ubo->skyParams, sizeof(ubo->skyParams));
+    fold(ubo->skyModelParams, sizeof(ubo->skyModelParams));
+    fold(ubo->weatherParams, sizeof(ubo->weatherParams));
+    fold(ubo->auroraParams, sizeof(ubo->auroraParams));
+
+    return hash;
+}
+
+bool skyLutNeedsRebuild(const CameraUBO* ubo)
+{
+    if(!g_skyLutValid)
+    {
+        return true;
+    }
+
+    // 太阳方向：相位差按 1 取模（跨过 0/1 边界不能算作变化）。
+    float phaseDelta = ubo->historyParamsPadding1 - g_skyLutPhase;
+    phaseDelta -= std::floor(phaseDelta + 0.5f);
+
+    if(std::fabs(phaseDelta) > SKY_LUT_PHASE_EPS)
+    {
+        return true;
+    }
+
+    if(skyLutParamHash(ubo) != g_skyLutParamHash)
+    {
+        return true;
+    }
+
+    // LUT 里随时间动画的两项：响应时逐帧重建（与改动前一致）。
+    const float rainAmount = std::fabs(ubo->weatherParams[0]);
+    const float thunderAmount = std::fabs(ubo->weatherParams[1]);
+    float auroraAmount = 0.0f;
+
+    for(int i = 0; i < 4; ++i)
+    {
+        auroraAmount += std::fabs(ubo->auroraParams[i]);
+    }
+
+    if(rainAmount > 1.0e-3f || thunderAmount > 1.0e-3f || auroraAmount > 1.0e-3f)
+    {
+        return true;
+    }
+
+    // 兜底：连续跳过太久就重建一次。
+    if(g_skyLutStaleFrames + 1u >= SKY_LUT_MAX_STALE_FRAMES)
+    {
+        return true;
+    }
+
+    return false;
+}
+} // namespace
+
+
 void recordSkyAtmosphere(VkCommandBuffer cmd)
 {
     if(cmd == VK_NULL_HANDLE || g_skyAtmospherePipeline == VK_NULL_HANDLE)
     {
+        return;
+    }
+
+    const CameraUBO* skyLutUbo =
+        static_cast<const CameraUBO*>(g_cameraUboMapped);
+
+    if(skyLutUbo != nullptr && !skyLutNeedsRebuild(skyLutUbo))
+    {
+        ++g_skyLutStaleFrames;
         return;
     }
 
@@ -1000,6 +1106,15 @@ void recordSkyAtmosphere(VkCommandBuffer cmd)
     }
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0u, 0u, nullptr, 0u, nullptr, 2u, barriers);
+
+    // 记录本次构建的输入快照（下一次据此判断是否可跳过）。
+    if(skyLutUbo != nullptr)
+    {
+        g_skyLutPhase = skyLutUbo->historyParamsPadding1;
+        g_skyLutParamHash = skyLutParamHash(skyLutUbo);
+        g_skyLutStaleFrames = 0u;
+        g_skyLutValid = true;
+    }
 }
 void destroySkyAtmosphereResources()
 {

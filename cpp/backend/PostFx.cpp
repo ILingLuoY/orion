@@ -378,6 +378,70 @@ void updateSDRPostDescriptor()
 }
 
 
+void updateAeHistogramMeteringBindings()
+{
+    if(g_aeHistogramSet == VK_NULL_HANDLE ||
+       g_volumetricCloudSampler == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    static VkImageView lastDepthView = VK_NULL_HANDLE;
+    static VkImageView lastCloudView = VK_NULL_HANDLE;
+
+    if(g_dlssDepthView == lastDepthView &&
+       g_volumetricCloudResolvedView == lastCloudView)
+    {
+        return;
+    }
+
+    if(g_dlssDepthView == VK_NULL_HANDLE ||
+       g_volumetricCloudResolvedView == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorImageInfo depthInfo{};
+
+    depthInfo.sampler = g_volumetricCloudSampler;
+    depthInfo.imageView = g_dlssDepthView;
+    depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo cloudInfo{};
+
+    cloudInfo.sampler = g_volumetricCloudSampler;
+    cloudInfo.imageView = g_volumetricCloudResolvedView;
+    cloudInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[2]{};
+
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = g_aeHistogramSet;
+    writes[0].dstBinding = 2;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = &depthInfo;
+
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = g_aeHistogramSet;
+    writes[1].dstBinding = 3;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].pImageInfo = &cloudInfo;
+
+    vkUpdateDescriptorSets(
+        g_device,
+        2,
+        writes,
+        0,
+        nullptr
+    );
+
+    lastDepthView = g_dlssDepthView;
+    lastCloudView = g_volumetricCloudResolvedView;
+}
+
+
 void createHDRPostPipeline()
 {
     if(
@@ -576,7 +640,8 @@ void createAutoExposurePipeline()
 
 
 
-    VkDescriptorSetLayoutBinding histogramBindings[2]{};
+    // 2026-11-15：测光 v2 需要深度（天空判定）与云 resolve（区分云/天空）。
+    VkDescriptorSetLayoutBinding histogramBindings[4]{};
 
     histogramBindings[0].binding =
         0;
@@ -604,12 +669,38 @@ void createAutoExposurePipeline()
         VK_SHADER_STAGE_COMPUTE_BIT;
 
 
+    histogramBindings[2].binding =
+        2;
+
+    histogramBindings[2].descriptorType =
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+
+    histogramBindings[2].descriptorCount =
+        1;
+
+    histogramBindings[2].stageFlags =
+        VK_SHADER_STAGE_COMPUTE_BIT;
+
+
+    histogramBindings[3].binding =
+        3;
+
+    histogramBindings[3].descriptorType =
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+
+    histogramBindings[3].descriptorCount =
+        1;
+
+    histogramBindings[3].stageFlags =
+        VK_SHADER_STAGE_COMPUTE_BIT;
+
+
     VkDescriptorSetLayoutCreateInfo histogramLayoutInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
     };
 
     histogramLayoutInfo.bindingCount =
-        2;
+        4;
 
     histogramLayoutInfo.pBindings =
         histogramBindings;
@@ -625,7 +716,7 @@ void createAutoExposurePipeline()
     );
 
 
-    VkDescriptorPoolSize histogramPoolSizes[2]{};
+    VkDescriptorPoolSize histogramPoolSizes[3]{};
 
     histogramPoolSizes[0].type =
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -639,6 +730,12 @@ void createAutoExposurePipeline()
     histogramPoolSizes[1].descriptorCount =
         1;
 
+    histogramPoolSizes[2].type =
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+
+    histogramPoolSizes[2].descriptorCount =
+        2;
+
 
     VkDescriptorPoolCreateInfo histogramPoolInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
@@ -648,7 +745,7 @@ void createAutoExposurePipeline()
         1;
 
     histogramPoolInfo.poolSizeCount =
-        2;
+        3;
 
     histogramPoolInfo.pPoolSizes =
         histogramPoolSizes;
@@ -739,6 +836,24 @@ void createAutoExposurePipeline()
 
     histogramPipelineLayoutInfo.pSetLayouts =
         &g_aeHistogramSetLayout;
+
+    // 2026-11-15：直方图 pass 需要 log 范围与测光权重。
+    VkPushConstantRange histogramPushRange{};
+
+    histogramPushRange.stageFlags =
+        VK_SHADER_STAGE_COMPUTE_BIT;
+
+    histogramPushRange.offset =
+        0;
+
+    histogramPushRange.size =
+        sizeof(AeHistogramPushConstants);
+
+    histogramPipelineLayoutInfo.pushConstantRangeCount =
+        1;
+
+    histogramPipelineLayoutInfo.pPushConstantRanges =
+        &histogramPushRange;
 
     check(
         vkCreatePipelineLayout(

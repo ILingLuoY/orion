@@ -182,6 +182,10 @@ public class LevelRendererMixin {
             boolean shouldRenderSky,
             boolean renderDebug,
             CallbackInfo ci) {
+        // 2026-11-09：整段 level render 的墙钟起点（含本 HEAD 内的我们的 JNI）。
+        com.example.client.FrameBudget.beginLevelRender();
+        com.example.client.LevelPhaseProbe.beginFrame();
+        com.example.client.FrameBudget.beginCaptureHead();
         rtx$partialTick = Minecraft.getInstance().getDeltaTracker().getGameTimeDeltaPartialTick(false);
         rtx$logJavaMemory();
         VoxyLodManager.tick();
@@ -198,6 +202,17 @@ public class LevelRendererMixin {
         DynamicLightCapture.submitFrame();
         rtx$uploadVisibleSections(cameraState);
         VoxyLodManager.perfAdd(VoxyLodManager.PERF_CAPTURE, System.nanoTime() - rtx$t2);
+        com.example.client.FrameBudget.endCaptureHead();
+    }
+
+    @Inject(method = "submitEntities", at = @At("HEAD"))
+    private void rtx$beginSubmitEntities(
+            PoseStack poseStack,
+            LevelRenderState levelRenderState,
+            SubmitNodeCollector output,
+            CallbackInfo ci) {
+        // 2026-11-09：实体提交整段（含逐模型捕获的我们的 JNI）。
+        com.example.client.FrameBudget.beginSubmitEntities();
     }
 
     @Inject(method = "submitEntities", at = @At("TAIL"))
@@ -206,6 +221,7 @@ public class LevelRendererMixin {
             LevelRenderState levelRenderState,
             SubmitNodeCollector output,
             CallbackInfo ci) {
+        com.example.client.FrameBudget.endSubmitEntities();
         var player = Minecraft.getInstance().player;
         if (player == null) {
             EntityRtCapture.disarmLocalPlayerProxyFallback();
@@ -245,6 +261,10 @@ public class LevelRendererMixin {
             boolean renderDebug,
             CallbackInfo ci) {
 
+        // 2026-11-09：level render 墙钟终点（第一句，保证覆盖整段）。
+        com.example.client.FrameBudget.endLevelRender();
+        com.example.client.LevelPhaseProbe.endFrame();
+
         DhBridge.markFrameEnded();
 
         if (NativeVulkan.handlesPending) {
@@ -260,5 +280,71 @@ public class LevelRendererMixin {
         }
 
         ParticleRtCapture.endFrame();
+    }
+
+    // ── 2026-11-11：level 段 15.5 ms 内部归因（ORION_LEVEL_PHASES=1 才有输出） ──
+    // submitFeatures = 实体 / 方块实体 / 破坏动画 / 粒子 / gizmo 的提交（原版，纯浪费的一半嫌疑）
+    @Inject(method = "submitFeatures", at = @At("HEAD"))
+    private void rtx$phaseSubmitHead(
+            LevelRenderState levelRenderState,
+            SubmitNodeCollector output,
+            boolean renderOutline,
+            CallbackInfo ci) {
+        com.example.client.LevelPhaseProbe.submitHead();
+    }
+
+    @Inject(method = "submitFeatures", at = @At("RETURN"))
+    private void rtx$phaseSubmitTail(
+            LevelRenderState levelRenderState,
+            SubmitNodeCollector output,
+            boolean renderOutline,
+            CallbackInfo ci) {
+        com.example.client.LevelPhaseProbe.submitTail();
+    }
+
+    // prepareChunkRenders* = 可见段遍历 + draw group 构建 + 动态 UBO 写入（差异分配的大头）
+    @Inject(method = "prepareChunkRenders", at = @At("HEAD"))
+    private void rtx$phasePrepareHead(org.joml.Matrix4fc matrix, boolean respectOrder, CallbackInfoReturnable<net.minecraft.client.renderer.chunk.ChunkSectionsToRender> cir) {
+        com.example.client.LevelPhaseProbe.prepareHead();
+    }
+
+    @Inject(method = "prepareChunkRenders", at = @At("RETURN"))
+    private void rtx$phasePrepareTail(org.joml.Matrix4fc matrix, boolean respectOrder, CallbackInfoReturnable<net.minecraft.client.renderer.chunk.ChunkSectionsToRender> cir) {
+        com.example.client.LevelPhaseProbe.prepareTail();
+    }
+
+    @Inject(method = "prepareChunkRendersIndirect", at = @At("HEAD"))
+    private void rtx$phasePrepareIndirectHead(org.joml.Matrix4fc matrix, boolean respectOrder, CallbackInfoReturnable<net.minecraft.client.renderer.chunk.ChunkSectionsToRender> cir) {
+        com.example.client.LevelPhaseProbe.prepareHead();
+    }
+
+    @Inject(method = "prepareChunkRendersIndirect", at = @At("RETURN"))
+    private void rtx$phasePrepareIndirectTail(org.joml.Matrix4fc matrix, boolean respectOrder, CallbackInfoReturnable<net.minecraft.client.renderer.chunk.ChunkSectionsToRender> cir) {
+        com.example.client.LevelPhaseProbe.prepareTail();
+    }
+
+    /**
+     * 2026-11-11 接管式渲染第一层，**变体 A**：跳过地形的 draw group 构建。
+     *
+     * <p>这是 DrawIndirect 与 DrawSeparate 两条路径的<b>共同上游</b>。返回 0 后
+     * 每个 layer 的 draw group 为空、{@code sectionInfos} 为空、{@code largestIndexCount}=0，
+     * 于是下游 {@code renderGroup} 的空判断自然把 {@code drawIndexedIndirect} /
+     * {@code drawMultipleIndexed} 全部跳过 —— 地形不再进入命令缓冲，
+     * 遍历与逐段分配也一起消失。RT 的深度是自己写的，不消费原版深度，
+     * 详见 {@code TerrainTakeover} 的类注释。
+     *
+     * <p><b>默认不走这条</b>（{@code ORION_TAKEOVER_EXTRACT=1} 才开）。2026-11-11 实测
+     * 变体 A 会让 {@code rebuildWorldGeometry} 的 {@code pCap}（等区块锁）从 2 ms 涨到
+     * 65~200 ms；默认改用变体 B（在 {@code renderGroup} 取消录制），保留本方法全部簿记。
+     */
+    @Inject(method = "extractSectionDrawGroups", at = @At("HEAD"), cancellable = true)
+    private void rtx$takeoverSkipTerrainDrawGroups(
+            boolean respectTranslucentOrder,
+            java.util.List<?> sectionInfos,
+            java.util.Map<?, ?> drawGroups,
+            CallbackInfoReturnable<Integer> cir) {
+        if (com.example.client.TerrainTakeover.skipTerrainExtraction()) {
+            cir.setReturnValue(0);
+        }
     }
 }

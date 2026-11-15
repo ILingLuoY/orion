@@ -1,5 +1,19 @@
 #version 460
 
+// 2026-11-15：自动曝光测光直方图 v2。
+//
+// 旧版（本文件上一版）每 8x8 像素块只投**一个**"块内 log 亮度平均"样本：
+//   · 高光被块平均抹平 —— 云的亮面/暗面差异在进入直方图前就没了；
+//   · 块内方差丢失，天空/云/地面混在同一块时样本值不代表任何一方；
+//   · 没有任何测光权重，云、天空、地面权重相同，抬头/低头会让 targetEV 猛跳。
+// 实测 run/rt_debug.log（2026-11-15 14:07）：avgLogLuma 在 -1.97 ~ -2.77 之间
+// 逐秒摆动，currentEV 跟着 ±0.4 反复跳，maxEV=1 时直接顶死。
+//
+// 现在：逐像素 log2 亮度 → 线程组共享直方图（shared 256 bins）→ 全局合并，
+// 每个样本带「中心权重 × 天空/云权重」计数。参考实现：
+//   · Unreal Engine 5 Auto Exposure Histogram（64 bins，8x8 线程组按块统计）
+//   · Unity URP Exposure（log2 直方图 + 百分位修剪）
+//   · UE 用 Exposure Metering Mask 做中心加权；这里程序化生成等价权重。
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -12,26 +26,79 @@ buffer AeHistogram
     uint bins[256];
 };
 
-const float AE_LOG2_MIN = -10.0;
-const float AE_LOG2_MAX = 6.0;
-const uint AE_BIN_COUNT = 256u;
-const float AE_LUMA_FLOOR = 1.0e-5;
+// 反投影深度（R32F，reversed-Z，0 = 没有几何命中 = 天空或云）
+layout(binding = 2, set = 0)
+uniform sampler2D sceneDepth;
 
+// 云 resolve 结果（rgba16f，a = 覆盖率）。用来把"云"从"天空"里分出来：
+// 云的辐射是场景里最亮的部分之一，必须参与测光，否则它的亮度只能由
+// 云合成自己的 shoulder 决定（以前那套：cloudWhite 反过来又挂在 AE 的
+// currentEV 上 ⇒ 自反馈环，云的受光被锁死、层次被抹平）。
+layout(binding = 3, set = 0)
+uniform sampler2D cloudResolvedImage;
+
+layout(push_constant) uniform AeHistogramParams
+{
+    float logMin;
+    float logMax;
+    float centerWeight;   // 0 = 全画面均匀，1 = 强中心测光
+    float skyWeight;      // 无云天空像素的权重
+    float cloudWeight;    // 云像素的权重
+    float skyDepthEps;    // depth <= eps 视为无几何（天空/云）
+} ae;
+
+const uint AE_BIN_COUNT = 256u;
+const float AE_LUMA_FLOOR = 1.0e-6;
 const vec3 AE_LUMA_WEIGHTS = vec3(0.2126, 0.7152, 0.0722);
+
+// 中心加权的边缘下限：中心 1.0 → 画面角落 CENTER_FLOOR。
+// 不要取 0 —— 边缘完全不计权时，小目标从边缘进入视野会让曝光完全不响应。
+const float CENTER_FLOOR = 0.10;
+
+// 注意：云 resolve 的 a 通道是**透射率**（composite 里是
+// scene.rgb = scene.rgb * cloud.a + cloud.rgb），无云处 a=1、全云处 a→0。
+// 所以覆盖率 = 1 - a，别直接用 a 当 alpha（那样会把整片天空都判成云）。
+const float CLOUD_COVERAGE_EPS = 0.01;
+
+shared uint tileBins[AE_BIN_COUNT];
+
+float meterWeight(vec2 uv, float depth, float cloudAlpha)
+{
+    vec2 d = (uv - 0.5) * 2.0;
+    float r = clamp(length(d) * 0.70710678, 0.0, 1.0);
+    float spatial =
+        mix(1.0, mix(1.0, CENTER_FLOOR, clamp(ae.centerWeight, 0.0, 1.0)),
+            smoothstep(0.0, 1.0, r));
+
+    float w = 1.0;
+
+    if(depth <= ae.skyDepthEps)
+    {
+        float coverage = 1.0 - clamp(cloudAlpha, 0.0, 1.0);
+
+        w = (coverage > CLOUD_COVERAGE_EPS)
+            ? clamp(ae.cloudWeight, 0.0, 4.0)
+            : clamp(ae.skyWeight, 0.0, 4.0);
+    }
+
+    return spatial * w;
+}
 
 void main()
 {
-    ivec2 size = imageSize(rrOutputImage);
-
-    ivec2 origin = ivec2(gl_GlobalInvocationID.xy) * 8;
-
-    if(origin.x >= size.x || origin.y >= size.y)
+    // 注意：下面的 barrier() 要求全组线程都到达，因此边界外线程必须走完整流程，
+    // 只是不采集样本（旧版在这里直接 return，改成分块共享直方图后会死锁）。
+    for(uint i = gl_LocalInvocationIndex; i < AE_BIN_COUNT; i += 64u)
     {
-        return;
+        tileBins[i] = 0u;
     }
 
-    float sumLog = 0.0;
-    uint valid = 0u;
+    barrier();
+    memoryBarrierShared();
+
+    ivec2 size = imageSize(rrOutputImage);
+    ivec2 origin = ivec2(gl_GlobalInvocationID.xy) * 8;
+    vec2 invSize = 1.0 / vec2(size);
 
     for(int y = 0; y < 8; ++y)
     {
@@ -45,28 +112,46 @@ void main()
             }
 
             vec3 c = max(imageLoad(rrOutputImage, p).rgb, vec3(0.0));
-
             float luma = dot(c, AE_LUMA_WEIGHTS);
 
-            sumLog += log2(max(luma, AE_LUMA_FLOOR));
-            valid += 1u;
+            vec2 uv = (vec2(p) + vec2(0.5)) * invSize;
+
+            float depth = textureLod(sceneDepth, uv, 0.0).r;
+            float cloudAlpha = textureLod(cloudResolvedImage, uv, 0.0).a;
+
+            float w = meterWeight(uv, depth, cloudAlpha);
+
+            if(w <= 1.0e-4)
+            {
+                continue;
+            }
+
+            // 直方图 bin 是 uint 计数，权重按 1/8 步长量化（0.125 精度）。
+            uint add = max(1u, uint(w * 8.0 + 0.5));
+
+            float logLuma = log2(max(luma, AE_LUMA_FLOOR));
+
+            float t = clamp(
+                (logLuma - ae.logMin) / max(ae.logMax - ae.logMin, 1.0e-3),
+                0.0,
+                1.0);
+
+            uint bin = min(uint(t * float(AE_BIN_COUNT)), AE_BIN_COUNT - 1u);
+
+            atomicAdd(tileBins[bin], add);
         }
     }
 
-    if(valid == 0u)
+    barrier();
+    memoryBarrierShared();
+
+    for(uint i = gl_LocalInvocationIndex; i < AE_BIN_COUNT; i += 64u)
     {
-        return;
+        uint c = tileBins[i];
+
+        if(c != 0u)
+        {
+            atomicAdd(bins[i], c);
+        }
     }
-
-    float logLuma = sumLog / float(valid);
-
-    float t = clamp(
-        (logLuma - AE_LOG2_MIN) / (AE_LOG2_MAX - AE_LOG2_MIN),
-        0.0,
-        1.0
-    );
-
-    uint bin = min(uint(t * float(AE_BIN_COUNT)), AE_BIN_COUNT - 1u);
-
-    atomicAdd(bins[bin], 1u);
 }

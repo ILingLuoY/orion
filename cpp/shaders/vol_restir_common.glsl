@@ -1,6 +1,33 @@
 #ifndef VOL_RESTIR_COMMON_GLSL
 #define VOL_RESTIR_COMMON_GLSL
 
+// 2026-11-09：volRestirLightSignificant() 用到 localLightProfileLumens()。
+// 依赖调用方已经声明 CameraProperties（本文件直接读 cam.*）；五个 vol_restir_*
+// TU 全部在 include 本文件之前就有 camera_ubo.glsl，顺序满足。
+#include "local_light_profile.glsl"
+
+// ===========================================================================
+// 2026-11-09：体积光的"显著光源"门限
+//
+// 病征（用户）："体积光在头顶垂直射下来，明明头顶没有任何光源"。
+// 截图证据：洞穴洞顶/岩壁密布**发光地衣**（glow lichen），它们是真实光源，
+// 但只是 0.17 有效亮度的表面辉光。灯表把每个发光**体素**当成独立点光源
+// （`tbl` 实测 6000~8000 条），几千个叠在一起把整洞的雾均匀点亮 ⇒ 视觉上
+// 就是"从头顶垂下来的光幕"，而 NEE 对它们全部成立（在同一片空气里）。
+//
+// 口径：只用辐照强度（lumens × emission/15）判显著，不用类型白名单 ——
+// 这样火把 0.93 / 岩浆 1.90 / 荧石 1.45 / 营火 1.30 / 红石火把 0.24 全部保留，
+// 而地衣 0.17 / 紫水晶 0.13 / 岩浆块 0.10 / 棕色蘑菇 0.004 被踢出体积光。
+// 表面照明（rgen 的 binding 17）**不受影响** —— 本判据只作用于体积光三件套。
+// ===========================================================================
+const float VOL_LIGHT_MIN_SIGNIFICANCE = 0.20;
+
+bool volRestirLightSignificant(uint typeCode, float emissionLevel)
+{
+    return localLightProfileLumens(typeCode) *
+        clamp(emissionLevel / 15.0, 0.0, 1.0) >= VOL_LIGHT_MIN_SIGNIFICANCE;
+}
+
 const int VOL_RESTIR_SAMPLE_COUNT = 32;
 
 const uint VOL_RESTIR_LIGHT_INDEX_BIAS = 1u;
@@ -139,7 +166,9 @@ vec3 volRestirFroxelCenter(
 // —— 与 rt_test.rgen:19782 的 MV 构造逐字同口径。
 mat4 volRestirPrevViewProj()
 {
-    return inverse(cam.prevViewInverse * cam.prevProjInverse);
+    // 2026-11-09：宿主每帧算好（= inverse(prevViewInverse * prevProjInverse)），
+    // 这里不再逐像素求逆。
+    return cam.prevViewProj;
 }
 
 #endif

@@ -157,6 +157,18 @@ public final class NativeVulkan {
      * 出厂 true（旧行为）。
      */
     public static native boolean setRTGlossyEnabled(boolean enabled);
+    /**
+     * 2026-11-15「性能模式」：SSR 的区块下限，写进 CameraUBO.ssHybridParams.w。
+     * 0 ⇒ 着色器回落到 12（旧行为）；8 ⇒ 8 区块以外的镜面交给 SSR，
+     * 6~8 区块由 SSPT 负责（配合 setSSPTRange(8)）。
+     */
+    public static native boolean setSsHybridFloor(float chunks);
+    /**
+     * 2026-11-15「性能模式」总开关：写 CameraUBO.perfBandParams.z。
+     * 打开后 ss_hybrid 按「相机到表面」的距离分档（≤6 RT / 6~8 SSPT / >8 SSR），
+     * rgen 的漫反射弹射次数也按距离分档（≤4 用设定值，4~6 只 1 弹）。
+     */
+    public static native boolean setPerformanceMode(boolean enabled);
     public static native boolean uploadVoxyLodAtlas(byte[] pixels, int size, int mipLevels);
 
     public static native void updateAtlas(long imageView, long sampler);
@@ -381,6 +393,12 @@ public final class NativeVulkan {
             float value
     );
 
+    /**
+     * 2026-11-07：回读云型。native 的 setCloudType 会把旧出厂值 0.35 迁移成 0.8
+     * （JniSettings.cpp），界面据此回写存档，避免"存档存 0.35、实际跑 0.8"。
+     */
+    public static native float getCloudType();
+
     /** 2026-10-18：云缘侵蚀幅度 [0,2]（cloudParams5.y，1.0 = 出厂标定）。 */
     public static native boolean setCloudErosionScale(
             float value
@@ -519,24 +537,6 @@ public final class NativeVulkan {
 
     public static native boolean getCloudFadeFollowsRrMode();
 
-    /**
-     * 2026-10-06 远云剥离 RR：云层在输出分辨率渲染、合成挪到 RR evaluate 之后。
-     *
-     * <p>原状是云在 RR <b>之前</b>合成进 RR 的颜色输入（{@code g_rtOutputImage}，
-     * render 分辨率），于是云的清晰度被 RR 从 render 分辨率上采样到输出分辨率的
-     * 那一步限死 —— 档位越低、render 分辨率越低，远景云越糊（超高性能档
-     * 707x376 → 2122x1129）。开启后云不进 RR，直接以输出分辨率合成到 RR 的输出上，
-     * 清晰度与档位无关。</p>
-     *
-     * <p>代价：云的 march 与合成都在输出分辨率跑（像素数按
-     * (输出/render)² 增长，超高性能档约 9 倍）。</p>
-     *
-     * <p>关掉 = 逐字节回到"云进 RR 颜色输入"的旧档。</p>
-     */
-    public static native boolean setCloudPostRrComposite(boolean enabled);
-
-    public static native boolean getCloudPostRrComposite();
-
     /** 批次3：水体观感四件套（waterParams）。见 WaterParamsSettings.toParamArray()。 */
     public static native boolean setWaterParams(float[] params);
 
@@ -579,12 +579,6 @@ public final class NativeVulkan {
     public static native boolean setCloudPhiParams(float[] params);
 
     /**
-     * 参考重构（2026-10-02）：受光逻辑三个尺度量（有效源强曲线尺度 / 曲线指数 /
-     * 环境 upward-AO 强度）。见 RTXSettingsConfig.CloudLightSettings.toParamArray()。
-     */
-    public static native boolean setCloudLightParams(float[] params);
-
-    /**
      * 参考重构（2026-10-02）：云底软化 + 两级步进阈值。**密度场共享** ⇒ 视图、
      * 云影、反射、光柱四个消费者同源。见
      * RTXSettingsConfig.CloudShapeSettings.toParamArray()。
@@ -612,14 +606,6 @@ public final class NativeVulkan {
     public static native boolean setCloudAmbientParams(float[] params);
 
     /**
-     * 2026-10-14 **日落天光修正**：天光冷化强度 / 天光能量衰减强度（0 = 关 = 逐位
-     * 旧档）。把环境光色相与直射色相解耦（日落天顶天光是蓝紫，不是直射的橙红），
-     * 并让天光能量在低太阳下真正衰减。见
-     * RTXSettingsConfig.CloudSkyHueSettings.toParamArray()。
-     */
-    public static native boolean setCloudSkyHueParams(float[] params);
-
-    /**
      * 2026-10-15 云地面反射与显式视觉回退参数：
      * x = 均匀水平地面 Lambert 反照率，y = 地面反射近似强度，
      * z = 非物理自阴影残光回退，w = 非物理相位地板回退。
@@ -633,12 +619,6 @@ public final class NativeVulkan {
      * 见 RTXSettingsConfig.CloudMs2Settings.toParamArray()。
      */
     public static native boolean setCloudMs2Params(float[] params);
-
-    /**
-     * **#5 光路太阳色红化 + #7 粉末口径**：越深处的直射越红；粉末不施加于方向性
-     * 散射（保云缘亮边）。见 RTXSettingsConfig.CloudLight2Settings.toParamArray()。
-     */
-    public static native boolean setCloudLight2Params(float[] params);
 
     /**
      * **#3 剖面云型**（Cu/Tcu/Cb 三段插值 + 云型随区域幅度）。**密度场共享** ⇒
@@ -671,6 +651,15 @@ public final class NativeVulkan {
      * 消费方 volumetric_fog.glsl：层厚 ×6 = e 折叠格数，浓度 ×0.05 = 每格消光。
      */
     public static native boolean setFogGroundMistParams(float[] params);
+
+    /** 云隙光三件套：[enabled, 强度(云层光学厚度倍率), 缝宽偏置]。 */
+    public static native boolean setCloudGapParams(float[] params);
+
+    /** 雨波纹：[大小倍率(0.25~4), 明显度(0~3)]。水面与地面水洼共用。 */
+    public static native boolean setRainRippleParams(float[] params);
+
+    /** 雾光学：[涡流强度(0~2), 红权重, 绿权重, 蓝权重(0.5~1.5)]。 */
+    public static native boolean setFogOpticsParams(float[] params);
 
     /**
  * 2026-10-10 **#3 天光自遮挡 / #4 时域速度抑制**
@@ -1265,6 +1254,11 @@ public final class NativeVulkan {
 
 
     public static void resetGuiRtState() {
+
+        // 2026-11-11 接管式渲染：帧边界结算"上一帧 RT 是否真的出图了"。
+        // 必须在清零之前取走 —— 清零后这个信息就没了；而地形提交发生在本帧 RT 注入
+        // 之前，只有上一帧的结论可以用来决定本帧要不要跳过地形光栅。
+        com.example.client.TerrainTakeover.onFrameBoundary(rtInjectedToMainTarget);
 
         pendingGuiTargetImage = 0L;
 
@@ -1875,10 +1869,33 @@ public final class NativeVulkan {
         )) {
             System.err.println("[RTX CONFIG] Failed to restore SSR range");
         }
+        if(!setGiNearRate(
+                RTXSettingsConfig.getGiNearRate()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore GI near rate");
+        }
+        if(!setGlossyRoughLod(
+                RTXSettingsConfig.isGlossyRoughLod()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore glossy rough LOD");
+        }
         if(!setRTGlossyEnabled(
                 RTXSettingsConfig.isRTGlossyEnabled()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore RT glossy switch");
+        }
+        // 2026-11-15「性能模式」：SSR 区块下限（性能模式 8，否则 12）。
+        if(!setSsHybridFloor(
+                RTXSettingsConfig.isPerformanceMode()
+                        ? RTXSettingsConfig.PERF_MODE_SSR_FLOOR_CHUNKS
+                        : 12.0f
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore SS hybrid floor");
+        }
+        if(!setPerformanceMode(
+                RTXSettingsConfig.isPerformanceMode()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore performance mode");
         }
         if(!setCloudSunReddening(
                 RTXSettingsConfig.getCloudSunReddening()
@@ -1961,7 +1978,9 @@ public final class NativeVulkan {
         )) {
             System.err.println("[RTX CONFIG] Failed to restore motion debug view");
         }
-        setMotionVectorScaleMode(1);
+        // 2026-11-07 死设置修复：这里原来无条件 setMotionVectorScaleMode(1)，
+        // 把上面 1664-1667 刚从存档恢复的值整体覆盖 ⇒「运动矢量」开关的持久化
+        // 失效（重启后 UI 显示关、native 却是 1）。删掉这行，恢复"存档优先"。
         if(!setCloudMarchParams(
                 RTXSettingsConfig.getCloudMarchSettings().toParamArray()
         )) {
@@ -1971,11 +1990,6 @@ public final class NativeVulkan {
                 RTXSettingsConfig.isCloudFadeFollowsRrMode()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore cloud far fade mode");
-        }
-        if(!setCloudPostRrComposite(
-                RTXSettingsConfig.isCloudPostRrComposite()
-        )) {
-            System.err.println("[RTX CONFIG] Failed to restore cloud post-RR composite");
         }
         if(!setWaterParams(
                 RTXSettingsConfig.getWaterParamsSettings().toParamArray()
@@ -2057,9 +2071,6 @@ public final class NativeVulkan {
         RTXSettingsConfig.CloudPhiSettings cloudPhi = RTXSettingsConfig.getCloudPhiSettings();
         if(!setCloudPhiParams(cloudPhi.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud phi settings");
-        RTXSettingsConfig.CloudLightSettings cloudLight = RTXSettingsConfig.getCloudLightSettings();
-        if(!setCloudLightParams(cloudLight.toParamArray()))
-            System.err.println("[RTX CONFIG] Failed to restore cloud light settings");
         RTXSettingsConfig.CloudShapeSettings cloudShape = RTXSettingsConfig.getCloudShapeSettings();
         if(!setCloudShapeParams(cloudShape.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud shape settings");
@@ -2073,10 +2084,6 @@ public final class NativeVulkan {
                 RTXSettingsConfig.getCloudAmbientSettings();
         if(!setCloudAmbientParams(cloudAmbient.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud ambient settings");
-        RTXSettingsConfig.CloudSkyHueSettings cloudSkyHue =
-                RTXSettingsConfig.getCloudSkyHueSettings();
-        if(!setCloudSkyHueParams(cloudSkyHue.toParamArray()))
-            System.err.println("[RTX CONFIG] Failed to restore cloud sky hue settings");
         RTXSettingsConfig.CloudPhysicsSettings cloudPhysics =
                 RTXSettingsConfig.getCloudPhysicsSettings();
         if(!setCloudPhysicsParams(cloudPhysics.toParamArray()))
@@ -2084,9 +2091,6 @@ public final class NativeVulkan {
         RTXSettingsConfig.CloudMs2Settings cloudMs2 = RTXSettingsConfig.getCloudMs2Settings();
         if(!setCloudMs2Params(cloudMs2.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud ms2 settings");
-        RTXSettingsConfig.CloudLight2Settings cloudLight2 = RTXSettingsConfig.getCloudLight2Settings();
-        if(!setCloudLight2Params(cloudLight2.toParamArray()))
-            System.err.println("[RTX CONFIG] Failed to restore cloud light2 settings");
         RTXSettingsConfig.CloudProfileSettings cloudProfile =
                 RTXSettingsConfig.getCloudProfileSettings();
         if(!setCloudProfileParams(cloudProfile.toParamArray()))

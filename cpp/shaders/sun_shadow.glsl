@@ -1,6 +1,21 @@
 #ifndef SUN_SHADOW_GLSL
 #define SUN_SHADOW_GLSL
 
+// ===========================================================================
+// 2026-11-12：**无数据**（生产者未命中 / 采样点在盒外）时的取值。
+//
+// 之前的做法是按"离相机距离"或"离盒距离"渐隐到 0 —— 两者都是**相机相对**的，
+// 抬头看天时会在头顶切出一个盖子，观感就是"总有一道体积光从头顶直射下来"
+// （用户实测：关体积雾即消失，改半径也没用）。
+//
+// 正确判据是**采样点相对当地地表**：地表以上 = 露天（没有东西挡着，本该受光），
+// 地表以下 = 洞内（没有几何数据就不该给光）。体积雾在每次调用前把它写进这个
+// 变量；表面着色（rgen）不定义宏 ⇒ 不受影响、始终按 1.0。
+// ===========================================================================
+#ifdef SUN_SHADOW_TREAT_NO_HIT_AS_NO_DATA
+float sunShadowNoDataVisibility = 1.0;
+#endif
+
 #ifndef SUN_SHADOW_Z_FADE
 #define SUN_SHADOW_Z_FADE 1
 #endif
@@ -192,15 +207,92 @@ float sunShadowVisibilityIn(
     {
         outsideFade01 = smoothstep(
             0.0, SUN_SHADOW_OUTSIDE_FADE_BLOCKS, outsideDistance);
+#ifdef SUN_SHADOW_TREAT_NO_HIT_AS_NO_DATA
+        // 2026-11-11：盒外不再"硬判 0"。
+        //
+        // 上一版直接 return 0，靠 volumetric_fog.glsl 里 128~157 格的
+        // shadowCoverage 渐隐遮住硬边。但那个渐隐是**以相机为圆心**的球壳：
+        // 抬头看天时它正好在头顶切出一个"盖子"，亮区被截断 ⇒ 观感就是
+        // "头顶总有一道体积光直射下来"（用户实测：关体积雾即消失）。
+        //
+        // 现在改成**夹取边界列**：盒外用最近一列的真实遮挡值（空间上连续），
+        // 再按离盒距离平滑淡出到 0，既没有硬边、也不会出现相机相对的盖子。
+        const float outsideDepth = extentZ - dot(local, sunDirection);
+        const vec2 clampedUv = clamp(uv, vec2(0.0), vec2(1.0));
+        const float clampedStored = texture(shadowMap, clampedUv).r;
+
+        outsideFade01 = 0.0;
+
+        if(clampedStored >= 2.0 * extentZ - 1.0)
+        {
+            // 最近一列也没有几何 ⇒ 无数据 ⇒ 露天取 1、洞内取 0
+            return sunShadowNoDataVisibility;
+        }
+
+        const float borderVisible =
+            outsideDepth < clampedStored + bias ? 1.0 : 0.0;
+        const float smearFade = 1.0 - smoothstep(
+            SUN_SHADOW_OUTSIDE_FADE_BLOCKS * 2.0,
+            SUN_SHADOW_OUTSIDE_FADE_BLOCKS * 8.0,
+            outsideDistance);
+
+        return borderVisible * smearFade * sunShadowNoDataVisibility;
+#else
         return mix(
             1.0,
             outsideVisibility,
             outsideFade01);
+#endif
     }
     outsideFade01 = 0.0;
     float depth = extentZ - dot(local, sunDirection);
     vec2 sampleUv = uv + sunShadowJitter(sampleIndex) * texel;
+#ifdef SUN_SHADOW_TREAT_NO_HIT_AS_NO_DATA
+    // 2026-11-09：生产者 miss 时写的是 `2 * extentZ`（见 rt_sun_shadow.comp 的
+    // sunShadowTraceDepth(origin, -sunDirection, 2 * SUN_SHADOW_EXTENT_Z)）。
+    //
+    // 在闭合世界里，从盒的朝阳面沿 -sun 走满 2*extentZ 不可能什么都碰不到（地形
+    // 从基岩到地表连续），所以 miss 的唯一现实含义是：**这一列没有几何**
+    // —— 阴影盒（±160）超出了已加载/已进 TLAS 的地形范围。
+    //
+    // 以前它被当成"没有遮挡体 ⇒ 受光"（depth < 320 恒成立），于是雾在没有几何
+    // 覆盖的地方整片被太阳点亮 —— 就是"太阳体积光穿墙、从地表灌到地下"。
+    // 这里改判为"无数据"，交给 outsideFade 走 SUN_SHADOW_OUTSIDE_VISIBILITY（暗）。
+    if(texture(shadowMap, sampleUv).r >= 2.0 * extentZ - 1.0)
+    {
+        // 返回 **0**（完全遮蔽），不要返回 outsideVisibility：
+        // 体积雾那条调用给的 outsideVisibility 是
+        // SUN_SHADOW_OUTSIDE_VISIBILITY = 0.08，是给"盒外远处"用的软边界；
+        // 而"盒内这一列没有几何"没有理由保留 8% 的太阳 —— 在漆黑洞穴里
+        // 8% 仍然可见，表现为残留光柱（实测 user：上一版"几乎不穿墙"后还剩一层）。
+        //
+        // 不清 outsideFade01：sunShadowFogVisibility 会按它做
+        // mix(visibility, 0.08, noDataFade)，置 1 就被拉回 0.08。
+        // 2026-11-12：不再硬判 0（那会给露天天空切出一个跟随相机的盖子），
+        // 改由调用方按"是否高于当地地表"决定（露天 1 / 洞内 0）。
+        return sunShadowNoDataVisibility;
+    }
+#endif
 #ifdef SUN_SHADOW_PCF_TAPS_4
+#ifdef SUN_SHADOW_TREAT_NO_HIT_AS_NO_DATA
+    // 2026-11-13（A3）：体积雾的判据是"4 个 tap 全部受光才算受光"，
+    // 所以可以**遇到第一个被挡就返回 0** —— 与原来的 step(3.5, lit) 完全等价，
+    // 但平均只需 1.x 次采样（遮挡处通常第 1 个 tap 就命中）。
+    for(int tapY = 0; tapY < 2; ++tapY)
+    {
+        for(int tapX = 0; tapX < 2; ++tapX)
+        {
+            vec2 tapUv = sampleUv +
+                (vec2(float(tapX), float(tapY)) - 0.5) * texel;
+
+            if(depth >= texture(shadowMap, tapUv).r + bias)
+            {
+                return 0.0;
+            }
+        }
+    }
+    return 1.0;
+#else
     float lit = 0.0;
     for(int tapY = 0; tapY < 2; ++tapY)
     {
@@ -211,7 +303,9 @@ float sunShadowVisibilityIn(
             lit += depth < texture(shadowMap, tapUv).r + bias ? 1.0 : 0.0;
         }
     }
+    // 表面着色（rgen，未定义 TREAT 宏）：保持原来的平均语义。
     return lit * 0.25;
+#endif
 #else
     float stored = texture(shadowMap, sampleUv).r;
     return depth < stored + bias ? 1.0 : 0.0;

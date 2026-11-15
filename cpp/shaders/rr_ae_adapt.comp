@@ -1,5 +1,23 @@
 #version 460
 
+// 2026-11-15：自动曝光适应 v2。
+//
+// 旧版：
+//   · 只做一次指数逼近，alpha = 1 - exp(-dt*rate)，没有"线性段"；
+//     实测（run/rt_debug.log 2026-11-15 14:07）currentEV 在 1 秒内 ±0.4 反复跳。
+//   · trim 默认 0.02/0.98 ≈ 不修剪，云/太阳这类极亮像素直接主导均值。
+//   · 直方图 log 范围 [-10, 6]，物理天空/云的辐射经常超出上界，全部堆进最后
+//     一个 bin（等于"没有被测光"）。
+//
+// 现在按 UE 的 Eye Adaptation 口径：
+//   · 线性段 + 指数段两段适应，在距目标 transitionDistance（默认 1.5 EV）处
+//     切换，切换点一阶连续（指数段速率 k = rate / transitionDistance）。
+//     UE 的对应 cvar：r.EyeAdaptation.ExponentialTransitionDistance。
+//   · 百分位修剪（Low/High Percent，UE 推荐 70~80 / 80~95 ⇒ 这里 trimLow=0.15、
+//     trimHigh=0.90），把最暗/最亮的固定比例样本排除在均值之外。
+//   · 死区：|target-current| < 1e-3 EV 时直接吸附，避免量化抖动。
+//
+// cloudWhite 保留发布，但云合成已经不再读它（见 volumetric_cloud_composite.comp）。
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
@@ -13,56 +31,57 @@ layout(binding = 1, set = 0)
 buffer AeState
 {
     float currentEV;
-
     float targetEV;
-
     float avgLogLuma;
-
     uint sampleCount;
-
     float cloudWhite;
 };
 
 layout(push_constant) uniform AeParams
 {
     float dtSec;
-
     float keyEV;
-
     float minEV;
     float maxEV;
-
-    float adaptUpRate;
-    float adaptDownRate;
-
-    float trimLow;
-    float trimHigh;
-
-    int enabled;
-
+    float adaptUpRate;      // EV / s（变亮方向）
+    float adaptDownRate;    // EV / s（变暗方向）
+    float trimLow;          // 0..1，排除最暗的该比例样本
+    float trimHigh;         // 0..1，排除最亮的该比例样本
+    float logMin;           // 必须与 rr_ae_histogram.comp 一致
+    float logMax;           // 必须与 rr_ae_histogram.comp 一致
     float displayWhiteScale;
-};
+    float transitionDistance;
+    int enabled;
+    int pad0;
+} ae;
 
-const float AE_LOG2_MIN = -10.0;
-const float AE_LOG2_MAX = 6.0;
 const uint AE_BIN_COUNT = 256u;
 
-// Every exit below has to publish this, otherwise the cloud rolloff keeps
-// compressing against a stale white level while the exposure it was derived
-// from has already moved.
+float binCenter(uint i)
+{
+    return ae.logMin +
+        (float(i) + 0.5) * (ae.logMax - ae.logMin) / float(AE_BIN_COUNT);
+}
+
+void clearBins()
+{
+    for(uint i = 0u; i < AE_BIN_COUNT; ++i)
+    {
+        bins[i] = 0u;
+    }
+}
+
+// 每次退出都必须发布，否则云端/白点会拿着已经过期的白点继续工作。
 void publishCloudWhite()
 {
-    cloudWhite = exp2(-currentEV) * displayWhiteScale;
+    cloudWhite = exp2(-currentEV) * ae.displayWhiteScale;
 }
 
 void main()
 {
-    if(enabled == 0)
+    if(ae.enabled == 0)
     {
-        for(uint i = 0u; i < AE_BIN_COUNT; ++i)
-        {
-            bins[i] = 0u;
-        }
+        clearBins();
 
         currentEV = 0.0;
         targetEV = 0.0;
@@ -83,10 +102,7 @@ void main()
 
     if(total == 0u)
     {
-        for(uint i = 0u; i < AE_BIN_COUNT; ++i)
-        {
-            bins[i] = 0u;
-        }
+        clearBins();
 
         sampleCount = 0u;
         targetEV = currentEV;
@@ -97,8 +113,11 @@ void main()
         return;
     }
 
-    uint lowCut = uint(float(total) * trimLow);
-    uint highCut = uint(float(total) * trimHigh);
+    float lowFrac = clamp(ae.trimLow, 0.0, 0.98);
+    float highFrac = clamp(max(ae.trimHigh, lowFrac), 0.0, 1.0);
+
+    uint lowCut = uint(float(total) * lowFrac);
+    uint highCut = uint(float(total) * highFrac);
 
     uint cum = 0u;
     uint used = 0u;
@@ -113,13 +132,7 @@ void main()
 
         if(cum > lowCut && prevCum < highCut)
         {
-            float binCenter =
-                AE_LOG2_MIN +
-                (float(i) + 0.5) *
-                    (AE_LOG2_MAX - AE_LOG2_MIN) /
-                    float(AE_BIN_COUNT);
-
-            weighted += binCenter * (float(c) / float(total));
+            weighted += binCenter(i) * float(c);
             used += c;
         }
 
@@ -136,19 +149,32 @@ void main()
         return;
     }
 
-    float avgLogLum = weighted * (float(total) / float(used));
+    float avgLogLum = weighted / float(used);
 
-    float target = clamp(keyEV - avgLogLum, minEV, maxEV);
+    float target = clamp(ae.keyEV - avgLogLum, ae.minEV, ae.maxEV);
 
-    float rate =
-        target > currentEV
-            ? adaptUpRate
-            : adaptDownRate;
+    // ---- 线性 + 指数两段适应 ----------------------------------------------
+    float delta = target - currentEV;
+    float rate = (delta >= 0.0) ? ae.adaptUpRate : ae.adaptDownRate;
+    float step = max(rate, 0.0) * max(ae.dtSec, 0.0);
+    float transition = max(ae.transitionDistance, 0.05);
 
-    float alpha =
-        1.0 - exp(-max(dtSec, 0.0) * max(rate, 0.0));
+    if(abs(delta) <= 1.0e-3)
+    {
+        currentEV = target;
+    }
+    else if(abs(delta) >= transition)
+    {
+        currentEV += sign(delta) * min(step, abs(delta));
+    }
+    else
+    {
+        float k = max(rate, 1.0e-3) / transition;
+        float alpha = 1.0 - exp(-k * max(ae.dtSec, 0.0));
+        currentEV = mix(currentEV, target, clamp(alpha, 0.0, 1.0));
+    }
 
-    currentEV = mix(currentEV, target, clamp(alpha, 0.0, 1.0));
+    currentEV = clamp(currentEV, ae.minEV, ae.maxEV);
 
     targetEV = target;
     avgLogLuma = avgLogLum;

@@ -1726,6 +1726,53 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
         "volumetric cloud depth image view create failed");
         RTLogFlushed("[VOLCLOUD] passed check at L39697");
 
+    // =====================================================================
+    // 2026-11-15：体积雾 froxel 重构的资源（Pass 1 密度 3D + Pass 3 两张 2D）。
+    // 尺寸跟随云 pass（2D 与云一一对应 texelFetch；3D 是云分辨率 / 4 × 64 层）。
+    // =====================================================================
+    const uint32_t froxelWidth = std::max(1u, cloudWidth / FOG_FROXEL_DOWNSCALE);
+    const uint32_t froxelHeight = std::max(1u, cloudHeight / FOG_FROXEL_DOWNSCALE);
+    createVolumeRestir3DImage(froxelWidth, froxelHeight, FOG_FROXEL_DEPTH,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        g_fogFroxelDensityImage, g_fogFroxelDensityMemory, g_fogFroxelDensityView);
+
+    {
+        VkImageCreateInfo screenInfo = imageInfo;   // rgba16f 2D，尺寸同云
+        screenInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        check(vkCreateImage(g_device, &screenInfo, nullptr,
+            &g_fogScreenColorImage), "fog screen color image create failed");
+        vkGetImageMemoryRequirements(g_device, g_fogScreenColorImage, &requirements);
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = findMemoryType(g_physicalDevice,
+            requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(g_device, &allocation, nullptr,
+            &g_fogScreenColorMemory), "fog screen color allocate failed");
+        check(vkBindImageMemory(g_device, g_fogScreenColorImage,
+            g_fogScreenColorMemory, 0u), "fog screen color bind failed");
+        viewInfo.image = g_fogScreenColorImage;
+        viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        check(vkCreateImageView(g_device, &viewInfo, nullptr,
+            &g_fogScreenColorView), "fog screen color view create failed");
+
+        VkImageCreateInfo distInfo = imageInfo;
+        distInfo.format = VK_FORMAT_R16G16_SFLOAT;
+        distInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        check(vkCreateImage(g_device, &distInfo, nullptr,
+            &g_fogScreenDistImage), "fog screen dist image create failed");
+        vkGetImageMemoryRequirements(g_device, g_fogScreenDistImage, &requirements);
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = findMemoryType(g_physicalDevice,
+            requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(g_device, &allocation, nullptr,
+            &g_fogScreenDistMemory), "fog screen dist allocate failed");
+        check(vkBindImageMemory(g_device, g_fogScreenDistImage,
+            g_fogScreenDistMemory, 0u), "fog screen dist bind failed");
+        viewInfo.image = g_fogScreenDistImage;
+        viewInfo.format = VK_FORMAT_R16G16_SFLOAT;
+        check(vkCreateImageView(g_device, &viewInfo, nullptr,
+            &g_fogScreenDistView), "fog screen dist view create failed");
+    }
+
     check(vkCreateImage(g_device, &imageInfo, nullptr, &g_volumetricCloudHistoryDepthImage),
         "volumetric cloud history depth image create failed");
         RTLogFlushed("[VOLCLOUD] passed check at L39700");
@@ -1818,7 +1865,7 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
         g_godRayHistoryNeedsClear.store(true);
     }
 
-    VkDescriptorSetLayoutBinding renderBindings[14]{};
+    VkDescriptorSetLayoutBinding renderBindings[22]{};
     renderBindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
         VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     renderBindings[1] = { 1u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
@@ -1847,10 +1894,47 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
         VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     renderBindings[13] = { 13u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
         VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    // 2026-11-12：云影图（雾的云隙光查这张图，见 rt_cloud_shadow.comp）。
+    // 实际写入在 recordCloudShadowMap() 里懒完成，这里只需要布局里有这条。
+    renderBindings[14] = { 14u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    // 2026-11-12：太阳可见性体积（S1，rt_sun_volume.comp 烘的 64×64×32）。
+    // 近场 [near,32] 格的太阳遮挡用射线真值，替代阴影图 PCF。
+    //
+    // 2026-11-15 修复：原来 bindingCount 写的是 15u，只覆盖 0..14 —— binding 15
+    // 从未注册进布局，而 recordSunVisibilityVolume() 一直在往 15 写描述符、
+    // v5 也一直在采样它 ⇒ 采样读取的是**未定义描述符**，近场雾的太阳可见性
+    // 是垃圾值（"地下漏光 / 遮挡处朝太阳漏光 / 又密又怪"的硬来源）。
+    // 现在 bindingCount 与实际绑定条数一致。
+    renderBindings[15] = { 15u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    // 2026-11-15：L2 太阳遮挡真值 —— 体积雾的 march 逐样本 inline ray query
+    // （v5 的 binding 16）。比"阴影图 + 无数据启发式 + S1 体积"三层拼接干净，
+    // 近场完全按几何判定。TLAS 句柄会随实例增长重建，所以写入是懒的（见
+    // recordSunVisibilityVolume 里的绑定跟随）。
+    renderBindings[16] = { 16u, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    // 2026-11-15：体积雾 froxel 重构（Pass 1 密度 / Pass 3 合成）。
+    //   17 = 密度 froxel（合成 pass 双线性采样，combined sampler 3D）
+    //   18 = 密度 froxel（density pass 写入，storage 3D）
+    //   19/20 = 合成输出（屏幕 2D：scattering+transmittance / dist）
+    //   21/22 = 同两张 2D 的采样视图（v5 直接 texelFetch，替代内嵌雾 march）
+    renderBindings[17] = { 17u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    renderBindings[18] = { 18u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    renderBindings[19] = { 19u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    renderBindings[20] = { 20u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    renderBindings[21] = { 21u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    renderBindings[22] = { 22u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     VkDescriptorSetLayoutCreateInfo renderLayoutInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
     };
-    renderLayoutInfo.bindingCount = 14u;
+    renderLayoutInfo.bindingCount = 22u;
     renderLayoutInfo.pBindings = renderBindings;
     check(vkCreateDescriptorSetLayout(g_device, &renderLayoutInfo, nullptr,
         &g_volumetricCloudRenderSetLayout), "volumetric cloud render set layout failed");
@@ -1926,8 +2010,8 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
     VkDescriptorPoolSize poolSizes[5] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4u },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 21u },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6u },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 24u },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9u },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3u }
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -2141,7 +2225,7 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
     godRayHistoryInfo.sampler = g_volumetricCloudSampler;
     godRayHistoryInfo.imageView = g_godRayHistoryView;
     godRayHistoryInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkWriteDescriptorSet writes[36]{};
+    VkWriteDescriptorSet writes[42]{};
     writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
         g_volumetricCloudRenderSet, 0u, 0u, 1u,
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &cameraInfo, nullptr };
@@ -2262,7 +2346,63 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
         g_cloudFogLightGridBound = g_localLightGridGpuBuffer;
         g_cloudFogLightDescriptorsReady.store(true);
     }
-    writeCount = writeCount < 36u ? writeCount : 36u;
+    // 2026-11-15：froxel 重构的 6 条新 binding。
+    // （image info 必须声明在本函数作用域：vkUpdateDescriptorSets 在后面才调用。）
+    VkDescriptorImageInfo fogDensitySamplerInfo{};
+    VkDescriptorImageInfo fogDensityStorageInfo{};
+    VkDescriptorImageInfo fogColorStorageInfo{};
+    VkDescriptorImageInfo fogDistStorageInfo{};
+    VkDescriptorImageInfo fogColorSamplerInfo{};
+    VkDescriptorImageInfo fogDistSamplerInfo{};
+
+    if(g_fogFroxelDensityView != VK_NULL_HANDLE)
+    {
+        fogDensitySamplerInfo.sampler = g_volumetricCloudSampler;
+        fogDensitySamplerInfo.imageView = g_fogFroxelDensityView;
+        fogDensitySamplerInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        fogDensityStorageInfo.imageView = g_fogFroxelDensityView;
+        fogDensityStorageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            g_volumetricCloudRenderSet, 17u, 0u, 1u,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &fogDensitySamplerInfo,
+            nullptr, nullptr };
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            g_volumetricCloudRenderSet, 18u, 0u, 1u,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fogDensityStorageInfo,
+            nullptr, nullptr };
+    }
+    if(g_fogScreenColorView != VK_NULL_HANDLE && g_fogScreenDistView != VK_NULL_HANDLE)
+    {
+        fogColorStorageInfo.imageView = g_fogScreenColorView;
+        fogColorStorageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        fogDistStorageInfo.imageView = g_fogScreenDistView;
+        fogDistStorageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        fogColorSamplerInfo.sampler = g_volumetricCloudSampler;
+        fogColorSamplerInfo.imageView = g_fogScreenColorView;
+        fogColorSamplerInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        fogDistSamplerInfo.sampler = g_volumetricCloudSampler;
+        fogDistSamplerInfo.imageView = g_fogScreenDistView;
+        fogDistSamplerInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            g_volumetricCloudRenderSet, 19u, 0u, 1u,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fogColorStorageInfo,
+            nullptr, nullptr };
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            g_volumetricCloudRenderSet, 20u, 0u, 1u,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fogDistStorageInfo,
+            nullptr, nullptr };
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            g_volumetricCloudRenderSet, 21u, 0u, 1u,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &fogColorSamplerInfo,
+            nullptr, nullptr };
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            g_volumetricCloudRenderSet, 22u, 0u, 1u,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &fogDistSamplerInfo,
+            nullptr, nullptr };
+    }
+    writeCount = writeCount < 42u ? writeCount : 42u;
 
     {
         uint32_t safeCount = 0u;
@@ -2395,7 +2535,6 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &atrousResolvedStorageInfo, nullptr, nullptr };
         vkUpdateDescriptorSets(g_device, 6u, atrousWrites, 0u, nullptr);
     }
-    g_volumetricCloudCompositeTargetView = g_rtOutputView;
     g_volumetricCloudWidth = cloudWidth;
     g_volumetricCloudHeight = cloudHeight;
     g_volumetricCloudBoundRenderWidth = g_rtOutputWidth;
@@ -2518,6 +2657,120 @@ void createVolumetricCloudPipeline(uint32_t width, uint32_t height)
                     "), no cloud render pass this session");
             }
         }
+        // =====================================================================
+        // 2026-11-15：体积雾 froxel 重构的两个 compute pass。
+        // 失败时保持句柄为 NULL ⇒ recordFogFroxelPasses() 直接跳过 ⇒
+        // v5 采样的两张屏幕图未写入（雾消失）——开发期可接受，日志会说明原因。
+        // =====================================================================
+        if(g_fogFroxelDensityPipeline == VK_NULL_HANDLE)
+        {
+            try
+            {
+                const std::vector<uint8_t> densityCode = loadSpv(
+                    "shaders/fog_froxel_density.comp.spv");
+                VkShaderModule densityShader = createShaderModule(g_device, densityCode);
+
+                VkPushConstantRange froxelPush{};
+                froxelPush.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+                froxelPush.offset = 0u;
+                froxelPush.size = 16u;
+                VkPipelineLayoutCreateInfo froxelLayoutInfo{
+                    VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+                };
+                froxelLayoutInfo.setLayoutCount = 1u;
+                froxelLayoutInfo.pSetLayouts = &g_volumetricCloudRenderSetLayout;
+                froxelLayoutInfo.pushConstantRangeCount = 1u;
+                froxelLayoutInfo.pPushConstantRanges = &froxelPush;
+                check(vkCreatePipelineLayout(g_device, &froxelLayoutInfo, nullptr,
+                    &g_fogFroxelDensityPipelineLayout),
+                    "fog froxel density pipeline layout failed");
+
+                VkPipelineShaderStageCreateInfo froxelStage{
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+                };
+                froxelStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                froxelStage.module = densityShader;
+                froxelStage.pName = "main";
+                VkComputePipelineCreateInfo froxelPipelineInfo{
+                    VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+                };
+                froxelPipelineInfo.stage = froxelStage;
+                froxelPipelineInfo.layout = g_fogFroxelDensityPipelineLayout;
+                const VkResult densityResult = vkCreateComputePipelines(g_device,
+                    getSharedPipelineCache(), 1u, &froxelPipelineInfo, nullptr,
+                    &g_fogFroxelDensityPipeline);
+                vkDestroyShaderModule(g_device, densityShader, nullptr);
+                if(densityResult == VK_SUCCESS)
+                {
+                    RTLog("[FOG FROXEL] density pass created");
+                }
+                else
+                {
+                    RTLog("[FOG FROXEL] density pass creation failed (" +
+                        std::to_string(static_cast<int>(densityResult)) + ")");
+                }
+            }
+            catch(const std::exception& error)
+            {
+                RTLog(std::string("[FOG FROXEL] density pass unavailable (") +
+                    error.what() + ")");
+            }
+        }
+        if(g_fogFroxelCompositePipeline == VK_NULL_HANDLE)
+        {
+            try
+            {
+                const std::vector<uint8_t> compositeCode = loadSpv(
+                    "shaders/fog_froxel_composite.comp.spv");
+                VkShaderModule froxelCompositeShader =
+                    createShaderModule(g_device, compositeCode);
+
+                VkPushConstantRange froxelPush{};
+                froxelPush.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+                froxelPush.offset = 0u;
+                froxelPush.size = 16u;
+                VkPipelineLayoutCreateInfo froxelLayoutInfo{
+                    VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+                };
+                froxelLayoutInfo.setLayoutCount = 1u;
+                froxelLayoutInfo.pSetLayouts = &g_volumetricCloudRenderSetLayout;
+                froxelLayoutInfo.pushConstantRangeCount = 1u;
+                froxelLayoutInfo.pPushConstantRanges = &froxelPush;
+                check(vkCreatePipelineLayout(g_device, &froxelLayoutInfo, nullptr,
+                    &g_fogFroxelCompositePipelineLayout),
+                    "fog froxel composite pipeline layout failed");
+
+                VkPipelineShaderStageCreateInfo froxelStage{
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+                };
+                froxelStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                froxelStage.module = froxelCompositeShader;
+                froxelStage.pName = "main";
+                VkComputePipelineCreateInfo froxelPipelineInfo{
+                    VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+                };
+                froxelPipelineInfo.stage = froxelStage;
+                froxelPipelineInfo.layout = g_fogFroxelCompositePipelineLayout;
+                const VkResult compositeResult = vkCreateComputePipelines(g_device,
+                    getSharedPipelineCache(), 1u, &froxelPipelineInfo, nullptr,
+                    &g_fogFroxelCompositePipeline);
+                vkDestroyShaderModule(g_device, froxelCompositeShader, nullptr);
+                if(compositeResult == VK_SUCCESS)
+                {
+                    RTLog("[FOG FROXEL] composite pass created");
+                }
+                else
+                {
+                    RTLog("[FOG FROXEL] composite pass creation failed (" +
+                        std::to_string(static_cast<int>(compositeResult)) + ")");
+                }
+            }
+            catch(const std::exception& error)
+            {
+                RTLog(std::string("[FOG FROXEL] composite pass unavailable (") +
+                    error.what() + ")");
+            }
+        }
         VkPipelineShaderStageCreateInfo resolveStage = renderStage;
         resolveStage.module = resolveShader;
         VkComputePipelineCreateInfo resolvePipelineInfo{
@@ -2621,31 +2874,6 @@ void createVolumetricCloudPipeline(uint32_t width, uint32_t height)
     vkDestroyShaderModule(g_device, compositeShader, nullptr);
     vkDestroyShaderModule(g_device, lightShader, nullptr);
     RTLog("[CLOUD] full-resolution world-anchored render, temporal resolve, and composite pipelines created");
-}
-
-// 把云合成 pass 的目标图（描述符 binding 1）指向 target，只在真的变了才写一次
-// 描述符。两条路径共用同一个描述符集：旧档指向 g_rtOutputView（RR 的输入），
-// 远云剥离档指向 g_dlssOutputView（RR 的输出，见 recordCloudComposite），
-// 所以模式来回切时必须两边都来改绑，否则会把云合成到上一档的图里。
-void setCloudCompositeTarget(VkImageView target)
-{
-    if(target == VK_NULL_HANDLE ||
-       g_volumetricCloudCompositeSet == VK_NULL_HANDLE ||
-       g_volumetricCloudCompositeTargetView == target)
-    {
-        return;
-    }
-    VkDescriptorImageInfo targetInfo{};
-    targetInfo.imageView = target;
-    targetInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkWriteDescriptorSet targetWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    targetWrite.dstSet = g_volumetricCloudCompositeSet;
-    targetWrite.dstBinding = 1u;
-    targetWrite.descriptorCount = 1u;
-    targetWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    targetWrite.pImageInfo = &targetInfo;
-    vkUpdateDescriptorSets(g_device, 1u, &targetWrite, 0u, nullptr);
-    g_volumetricCloudCompositeTargetView = target;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2769,8 +2997,739 @@ void maybeHotReloadVolumetricCloudShaders()
     g_cloudSpvStampSeen = now;
     hotReloadVolumetricCloudPipelines();
 }
+// ===========================================================================
+// 2026-11-12：云影图（cloud shadow map）
+//
+// 供体积雾的"云隙光"查询：从云层沿太阳方向积分光学厚度，输出 exp(-τ)。
+// 与主云 pass 用同一个密度函数（rt_cloud_shadow.comp 调 hpEvaluateCloudProperties），
+// 所以光柱与真实云隙在位置上一致。
+//
+// 资源全部**懒创建**，并把结果挂到云 pass 描述符集的 binding 14 上
+//（render set 可能比本 pass 晚创建，所以每次记录时检查是否需要重绑）。
+// 任何一步失败都只让云隙光退化（binding 14 保持未绑定 → 雾侧回落到旧噪声），
+// 不影响云/雾本身。
+// ===========================================================================
+namespace
+{
+    constexpr uint32_t CLOUD_SHADOW_RES = 256u;
+
+    VkImage g_cloudShadowImage = VK_NULL_HANDLE;
+    VkDeviceMemory g_cloudShadowMemory = VK_NULL_HANDLE;
+    VkImageView g_cloudShadowView = VK_NULL_HANDLE;
+    VkSampler g_cloudShadowSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout g_cloudShadowSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool g_cloudShadowPool = VK_NULL_HANDLE;
+    VkDescriptorSet g_cloudShadowSet = VK_NULL_HANDLE;
+    VkPipelineLayout g_cloudShadowPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline g_cloudShadowPipeline = VK_NULL_HANDLE;
+    bool g_cloudShadowFailed = false;
+    bool g_cloudShadowLayoutReady = false;
+    VkDescriptorSet g_cloudShadowBoundSet = VK_NULL_HANDLE;
+
+    bool createCloudShadowPass()
+    {
+        if(g_cloudShadowPipeline != VK_NULL_HANDLE)
+        {
+            return true;
+        }
+        if(g_cloudShadowFailed || g_device == VK_NULL_HANDLE ||
+           g_physicalDevice == VK_NULL_HANDLE || g_cameraUboBuffer == VK_NULL_HANDLE ||
+           g_cloudBaseNoiseView == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        try
+        {
+            VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            imageInfo.imageType = VK_IMAGE_TYPE_2D;
+            imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+            imageInfo.extent = { CLOUD_SHADOW_RES, CLOUD_SHADOW_RES, 1u };
+            imageInfo.mipLevels = 1u;
+            imageInfo.arrayLayers = 1u;
+            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            check(vkCreateImage(g_device, &imageInfo, nullptr, &g_cloudShadowImage),
+                "cloud shadow image create failed");
+
+            VkMemoryRequirements requirements{};
+            vkGetImageMemoryRequirements(g_device, g_cloudShadowImage, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = findMemoryType(g_physicalDevice,
+                requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            check(vkAllocateMemory(g_device, &allocation, nullptr, &g_cloudShadowMemory),
+                "cloud shadow memory allocate failed");
+            check(vkBindImageMemory(g_device, g_cloudShadowImage, g_cloudShadowMemory, 0u),
+                "cloud shadow image bind failed");
+
+            VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            viewInfo.image = g_cloudShadowImage;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.levelCount = 1u;
+            viewInfo.subresourceRange.layerCount = 1u;
+            check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_cloudShadowView),
+                "cloud shadow view create failed");
+
+            VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            samplerInfo.magFilter = VK_FILTER_LINEAR;
+            samplerInfo.minFilter = VK_FILTER_LINEAR;
+            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.maxLod = 0.0f;
+            check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_cloudShadowSampler),
+                "cloud shadow sampler create failed");
+
+            VkDescriptorSetLayoutBinding bindings[5]{};
+            bindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            for(uint32_t i = 1u; i < 4u; ++i)
+            {
+                bindings[i] = { i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
+                    VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            }
+            bindings[4] = { 4u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+            };
+            layoutInfo.bindingCount = 5u;
+            layoutInfo.pBindings = bindings;
+            check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
+                &g_cloudShadowSetLayout), "cloud shadow set layout failed");
+
+            VkDescriptorPoolSize poolSizes[3] = {
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3u },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u }
+            };
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = 1u;
+            poolInfo.poolSizeCount = 3u;
+            poolInfo.pPoolSizes = poolSizes;
+            check(vkCreateDescriptorPool(g_device, &poolInfo, nullptr, &g_cloudShadowPool),
+                "cloud shadow pool failed");
+
+            VkDescriptorSetAllocateInfo setAllocation{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+            };
+            setAllocation.descriptorPool = g_cloudShadowPool;
+            setAllocation.descriptorSetCount = 1u;
+            setAllocation.pSetLayouts = &g_cloudShadowSetLayout;
+            check(vkAllocateDescriptorSets(g_device, &setAllocation, &g_cloudShadowSet),
+                "cloud shadow set allocate failed");
+
+            VkDescriptorBufferInfo cameraInfo{};
+            cameraInfo.buffer = g_cameraUboBuffer;
+            cameraInfo.range = sizeof(CameraUBO);
+
+            VkDescriptorImageInfo weatherInfo{};
+            weatherInfo.sampler = g_cloudV4AtlasView
+                ? g_cloudV4AtlasSampler : g_cloudBaseNoiseSampler;
+            weatherInfo.imageView = g_cloudV4AtlasView
+                ? g_cloudV4AtlasView : g_cloudBaseNoiseView;
+            weatherInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorImageInfo baseInfo{};
+            baseInfo.sampler = g_cloudBaseNoiseSampler;
+            baseInfo.imageView = g_cloudBaseNoiseView;
+            baseInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorImageInfo erosionInfo{};
+            erosionInfo.sampler = g_cloudV3CurlView
+                ? g_cloudV3CurlSampler : g_cloudBaseNoiseSampler;
+            erosionInfo.imageView = g_cloudV3CurlView
+                ? g_cloudV3CurlView : g_cloudBaseNoiseView;
+            erosionInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorImageInfo storageInfo{};
+            storageInfo.imageView = g_cloudShadowView;
+            storageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet writes[5]{};
+            writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                g_cloudShadowSet, 0u, 0u, 1u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                nullptr, &cameraInfo, nullptr };
+            writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                g_cloudShadowSet, 1u, 0u, 1u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                &weatherInfo, nullptr, nullptr };
+            writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                g_cloudShadowSet, 2u, 0u, 1u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                &baseInfo, nullptr, nullptr };
+            writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                g_cloudShadowSet, 3u, 0u, 1u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                &erosionInfo, nullptr, nullptr };
+            writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                g_cloudShadowSet, 4u, 0u, 1u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                &storageInfo, nullptr, nullptr };
+            vkUpdateDescriptorSets(g_device, 5u, writes, 0u, nullptr);
+
+            const std::vector<uint8_t> code = loadSpv("shaders/rt_cloud_shadow.comp.spv");
+            VkShaderModule shader = createShaderModule(g_device, code);
+
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+            };
+            pipelineLayoutInfo.setLayoutCount = 1u;
+            pipelineLayoutInfo.pSetLayouts = &g_cloudShadowSetLayout;
+            check(vkCreatePipelineLayout(g_device, &pipelineLayoutInfo, nullptr,
+                &g_cloudShadowPipelineLayout), "cloud shadow pipeline layout failed");
+
+            VkPipelineShaderStageCreateInfo stage{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+            };
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = shader;
+            stage.pName = "main";
+
+            VkComputePipelineCreateInfo pipelineInfo{
+                VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+            };
+            pipelineInfo.stage = stage;
+            pipelineInfo.layout = g_cloudShadowPipelineLayout;
+            check(vkCreateComputePipelines(g_device, getSharedPipelineCache(), 1u,
+                &pipelineInfo, nullptr, &g_cloudShadowPipeline),
+                "cloud shadow pipeline failed");
+
+            vkDestroyShaderModule(g_device, shader, nullptr);
+
+            RTLog("[CLOUD SHADOW] map ready (256x256, extent 512)");
+            return true;
+        }
+        catch(...)
+        {
+            RTLog("[CLOUD SHADOW] creation failed; cloud gap light stays off");
+            g_cloudShadowFailed = true;
+            return false;
+        }
+    }
+
+    // 记录云影图。每帧一次，256² / 8 = 32×32 组。
+    void recordCloudShadowMap(VkCommandBuffer cmd)
+    {
+        if(cmd == VK_NULL_HANDLE || !createCloudShadowPass())
+        {
+            return;
+        }
+
+        // 把结果挂到云 pass 的 binding 14（render set 可能晚于本 pass 创建）
+        if(g_cloudShadowBoundSet != g_volumetricCloudRenderSet &&
+           g_volumetricCloudRenderSet != VK_NULL_HANDLE)
+        {
+            VkDescriptorImageInfo info{};
+            info.sampler = g_cloudShadowSampler;
+            info.imageView = g_cloudShadowView;
+            info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            write.dstSet = g_volumetricCloudRenderSet;
+            write.dstBinding = 14u;
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &info;
+            vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+
+            g_cloudShadowBoundSet = g_volumetricCloudRenderSet;
+        }
+
+        // 2026-11-13（A1）：消费方 volumetric_fog.glsl 的 cloudGapTransmittance()
+        // 目前直接 `return 1.0`（用户：先不管云），所以这条 pass 的结果没人用。
+        // 资源仍然照建（保证 binding 14 是有效描述符），但**跳过每帧 dispatch**
+        // ——原来 131k texel × 4 次密度求值全白跑。
+        // 恢复云遮挡时把这里改回 true，并删掉 shader 里那句 return 1.0。
+        constexpr bool CLOUD_SHADOW_CONSUMER_ENABLED = false;
+        if(!CLOUD_SHADOW_CONSUMER_ENABLED)
+        {
+            return;
+        }
+
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = g_cloudShadowLayoutReady
+            ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = g_cloudShadowImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1u;
+        barrier.subresourceRange.layerCount = 1u;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+            1u, &barrier);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_cloudShadowPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            g_cloudShadowPipelineLayout, 0u, 1u, &g_cloudShadowSet, 0u, nullptr);
+        vkCmdDispatch(cmd, (CLOUD_SHADOW_RES + 7u) / 8u, (CLOUD_SHADOW_RES + 7u) / 8u, 1u);
+
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+            1u, &barrier);
+
+        g_cloudShadowLayoutReady = true;
+    }
+
+    // =======================================================================
+    // 2026-11-12：太阳可见性体积（S1）
+    //
+    // 与云影图同一个套路：懒创建 + 每帧 dispatch + 挂到云 pass 的 binding 15。
+    // 尺寸固定 64×64×32（相机视锥对齐，深度覆盖 [near, 32] 格）。
+    // 每 texel 一条朝太阳的 ray query ⇒ 近场太阳遮挡是**真值**，不再依赖
+    // 阴影图的 PCF 与"无数据"判据（那是洞穴漏光的来源）。
+    // =======================================================================
+    constexpr uint32_t SUN_VIS_W = 64u;
+    constexpr uint32_t SUN_VIS_H = 64u;
+    constexpr uint32_t SUN_VIS_D = 32u;
+
+    VkImage g_sunVisImage = VK_NULL_HANDLE;
+    VkDeviceMemory g_sunVisMemory = VK_NULL_HANDLE;
+    VkImageView g_sunVisView = VK_NULL_HANDLE;
+    VkSampler g_sunVisSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout g_sunVisSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool g_sunVisPool = VK_NULL_HANDLE;
+    VkDescriptorSet g_sunVisSet = VK_NULL_HANDLE;
+    VkPipelineLayout g_sunVisPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline g_sunVisPipeline = VK_NULL_HANDLE;
+    bool g_sunVisFailed = false;
+    bool g_sunVisLayoutReady = false;
+    VkDescriptorSet g_sunVisBoundSet = VK_NULL_HANDLE;
+
+    // 2026-11-14：binding 1（TLAS）当前写进去的是哪个 g_tlas。
+    // 与 g_sunShadowTlasHandle / g_terrainHeightTlasHandle 同一套约定。
+    VkAccelerationStructureKHR g_sunVisTlasHandle = VK_NULL_HANDLE;
+
+    bool createSunVisibilityPass()
+    {
+        if(g_sunVisPipeline != VK_NULL_HANDLE)
+        {
+            return true;
+        }
+        if(g_sunVisFailed || g_device == VK_NULL_HANDLE ||
+           g_physicalDevice == VK_NULL_HANDLE || g_cameraUboBuffer == VK_NULL_HANDLE ||
+           g_tlas == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        try
+        {
+            VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            imageInfo.imageType = VK_IMAGE_TYPE_3D;
+            imageInfo.format = VK_FORMAT_R8_UNORM;
+            imageInfo.extent = { SUN_VIS_W, SUN_VIS_H, SUN_VIS_D };
+            imageInfo.mipLevels = 1u;
+            imageInfo.arrayLayers = 1u;
+            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            check(vkCreateImage(g_device, &imageInfo, nullptr, &g_sunVisImage),
+                "sun visibility image create failed");
+
+            VkMemoryRequirements requirements{};
+            vkGetImageMemoryRequirements(g_device, g_sunVisImage, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = findMemoryType(g_physicalDevice,
+                requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            check(vkAllocateMemory(g_device, &allocation, nullptr, &g_sunVisMemory),
+                "sun visibility memory allocate failed");
+            check(vkBindImageMemory(g_device, g_sunVisImage, g_sunVisMemory, 0u),
+                "sun visibility image bind failed");
+
+            VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            viewInfo.image = g_sunVisImage;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+            viewInfo.format = VK_FORMAT_R8_UNORM;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.levelCount = 1u;
+            viewInfo.subresourceRange.layerCount = 1u;
+            check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_sunVisView),
+                "sun visibility view create failed");
+
+            VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            samplerInfo.magFilter = VK_FILTER_LINEAR;
+            samplerInfo.minFilter = VK_FILTER_LINEAR;
+            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.maxLod = 0.0f;
+            check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_sunVisSampler),
+                "sun visibility sampler create failed");
+
+            VkDescriptorSetLayoutBinding bindings[3]{};
+            bindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[1] = { 1u, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[2] = { 2u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+            };
+            layoutInfo.bindingCount = 3u;
+            layoutInfo.pBindings = bindings;
+            check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
+                &g_sunVisSetLayout), "sun visibility set layout failed");
+
+            VkDescriptorPoolSize poolSizes[3] = {
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
+                { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u }
+            };
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = 1u;
+            poolInfo.poolSizeCount = 3u;
+            poolInfo.pPoolSizes = poolSizes;
+            check(vkCreateDescriptorPool(g_device, &poolInfo, nullptr, &g_sunVisPool),
+                "sun visibility pool failed");
+
+            VkDescriptorSetAllocateInfo setAllocation{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+            };
+            setAllocation.descriptorPool = g_sunVisPool;
+            setAllocation.descriptorSetCount = 1u;
+            setAllocation.pSetLayouts = &g_sunVisSetLayout;
+            check(vkAllocateDescriptorSets(g_device, &setAllocation, &g_sunVisSet),
+                "sun visibility set allocate failed");
+
+            VkDescriptorBufferInfo cameraInfo{};
+            cameraInfo.buffer = g_cameraUboBuffer;
+            cameraInfo.range = sizeof(CameraUBO);
+
+            VkDescriptorImageInfo storageInfo{};
+            storageInfo.imageView = g_sunVisView;
+            storageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSetAccelerationStructureKHR tlasInfo{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+            };
+            tlasInfo.accelerationStructureCount = 1u;
+            tlasInfo.pAccelerationStructures = &g_tlas;
+
+            VkWriteDescriptorSet writes[3]{};
+            writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                g_sunVisSet, 0u, 0u, 1u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                nullptr, &cameraInfo, nullptr };
+            writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                g_sunVisSet, 1u, 0u, 1u, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+                nullptr, nullptr, nullptr };
+            writes[1].pNext = &tlasInfo;
+            writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                g_sunVisSet, 2u, 0u, 1u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                &storageInfo, nullptr, nullptr };
+            vkUpdateDescriptorSets(g_device, 3u, writes, 0u, nullptr);
+
+            const std::vector<uint8_t> code = loadSpv("shaders/rt_sun_volume.comp.spv");
+            VkShaderModule shader = createShaderModule(g_device, code);
+
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+            };
+            pipelineLayoutInfo.setLayoutCount = 1u;
+            pipelineLayoutInfo.pSetLayouts = &g_sunVisSetLayout;
+            check(vkCreatePipelineLayout(g_device, &pipelineLayoutInfo, nullptr,
+                &g_sunVisPipelineLayout), "sun visibility pipeline layout failed");
+
+            VkPipelineShaderStageCreateInfo stage{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+            };
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = shader;
+            stage.pName = "main";
+
+            VkComputePipelineCreateInfo pipelineInfo{
+                VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+            };
+            pipelineInfo.stage = stage;
+            pipelineInfo.layout = g_sunVisPipelineLayout;
+            check(vkCreateComputePipelines(g_device, getSharedPipelineCache(), 1u,
+                &pipelineInfo, nullptr, &g_sunVisPipeline),
+                "sun visibility pipeline failed");
+
+            vkDestroyShaderModule(g_device, shader, nullptr);
+
+            RTLog("[SUN VIS] volume ready (64x64x32, near..32 blocks)");
+            return true;
+        }
+        catch(...)
+        {
+            RTLog("[SUN VIS] creation failed; sun term keeps using the shadow map");
+            g_sunVisFailed = true;
+            return false;
+        }
+    }
+
+    void recordSunVisibilityVolume(VkCommandBuffer cmd)
+    {
+        if(cmd == VK_NULL_HANDLE || !createSunVisibilityPass())
+        {
+            return;
+        }
+
+        // 2026-11-14 TDR 根因修复：binding 1 必须跟随 g_tlas。
+        //
+        // 原实现只在 createSunVisibilityPass() 里写过一次 binding 1，而 g_tlas
+        // 会随实例容量增长被销毁重建（parkTlasStorage / releaseRetirementSlot
+        // → destroyAS）⇒ 描述符指向已销毁的 AS ⇒ rt_sun_volume.comp 的
+        // inline ray query 遍历已释放的 BVH 内存 ⇒ GPU 挂死、且因为内存仍在
+        // 驱动堆里映射着而不报 page fault（实测 vkGetDeviceFaultInfoEXT 只回
+        // -13 DEVICE_LOST）。
+        //
+        // 流式加载（实例数 4165→4364）期间每涨一次就重建一次 TLAS，
+        // 所以表现为"边走边崩"。
+        if(g_tlas == VK_NULL_HANDLE)
+        {
+            return;
+        }
+
+        if(g_sunVisTlasHandle != g_tlas)
+        {
+            VkAccelerationStructureKHR tlasHandle = g_tlas;
+
+            VkWriteDescriptorSetAccelerationStructureKHR tlasInfo{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+            };
+            tlasInfo.accelerationStructureCount = 1u;
+            tlasInfo.pAccelerationStructures = &tlasHandle;
+
+            VkWriteDescriptorSet tlasWrite{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+            };
+            tlasWrite.dstSet = g_sunVisSet;
+            tlasWrite.dstBinding = 1u;
+            tlasWrite.descriptorCount = 1u;
+            tlasWrite.descriptorType =
+                VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            tlasWrite.pNext = &tlasInfo;
+
+            vkUpdateDescriptorSets(g_device, 1u, &tlasWrite, 0u, nullptr);
+
+            g_sunVisTlasHandle = g_tlas;
+        }
+
+        // 2026-11-15：体积雾的 binding 16（TLAS）同样必须跟随 g_tlas ——
+        // ray query 遍历已销毁的 BVH 会和 S1 那条一样直接 TDR（见上面注释）。
+        if(g_volumetricCloudRenderSet != VK_NULL_HANDLE)
+        {
+            static VkAccelerationStructureKHR boundFogTlas = VK_NULL_HANDLE;
+            static VkDescriptorSet boundFogTlasSet = VK_NULL_HANDLE;
+
+            if(boundFogTlas != g_tlas || boundFogTlasSet != g_volumetricCloudRenderSet)
+            {
+                VkAccelerationStructureKHR tlasHandle = g_tlas;
+
+                VkWriteDescriptorSetAccelerationStructureKHR tlasInfo{
+                    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+                };
+                tlasInfo.accelerationStructureCount = 1u;
+                tlasInfo.pAccelerationStructures = &tlasHandle;
+
+                VkWriteDescriptorSet tlasWrite{
+                    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+                };
+                tlasWrite.dstSet = g_volumetricCloudRenderSet;
+                tlasWrite.dstBinding = 16u;
+                tlasWrite.descriptorCount = 1u;
+                tlasWrite.descriptorType =
+                    VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+                tlasWrite.pNext = &tlasInfo;
+
+                vkUpdateDescriptorSets(g_device, 1u, &tlasWrite, 0u, nullptr);
+
+                boundFogTlas = g_tlas;
+                boundFogTlasSet = g_volumetricCloudRenderSet;
+
+                RTLogFlushed("[FOG RAY] TLAS bound to cloud render set binding 16");
+            }
+        }
+
+        if(g_sunVisBoundSet != g_volumetricCloudRenderSet &&
+           g_volumetricCloudRenderSet != VK_NULL_HANDLE)
+        {
+            VkDescriptorImageInfo info{};
+            info.sampler = g_sunVisSampler;
+            info.imageView = g_sunVisView;
+            info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            write.dstSet = g_volumetricCloudRenderSet;
+            write.dstBinding = 15u;
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &info;
+            vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+
+            g_sunVisBoundSet = g_volumetricCloudRenderSet;
+        }
+
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = g_sunVisLayoutReady
+            ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = g_sunVisImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1u;
+        barrier.subresourceRange.layerCount = 1u;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+            1u, &barrier);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_sunVisPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            g_sunVisPipelineLayout, 0u, 1u, &g_sunVisSet, 0u, nullptr);
+        vkCmdDispatch(cmd,
+            (SUN_VIS_W + 7u) / 8u, (SUN_VIS_H + 7u) / 8u, SUN_VIS_D);
+
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+            1u, &barrier);
+
+        g_sunVisLayoutReady = true;
+    }
+}
+
+// =====================================================================
+// 2026-11-15：体积雾 froxel 重构（Pass 1 密度 → Pass 3 合成）。
+// 在云 pass 之前录：v5 里 evaluateAnalyticFog 已被替换为采样两张屏幕图。
+// 依赖：g_volumetricCloudRenderSet 的 binding 17..22 已写入。
+// =====================================================================
+void recordFogFroxelPasses(VkCommandBuffer cmd)
+{
+    if(cmd == VK_NULL_HANDLE ||
+       g_fogFroxelDensityPipeline == VK_NULL_HANDLE ||
+       g_fogFroxelCompositePipeline == VK_NULL_HANDLE ||
+       g_fogFroxelDensityPipelineLayout == VK_NULL_HANDLE ||
+       g_fogFroxelCompositePipelineLayout == VK_NULL_HANDLE ||
+       g_fogFroxelDensityView == VK_NULL_HANDLE ||
+       g_fogScreenColorView == VK_NULL_HANDLE ||
+       g_fogScreenDistView == VK_NULL_HANDLE ||
+       g_volumetricCloudRenderSet == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    const uint32_t froxelWidth =
+        std::max(1u, g_volumetricCloudWidth / FOG_FROXEL_DOWNSCALE);
+    const uint32_t froxelHeight =
+        std::max(1u, g_volumetricCloudHeight / FOG_FROXEL_DOWNSCALE);
+
+    // 三张目标图每帧整图重写：UNDEFINED → GENERAL（丢弃旧内容语义）。
+    VkImageMemoryBarrier fogTargets[3]{};
+    for(uint32_t i = 0u; i < 3u; ++i)
+    {
+        fogTargets[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        fogTargets[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        fogTargets[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        fogTargets[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        fogTargets[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        fogTargets[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        fogTargets[i].subresourceRange.levelCount = 1u;
+        fogTargets[i].subresourceRange.layerCount = 1u;
+        fogTargets[i].srcAccessMask = 0u;
+        fogTargets[i].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    }
+    fogTargets[0].image = g_fogFroxelDensityImage;
+    fogTargets[1].image = g_fogScreenColorImage;
+    fogTargets[2].image = g_fogScreenDistImage;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+        3u, fogTargets);
+
+    // Pass 1：密度 froxel。
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_fogFroxelDensityPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_fogFroxelDensityPipelineLayout, 0u, 1u,
+        &g_volumetricCloudRenderSet, 0u, nullptr);
+    const float densityPush[4] = {
+        float(FOG_FROXEL_DEPTH), g_fogMaxDistance.load(), 0.0f, 0.0f };
+    vkCmdPushConstants(cmd, g_fogFroxelDensityPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(densityPush), densityPush);
+    vkCmdDispatch(cmd, (froxelWidth + 3u) / 4u, (froxelHeight + 3u) / 4u,
+        (FOG_FROXEL_DEPTH + 3u) / 4u);
+
+    {
+        VkMemoryBarrier froxelToComposite{
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        froxelToComposite.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        froxelToComposite.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 1u, &froxelToComposite,
+            0u, nullptr, 0u, nullptr);
+    }
+
+    // Pass 3：沿视线积分，输出两张屏幕图。
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_fogFroxelCompositePipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_fogFroxelCompositePipelineLayout, 0u, 1u,
+        &g_volumetricCloudRenderSet, 0u, nullptr);
+    const float compositePush[4] = { float(FOG_FROXEL_DEPTH), 0.0f, 0.0f, 0.0f };
+    vkCmdPushConstants(cmd, g_fogFroxelCompositePipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(compositePush), compositePush);
+    vkCmdDispatch(cmd, (g_volumetricCloudWidth + 7u) / 8u,
+        (g_volumetricCloudHeight + 7u) / 8u, 1u);
+
+    {
+        VkImageMemoryBarrier fogDone[2]{};
+        for(uint32_t i = 0u; i < 2u; ++i)
+        {
+            fogDone[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            fogDone[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            fogDone[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            fogDone[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            fogDone[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            fogDone[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            fogDone[i].subresourceRange.levelCount = 1u;
+            fogDone[i].subresourceRange.layerCount = 1u;
+            fogDone[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            fogDone[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        }
+        fogDone[0].image = g_fogScreenColorImage;
+        fogDone[1].image = g_fogScreenDistImage;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+            2u, fogDone);
+    }
+}
+
 void recordVolumetricClouds(VkCommandBuffer cmd)
 {
+    // 2026-11-12：先烘云影图与太阳可见性体积，雾在同一条 command buffer 后面读。
+    recordCloudShadowMap(cmd);
+
+    rtCheckpoint(cmd, "cloud:shadow");
+    recordSunVisibilityVolume(cmd);
+
+    rtCheckpoint(cmd, "cloud:sunvis");
+
+    // 2026-11-15：froxel 雾（密度 + 合成），v5 稍后采样两张屏幕图。
+    recordFogFroxelPasses(cmd);
+    rtCheckpoint(cmd, "cloud:fogfroxel");
+
     maybeHotReloadVolumetricCloudShaders();
     if(cmd == VK_NULL_HANDLE || g_volumetricCloudRenderPipelineV3 == VK_NULL_HANDLE ||
        g_volumetricCloudResolvePipeline == VK_NULL_HANDLE ||
@@ -2788,9 +3747,13 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
     updateCloudLocalLightDescriptors();
     recordSunShadowMap(cmd);
 
+    rtCheckpoint(cmd, "cloud:sunshadow");
+
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SNEAR);
 
     recordTerrainHeightMap(cmd);
+
+    rtCheckpoint(cmd, "cloud:terrain");
 
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_HEIGHT);
     VkImageMemoryBarrier cloudBarriers[3]{};
@@ -2896,6 +3859,8 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
     vkCmdDispatch(cmd, (g_volumetricCloudWidth + 7u) / 8u,
         (g_volumetricCloudHeight + 7u) / 8u, 1u);
 
+    rtCheckpoint(cmd, "cloud:march");
+
     VkImageMemoryBarrier resolveBarriers[2]{};
     resolveBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     resolveBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2920,51 +3885,12 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
     vkCmdDispatch(cmd, (g_volumetricCloudWidth + 7u) / 8u,
         (g_volumetricCloudHeight + 7u) / 8u, 1u);
 
-    if(g_cloudPostRrComposite.load() &&
-       kCloudAtrousIterations > 0u &&
-       g_volumetricCloudAtrousPipeline != VK_NULL_HANDLE &&
-       g_volumetricCloudAtrousSetForward != VK_NULL_HANDLE &&
-       g_volumetricCloudAtrousSetBackward != VK_NULL_HANDLE &&
-       g_volumetricCloudWidth > 0u && g_volumetricCloudHeight > 0u)
-    {
-        static const int atrousStrides[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
-        const uint32_t atrousGroupsX = (g_volumetricCloudWidth + 7u) / 8u;
-        const uint32_t atrousGroupsY = (g_volumetricCloudHeight + 7u) / 8u;
-        for(uint32_t iteration = 0u; iteration < kCloudAtrousIterations; ++iteration)
-        {
-            VkMemoryBarrier atrousBarrier{};
-            atrousBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            atrousBarrier.srcAccessMask =
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            atrousBarrier.dstAccessMask =
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 1u, &atrousBarrier,
-                0u, nullptr, 0u, nullptr);
+    rtCheckpoint(cmd, "cloud:resolve");
 
-            const VkDescriptorSet atrousSet = (iteration & 1u) == 0u
-                ? g_volumetricCloudAtrousSetForward
-                : g_volumetricCloudAtrousSetBackward;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                g_volumetricCloudAtrousPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                g_volumetricCloudAtrousPipelineLayout, 0u, 1u, &atrousSet, 0u, nullptr);
-            struct CloudAtrousPush
-            {
-                int32_t stride;
-                float phiDepthRel;
-                float phiAlpha;
-                float phiLum;
-            } atrousPush;
-            atrousPush.stride = atrousStrides[iteration];
-            atrousPush.phiDepthRel = 0.06f;
-            atrousPush.phiAlpha = 0.20f;
-            atrousPush.phiLum = 1.5f;
-            vkCmdPushConstants(cmd, g_volumetricCloudAtrousPipelineLayout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(atrousPush), &atrousPush);
-            vkCmdDispatch(cmd, atrousGroupsX, atrousGroupsY, 1u);
-        }
-    }
+    // 2026-11-13：云 atrous 去噪调度块删除。它只服务已退役的"远云脱离RR"档
+    // （postRrComposite 开启时才跑），该档把云合成写进 RR 输入图导致切回旧档
+    // 黑屏；atrous 管线/描述符资源仍随云资源一起创建/销毁（无害保留）。
+    // kCloudAtrousIterations 常量保留在 OrionInternal.h 供回退参考。
 
     VkImageMemoryBarrier copyBarriers[4]{};
     copyBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -3014,7 +3940,7 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 4u, copyBarriers);
 
-    if(!g_cloudPostRrComposite.load() && g_aeStateBuffer != VK_NULL_HANDLE)
+    if(g_aeStateBuffer != VK_NULL_HANDLE)
     {
         VkBufferMemoryBarrier aeStateBarrier{};
         aeStateBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -3030,7 +3956,7 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
             &aeStateBarrier, 0u, nullptr);
     }
 
-    if(!g_cloudPostRrComposite.load())
+    // 2026-11-13：pre-RR 云合成成为唯一路径（"远云脱离RR"开关已退役）。
     {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volumetricCloudCompositePipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3040,10 +3966,25 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
         compositePush.splitDistance =
             cloudFarBandSplitActive() ? cloudFarBandSplitDistance() : 0.0f;
         compositePush.mode = 0.0f;
+        // 2026-11-15：白点不再从 AeState.cloudWhite 取（那会形成
+        // "云亮 → AE 压曝光 → 白点被拉大 → 云被压回白点" 的自反馈环）。
+        compositePush.whiteScale =
+            (hdrOutputActive() ? AE_HDR_CLOUD_WHITE_SCALE : 1.0f) *
+            g_cloudShoulderScale;
+        // 与下游曝光强度同口径：SDR 走 UI 的"自动曝光强度"，
+        // HDR 走 rr_hdr_encode.comp 里的 AE_EXPOSURE_STRENGTH = 0.6。
+        // ORION_CLOUD_SHOULDER_STRENGTH 可强制成旧口径（1.0）做 A/B。
+        compositePush.exposureStrength =
+            g_cloudShoulderStrength >= 0.0f
+                ? g_cloudShoulderStrength
+                : (hdrOutputActive() ? AE_HDR_EXPOSURE_STRENGTH
+                                     : g_postExposureStrength.load());
         vkCmdPushConstants(cmd, g_volumetricCloudCompositePipelineLayout,
             VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(compositePush), &compositePush);
         vkCmdDispatch(cmd, (g_rtOutputWidth + 7u) / 8u,
             (g_rtOutputHeight + 7u) / 8u, 1u);
+
+        rtCheckpoint(cmd, "cloud:composite");
     }
 
     // 2026-11-01：这里原来整块被 `volRestirEnabled() == 0u` 门控 —— 于是 ReSTIR
@@ -3360,6 +4301,8 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
                     selfTestPipelineLayout, 0u, 1u, &selfTestSet, 0u, nullptr);
                 vkCmdDispatch(cmd, 1u, 1u, 1u);
 
+                rtCheckpoint(cmd, "cloud:raytest");
+
                 VkMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
                 hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
                 hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -3396,6 +4339,8 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 g_volumetricLightPipelineLayout, 0u, 1u, &g_volumetricLightSet, 0u, nullptr);
             vkCmdDispatch(cmd, (g_godRayWidth + 7u) / 8u, (g_godRayHeight + 7u) / 8u, 1u);
+
+            rtCheckpoint(cmd, "cloud:vollight");
         }
 
         VkImageMemoryBarrier godRayReadBarrier{};
@@ -3429,6 +4374,8 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
             g_godRayCompositePipelineLayout, 0u, 1u, &g_godRayCompositeSet, 0u, nullptr);
         vkCmdDispatch(cmd, (g_rtOutputWidth + 7u) / 8u, (g_rtOutputHeight + 7u) / 8u, 1u);
 
+        rtCheckpoint(cmd, "cloud:godray");
+
         if(volRestirEnabled() == 0u &&
            g_godRayHistoryImage != VK_NULL_HANDLE &&
            g_godRayWidth == g_rtOutputWidth &&
@@ -3446,87 +4393,6 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
     }
 }
 
-// =====================================================
-// 2026-10-06 远云剥离 RR：云合成搬到 RR evaluate 之后
-//
-// 与 recordVolumetricClouds 尾部那一段是同一个 pass（同一套 pipeline、描述符集
-// 与着色器），差别只有两点：目标图从 RR 的**输入**（g_rtOutputImage，render
-// 分辨率）换成 RR 的**输出**（g_dlssOutputView，输出分辨率），dispatch 尺寸跟着
-// 换。云层这时也在输出分辨率（见主循环对 createVolumetricCloudPipeline 的调用），
-// 所以是 1:1 合成，完全不经过 RR 的上采样 ⇒ 清晰度与 RR 档位无关。
-//
-// 只能录在 g_slEvaluateFeature 之后：在那之前 g_dlssOutputView 里还是上一帧的内容。
-// =====================================================
-void recordCloudComposite(VkCommandBuffer cmd)
-{
-    if(!(g_cloudPostRrComposite.load() || cloudFarBandSplitActive()))
-    {
-        return;
-    }
-    if(cmd == VK_NULL_HANDLE ||
-       g_volumetricCloudCompositePipeline == VK_NULL_HANDLE ||
-       g_volumetricCloudCompositePipelineLayout == VK_NULL_HANDLE ||
-       g_volumetricCloudCompositeSet == VK_NULL_HANDLE ||
-       g_volumetricCloudResolvedImage == VK_NULL_HANDLE ||
-       g_dlssOutputImage == VK_NULL_HANDLE ||
-       g_dlssOutputView == VK_NULL_HANDLE ||
-       g_dlssOutputWidth == 0u || g_dlssOutputHeight == 0u)
-    {
-        return;
-    }
-
-
-    VkImageMemoryBarrier barriers[2]{};
-    for(uint32_t i = 0u; i < 2u; ++i)
-    {
-        barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barriers[i].subresourceRange.levelCount = 1u;
-        barriers[i].subresourceRange.layerCount = 1u;
-        barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    }
-    barriers[0].image = g_volumetricCloudResolvedImage;
-    barriers[1].image = g_dlssOutputImage;
-    barriers[1].dstAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
-        2u, barriers);
-
-    if(g_aeStateBuffer != VK_NULL_HANDLE)
-    {
-        VkBufferMemoryBarrier aeStateBarrier{};
-        aeStateBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        aeStateBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        aeStateBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        aeStateBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        aeStateBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        aeStateBarrier.buffer = g_aeStateBuffer;
-        aeStateBarrier.offset = 0u;
-        aeStateBarrier.size = VK_WHOLE_SIZE;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u,
-            &aeStateBarrier, 0u, nullptr);
-    }
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volumetricCloudCompositePipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        g_volumetricCloudCompositePipelineLayout, 0u, 1u, &g_volumetricCloudCompositeSet,
-        0u, nullptr);
-    CloudCompositePush compositePush{};
-    compositePush.splitDistance =
-        cloudFarBandSplitActive() ? cloudFarBandSplitDistance() : 0.0f;
-    compositePush.mode = cloudFarBandSplitActive() ? 1.0f : 0.0f;
-    vkCmdPushConstants(cmd, g_volumetricCloudCompositePipelineLayout,
-        VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(compositePush), &compositePush);
-    vkCmdDispatch(cmd, (g_dlssOutputWidth + 7u) / 8u,
-        (g_dlssOutputHeight + 7u) / 8u, 1u);
-}
 void destroyVolumetricCloudResources()
 {
     if(g_device != VK_NULL_HANDLE)
@@ -3556,6 +4422,33 @@ void destroyVolumetricCloudResources()
     if(g_volumetricCloudAtrousPipelineLayout) vkDestroyPipelineLayout(g_device, g_volumetricCloudAtrousPipelineLayout, nullptr);
     if(g_volumetricCloudAtrousDescriptorPool) vkDestroyDescriptorPool(g_device, g_volumetricCloudAtrousDescriptorPool, nullptr);
     if(g_volumetricCloudAtrousSetLayout) vkDestroyDescriptorSetLayout(g_device, g_volumetricCloudAtrousSetLayout, nullptr);
+    // 2026-11-15：froxel 重构的资源销毁。
+    if(g_fogFroxelCompositePipeline) vkDestroyPipeline(g_device, g_fogFroxelCompositePipeline, nullptr);
+    if(g_fogFroxelCompositePipelineLayout) vkDestroyPipelineLayout(g_device, g_fogFroxelCompositePipelineLayout, nullptr);
+    if(g_fogFroxelDensityPipeline) vkDestroyPipeline(g_device, g_fogFroxelDensityPipeline, nullptr);
+    if(g_fogFroxelDensityPipelineLayout) vkDestroyPipelineLayout(g_device, g_fogFroxelDensityPipelineLayout, nullptr);
+    if(g_fogScreenDistView) vkDestroyImageView(g_device, g_fogScreenDistView, nullptr);
+    if(g_fogScreenDistImage) vkDestroyImage(g_device, g_fogScreenDistImage, nullptr);
+    if(g_fogScreenDistMemory) vkFreeMemory(g_device, g_fogScreenDistMemory, nullptr);
+    if(g_fogScreenColorView) vkDestroyImageView(g_device, g_fogScreenColorView, nullptr);
+    if(g_fogScreenColorImage) vkDestroyImage(g_device, g_fogScreenColorImage, nullptr);
+    if(g_fogScreenColorMemory) vkFreeMemory(g_device, g_fogScreenColorMemory, nullptr);
+    if(g_fogFroxelDensityView) vkDestroyImageView(g_device, g_fogFroxelDensityView, nullptr);
+    if(g_fogFroxelDensityImage) vkDestroyImage(g_device, g_fogFroxelDensityImage, nullptr);
+    if(g_fogFroxelDensityMemory) vkFreeMemory(g_device, g_fogFroxelDensityMemory, nullptr);
+    g_fogFroxelCompositePipeline = VK_NULL_HANDLE;
+    g_fogFroxelCompositePipelineLayout = VK_NULL_HANDLE;
+    g_fogFroxelDensityPipeline = VK_NULL_HANDLE;
+    g_fogFroxelDensityPipelineLayout = VK_NULL_HANDLE;
+    g_fogScreenDistView = VK_NULL_HANDLE;
+    g_fogScreenDistImage = VK_NULL_HANDLE;
+    g_fogScreenDistMemory = VK_NULL_HANDLE;
+    g_fogScreenColorView = VK_NULL_HANDLE;
+    g_fogScreenColorImage = VK_NULL_HANDLE;
+    g_fogScreenColorMemory = VK_NULL_HANDLE;
+    g_fogFroxelDensityView = VK_NULL_HANDLE;
+    g_fogFroxelDensityImage = VK_NULL_HANDLE;
+    g_fogFroxelDensityMemory = VK_NULL_HANDLE;
     if(g_volumetricCloudSampler) vkDestroySampler(g_device, g_volumetricCloudSampler, nullptr);
     if(g_volumetricCloudHistoryDepthView) vkDestroyImageView(g_device, g_volumetricCloudHistoryDepthView, nullptr);
     if(g_volumetricCloudHistoryDepthImage) vkDestroyImage(g_device, g_volumetricCloudHistoryDepthImage, nullptr);
@@ -3607,7 +4500,6 @@ void destroyVolumetricCloudResources()
     g_volumetricCloudRenderSet = VK_NULL_HANDLE;
     g_volumetricCloudResolveSet = VK_NULL_HANDLE;
     g_volumetricCloudCompositeSet = VK_NULL_HANDLE;
-    g_volumetricCloudCompositeTargetView = VK_NULL_HANDLE;
     g_volumetricCloudRenderPipelineLayout = VK_NULL_HANDLE;
     g_volumetricCloudResolvePipelineLayout = VK_NULL_HANDLE;
     g_volumetricCloudCompositePipelineLayout = VK_NULL_HANDLE;

@@ -234,10 +234,10 @@ void storeGodRayNeutral(ivec2 pixel)
 vec2 reprojectUv(vec3 worldPoint, out bool valid)
 {
     valid = false;
-    mat4 prevProj = inverse(cam.prevProjInverse);
-    vec3 prevViewPoint = transpose(mat3(cam.prevViewInverse)) *
-        (worldPoint - cam.prevViewInverse[3].xyz);
-    vec4 prevClip = prevProj * vec4(prevViewPoint, 1.0);
+    // 2026-11-09：一次矩阵乘代替"转置近似 view + 每像素求逆投影"。
+    // cam.prevViewProj = inverse(prevProjInverse) * inverse(prevViewInverse)，
+    // 对刚性相机与原来的 transpose(mat3) 写法同值（原来那步是避免 4x4 求逆的近似）。
+    vec4 prevClip = cam.prevViewProj * vec4(worldPoint, 1.0);
     if(abs(prevClip.w) <= 1.0e-6)
     {
         return vec2(-1.0);
@@ -443,9 +443,13 @@ void main()
     }
     float dayAmount = smoothstep(-0.03, 0.03, sunElevation);
     float elevationMagnitude = abs(sunElevation) / SOLAR_LATITUDE_35_COS;
-    vec3 lightColor = mix(vec3(0.46, 0.56, 1.00), sunColor(lightDirection), dayAmount);
+    // 2026-11-13：夜间色改调共享的 skyModelMoonColor（原来硬编码）。
+    vec3 lightColor = mix(skyModelMoonColor(sunElevation), sunColor(lightDirection), dayAmount);
     float lightEnergy = GODRAY_SUN_ENERGY * mix(
         GODRAY_MOON_FRACTION * elevationMagnitude, 1.0, dayAmount);
+
+    // 2026-11-13：与地形同源的月相调光。
+    lightEnergy *= mix(1.0, skyModelMoonPhaseDim(cam.sssParams.z, 0.35), 1.0 - dayAmount);
 
     vec2 ndc = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
     ndc.y = -ndc.y;

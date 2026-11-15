@@ -107,6 +107,22 @@ layout(buffer_reference, scalar) buffer Vertices {
 // 解包后仍返回老的 48B Vertex ⇒ 下游 materialId/pad1/pad2 使用点零改动。
 // 编译期开关必须与 C++ 的 SECTION_VERTEX_32B_ENABLED 一致。
 // =====================================================
+
+// =====================================================
+// 2026-11-12：实例变换（实例化第一步）。
+//
+// TLAS 实例不再恒为单位矩阵：顶点可以按**模型局部空间**上传，命中着色器在读取
+// 顶点时把位置变回世界空间。恒等实例下与旧行为数学等价（mat4x3 乘加一次）。
+// 法线由世界空间顶点差分得到（cross(pos1-pos0, pos2-pos0)），所以也会自动正确，
+// 前提是实例变换只含旋转+平移（当前设计如此）。
+//
+// ⚠ 必须定义在 #if SECTION_VERTEX_32B **之前**：32B 与 48B 两条顶点路径都要用它。
+// =====================================================
+vec3 rtObjectToWorld(vec3 localPosition)
+{
+    return gl_ObjectToWorldEXT * vec4(localPosition, 1.0);
+}
+
 #if SECTION_VERTEX_32B
 struct SectionVertex32
 {
@@ -128,9 +144,10 @@ Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
         const SectionVertex32 packed = SectionVertices32(addr).v[index];
 
         Vertex unpacked;
-        unpacked.x = packed.x;
-        unpacked.y = packed.y;
-        unpacked.z = packed.z;
+        const vec3 world = rtObjectToWorld(vec3(packed.x, packed.y, packed.z));
+        unpacked.x = world.x;
+        unpacked.y = world.y;
+        unpacked.z = world.z;
         unpacked.u = packed.u;
         unpacked.v = packed.v;
         unpacked.r = float(packed.color & 0xFFu) / 255.0;
@@ -146,12 +163,22 @@ Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
         return unpacked;
     }
 
-    return Vertices(addr).v[index];
+    Vertex raw = Vertices(addr).v[index];
+    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
+    raw.x = world.x;
+    raw.y = world.y;
+    raw.z = world.z;
+    return raw;
 }
 #else
 Vertex loadSectionVertex(uint64_t addr, uint /*stride*/, uint index)
 {
-    return Vertices(addr).v[index];
+    Vertex raw = Vertices(addr).v[index];
+    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
+    raw.x = world.x;
+    raw.y = world.y;
+    raw.z = world.z;
+    return raw;
 }
 #endif
 
@@ -280,6 +307,17 @@ layout(std430, binding = 17, set = 0) readonly buffer LocalLightBuffer
 
 void main()
 {
+    // 2026-11-11 太阳可见度（软影 A 方案，形态 1）：
+    // 这条射线只需要"遮挡物距离"，把 gl_HitTEXT 写进 payload 后立刻返回，
+    // **不进材质解析**。它替代了原来"整条射线都 SkipClosestHitShader"的做法
+    // （那样 any-hit 拿不到任何 t）。purpose 5 = RT_PURPOSE_GLASS_VISIBILITY，
+    // 与 rt_test.rahit 的同名常量一致。
+    if((payload.state & 0x7u) == 5u)
+    {
+        payload.hitDistance = gl_HitTEXT;
+        return;
+    }
+
     // 2026-10-25：GI 射线跳过 POM 的开关来自 rgen 播种的 state 位（bit 17）。
     // 必须在 resolveHitMaterial() 之前播种 —— 材质解析里就会调 traceParallax()。
     g_giRaySkipPOM =

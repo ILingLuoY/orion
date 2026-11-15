@@ -48,7 +48,8 @@ VARIANTS = {
     # 2026-11-02：玻璃解析半侧的加回与 rt_test.rgen 的拆分必须同一个宏值。
     'rr_sdr_post.comp.spv': ('rr_sdr_post.comp', ['-DRR_STABLE_GLASS_RADIANCE=1']),
     'rr_hdr_encode.comp.spv': ('rr_hdr_encode.comp', ['-DRR_STABLE_GLASS_RADIANCE=1']),
-    'sparse_active_mask.comp.spv': ('sparse_active_mask.comp', ['-DSPARSE_EDGE_AWARE=1']),
+    # 2026-11-08：与 _deploy_stale_spv.py 同口径 —— edge-aware 关闭（回到 11-02 纯 rate 掩码）。
+    'sparse_active_mask.comp.spv': ('sparse_active_mask.comp', ['-DSPARSE_ORDERED_BAYER=0']),
 }
 
 TARGET_ENVS = ('vulkan1.2', 'vulkan1.4')

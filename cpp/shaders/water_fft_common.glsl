@@ -2,8 +2,8 @@
 #ifndef WATER_FFT_COMMON_GLSL
 #define WATER_FFT_COMMON_GLSL
 
-#define WATER_FFT_N 256u
-#define WATER_FFT_LOG2_N 8
+#define WATER_FFT_N 512u
+#define WATER_FFT_LOG2_N 9
 #define WATER_FFT_PI 3.14159265358979
 #define WATER_FFT_GRAVITY 9.81
 
@@ -70,7 +70,7 @@ vec2 waterFftGridIndex(uvec2 store)
 
 // 格点索引 → 物理波数。Tessendorf.glsl 的 GetWaveFieldCoord：k = m·(L/N)，
 // L=250、N=1024、**不含 2π**。⚠ 波数步长固定为 L/1024，
-// **与本站 FFT 分辨率 WATER_FFT_N 无关**：若误用 K_SPAN/WATER_FFT_N(=256) 步长会粗 4×，
+// **与本站 FFT 分辨率 WATER_FFT_N 无关**：若误用 K_SPAN/WATER_FFT_N(=512) 步长会粗 4×，
 // 丢掉承载主要能量的低频波（k≈0.43 的 ~5 格涌浪），水面会近乎全平。
 // 再按 (10/period) 缩放：宿主把世界平铺周期 P 经 texelWorldSize = P/N 传进来
 //（⇒ P = texelWorldSize·N），固定 10 格；缩放后 k = κ·(2500/(1024·2π))

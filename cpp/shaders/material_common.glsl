@@ -148,9 +148,21 @@ vec2 rainImpactRippleGradient(vec2 worldXZ, float cameraDistance)
         return vec2(0.0);
     }
 
-    const float CELL_SIZE = 0.432;
-    const float RING_SPEED = 0.336;
-    const float RING_FREQUENCY = 66.66667;
+    // 2026-11-11：UI 旋钮。与 rchit_helpers_water.glsl 逐字同口径
+    //（两处必须一致，否则水面与地面观感会分叉）。
+    //   godRayParams2.w = size + strength * 8；<=0 ⇒ 默认 (1,1)
+    const float packedRipple = cam.godRayParams2.w;
+    float rippleSize = 1.0;
+    float rippleStrength = 1.0;
+    if(packedRipple > 0.0)
+    {
+        rippleStrength = clamp(floor(packedRipple / 8.0 + 1.0e-4), 0.0, 3.0);
+        const float rawSize = packedRipple - rippleStrength * 8.0;
+        rippleSize = clamp(rawSize <= 0.0 ? 1.0 : rawSize, 0.25, 4.0);
+    }
+    const float CELL_SIZE = 0.432 * rippleSize;
+    const float RING_SPEED = 0.336 * rippleSize;
+    const float RING_FREQUENCY = 66.66667 / rippleSize;
     float time = uintBitsToFloat(cam.padding);
     vec2 baseCell = floor(worldXZ / CELL_SIZE);
     vec2 gradient = vec2(0.0);
@@ -180,7 +192,7 @@ vec2 rainImpactRippleGradient(vec2 worldXZ, float cameraDistance)
         }
     }
 
-    return gradient * (0.060 * rain * nearFade);
+    return gradient * (0.060 * rain * nearFade * rippleStrength);
 }
 
 WaterWaveSurface evaluateWaterWaveSurface(vec2 worldXZ, float waterY)
@@ -259,6 +271,13 @@ WaterWaveSurface evaluateWaterWaveSurfaceClassify(vec2 worldXZ, float waterY)
 
 
 
+#ifndef ORION_ATLAS_DYNAMIC_INDEX
+// 2026-11-10：开启 sampler2D[64] 的动态下标（Vulkan 1.0 的
+// shaderSampledImageArrayDynamicIndexing，由 VulkanBackendMixin 在 createDevice 时补）。
+// 回退：-DORION_ATLAS_DYNAMIC_INDEX=0 ⇒ 走原来的 64 路 switch。
+#define ORION_ATLAS_DYNAMIC_INDEX 0
+#endif
+
 layout(binding = 3, set = 0) uniform sampler2D blockAtlas;
 layout(binding = 36, set = 0) uniform sampler2D entityAtlases[64];
 layout(binding = 63, set = 0) uniform sampler2D entityNormalAtlases[64];
@@ -270,6 +289,14 @@ layout(binding = 49, set = 0) uniform sampler2D dhBlockRatioAtlas;
 
 vec4 sampleEntityAtlas(uint textureSlot, vec2 uv)
 {
+#if ORION_ATLAS_DYNAMIC_INDEX
+    if(textureSlot == 0u || textureSlot > 64u)
+    {
+        return vec4(1.0);
+    }
+    return textureLod(entityAtlases[textureSlot - 1u], uv, 0.0);
+#endif
+
     switch(textureSlot)
     {
         case 1u: return textureLod(entityAtlases[0], uv, 0.0);
@@ -350,6 +377,18 @@ void sampleEntityPbr(
     out vec4 specularTexel
 )
 {
+#if ORION_ATLAS_DYNAMIC_INDEX
+    if(textureSlot == 0u || textureSlot > 64u)
+    {
+        normalTexel = vec4(0.0, 0.0, 0.0, 1.0);
+        specularTexel = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    normalTexel = textureLod(entityNormalAtlases[textureSlot - 1u], uv, 0.0);
+    specularTexel = textureLod(entitySpecularAtlases[textureSlot - 1u], uv, 0.0);
+    return;
+#endif
+
     switch(textureSlot)
     {
         case 1u: normalTexel = textureLod(entityNormalAtlases[0], uv, 0.0); specularTexel = textureLod(entitySpecularAtlases[0], uv, 0.0); return;

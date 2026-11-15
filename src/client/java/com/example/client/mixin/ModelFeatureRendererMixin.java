@@ -39,11 +39,22 @@ public class ModelFeatureRendererMixin {
             ci.cancel();
             return;
         }
+        // 2026-11-12：同 getVertexBuilder —— 只在诊断开启时才计 nanoTime
+        final boolean probe = com.example.client.LevelPhaseProbe.probeEnabled();
+        final long captureStart = probe ? System.nanoTime() : 0L;
         EntityRtCapture.beginModel(submit);
+        if (probe && captureStart != 0L) {
+            com.example.client.LevelPhaseProbe.captureAdd(System.nanoTime() - captureStart);
+        }
     }
 
     @Inject(method = "prepareModel", at = @At("RETURN"))
     private <S> void rtx$endModelCapture(ModelFeatureRenderer.Submit<S> submit, CallbackInfo ci) {
+        final boolean probe = com.example.client.LevelPhaseProbe.probeEnabled();
+        final long captureStart = probe ? System.nanoTime() : 0L;
         EntityRtCapture.endModel();
+        if (probe && captureStart != 0L) {
+            com.example.client.LevelPhaseProbe.captureAdd(System.nanoTime() - captureStart);
+        }
     }
 }

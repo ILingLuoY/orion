@@ -39,8 +39,13 @@
 | SER off | **28.05** | 38 |
 | mode 1 | 15.66 | 39 |
 | mode 4（role-table key） | 16.26 | 38 |
-| mode 5（现网 pin，driver key） | 16.02 | 38 |
-| mode 6 | 15.50 | 38 |
+| mode 5（driver key） | 16.02 | 38 |
+| mode 6（**现网 pin**） | 15.50 | 38 |
+
+> 2026-11-07 核对：现网 pin 是 **mode 6**（`cpp/backend/Perf.cpp`
+> `updatePerfL10SerPathToggles()` 的 else 分支写 `6u`），本表此前把 mode 5 标成
+> "现网 pin" 是旧口径。mode 4/5/6 之间的差异全部落在 ±1.5% 噪声带内，选 6 只是
+> 取了本局最快档，不代表键内容有意义。
 
 - **SER 价格 = 12.04 ms（42.9%）**，36/36 周期全胜。
 - 由此可算：SER off 时材质部分 ≈ 18.8 ms，SER on 时 7.45 ms ⇒ **SER 已把材质求值压掉 60%**。

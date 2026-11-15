@@ -500,6 +500,15 @@ bool ssMarchRay(
 // 只处理「RT 镜面命中距离 > 12 区块（192 格）或未命中」的像素 —— 用户
 // 2026-11-02 的硬性约束。
 // ============================================================================
+// 2026-11-15「性能模式」：SSR 的区块下限改为运行时值（cam.ssHybridParams.w）。
+// 0 ⇒ 旧行为（12 区块）。性能模式传 8 ⇒ 8 区块以外的镜面交给 SSR。
+float ssSsrFloorChunks()
+{
+    const float raw = cam.ssHybridParams.w;
+
+    return raw > 0.0 ? raw : 12.0;
+}
+
 bool ssShouldRunSsr(ivec2 pixel, float specularHitDistance)
 {
     if(cam.ssHybridParams.y <= 0.0)
@@ -509,7 +518,7 @@ bool ssShouldRunSsr(ivec2 pixel, float specularHitDistance)
 
     // 未命中（天空）= 65504，视作远场，需要屏幕空间补；
     // 命中距离 <= 192 的像素 RT 已经有正确答案，SSR 不接手。
-    return specularHitDistance > SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS;
+    return specularHitDistance > ssSsrFloorChunks() * SS_CHUNK_METERS;
 }
 
 // 锥形抖动：roughness 越大，采样方向越散（0 粗糙 = 纯镜面）
@@ -725,8 +734,9 @@ void main()
         return;
     }
 
-    ssWorldToView = inverse(cam.viewInverse);
-    ssViewToClip = inverse(cam.projInverse);
+    // 2026-11-09：宿主算好的正变换（CameraUBO.viewMatrix / projectionMatrix）
+    ssWorldToView = cam.viewMatrix;
+    ssViewToClip = cam.projectionMatrix;
     ssCameraPosition = cam.viewInverse[3].xyz;
 
     const vec2 uv = (vec2(pixel) + 0.5) / vec2(ssExtent);
@@ -787,16 +797,30 @@ void main()
         surfaceRoughness <= SS_SSR_ROUGHNESS_MAX;
 
     // 12 区块硬性门槛的软化：硬切会在 192 格处留下"RT 反射 ↔ SSR 反射"接缝。
+    const float ssrFloorMeters = ssSsrFloorChunks() * SS_CHUNK_METERS;
+
+    // 2026-11-15「性能模式」：按**相机到该像素表面的距离**分档
+    //   ≤ rtBand(6 区块) → RT；6~8 → SSPT；> ssrFloor(8) → SSR
+    // 非性能模式（z = 0）时沿用旧的"按 RT 命中距离"判据。
+    const float perfRtBandMeters =
+        max(0.0, cam.perfBandParams.x) * SS_CHUNK_METERS;
+
+    const bool perfBandMode =
+        cam.perfBandParams.z > 0.5 && perfRtBandMeters > 0.0;
+
     const float ssrGate = smoothstep(
-        SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS,
-        SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS + 32.0,
-        specularHitDistance);
+        ssrFloorMeters,
+        ssrFloorMeters + 32.0,
+        perfBandMode ? surfaceDistance : specularHitDistance);
 
     // 本像素的镜面归谁：RT 命中距离 > 12 区块 ⇒ SSR（远场）；
     // 其余且表面在 SSPT 射程内 ⇒ SSPT 的近场镜面。**互斥**，不会双替换。
+    // 2026-11-15「性能模式」分档见上面的 perfBandMode 定义。
     const bool ssrOwnsPixel =
         ssrEnabled && specularLobePresent && roughnessAccepted &&
-        ssShouldRunSsr(pixel, specularHitDistance);
+        (perfBandMode
+                ? (surfaceDistance > ssrFloorMeters)
+                : ssShouldRunSsr(pixel, specularHitDistance));
 
     // ========================================================================
     // SSR：替换镜面分项（远场，>12 区块）
@@ -838,7 +862,14 @@ void main()
                 if(confidence > 0.0)
                 {
                     const vec3 specularTerm = imageLoad(specTermImage, pixel).rgb;
-                    const vec3 replacement = specularAlbedo * radiance;
+
+                    // 2026-11-15 修复 A（火点钳制）：SSR/SSPT 的辐射度是单样本
+                    // 随机量，而它替换掉的是 RR 已降噪的 RT 项。金属/水面的
+                    // specularAlbedo 有色 ⇒ 命中一个亮像素就是彩色火点，RR 洗不掉。
+                    // 用 RT 参考量（specTerm）做上界，口径与漫反射的 ratio≤4 一致。
+                    const vec3 replacement = min(
+                        specularAlbedo * radiance,
+                        max(specularTerm, vec3(1.0e-4)) * 4.0);
 
                     color = color - specularTerm * confidence +
                             replacement * confidence;
@@ -849,10 +880,17 @@ void main()
                     // 屏幕空间射线却留着 RT 的那个距离 ⇒ 历史采样落在错的深度上 ⇒
                     // 反射整体糊 / 拖影。同址读写（本 invocation 只碰自己这一格），
                     // 与相邻 invocation 无交叉。
+                    // 2026-11-15 修复 B（guide 抖动）：原来是**直接覆盖**成单样本的
+                    // 屏幕空间距离 ⇒ guide 逐帧抖、且只在被接管像素上写 ⇒ 空间断续，
+                    // RR 历史反复被拒 ⇒ 闪动 + 彩噪。改为按置信度与 RT 距离混合，
+                    // 让 guide 保持连续、随时间平滑。
+                    const float guideBlend = 0.35 * confidence;
+
                     imageStore(
                         specularHitImage,
                         pixel,
-                        vec4(hitDistance, 0.0, 0.0, 0.0));
+                        vec4(mix(specularHitDistance, hitDistance, guideBlend),
+                             0.0, 0.0, 0.0));
                 }
             }
     }
@@ -900,14 +938,20 @@ void main()
                     // 必须扣掉环境底：环境底是"整个半球"的粗糙替身，而屏幕
                     // 空间那份只是它的一部分，不扣就在 GI 关掉时把环境底
                     // 加两遍（贴墙处双层亮）。
+                    // 2026-11-15 暗部死黑修复：原来直接做减法。屏幕外射线追不到
+                    // 东西时 traced < ambientFallback ⇒ 这一项为负，把已有光照扣掉，
+                    // 室内/暗部越算越黑。钳到非负：屏幕空间只允许「补光」。
                     color += diffuseAlbedo *
-                             (traced - vec3(ambientFallback)) *
+                             max(traced - vec3(ambientFallback), vec3(0.0)) *
                              confidence;
                 }
             }
 
             // ---- 镜面（近场，与 SSR 互斥）----
-            if(specularLobePresent && roughnessAccepted && !ssrOwnsPixel)
+            // 2026-11-15：性能模式下 ≥ rtBand(6 区块) 的像素才交给 SSPT 镜面
+            // （6 区块以内保持 RT 结果，和"主光追 6 区块以内"的分工一致）。
+            if(specularLobePresent && roughnessAccepted && !ssrOwnsPixel &&
+               (!perfBandMode || surfaceDistance > perfRtBandMeters))
             {
                 float specularConfidence = 0.0;
                 float specularHitDistanceMeters = 0.0;
@@ -925,15 +969,26 @@ void main()
                     const vec3 specularTerm =
                         imageLoad(specTermImage, pixel).rgb;
 
+                    // 2026-11-15 修复 A（火点钳制，与 SSR 分支同口径）。
+                    const vec3 specularReplacement = min(
+                        specularAlbedo * specularTraced,
+                        max(specularTerm, vec3(1.0e-4)) * 4.0);
+
                     color = color - specularTerm * specularConfidence +
-                            specularAlbedo * specularTraced * specularConfidence;
+                            specularReplacement * specularConfidence;
 
                     // 与 SSR 同一条 RR 契约：换了镜面内容就要把命中距离交回
                     // RR，否则它按 RT 的旧距离重投影 ⇒ 反射拖影。
+                    // 2026-11-15 修复 B：按置信度与 RT 距离混合，避免把单样本
+                    // 噪声距离直接灌进 guide（那是闪动/彩噪的直接来源）。
+                    const float guideBlend = 0.35 * specularConfidence;
+
                     imageStore(
                         specularHitImage,
                         pixel,
-                        vec4(specularHitDistanceMeters, 0.0, 0.0, 0.0));
+                        vec4(mix(specularHitDistance, specularHitDistanceMeters,
+                                 guideBlend),
+                             0.0, 0.0, 0.0));
                 }
             }
         }

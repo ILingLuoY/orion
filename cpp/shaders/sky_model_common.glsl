@@ -154,27 +154,105 @@ vec3 twilightPalette(float sunElevation)
     );
 }
 
+
+// =============================================================================
+// 2026-11-13 夜间月光色阶（**单一真源**）
+//
+// 地形（rt_test.rgen）、云（volumetric_clouds_v3/v5）、体积光（volumetric_light）
+// 四处必须用同一份，否则夜里"地偏银、云恒冷蓝"。
+// 口径：月亮越高越接近银白，越低越偏深蓝（低仰角大气消光 + 浦肯野效应）。
+// ⚠ 本函数**不得**引用 cam.sssParams 之类的"扩展字段"：cloud_bevy_preview.comp
+//   用的是裁剪版 camera block，引用不存在的字段会让它编译失败。
+// sunElevation 就是 sunDirection().y（0.819·sin(相位)），负值表示太阳在地平线下。
+// =============================================================================
+vec3 skyModelMoonColor(float sunElevation)
+{
+    float moonHeight = clamp(-sunElevation, 0.0, 1.0);
+
+    return mix(
+        vec3(0.44, 0.56, 1.00),
+        vec3(0.74, 0.82, 1.00),
+        smoothstep(0.0, 0.55, moonHeight));
+}
+
+// 月相调光系数（满月 1.0 / 新月 floor）。调用方只在夜间权重上乘它。
+// ⚠ 同上：只有确认该 TU 的 camera block 含 sssParams 时才能调用。
+float skyModelMoonPhaseDim(float moonPhase01, float floorValue)
+{
+    float illuminated = 0.5 + 0.5 * cos(6.28318530718 * clamp(moonPhase01, 0.0, 1.0));
+    return mix(floorValue, 1.0, illuminated);
+}
+
 // 阳光色核心。goldenStrength：日照金山混入强度（1.0 全档 / 0.5 云半档）。
 // goldenStrength=1.0 时 mix(x,y,1.0) 逐位等于 y（0·x+y，IEEE 精确），与
 // 旧直写 skySunGoldenTint(...) 语义一致。
 vec3 skyModelSunColor(vec3 lightDirection, float goldenStrength)
 {
+    float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
+    float thunder = clamp(cam.weatherParams.y, 0.0, 1.0);
+    vec3 weatherScale = mix(1.0, 0.35, rain) *
+        mix(vec3(1.0), vec3(0.72, 0.78, 0.86), thunder);
+
+    // =====================================================
+    // 2026-11-13 夜间口径修正（用户：日落后到月出前，云的光照/颜色很怪）
+    //
+    // 病灶：本函数用 lightDirection.y 判暮色，但夜间的 lightDirection 已经被
+    // getTimeDrivenSkyLightDirection() 翻成**月亮**（y 为正）。太阳刚落、月亮
+    // 刚升起时 lightDirection.y ≈ 0..0.22 ⇒ sunset ≈ 1 ⇒ 月光被混进 78% 的
+    // 黄昏橘红。而 rt_test.rgen 里那份副本有 elevation<0 的冷月蓝分支 ⇒
+    // 地形冷蓝、云/体积光橘红，两边分裂。
+    //
+    // 修法：夜间直接给与 rgen 同值的冷月蓝（0.46,0.56,1.00）。
+    // **白天路径逐位不变** —— 早退之后的所有表达式保持原样。
+    // 暮色暖调只属于"太阳仍在地平线上"的直射光；日落之后的暖色应该来自
+    // 天空散射（sky_atmosphere.comp 里的 twilightPalette），不是这一束平行光。
+    // 回退：删掉下面这个 if 块即逐位回到改动前。
+    // =====================================================
+    // ⚠ 夜间判据必须与 getTimeDrivenSunElevation() 逐条对齐：那个函数在**末地**
+    //   （weatherParams.z ≈ 3）恒返回 1.0（光源球固定天顶，注释原文：
+    //   "昼夜翻转 / 暮色染色 / 月光档都不再参与末地"）。
+    //   本函数 2026-11-13 的首版漏了这个特例 ⇒ 末地在 phase 下半段会被强制成
+    //   冷月蓝。这里补上；非末地逐位不变（endDimension 恒 false）。
+#if END_ORB_ENABLE
+    const bool skyModelEndDimension =
+        abs(cam.weatherParams.z - 3.0) < 0.25;
+#else
+    const bool skyModelEndDimension = false;
+#endif
+
+    float sunElevationNow =
+        sin(fract(cam.historyParams.w) * 6.28318530718);
+
+    if(!skyModelEndDimension && sunElevationNow < 0.0)
+    {
+        // 2026-11-13：与 rt_test.rgen 的 getTimeDrivenSkyLightColorRaw() 同口径
+        //（云/体积光走这里，地形走那边，两份必须一致，否则夜里"云蓝地橙"）。
+        //   ① 月亮越高越银白、越低越深蓝
+        float moonHeightNow = clamp(-sunElevationNow, 0.0, 1.0);
+
+        vec3 moonColor = skyModelMoonColor(sunElevationNow);
+
+        // ⚠ 月相调光**只**在 rt_test.rgen 侧做。本头文件被 cloud_bevy_preview.comp
+        // 包含，而它用的是**裁剪版 camera block**（没有 sssParams 字段），
+        // 在这里引用 cam.sssParams 会让那个工具着色器编译失败
+        //（实测："'sssParams' : no such field in structure"）。
+        // 代价：云的月光不随相位变暗，地形的变暗 —— 已知的不一致，宁可如此。
+        return moonColor * weatherScale;
+    }
+
 #if SKY_SUN_TRANSMITTANCE_COLOR
     vec3 color = skySunPhysicalBaseColor(lightDirection.y);
 #else
     float highSun = smoothstep(0.08, 0.68, max(lightDirection.y, 0.0));
     vec3 color = mix(vec3(1.0, 0.45, 0.18), vec3(1.0, 0.96, 0.90), highSun);
 #endif
-    float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
-    float thunder = clamp(cam.weatherParams.y, 0.0, 1.0);
     float sunset = 1.0 - smoothstep(0.04, 0.22, lightDirection.y);
     vec3 twilightTint = twilightPalette(lightDirection.y);
     color = mix(color, twilightTint, sunset * 0.78);
 #if SKY_DAY_PHASE
     color = mix(color, skySunGoldenTint(color, lightDirection.y), goldenStrength);
 #endif
-    return color * mix(1.0, 0.35, rain) *
-        mix(vec3(1.0), vec3(0.72, 0.78, 0.86), thunder);
+    return color * weatherScale;
 }
 
 // ---------------------------------------------------------------------------

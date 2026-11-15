@@ -43,6 +43,19 @@ layout(location = 0) rayPayloadInEXT HitPayload payload;
 const uint RT_STATE_PURPOSE_MASK       = 0x7u;
 const uint RT_PURPOSE_PASSTHROUGH      = 4u;
 const uint RT_PURPOSE_GLASS_VISIBILITY = 5u;
+
+#ifndef GLASS_VISIBILITY_COVERAGE_CAUSTIC
+// 2026-11-13④：与 rt_test.rahit 的同名宏逐字同源（那份有完整说明）。
+// 2026-11-13⑦：宏定义提到 TU 顶部——前段"廉价早退"块在 GLASS_VISIBILITY
+// 分支之前就要用它。回退：-DGLASS_VISIBILITY_COVERAGE_CAUSTIC=0。
+// 2026-11-13（用户拍板）：玻璃光学焦散**整体回退**，默认置 0 ⇒ 可见性链
+// 逐位回到焦散前档（清玻璃走通用薄片滤光），④⑤⑦⑧ 全部编译掉。
+#define GLASS_VISIBILITY_COVERAGE_CAUSTIC 0
+#endif
+#ifndef GLASS_CAUSTIC_LIFT
+// 2026-11-13⑧：与 rt_test.rahit 的同名宏同值同义（阴影底 + 图案亮化）。
+#define GLASS_CAUSTIC_LIFT 0.5
+#endif
 // 2026-10-25 阶段 D：主射线透射段（单条射线 + any-hit 逐面累乘）。
 const uint RT_PURPOSE_PRIMARY_TRANSMISSION = 8u;
 
@@ -108,6 +121,14 @@ layout(buffer_reference, scalar) buffer Vertices {
 // 解包后仍返回老的 48B Vertex ⇒ 下游 materialId/pad1/pad2 使用点零改动。
 // 编译期开关必须与 C++ 的 SECTION_VERTEX_32B_ENABLED 一致。
 // =====================================================
+
+// 2026-11-12：实例变换（实例化第一步）。必须定义在 #if SECTION_VERTEX_32B 之前：
+// 32B 与 48B 两条顶点路径都要用它。恒等实例下与旧行为数学等价。
+vec3 rtObjectToWorld(vec3 localPosition)
+{
+    return gl_ObjectToWorldEXT * vec4(localPosition, 1.0);
+}
+
 #if SECTION_VERTEX_32B
 struct SectionVertex32
 {
@@ -129,9 +150,10 @@ Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
         const SectionVertex32 packed = SectionVertices32(addr).v[index];
 
         Vertex unpacked;
-        unpacked.x = packed.x;
-        unpacked.y = packed.y;
-        unpacked.z = packed.z;
+        const vec3 world = rtObjectToWorld(vec3(packed.x, packed.y, packed.z));
+        unpacked.x = world.x;
+        unpacked.y = world.y;
+        unpacked.z = world.z;
         unpacked.u = packed.u;
         unpacked.v = packed.v;
         unpacked.r = float(packed.color & 0xFFu) / 255.0;
@@ -147,12 +169,22 @@ Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
         return unpacked;
     }
 
-    return Vertices(addr).v[index];
+    Vertex raw = Vertices(addr).v[index];
+    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
+    raw.x = world.x;
+    raw.y = world.y;
+    raw.z = world.z;
+    return raw;
 }
 #else
 Vertex loadSectionVertex(uint64_t addr, uint /*stride*/, uint index)
 {
-    return Vertices(addr).v[index];
+    Vertex raw = Vertices(addr).v[index];
+    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
+    raw.x = world.x;
+    raw.y = world.y;
+    raw.z = world.z;
+    return raw;
 }
 #endif
 
@@ -708,6 +740,32 @@ if(
         return;
     }
 
+    // =====================================================
+    // 2026-11-13⑦：可见性链清玻璃的**廉价早退**（图集 texelFetch 之前）。
+    // 与 rt_test.rahit 的同名块逐字同源（那份有完整说明）。焦散开关关时，
+    // 清玻璃在 GLASS_VISIBILITY 分支会被"当空气"忽略——这里提前退出，
+    // 省一次图集 texelFetch/面，行为逐位等价（跳过 tint 累乘与面预算，
+    // payload.glassAlpha = 1.0 照抄 GLASS_VISIBILITY 块的雨洼语义）。
+    // 焦散开时不触发——覆盖率合成需要 atlasSample.a。
+    // =====================================================
+#if GLASS_VISIBILITY_COVERAGE_CAUSTIC
+    if(getRayPurpose(payload.state) == RT_PURPOSE_GLASS_VISIBILITY &&
+        cam.glassCausticParams.x <= 0.5 &&
+        materialId >= 2.0 && materialId < 2.05)
+    {
+        const vec3 visVertexColorRgb =
+            vec3(v0.r, v0.g, v0.b) * barycentrics.x +
+            vec3(v1.r, v1.g, v1.b) * barycentrics.y +
+            vec3(v2.r, v2.g, v2.b) * barycentrics.z;
+        if(glassVertexFactorIsFaceShade(visVertexColorRgb))
+        {
+            payload.glassAlpha = 1.0;
+            ignoreIntersectionEXT;
+            return;
+        }
+    }
+#endif
+
     vec4 atlasSample;
     if(isVoxyAnyHit)
     {
@@ -1149,7 +1207,11 @@ if(
         payload.glassAlpha = 1.0;
 
 #ifndef GI_CLEAR_GLASS_VISIBILITY_AS_AIR
-#define GI_CLEAR_GLASS_VISIBILITY_AS_AIR 1
+// 2026-11-13④（用户要求"本地光只做覆盖率合成，看着像焦散就行"）：默认置 0
+// —— 与 rt_test.rahit 的同名块逐字同源（那份有完整说明）。清玻璃改走下方
+// isLightExitFace 的覆盖率焦散合成 mix(1, 薄片, a)。染色玻璃不受影响。
+// 回退：-DGI_CLEAR_GLASS_VISIBILITY_AS_AIR=1 恢复清玻璃当空气。
+#define GI_CLEAR_GLASS_VISIBILITY_AS_AIR 0
 #endif
 #if GI_CLEAR_GLASS_VISIBILITY_AS_AIR
         // =====================================================
@@ -1293,6 +1355,36 @@ if(
                 getTransparentProfileTransmissionAnyHit(
                     getTransparentProfileFromRawMaterialId(materialId)
                 );
+
+#ifndef GLASS_VISIBILITY_COVERAGE_CAUSTIC
+// 2026-11-13④：与 rt_test.rahit 的同名块逐字同源（那份有完整说明）。
+// 可见性链的覆盖率焦散：清玻璃 mix(1, 薄片, a)，染色/致密体不混入。
+// 回退：-DGLASS_VISIBILITY_COVERAGE_CAUSTIC=0。
+#define GLASS_VISIBILITY_COVERAGE_CAUSTIC 1
+#endif
+#if GLASS_VISIBILITY_COVERAGE_CAUSTIC
+            if(materialId < 2.05 &&
+                glassVertexFactorIsFaceShade(vertexColor.rgb))
+            {
+                // 2026-11-13⑤：运行时 UI 开关（与 rt_test.rahit 同名块逐字同源）。
+                // 关 = 逐位恢复 2026-10-24 的"当空气"档。
+                if(cam.glassCausticParams.x > 0.5)
+                {
+                    // 2026-11-13⑧：与 rt_test.rahit 同名块逐字同源。
+                    const float visSheetAlpha =
+                        clamp(atlasSample.a * vertexColor.a, 0.0, 1.0);
+                    surfaceTransmission =
+                        surfaceTransmission +
+                        (vec3(1.0) - surfaceTransmission) *
+                            ((1.0 - visSheetAlpha) * GLASS_CAUSTIC_LIFT);
+                }
+                else
+                {
+                    ignoreIntersectionEXT;
+                    return;
+                }
+            }
+#endif
 
             // 2026-10-11 用户要求：去掉"玻璃在太阳/本地光方块下的焦散"（= R14
             // 出射面 POM 彩色光斑，见上方函数处的说明）。屏蔽保留，-D 打不开。

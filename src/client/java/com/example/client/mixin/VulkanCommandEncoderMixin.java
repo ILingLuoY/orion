@@ -131,13 +131,21 @@ public abstract class VulkanCommandEncoderMixin {
             }
 
 
-            NativeVulkan.recordFrameCommand(
-                    currentCommandBuffer.address(),
-                    image,
-                    NativeVulkan.pendingGuiTargetWidth,
-                    NativeVulkan.pendingGuiTargetHeight,
-                    true
-            );
+            // 2026-11-09：每帧 RT 录制的墙钟。注：真正的每帧入口是这里
+            // （targetIsMainRenderTarget=true），VulkanGpuSurfaceMixin 那条
+            // 主渲染路径不走 ⇒ 之前打在那条上量到的恒为 0。
+            com.example.client.FrameBudget.beginRecordFrame();
+            try {
+                NativeVulkan.recordFrameCommand(
+                        currentCommandBuffer.address(),
+                        image,
+                        NativeVulkan.pendingGuiTargetWidth,
+                        NativeVulkan.pendingGuiTargetHeight,
+                        true
+                );
+            } finally {
+                com.example.client.FrameBudget.endRecordFrame();
+            }
 
 
             NativeVulkan.guiRtPending =

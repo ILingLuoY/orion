@@ -94,6 +94,14 @@ layout(buffer_reference, scalar) buffer Vertices {
 // 解包后仍返回老的 48B Vertex ⇒ 下游 materialId/pad1/pad2 使用点零改动。
 // 编译期开关必须与 C++ 的 SECTION_VERTEX_32B_ENABLED 一致。
 // =====================================================
+
+// 2026-11-12：实例变换（实例化第一步）。必须定义在 #if SECTION_VERTEX_32B 之前：
+// 32B 与 48B 两条顶点路径都要用它。恒等实例下与旧行为数学等价。
+vec3 rtObjectToWorld(vec3 localPosition)
+{
+    return gl_ObjectToWorldEXT * vec4(localPosition, 1.0);
+}
+
 #if SECTION_VERTEX_32B
 struct SectionVertex32
 {
@@ -115,9 +123,10 @@ Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
         const SectionVertex32 packed = SectionVertices32(addr).v[index];
 
         Vertex unpacked;
-        unpacked.x = packed.x;
-        unpacked.y = packed.y;
-        unpacked.z = packed.z;
+        const vec3 world = rtObjectToWorld(vec3(packed.x, packed.y, packed.z));
+        unpacked.x = world.x;
+        unpacked.y = world.y;
+        unpacked.z = world.z;
         unpacked.u = packed.u;
         unpacked.v = packed.v;
         unpacked.r = float(packed.color & 0xFFu) / 255.0;
@@ -133,12 +142,22 @@ Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
         return unpacked;
     }
 
-    return Vertices(addr).v[index];
+    Vertex raw = Vertices(addr).v[index];
+    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
+    raw.x = world.x;
+    raw.y = world.y;
+    raw.z = world.z;
+    return raw;
 }
 #else
 Vertex loadSectionVertex(uint64_t addr, uint /*stride*/, uint index)
 {
-    return Vertices(addr).v[index];
+    Vertex raw = Vertices(addr).v[index];
+    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
+    raw.x = world.x;
+    raw.y = world.y;
+    raw.z = world.z;
+    return raw;
 }
 #endif
 
@@ -198,7 +217,17 @@ vec2 rainImpactRippleGradient(vec2 worldXZ, float cameraDistance)
 
     // Keep the opaque and translucent water paths bit-for-bit aligned:
     // every rain-impact dimension is 40% smaller than the dense field.
-    const float CELL_SIZE = 0.432;
+    // 2026-11-11：UI 旋钮（与水面同口径）。godRayParams2.w = size + strength*8。
+    const float packedRipple = cam.godRayParams2.w;
+    float rippleSize = 1.0;
+    float rippleStrength = 1.0;
+    if(packedRipple > 0.0)
+    {
+        rippleStrength = clamp(floor(packedRipple / 8.0 + 1.0e-4), 0.0, 3.0);
+        const float rawSize = packedRipple - rippleStrength * 8.0;
+        rippleSize = clamp(rawSize <= 0.0 ? 1.0 : rawSize, 0.25, 4.0);
+    }
+    const float CELL_SIZE = 0.432 * rippleSize;
     const float RING_SPEED = 0.336;
     const float RING_FREQUENCY = 66.66667;
     // Match the opaque/water path: native steady-clock time, not frame rate.
@@ -232,7 +261,7 @@ vec2 rainImpactRippleGradient(vec2 worldXZ, float cameraDistance)
     }
 
     // Match the confirmed visible ground-ripple amplitude.
-    return gradient * (0.060 * rain * nearFade);
+    return gradient * (0.060 * rain * nearFade * rippleStrength);
 }
 
 WaterWaveSurface evaluateWaterWaveSurface(vec2 worldXZ, float waterY)
@@ -1108,6 +1137,16 @@ currentMapDepth =
 // 4-8 height samples, no additional ray tracing.
 // =====================================================
 
+// 2026-11-10 遮蔽判据（世界尺度 + 纹素锚定）的三档 A/B，说明见
+// tracePOMSelfShadow 内的长注释：
+//   =0.15   浮雕影更明显
+//   =0.25   默认
+//   =0.5    更弱
+//   =0.016  约等于 2026-10-19 旧口径（一碰就全黑 ⇒ 豹纹）
+#ifndef POM_SELF_SHADOW_FULL_TEXELS
+#define POM_SELF_SHADOW_FULL_TEXELS 0.25
+#endif
+
 float tracePOMSelfShadow(
     vec2 hitUV,
     float hitDepth01,
@@ -1183,20 +1222,32 @@ float tracePOMSelfShadow(
 
 
     // =====================================================
-    // 2026-10-19 自阴影判据改为**归一化高度差**（与 rt_test.rchit 同口径，
-    // `parallaxShadow *= saturate(diff * 100.0 + 0.5)`），不再乘
-    // pomDepthScale。
+    // 2026-11-10：判据改回**世界尺度 + 纹素锚定**，与 rchit_helpers_pom.glsl
+    // 同口径（那份的长注释是完整取证，这里只留结论）。
     //
-    // 旧档按世界深度 0.03 格判定满遮蔽，而 pomDepthScale 默认 0.03 ⇒
-    // 需要 100% 归一化高度差；实际浮雕高度差 ~0.1 时遮蔽仅 ~3%，等于没有。
-    // 这里取 0.02（参考是 0.005，放宽 4 倍以适配 4~8 步采样）。
-    // 调强 = 改小；调弱 = 改大。采样数不变，性能与旧档同量级。
+    // 旧口径（0.02 归一化）在 pomDepthScale ≈ 0.05 时等于"相邻纹素差 5 级
+    // 就全黑"，于是遮蔽变成逐纹素的 0/1 豹纹。新口径要求埋得比 0.25 个
+    // 纹素的世界边长（16x16 贴图 ≈ 0.0156 格 ≈ 80 LSB）更深才算满遮蔽，
+    // 5 LSB 的纹素噪声只剩 ~6%。
+    // 三档 A/B 见文件内 POM_SELF_SHADOW_FULL_TEXELS。
     // =====================================================
-    const float SELF_SHADOW_FULL_NORMALIZED_DEPTH =
-        0.02;
+    float selfShadowTexelWorld =
+        1.0 /
+        max(
+            spriteSpan.x *
+                float(textureSize(normalAtlas, 0).x),
+            1.0
+        );
+
+    float selfShadowFullDepthWorld =
+        max(
+            selfShadowTexelWorld *
+                POM_SELF_SHADOW_FULL_TEXELS,
+            1.0e-6
+        );
 
 
-    float maxBlockDepthNormalized =
+    float maxBlockDepthWorld =
         0.0;
 
 
@@ -1251,32 +1302,27 @@ float tracePOMSelfShadow(
 
         // Positive means the light ray is underneath a
         // neighbouring height-field surface and is blocked.
-        // 归一化偏置 0.012 → 0.004（同 rt_test.rchit：旧偏置吃掉阈值 60%）。
-        float blockDepth =
-            rayDepth -
-            blockerDepth -
-            0.004;
+        // 2026-11-10：换算成世界单位再判定；偏置 0.004（= 1 LSB）只压数值抖动。
+        float blockDepthWorld =
+            (
+                rayDepth -
+                blockerDepth -
+                0.004
+            ) *
+            pomDepthScale;
 
 
-        float blockDepthNormalized =
+        maxBlockDepthWorld =
             max(
-                blockDepth,
-                0.0
+                maxBlockDepthWorld,
+                blockDepthWorld
             );
 
 
-        maxBlockDepthNormalized =
-            max(
-                maxBlockDepthNormalized,
-                blockDepthNormalized
-            );
-
-
-        // Early-out once the selected POM hit produces enough
-        // normalized height occlusion.
+        // Early-out once the ray is buried deeper than the texel-scaled bar.
         if(
-            maxBlockDepthNormalized >=
-            SELF_SHADOW_FULL_NORMALIZED_DEPTH
+            maxBlockDepthWorld >=
+            selfShadowFullDepthWorld
         )
         {
             return 0.0;
@@ -1288,8 +1334,8 @@ float tracePOMSelfShadow(
         1.0 -
         smoothstep(
             0.0,
-            SELF_SHADOW_FULL_NORMALIZED_DEPTH,
-            maxBlockDepthNormalized
+            selfShadowFullDepthWorld,
+            maxBlockDepthWorld
         );
 }
 

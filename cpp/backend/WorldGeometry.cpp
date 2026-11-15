@@ -81,34 +81,14 @@ bool rebuildWorldGeometry(
 
     bool forceReset = false;
 
+    // 2026-11-07i：这里持有的是 arena 视图，split 已在捕获点还池。
+    // 因此不再需要"函数退出时归还 split"的 RAII。
     std::vector<
         std::pair<
             uint64_t,
-            SectionGeometrySplit
+            CaptureArenaSegment
         >
     > sectionUpdates;
-
-    // 2026-11-06r：函数返回时把 sectionUpdates 里所有 split 连同容量还给池。
-    // RAII 形式，覆盖下面所有 early return；split 在 build 循环里只被读，
-    // 这里归还时它已经用完。
-    struct SectionSplitPoolReturn
-    {
-        std::vector<std::pair<uint64_t, SectionGeometrySplit>>* updates = nullptr;
-
-        ~SectionSplitPoolReturn()
-        {
-            if(updates == nullptr)
-            {
-                return;
-            }
-
-            for(auto& entry : *updates)
-            {
-                returnSectionSplitToPool(std::move(entry.second));
-            }
-        }
-    };
-    SectionSplitPoolReturn sectionSplitPoolReturn{&sectionUpdates};
 
 
 
@@ -250,7 +230,7 @@ bool rebuildWorldGeometry(
 
             std::unordered_map<
                 uint64_t,
-                SectionGeometrySplit
+                CaptureArenaSegment
             > mergedSections;
 
 
@@ -265,10 +245,14 @@ bool rebuildWorldGeometry(
                     continue;
                 }
 
-                geometryCaptureSectionLocked(
-                    spatialSectionKey,
-                    mergedSections[spatialSectionKey]
-                );
+                // 2026-11-07i：临时 split 填完 → 打包 → commit 进 arena → 还池。
+                SectionGeometrySplit split = takeSectionSplitFromPool();
+
+                geometryCaptureSectionLocked(spatialSectionKey, split);
+                packSectionSplitBucketsLocked(spatialSectionKey, split);
+
+                mergedSections[spatialSectionKey] = captureArenaCommit(split);
+                returnSectionSplitToPool(std::move(split));
             }
 
 
@@ -363,9 +347,11 @@ bool rebuildWorldGeometry(
 
             if(entityDirty && (adoptedCount + selectedCount) > 0u)
             {
+                // 2026-11-07g：这里不 take，推迟到真正捕获前（见下方捕获循环）。
+                // 否则"选 key"阶段就把池掏空，捕获线程唤醒即 miss。
                 sectionUpdates.emplace_back(
                     ENTITY_RT_SPATIAL_KEY,
-                    takeSectionSplitFromPool()
+                    CaptureArenaSegment{}
                 );
                 updateIndices.emplace(
                     ENTITY_RT_SPATIAL_KEY,
@@ -389,7 +375,7 @@ bool rebuildWorldGeometry(
                 }
                 sectionUpdates.emplace_back(
                     adoptedKey,
-                    std::move(capturedBatch[adopted].split)
+                    capturedBatch[adopted].segment
                 );
                 g_geometryAdoptedSectionTotal += 1u;
             }
@@ -467,9 +453,10 @@ bool rebuildWorldGeometry(
                 for(const auto& nearestEntry : nearest)
                 {
                     const size_t updateIndex = sectionUpdates.size();
+                    // 2026-11-07g：同上，take 推迟到捕获前。
                     sectionUpdates.emplace_back(
                         nearestEntry.second,
-                        takeSectionSplitFromPool());
+                        CaptureArenaSegment{});
                     updateIndices.emplace(nearestEntry.second, updateIndex);
                 }
             }
@@ -480,10 +467,13 @@ bool rebuildWorldGeometry(
                 sectionUpdates.front().first == ENTITY_RT_SPATIAL_KEY;
             if(onlyDynamicSection)
             {
-                geometryCaptureSectionLocked(
-                    ENTITY_RT_SPATIAL_KEY,
-                    sectionUpdates.front().second
-                );
+                // 2026-11-07i：临时 split → 捕获 → commit 进 arena → 立刻还池。
+                SectionGeometrySplit split = takeSectionSplitFromPool();
+
+                geometryCaptureSectionLocked(ENTITY_RT_SPATIAL_KEY, split);
+
+                sectionUpdates.front().second = captureArenaCommit(split);
+                returnSectionSplitToPool(std::move(split));
             }
             else
             {
@@ -511,10 +501,18 @@ bool rebuildWorldGeometry(
                     }
 
                     const size_t captureIndex = captureOrder[orderIndex];
+
+                    // 2026-11-07i：split 只在本次捕获内活着。填完立刻搬进 arena
+                    // 并还池 —— 池的稳态大小从此不再等于"在途段数"。
+                    SectionGeometrySplit split = takeSectionSplitFromPool();
+
                     geometryCaptureSectionLocked(
                         sectionUpdates[captureIndex].first,
-                        sectionUpdates[captureIndex].second
+                        split
                     );
+
+                    sectionUpdates[captureIndex].second = captureArenaCommit(split);
+                    returnSectionSplitToPool(std::move(split));
                     ++capturedCount;
                 }
 
@@ -624,7 +622,33 @@ bool rebuildWorldGeometry(
             << " capHoldMs="
             << (g_captureLockMaxHoldNanos.load(std::memory_order_relaxed) / 1.0e6)
             << " capWaitMs="
-            << (g_captureLockMaxWaitNanos.load(std::memory_order_relaxed) / 1.0e6);
+            << (g_captureLockMaxWaitNanos.load(std::memory_order_relaxed) / 1.0e6)
+            // 2026-11-07g：split 池命中与捕获扩容分桶（窗口增量口径）。
+            << " spHit=" << g_sectionSplitPoolTakeHits
+            << " spMiss=" << g_sectionSplitPoolTakeMisses
+            << " spRet=" << g_sectionSplitPoolReturns
+            << " spRej=" << g_sectionSplitPoolReturnRejects
+            << " spDrop=" << g_sectionSplitPoolReturnDrops
+            << " spStarve=" << g_sectionSplitPoolStarveSkips
+            << " spSize=" << g_sectionSplitPoolSize
+            << " growBk="
+            << g_captureGrowBucketCount[0] << "/"
+            << g_captureGrowBucketCount[1] << "/"
+            << g_captureGrowBucketCount[2] << "/"
+            << g_captureGrowBucketCount[3] << "/"
+            << g_captureGrowBucketCount[4] << "/"
+            << g_captureGrowBucketCount[5] << "/"
+            << g_captureGrowBucketCount[6] << "/"
+            << g_captureGrowBucketCount[7]
+            << " growEmpty=" << g_captureGrowFromEmpty
+            << " growSmall=" << g_captureGrowFromSmall
+            << " arenaN=" << g_captureArenaSegments
+            << " arenaMB="
+            << (static_cast<double>(g_captureArenaBytes) / 1048576.0)
+            << " arenaRst=" << g_captureArenaResets
+            << " arenaSkip=" << g_captureArenaSkipResets
+            << " arenaChunks=" << g_captureArenaChunks
+            << " arenaStale=" << g_captureArenaStaleSegments;
 
         {
             std::lock_guard<std::mutex> capturedLock(g_capturedSectionsMutex);
@@ -662,6 +686,24 @@ bool rebuildWorldGeometry(
         g_chunkLockMaxHoldNanos.store(0u, std::memory_order_relaxed);
         g_captureLockMaxHoldNanos.store(0u, std::memory_order_relaxed);
         g_captureLockMaxWaitNanos.store(0u, std::memory_order_relaxed);
+        g_sectionSplitPoolTakeHits = 0u;
+        g_sectionSplitPoolTakeMisses = 0u;
+        g_sectionSplitPoolReturns = 0u;
+        g_sectionSplitPoolReturnRejects = 0u;
+        g_sectionSplitPoolReturnDrops = 0u;
+        g_sectionSplitPoolStarveSkips = 0u;
+        for(size_t growBucket = 0u; growBucket < 8u; ++growBucket)
+        {
+            g_captureGrowBucketCount[growBucket] = 0u;
+            g_captureGrowBucketBytes[growBucket] = 0u;
+        }
+        g_captureGrowFromEmpty = 0u;
+        g_captureGrowFromSmall = 0u;
+        g_captureArenaSegments = 0u;
+        g_captureArenaBytes = 0u;
+        g_captureArenaResets = 0u;
+        g_captureArenaSkipResets = 0u;
+        g_captureArenaStaleSegments = 0u;
     }
 
 
@@ -752,8 +794,8 @@ bool rebuildWorldGeometry(
     uint64_t rebuiltWaterTriangleCount = 0;
     uint64_t rebuiltParticleTriangleCount = 0;
 
-    std::vector<RTSectionAS*>
-        sectionsNeedingBuild;
+    static std::vector<RTSectionAS*> sectionsNeedingBuild;
+    sectionsNeedingBuild.clear();
 
     sectionsNeedingBuild.reserve(
         sectionUpdates.size() * 7u
@@ -767,15 +809,19 @@ bool rebuildWorldGeometry(
     struct PendingSectionUpload
     {
         RTSectionAS* section = nullptr;
-        const std::vector<Vertex>* vertices = nullptr;
+        // 2026-11-07i：数据来自 capture arena（稳定地址），不再指向 split。
+        std::span<const Vertex> vertices;
         VkDeviceSize stagingOffset = 0;
-        const std::vector<float>* motion = nullptr;
-        const std::vector<SectionVertex>* packed = nullptr;
+        std::span<const float> motion;
+        std::span<const SectionVertex> packed;
     };
 
 
-    std::vector<PendingSectionUpload>
-        pendingUploads;
+    // 2026-11-07k：跨帧复用。rebuildWorldGeometry 只在渲染线程调用，
+    // 每帧 clear() 保留容量 —— 段数到 5500 时这几个容器原本每帧都要
+    // malloc/free 一次（几十~几百 KB），还要吃一次首次触碰的缺页。
+    static std::vector<PendingSectionUpload> pendingUploads;
+    pendingUploads.clear();
 
     pendingUploads.reserve(
         sectionUpdates.size() * 7u
@@ -832,6 +878,40 @@ bool rebuildWorldGeometry(
             );
         };
 
+    // 2026-11-12：本帧已创建的 OMM 段数（见下方闸门）。
+    uint32_t ommSectionsCreatedThisFrame = 0u;
+
+    // 2026-11-13：OMM 闸门改为「本帧累计 OMM 耗时预算」。
+    // 旧实现 = 计数上限（默认 1 段/帧）+ requeueSectionsFrom ⇒ 一个 cutout 段
+    // 就把【当前段之后的整条队列】回填并 break（sectionAbortedMidway），整帧
+    // 剩余段全部停摆。方块更新会经光照把一片相邻 section 标脏，其中门/草/
+    // 树叶/玻璃都是 cutout 段 ⇒ 队列按 1 段/帧爬 ⇒ 用户感知"开门、放置方块
+    // 好几秒才有反应"。新实现按耗时设预算（默认 3ms，且至少放行 1 段），
+    // 超限只回填【当前这一段】，其它段本帧照常重建。
+    double ommMsThisFrame = 0.0;
+
+    static const double sOmmMsPerFrameCap = []
+    {
+        const char* raw = std::getenv("ORION_OMM_MS_PER_FRAME");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 3.0;
+        }
+
+        const double parsed = std::atof(raw);
+
+        return parsed < 0.0 ? 0.0 : parsed;
+    }();
+
+    uint64_t ommDeferredSectionsThisFrame = 0u;
+
+    // 2026-11-12：build loop 的"class 调用总和"，用来把 bld 拆成
+    // 骨架（update 循环本身）与 class（rebuildGeometryClass × 7）两部分。
+    double bldClassSumMs = 0.0;
+    uint64_t bldClassCalls = 0u;
+    uint64_t bldUpdateCount = 0u;
+
     for(size_t sectionUpdateIndex = 0u;
         sectionUpdateIndex < sectionUpdates.size();
         ++sectionUpdateIndex)
@@ -872,6 +952,22 @@ bool rebuildWorldGeometry(
 
         auto& update = sectionUpdates[sectionUpdateIndex];
 
+        // 2026-11-07j：arena 代际校验。段所在的内存块若已被复位后的新段覆盖，
+        // 顶点数据就不是本段的 —— 继续 build 会得到一片错位/空白的几何
+        // （外部表现就是"某个方向整片没有几何"）。这里直接跳过并重新标脏。
+        if(update.second.arenaEpoch != 0u &&
+           update.second.arenaEpoch != g_captureArenaEpoch)
+        {
+            ++g_captureArenaStaleSegments;
+
+            {
+                std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+                g_dirtySectionKeys.insert(update.first);
+            }
+
+            continue;
+        }
+
         if(sectionUpdateIndex != 0u && g_asBuilt && !forceReset)
         {
             const double rebuildElapsedMs =
@@ -904,6 +1000,8 @@ bool rebuildWorldGeometry(
             }
         }
 
+        ++bldUpdateCount;
+
         const uint64_t spatialSectionKey =
             update.first;
 
@@ -911,11 +1009,11 @@ bool rebuildWorldGeometry(
             [&]
             (
                 uint64_t classKey,
-                const std::vector<Vertex>& vertices,
+                std::span<const Vertex> vertices,
                 bool opaqueGeometry,
                 const OmmCutoutInput* ommInput,
-                const std::vector<float>* vertexMotion,
-                const std::vector<SectionVertex>* packedVertices
+                std::span<const float> vertexMotion,
+                std::span<const SectionVertex> packedVertices
             )
             {
                 if(vramGovernorMode() >= 2 &&
@@ -1021,7 +1119,7 @@ bool rebuildWorldGeometry(
                             : static_cast<uint32_t>(vertices.size() / 3u);
 
                     const uint32_t newMotionFloats =
-                        (vertexMotion != nullptr && !vertexMotion->empty())
+                        (!vertexMotion.empty())
                             ? static_cast<uint32_t>(vertices.size() * 3u)
                             : 0u;
 
@@ -1082,7 +1180,7 @@ bool rebuildWorldGeometry(
                             }
 
                             pendingUploads.push_back(
-                                { &refitSection, &vertices, stagingOffset,
+                                { &refitSection, vertices, stagingOffset,
                                   vertexMotion, packedVertices }
                             );
                             totalStagingBytes =
@@ -1171,7 +1269,7 @@ bool rebuildWorldGeometry(
                     }
 
                     pendingUploads.push_back(
-                        { &insertedSection, &vertices, stagingOffset,
+                        { &insertedSection, vertices, stagingOffset,
                           vertexMotion, packedVertices }
                     );
                     totalStagingBytes =
@@ -1249,11 +1347,11 @@ bool rebuildWorldGeometry(
         struct RtGeometryClassPlan
         {
             uint64_t classKey;
-            const std::vector<Vertex>* vertices;
+            std::span<const Vertex> vertices;
             bool opaqueGeometry;
             const OmmCutoutInput* ommInput;
-            const std::vector<float>* vertexMotion;
-            const std::vector<SectionVertex>* packed;
+            std::span<const float> vertexMotion;
+            std::span<const SectionVertex> packed;
         };
 
         constexpr size_t RT_GEOMETRY_CLASS_COUNT = 7u;
@@ -1261,27 +1359,27 @@ bool rebuildWorldGeometry(
         const RtGeometryClassPlan geometryClassPlan[RT_GEOMETRY_CLASS_COUNT] =
         {
             { spatialSectionKey | SECTION_AS_CLASS_OPAQUE,
-              &update.second.opaque, true, nullptr, nullptr,
-              &update.second.opaquePacked },
+              update.second.opaque, true, nullptr, {},
+              update.second.opaquePacked },
             { spatialSectionKey | SECTION_AS_CLASS_OMM,
-              &update.second.ommCutout, false,
+              update.second.ommCutout, false,
               update.second.hasOmmInput ? &update.second.ommInput : nullptr,
-              nullptr, &update.second.ommCutoutPacked },
+              {}, update.second.ommCutoutPacked },
             { spatialSectionKey | SECTION_AS_CLASS_ALPHA,
-              &update.second.alpha, false, nullptr, nullptr,
-              &update.second.alphaPacked },
+              update.second.alpha, false, nullptr, {},
+              update.second.alphaPacked },
             { spatialSectionKey | SECTION_AS_CLASS_WATER,
-              &update.second.water, false, nullptr, nullptr,
-              &update.second.waterPacked },
+              update.second.water, false, nullptr, {},
+              update.second.waterPacked },
             { spatialSectionKey | SECTION_AS_CLASS_ENTITY,
-              &update.second.entity, false, nullptr,
-              &update.second.entityMotion, nullptr },
+              update.second.entity, false, nullptr,
+              update.second.entityMotion, {} },
             { spatialSectionKey | SECTION_AS_CLASS_LOCAL_PLAYER,
-              &update.second.localPlayer, false, nullptr,
-              &update.second.localPlayerMotion, nullptr },
+              update.second.localPlayer, false, nullptr,
+              update.second.localPlayerMotion, {} },
             { spatialSectionKey | SECTION_AS_CLASS_PARTICLE,
-              &update.second.particle, false, nullptr,
-              &update.second.particleMotion, nullptr }
+              update.second.particle, false, nullptr,
+              update.second.particleMotion, {} }
         };
 
         bool sectionAbortedMidway = false;
@@ -1304,14 +1402,122 @@ bool rebuildWorldGeometry(
             const RtGeometryClassPlan& plan =
                 geometryClassPlan[classIndex];
 
+            // 2026-11-12：OMM 创建闸门。
+            // createSectionOpacityMicromap 单段实测 0.9~3.2ms（[RT SECTION SLOW] 的
+            // ommMs 占 99%：4 次池化分配 + vkGetMicromapBuildSizesEXT +
+            // vkCreateMicromapEXT + 2 次 map/unmap），且随三角形数线性增长。
+            // 一帧连着建多个 alpha/cutout 段会把 CPU 尖峰叠到 13~18ms
+            // （[PERF L10 CPUPHASE] geometry max、[RT GEOMETRY] buildLoopMs 峰值）。
+            // 2026-11-13：闸门已从「每帧 N 段」改为「每帧累计 ommMs 预算」，
+            // 见上方 ommMsThisFrame 声明处注释；ORION_OMM_MS_PER_FRAME 可调
+            // （默认 3.0，0 = 不限）。
+            if(plan.ommInput != nullptr &&
+               (plan.classKey & ~SPATIAL_SECTION_KEY_MASK) ==
+                   SECTION_AS_CLASS_OMM)
+            {
+                // 2026-11-13：见 ommMsThisFrame 声明处注释。预算按「本帧累计
+                // OMM 耗时」而非段数。
+                // 2026-11-14：控制流退回旧版（requeueSectionsFrom +
+                // sectionAbortedMidway）。原因：改成「只回填当前段、继续建后续段」
+                // 之后，方块更新延迟改善，但崩溃频率暴涨（1~2 分钟一崩，同一个
+                // 5s 信号量超时，换存档也复现）—— 怀疑半成品段（部分 class 已
+                // 换新 AS、OMM/水/实体仍为旧）留在本帧 TLAS 里造成 GPU 侧悬垂。
+                // 现在只保留「按耗时而非按段数」这一条收益，中断语义回到已验证
+                // 版本。
+                if(sOmmMsPerFrameCap > 0.0 &&
+                   ommSectionsCreatedThisFrame > 0u &&
+                   ommMsThisFrame >= sOmmMsPerFrameCap)
+                {
+                    requeueSectionsFrom(sectionUpdateIndex);
+                    sectionAbortedMidway = true;
+                    break;
+                }
+
+                ++ommSectionsCreatedThisFrame;
+            }
+
+            const double sectionClassCreateMsBefore =
+                g_sectionASCreateMs;
+
+            const double sectionClassRetireMsBefore =
+                g_sectionASRetireMs;
+
+            const std::chrono::steady_clock::time_point sectionClassStart =
+                std::chrono::steady_clock::now();
+
             rebuildGeometryClass(
                 plan.classKey,
-                *plan.vertices,
+                plan.vertices,
                 plan.opaqueGeometry,
                 plan.ommInput,
                 plan.vertexMotion,
                 plan.packed
             );
+
+            // 2026-11-12：单段宽打点。此前 buildLoopMs 只有"每 600 帧一条 counters"
+            // 的全局累计（峰值 13.4ms 无法归因）。这里用全局计数器差值把一次调用
+            // 拆成 createSectionBLAS / retire / 其它（refit 判等 + 三角分类），
+            // 只加计时，不改任何逻辑。阈值：ORION_SECTION_SLOW_MS，默认 0.5。
+            const double sectionClassMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - sectionClassStart
+                ).count();
+
+            static const double s_sectionSlowLogMs = []
+            {
+                const char* raw = std::getenv("ORION_SECTION_SLOW_MS");
+
+                if(raw == nullptr || raw[0] == '\0')
+                {
+                    return 0.5;
+                }
+
+                const double parsed = std::atof(raw);
+
+                return parsed <= 0.0 ? 0.5 : parsed;
+            }();
+
+            bldClassSumMs += sectionClassMs;
+            ++bldClassCalls;
+            // g_sectionBuildOmmMs 是「最后一次 createSectionBLAS」的值，非 OMM
+            // 段会读到陈旧值 ⇒ 只累加本段确实是 OMM 类的那次。
+            if(plan.ommInput != nullptr)
+            {
+                ommMsThisFrame += g_sectionBuildOmmMs;
+            }
+
+            if(sectionClassMs >= s_sectionSlowLogMs)
+            {
+                const double sectionClassCreateMs =
+                    g_sectionASCreateMs - sectionClassCreateMsBefore;
+
+                const double sectionClassRetireMs =
+                    g_sectionASRetireMs - sectionClassRetireMsBefore;
+
+                RTLogFlushed(
+                    "[RT SECTION SLOW] frame=" +
+                    std::to_string(g_perfL10FrameSerial) +
+                    " key=" + std::to_string(plan.classKey) +
+                    " verts=" + std::to_string(plan.vertices.size()) +
+                    " totalMs=" + std::to_string(sectionClassMs) +
+                    " createMs=" + std::to_string(sectionClassCreateMs) +
+                    " retireMs=" + std::to_string(sectionClassRetireMs) +
+                    " opaque=" + std::string(plan.opaqueGeometry ? "1" : "0") +
+                    " prepMs=" + std::to_string(g_sectionBuildPrepMs) +
+                    " ommMs=" + std::to_string(g_sectionBuildOmmMs) +
+                    " bufMs=" + std::to_string(g_sectionBuildBufMs) +
+                    " vkBufMs=" + std::to_string(g_sectionBuildVkBufMs) +
+                    " reqMs=" + std::to_string(g_sectionBuildReqMs) +
+                    " sizesMs=" + std::to_string(g_sectionBuildSizesMs) +
+                    " memMs=" + std::to_string(g_sectionBuildMemMs) +
+                    " asMs=" + std::to_string(g_sectionBuildAsMs) +
+                    " addrMs=" + std::to_string(g_sectionBuildAddrMs) +
+                    " otherMs=" + std::to_string(
+                        sectionClassMs -
+                        sectionClassCreateMs -
+                        sectionClassRetireMs)
+                );
+            }
         }
 
         if(sectionAbortedMidway)
@@ -1322,6 +1528,41 @@ bool rebuildWorldGeometry(
 
     perfL10AfterBuildLoop =
         std::chrono::steady_clock::now();
+
+    // 2026-11-12：bld 归因。total 里 class 之和之外的部分就是 update 循环骨架
+    // （arena 代际校验、g_sectionBLAS 查找、pendingUploads 扩容、requeue 等）。
+    {
+        const double bldTotalMs =
+            std::chrono::duration<double, std::milli>(
+                perfL10AfterBuildLoop - perfL10BuildLoopStart
+            ).count();
+
+        if(ommDeferredSectionsThisFrame > 0u &&
+           (g_perfL10FrameSerial % 60u) == 0u)
+        {
+            RTLogFlushed(
+                "[RT OMM GATE] frame=" +
+                std::to_string(g_perfL10FrameSerial) +
+                " deferred=" + std::to_string(ommDeferredSectionsThisFrame) +
+                " created=" + std::to_string(ommSectionsCreatedThisFrame) +
+                " ommMsThisFrame=" + std::to_string(ommMsThisFrame) +
+                " capMs=" + std::to_string(sOmmMsPerFrameCap)
+            );
+        }
+
+        if(bldTotalMs >= 5.0)
+        {
+            RTLogFlushed(
+                "[RT BLD BREAKDOWN] frame=" +
+                std::to_string(g_perfL10FrameSerial) +
+                " totalMs=" + std::to_string(bldTotalMs) +
+                " classSumMs=" + std::to_string(bldClassSumMs) +
+                " skelMs=" + std::to_string(bldTotalMs - bldClassSumMs) +
+                " updateN=" + std::to_string(bldUpdateCount) +
+                " classCalls=" + std::to_string(bldClassCalls)
+            );
+        }
+    }
 
     std::chrono::steady_clock::time_point rtxTailAfterStaging =
         perfL10AfterBuildLoop;
@@ -1436,20 +1677,19 @@ bool rebuildWorldGeometry(
         {
             const VkDeviceSize vertexOnlyBytes =
                 static_cast<VkDeviceSize>(
-                    upload.vertices->size()
+                    upload.vertices.size()
                 ) *
                 static_cast<VkDeviceSize>(
                     upload.section->vertexStride);
 
             if(upload.section->packedSectionVertices &&
-               upload.packed != nullptr &&
-               upload.packed->size() == upload.vertices->size())
+               upload.packed.size() == upload.vertices.size())
             {
                 std::memcpy(
                     stagingBytes +
                         static_cast<size_t>(upload.stagingOffset),
-                    upload.packed->data(),
-                    static_cast<size_t>(upload.vertices->size()) *
+                    upload.packed.data(),
+                    static_cast<size_t>(upload.vertices.size()) *
                         sizeof(SectionVertex)
                 );
             }
@@ -1460,7 +1700,7 @@ bool rebuildWorldGeometry(
                         stagingBytes +
                         static_cast<size_t>(upload.stagingOffset));
 
-                const std::vector<Vertex>& source = *upload.vertices;
+                const std::span<const Vertex> source = upload.vertices;
 
                 for(size_t vertexIndex = 0u;
                     vertexIndex < source.size();
@@ -1476,7 +1716,7 @@ bool rebuildWorldGeometry(
                         static_cast<size_t>(
                             upload.stagingOffset
                         ),
-                    upload.vertices->data(),
+                    upload.vertices.data(),
                     static_cast<size_t>(
                         vertexOnlyBytes
                     )
@@ -1500,17 +1740,14 @@ bool rebuildWorldGeometry(
                     static_cast<size_t>(motionTailBytes)
                 );
 
-                if(
-                    upload.motion != nullptr &&
-                    !upload.motion->empty()
-                )
+                if(!upload.motion.empty())
                 {
                     std::memcpy(
                         tail,
-                        upload.motion->data(),
+                        upload.motion.data(),
                         std::min(
                             static_cast<size_t>(motionTailBytes),
-                            upload.motion->size() * sizeof(float)
+                            upload.motion.size() * sizeof(float)
                         )
                     );
                 }
@@ -1527,8 +1764,106 @@ bool rebuildWorldGeometry(
 
     rtxTailAfterStaging = std::chrono::steady_clock::now();
 
-    std::vector<RTSectionAS*>
-        orderedSections;
+    // 2026-11-07i：本帧的段全部消费完（staging 已把顶点拷走），队列为空时
+    // 复位 capture arena。还有在途段（捕获线程已 commit 但渲染线程没取）时
+    // 跳过，留到下一帧 —— 否则会把它们的数据覆盖掉。
+    {
+        size_t queuedSegments = 0u;
+
+        {
+            std::lock_guard<std::mutex> capturedLock(g_capturedSectionsMutex);
+            queuedSegments = g_capturedSections.size() - g_capturedSectionsHead;
+        }
+
+        captureArenaTryReset(queuedSegments);
+    }
+
+    // 2026-11-07k：跨帧复用（见 pendingUploads 的说明）。
+    static std::vector<RTSectionAS*> orderedSections;
+
+    // 2026-11-10：截面集合缓存。
+    //
+    // 触发 rebuild 的源有两类：世界/区块几何变化（markWorldGeometryDirty(true)，
+    // 会 bump terrain revision）与实体/粒子变化（markWorldGeometryDirty(false)，
+    // 只 bump world revision）。后者**完全不改变 section 集合**，却会重跑下面
+    // 三步：重建+排序 orderedSections、逐 section 写地址槽与角色表、
+    // rebuildLodCoverage 整表重建。这三步只依赖集合本身 ⇒ 用 terrain revision
+    // 做缓存键。实测 rebuild 占 geometry 段 100%（other≈0.01ms），
+    // 中位 2.83ms / p90 12.8ms，其中排序与整表重建是大头。
+    //
+    // 回退：ORION_SECTION_ROLE_CACHE=0（每次都重建，逐位回到改动前）。
+    // 2026-11-10 事故后改为**默认关闭**：
+    // 09:02 一局在进世界约 1 分钟后崩溃（VK semaphore 5s 超时 ⇒ GPU 挂死）。
+    // 最可能的原因是缓存里的 RTSectionAS* 变成了悬垂指针 —— 某个 section 被销毁
+    // 但没 bump terrain revision 时，复用旧列表会拿已释放的 blasAddress 去建
+    // TLAS。缓存本身没有代际校验，无法区分"同一指针换了内容"。
+    // 现在只在该 env 显式置 1 时启用，用于单独复现/验证。
+    static const bool s_sectionRoleCacheEnabled = []()
+    {
+        const char* raw = std::getenv("ORION_SECTION_ROLE_CACHE");
+        // 2026-11-12：默认开启。判等已补上"集合内容指纹 + slot 剔除保护"（见下方
+        // sectionSetFingerprintNow），能区分"同一 revision 但段被原地替换/指针复用"，
+        // 这是 2026-11-10 悬垂指针事故的关键缺口。回退：ORION_SECTION_ROLE_CACHE=0。
+        return raw == nullptr || raw[0] != '0';
+    }();
+    static uint64_t s_orderedSectionsRevision = ~0ull;
+    static size_t s_orderedSectionsCount = 0u;
+    static uint64_t s_orderedSectionsFingerprint = 0xcbf29ce484222325ull;
+
+    const uint64_t sectionRevisionNow =
+        g_terrainGeometryRevision.load(std::memory_order_acquire);
+
+    // 2026-11-12：集合内容指纹（每帧一次 O(段数) 只读遍历，不排序、不写表）。
+    // 专为捕获"revision 未变、size 未变，但段被原地重建/替换"的情形 ——
+    // 这正是 2026-11-10 悬垂指针事故的根因，只靠 revision + size 判不出来。
+    // 空集合时该值等于 FNV 初值，与 s_orderedSectionsFingerprint 的初值一致。
+    uint64_t sectionSetFingerprintNow = 0xcbf29ce484222325ull;
+
+    for(const auto& fingerprintEntry : g_sectionBLAS)
+    {
+        sectionSetFingerprintNow =
+            (sectionSetFingerprintNow ^ fingerprintEntry.first) *
+            0x100000001b3ull;
+        // 节点地址：唯一标识一个 map 元素的生命周期，能捕获"同 key 段被
+        // erase 后重新 emplace 到不同节点"的指针变化（旧列表里的指针会悬垂）。
+        sectionSetFingerprintNow =
+            (sectionSetFingerprintNow ^
+             static_cast<uint64_t>(
+                 reinterpret_cast<uintptr_t>(&fingerprintEntry.second))) *
+            0x100000001b3ull;
+        sectionSetFingerprintNow =
+            (sectionSetFingerprintNow ^
+             static_cast<uint64_t>(fingerprintEntry.second.blasAddress)) *
+            0x100000001b3ull;
+        sectionSetFingerprintNow =
+            (sectionSetFingerprintNow ^
+             static_cast<uint64_t>(fingerprintEntry.second.vertexAddress)) *
+            0x100000001b3ull;
+        sectionSetFingerprintNow =
+            (sectionSetFingerprintNow ^
+             static_cast<uint64_t>(fingerprintEntry.second.triangleCount)) *
+            0x100000001b3ull;
+    }
+
+    // 上一次重建曾因槽位耗尽剔除过段（列表比 map 短）⇒ 不缓存，下一帧继续重试，
+    // 与"每次重建都会重新尝试 ensureSectionVertexAddressSlot"的原语义一致。
+    const bool cachedSectionListTruncated =
+        orderedSections.size() != s_orderedSectionsCount;
+
+    const bool sectionSetChanged =
+        !s_sectionRoleCacheEnabled ||
+        cachedSectionListTruncated ||
+        sectionRevisionNow != s_orderedSectionsRevision ||
+        g_sectionBLAS.size() != s_orderedSectionsCount ||
+        sectionSetFingerprintNow != s_orderedSectionsFingerprint;
+
+    if(sectionSetChanged)
+    {
+    s_orderedSectionsRevision = sectionRevisionNow;
+    s_orderedSectionsCount = g_sectionBLAS.size();
+    s_orderedSectionsFingerprint = sectionSetFingerprintNow;
+
+    orderedSections.clear();
 
     orderedSections.reserve(
         g_sectionBLAS.size()
@@ -1590,6 +1925,7 @@ bool rebuildWorldGeometry(
         rebuildLodCoverage(
             orderedSections
         );
+    } // end of sectionSetChanged
 
 
     constexpr size_t MAX_TLAS_CUSTOM_INDEX_COUNT =
@@ -1943,7 +2279,11 @@ bool rebuildWorldGeometry(
 
         if(raw == nullptr || raw[0] == '\0')
         {
-            return 4u;
+            // 2026-11-12：4 -> 8。实测单次驱逐 ~10 ms（11 段的小场景也一样，因为它是
+            // O(全部段) 的扫描），4 帧一次折合 ~2.5 ms/帧，占轻量图单帧的 15%。
+            // 而 VRAM governor 自己是 30 tick 采样一次，8 帧的响应仍远快于它。
+            // 需要更激进回收时：ORION_VRAM_EVICT_INTERVAL=1/2/4 现场可调。
+            return 8u;
         }
 
         const int parsed = std::atoi(raw);
@@ -2090,6 +2430,10 @@ bool rebuildWorldGeometry(
 
         rtxPreCmdAfterOrdered = std::chrono::steady_clock::now();
 
+        // 2026-11-12：evict 内部分段打点（只计时）。
+        const std::chrono::steady_clock::time_point evictBlockStart =
+            rtxPreCmdAfterOrdered;
+
         // 2026-11-06：候选容器改成静态复用。
         // 段数驱动驱逐让这段每 4 帧就跑一次，每次重建 ~4000 个哈希节点
         // 纯属浪费；clear() 保留 bucket，后续插入不再分配。
@@ -2205,6 +2549,11 @@ bool rebuildWorldGeometry(
             }
         }
 
+        const std::chrono::steady_clock::time_point evictScanEnd =
+            std::chrono::steady_clock::now();
+
+        const size_t evictCandidateCount = candidates.size();
+
         if(!candidates.empty())
         {
             std::sort(
@@ -2215,6 +2564,9 @@ bool rebuildWorldGeometry(
                     return a.distanceSq > b.distanceSq;
                 }
             );
+
+            const std::chrono::steady_clock::time_point evictSortEnd =
+                std::chrono::steady_clock::now();
 
             const size_t evictQuota =
                 std::min(candidates.size(), vramEvictPerPass());
@@ -2247,6 +2599,11 @@ bool rebuildWorldGeometry(
                 }
             }
 
+            const std::chrono::steady_clock::time_point evictVictimsEnd =
+                std::chrono::steady_clock::now();
+
+            const size_t evictVictimCount = victims.size();
+
             orderedSections.erase(
                 std::remove_if(
                     orderedSections.begin(),
@@ -2259,6 +2616,9 @@ bool rebuildWorldGeometry(
                 ),
                 orderedSections.end()
             );
+
+            const std::chrono::steady_clock::time_point evictRemoveEnd =
+                std::chrono::steady_clock::now();
 
             for(auto it = g_sectionBLAS.begin(); it != g_sectionBLAS.end();)
             {
@@ -2280,14 +2640,55 @@ bool rebuildWorldGeometry(
             }
 
             g_vramEvictedSections += victims.size();
+
+            {
+                const std::chrono::steady_clock::time_point evictEnd =
+                    std::chrono::steady_clock::now();
+
+                const auto evictSegMs =
+                    [](const std::chrono::steady_clock::time_point& from,
+                       const std::chrono::steady_clock::time_point& to)
+                    {
+                        return std::chrono::duration<double, std::milli>(
+                            to - from
+                        ).count();
+                    };
+
+                const double evictTotalMs =
+                    evictSegMs(evictBlockStart, evictEnd);
+
+                if(evictTotalMs >= 3.0)
+                {
+                    RTLogFlushed(
+                        "[RT EVICT BREAKDOWN] frame=" +
+                        std::to_string(g_perfL10FrameSerial) +
+                        " totalMs=" + std::to_string(evictTotalMs) +
+                        " scanMs=" + std::to_string(
+                            evictSegMs(evictBlockStart, evictScanEnd)) +
+                        " sortMs=" + std::to_string(
+                            evictSegMs(evictScanEnd, evictSortEnd)) +
+                        " victimsMs=" + std::to_string(
+                            evictSegMs(evictSortEnd, evictVictimsEnd)) +
+                        " removeMs=" + std::to_string(
+                            evictSegMs(evictVictimsEnd, evictRemoveEnd)) +
+                        " retireMs=" + std::to_string(
+                            evictSegMs(evictRemoveEnd, evictEnd)) +
+                        " candidates=" + std::to_string(evictCandidateCount) +
+                        " victims=" + std::to_string(evictVictimCount) +
+                        " sections=" + std::to_string(g_sectionBLAS.size())
+                    );
+                }
+            }
         }
     }
 
 
     rtxPreCmdAfterEvict = std::chrono::steady_clock::now();
 
-    std::vector<VkAccelerationStructureInstanceKHR>
-        instances;
+    // 2026-11-07k：跨帧复用。段数 5500 时这个 vector 是 5500×64B ≈ 352KB，
+    // 原本每帧 malloc/free 一次。
+    static std::vector<VkAccelerationStructureInstanceKHR> instances;
+    instances.clear();
 
 
     if(orderedSections.empty())
@@ -2760,9 +3161,58 @@ bool rebuildWorldGeometry(
                 section.blasAddress;
 
 
-            instances.push_back(
-                instance
-            );
+            // 2026-11-12 实例化第 2 步：该 mesh 若登记了 N 组变换，就发 N 个实例
+            // （共享同一个 BLAS / vertexAddressSlot，只是实例矩阵不同）。
+            // 命中着色器已用 gl_ObjectToWorldEXT 把局部顶点变回世界（第 1 步）。
+            const auto instanceIt =
+                g_entityMeshInstances.find(section.sectionKey);
+
+            if(instanceIt != g_entityMeshInstances.end() &&
+               instanceIt->second.size() >= 12u)
+            {
+                const size_t registeredCount =
+                    instanceIt->second.size() / 12u;
+
+                static bool sLoggedInstanceExpansion = false;
+                if(!sLoggedInstanceExpansion)
+                {
+                    sLoggedInstanceExpansion = true;
+                    RTLog(
+                        "[INSTANCE] mesh key expanded to " +
+                        std::to_string(registeredCount) + " instances"
+                    );
+                }
+
+                for(size_t placedIndex = 0u;
+                    placedIndex < registeredCount;
+                    ++placedIndex)
+                {
+                    VkAccelerationStructureInstanceKHR placed = instance;
+                    const float* const m =
+                        instanceIt->second.data() + placedIndex * 12u;
+
+                    placed.transform.matrix[0][0] = m[0];
+                    placed.transform.matrix[0][1] = m[1];
+                    placed.transform.matrix[0][2] = m[2];
+                    placed.transform.matrix[0][3] = m[3];
+                    placed.transform.matrix[1][0] = m[4];
+                    placed.transform.matrix[1][1] = m[5];
+                    placed.transform.matrix[1][2] = m[6];
+                    placed.transform.matrix[1][3] = m[7];
+                    placed.transform.matrix[2][0] = m[8];
+                    placed.transform.matrix[2][1] = m[9];
+                    placed.transform.matrix[2][2] = m[10];
+                    placed.transform.matrix[2][3] = m[11];
+
+                    instances.push_back(placed);
+                }
+            }
+            else
+            {
+                instances.push_back(
+                    instance
+                );
+            }
         }
     }
 

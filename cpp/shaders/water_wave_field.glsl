@@ -7,7 +7,10 @@
 // 这与参考 HPWater 的机制一致（HPWaterFluidDynamics.cs：没有解析波带、没有风场，
 // 只有一套波方程场 + 外部波源；HPWaterFluidHeightToNormal 就是同一套中心差分）。
 //
-// **契约：不要再往这里加解析波带**（Gerstner 长波带 / 域扭曲 / 噪声倍频程）。
+// **契约更新（2026-11-15）**：原"不要再往这里加解析波带"由用户显式解除 ——
+// 本文件新增 waterFftMicroSlope（程序化微波细法线层，FFT Nyquist 之下的着色
+// 细节）。被删除的 Gerstner 长波带/域扭曲**不因此复活**：那两层仍然删着，
+// 需要时按波方程场重新接靶（见 docs/decisions/water-wave-field.md）。
 // GUI 的「波长倍率 / 主波向 / 涌浪陡度 / 波峰扭曲」与解析焦散目前没有作用对象，
 // 需要这两层时按波方程场重新接靶，而不是把删除的东西加回来。
 // 删除清单与副作用见 docs/decisions/water-wave-field.md
@@ -246,12 +249,13 @@ float waterFftSlopeLodFromProj(vec3 surfacePos, float rayDistance, float projSca
         return 0.0;
     }
     const float tilePeriod = max(cam.waterFftParams.x, 1.0e-3);
-    const float texelWorld = tilePeriod / 256.0;
+    // 纹素 = tile 周期 / WATER_FFT_N（2026-11-15 起 512；与宿主 static_assert 同步）。
+    const float texelWorld = tilePeriod / 512.0;
     vec3 toCam = surfacePos - cam.viewInverse[3].xyz;
     float dist = max(length(toCam), 1.0e-3);
     float noV = max(abs(toCam.y) / dist, 0.04);
     float worldPerPixel = max(rayDistance, 1.0e-3) / (projScale * noV);
-    return clamp(log2(max(worldPerPixel / texelWorld, 1.0e-4)), -8.0, 8.0);
+    return clamp(log2(max(worldPerPixel / texelWorld, 1.0e-4)), -8.0, 9.0);
 }
 
 // horizonFade = HORIZON_WAVE_FADE = 1 − exp(−4·|NoV|)，由调用方按
@@ -261,18 +265,78 @@ vec2 waterFftSwellSlope(vec2 worldXZ, float horizonFade, float waveLod)
 {
     const float tilePeriod = max(cam.waterFftParams.x, 1.0e-3);
     const vec2 uv = fract(worldXZ / tilePeriod);
-    const vec2 slope = textureLod(waterFftSlope, uv, clamp(waveLod, 0.0, 8.0)).rg;
+    const vec2 slope = textureLod(waterFftSlope, uv, clamp(waveLod, 0.0, 9.0)).rg;
 
     const float detailLod = clamp(
         waveLod + log2(max(tilePeriod / WATER_FFT_DETAIL_TILE, 1.0e-4)),
         0.0,
-        8.0
+        9.0
     );
     const vec2 detailUv = fract(worldXZ / WATER_FFT_DETAIL_TILE);
     const vec2 detailSlope =
         textureLod(waterFftSlope, detailUv, detailLod).ba;
 
     return (slope + detailSlope) * horizonFade;
+}
+
+// ── 2026-11-15 程序化微波细法线层（用户要求新增；见文件头契约更新）──
+//
+// 背景：FFT 细节瓦片 512² / 32 格，谱 Nyquist 把可表示的最细波限制在
+// ~0.32 格 —— 更细的碎浪微法线（0.2~0.5 格的闪烁颗粒）数据里没有 ⇒ 近看
+// 水面仍偏"CG 光滑"。本层在斜率空间加**两层解析 value-noise 梯度**
+// （waterSundialValueNoise：pcg2d hash + 解析导数，零纹理采样），特征尺度
+// 在 FFT Nyquist 之下，填补微波段。只在完整波面路径启用（classify 降本
+// 路径直接调 Capped 变体、不经过 waterNaturalWaveGradient，不付这层）。
+//
+// 消隐：按 waveLod（屏幕足迹）衰减 —— 足迹逼近微波尺度（~0.6 格/px）整层
+// 收掉，防远处噪点与逐帧闪烁；波幅旋钮 cam.waterFftParams.y = 0 时恒 0。
+// 强度定标：value-noise 梯度 |g|~O(1)，两层合成 ~6.8×O(1)，系数 0.006 把
+// 微斜率压到 ~0.04（约 FFT 涌浪斜率的 1/5）—— 观感偏弱/偏强改这个系数。
+vec2 waterFftMicroSlope(vec2 worldXZ, float waveLod)
+{
+    const float amplitude = cam.waterFftParams.y;
+    if(amplitude <= 0.0)
+    {
+        return vec2(0.0);
+    }
+    // lod > 1.2 ⇒ 足迹 ≥ ~0.6 格/px，微波已低于像素 ⇒ 收掉（顺带省 hash）。
+    if(waveLod > 1.2)
+    {
+        return vec2(0.0);
+    }
+    // lod 0（0.25 格/px）全量，lod 1.2 收到 ~0.15。
+    const float fade = exp2(-max(waveLod, 0.0) * 2.5);
+
+    const float speedMul = clamp(cam.waterFftParams.w, 0.0, 4.0);
+    const float waveTime = uintBitsToFloat(cam.padding) * speedMul;
+
+    // 两层：旋转错开 + 不同漂移速度/方向，避免同向对齐的"条纹感"。
+    // 世界斜率 = 噪声梯度（cell 单位）/ cellSize；权重 1 : 0.55。
+    const float c1 = cos(0.6109);
+    const float s1 = sin(0.6109);
+    const float c2 = cos(-1.9387);
+    const float s2 = sin(-1.9387);
+
+    vec2 total = vec2(0.0);
+    {
+        const float cellSize = 0.30;
+        const vec2 p =
+            mat2(c1, -s1, s1, c1) * (worldXZ / cellSize) +
+            waveTime * vec2(0.13, 0.07);
+        const ivec2 cell = ivec2(floor(p));
+        const vec3 n = waterSundialValueNoise(cell, p - vec2(cell));
+        total += n.yz * (1.0 / cellSize);
+    }
+    {
+        const float cellSize = 0.16;
+        const vec2 p =
+            mat2(c2, -s2, s2, c2) * (worldXZ / cellSize) +
+            waveTime * vec2(-0.09, 0.16);
+        const ivec2 cell = ivec2(floor(p));
+        const vec3 n = waterSundialValueNoise(cell, p - vec2(cell));
+        total += n.yz * (0.55 / cellSize);
+    }
+    return total * (0.006 * amplitude * fade);
 }
 #endif
 // ---------------------------------------------------------------------------
@@ -315,13 +379,21 @@ const int WATER_WAVE_FULL_OCTAVE_CAP = 16;
 
 vec2 waterNaturalWaveGradient(vec2 worldXZ, out float cameraDistance, float horizonFade, float waveLod)
 {
-    return waterNaturalWaveGradientCapped(
+    vec2 slope = waterNaturalWaveGradientCapped(
         worldXZ,
         cameraDistance,
         WATER_WAVE_FULL_OCTAVE_CAP,
         horizonFade,
         waveLod
     );
+#if WATER_WAVES_FFT_SWELL
+    // 2026-11-15：程序化微波细法线层（waterFftMicroSlope）。只在完整波面
+    // 路径加 —— classify 降本路径调的是上面的 Capped 变体，微波层不参与
+    // 界面能量 march，符合"第 3/4 八度在 Beer-Lambert 积分里不可见"的
+    // 既有降本口径。
+    slope += waterFftMicroSlope(worldXZ, waveLod);
+#endif
+    return slope;
 }
 
 // ===========================================================================

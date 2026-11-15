@@ -241,33 +241,99 @@ over 的退出条件是 ratio < lowWater(0.62)，但驱逐只释放 BLAS（asBla
 | **`pCap`（等 `g_chunkMutex`）** | avg 8.50 / max 20.24 ms | 捕获线程单段持锁 ~4.8 ms × 排队；`capPerWake=1` 无效 |
 | `VLI wait`（等 `g_vliMutex`） | avg 7.55 / max 31.24 ms | `gather` 已限流，但 `pending` 与 `vliGrow` 仍在 |
 
-已排除 `CAPSLOW` 的"计算"假设：`Mcycles` 换算只有 ~1.45 ms，而墙钟 35.96 ms ⇒ 96% 在等内存（每顶点 300~600 ns，是 memcpy 的数百倍）。下一步该查的是**捕获是否还有漏掉的冷分配**（给 7 个 layer + 3 个 motion + 4 个 packed 各加一个 `capacity()==0` 计数），而不是继续切分 route/copy/omm。
+已排除 `CAPSLOW` 的"计算"假设：`Mcycles` 换算只有 ~1.45 ms，而墙钟 35.96 ms ⇒ 96% 在等内存（每顶点 300~600 ns，是 memcpy 的数百倍）。"捕获是否还有漏掉的冷分配"已在 10.5 用探针回答：冷分配确实存在，但归因不是漏加的层，而是 split 池的稳态规模被峰值并发钉死。
 
-### 10.5 决定性发现：capture 的 split 池**基本没命中**
+### 10.5 split 池的真实命中情况（**推翻**此前的"基本没命中"结论）
 
-在唯一汇聚点 `geometryAppendSectionVertices` 的扩容分支加了累计计数（`destination.capacity() < requiredSize` 即"这次必须新分配"），输出并入 `[CHUNK LOCK]`：
+上一版据 `grow=22144 / growMB=4385` 推断"池命中率接近 0"。这个推断是错的，错在两处口径：
 
-```text
-12:34:07  [CHUNK LOCK] site=capture held=8.31  grow=241    growMB=36.2
-12:37:49  [CHUNK LOCK] site=capture held=3.26  grow=22144  growMB=4385.0
-```
+1. `counters` 行里的 `poolHit/poolMiss` 是 **SectionMemory 显存池**，与 split 缓冲池无关；
+2. `captured` 只统计**捕获线程**的产出，渲染线程每帧自己的同步捕获不计入 ⇒ "grow / captured" 会高估扩容率（1.13 就是这么算出来的）。
 
-**3.7 分钟：22144 次扩容、4385 MB 新分配（平均每次 ~198 KB）。**
-
-如果池在工作，这个数字应当在开局几百次后**归零**（容量足够后全是复用）。实际却线性增长 ⇒ 每次捕获都在真正分配新内存，而不是复用池里的 buffer。这正好解释了每顶点 300~600 ns 的开销（memcpy 应为 ~3 ns）——时间花在**分配与缺页**上。
-
-**没命中的机制**（推断，待下一轮验证）：
+补上真正的探针（`spHit/spMiss/spRet/spRej/spDrop/spStarve/spSize` 与 `growEmpty/growSmall`）后实测稳态：
 
 ```text
-捕获线程：take(池空) → 冷分配 → 填充 → 入队
-渲染线程：取队列 → 使用 → rebuildWorldGeometry **退出时**才 return
+spHit=3051 spMiss=737 spRet=3046 spRej=151 spDrop=0 spStarve=482 spSize=13
+growBk=261/215/0/182/95/63/71/0  growEmpty=481  growSmall=406
 ```
 
-归还只发生在函数退出那一刻，而捕获是独立持续运行的；只要捕获快于「渲染消费 + 函数退出归还」这个周期，池就**一直是空的**。再加上池上限 24、一次 wake 可吃掉几十个 split，命中率自然接近 0。
+- 命中率 = 3051/(3051+737) = **80.6%**（不是 0）；
+- 扩容率 ≈ **0.34 次/捕获**（不是每次）；
+- 扩容归因：`growEmpty`（拿到空槽）**56%**、`growSmall`（槽不够大）**44%**。
 
-**修复方向（S 级，两处都在 `WorldGeometry.cpp`，无需动 `geometryCaptureSectionLocked`）**：
+**池为什么长不大**（这是真正的问题）：带容量的槽只能由「冷分配 → 填充 → 归还」产生，所以**池的稳态大小 ≈ 峰值并发在途段数**（实测 13~24），与 `SECTION_SPLIT_POOL_LIMIT` 设多大无关——实测把它从 24 提到 96 完全没有效果。峰值并发 = 捕获线程一次唤醒连捕的段数（队列上限 `GEOMETRY_CAPTURE_MAX_QUEUED=256` 内可一口气抓上百段）+ 渲染线程一帧捕获的段数（~6）。
 
-1. 把归还从「函数退出时统一还」改成「build 循环里每处理完一个 `update` 就还池」；
-2. 池上限 `SECTION_SPLIT_POOL_LIMIT`（当前 24）提到 128，给两个线程之间留够缓冲。
+本轮改动（`Geometry.cpp` / `WorldGeometry.cpp`）：
 
-预期：`grow` 在开局后停止增长、`capHold` 从 ~4.8 ms 降到 1 ms 量级，`pCap`（当前 8.50 / 20.24 ms）随之塌到 2~3 ms。
+1. **take 推迟到捕获前**。原先"选 key"阶段就按 `batchCap` 一次 take 24 个，而时间预算只让 1.4 个真正捕获 ⇒ 22 个槽整帧滞留池外（`spSize` 被压到 0，捕获线程随即 miss）。
+2. **max-fit 取槽**（取总容量最大的），池满时**以大换小**（原先 LIFO、池满直接丢弃）。
+3. **捕获线程池空时不冷分配**：结束本轮唤醒，4 ms 后重试（连续 32 次唤醒才兜底冷分配，避免世界加载被饿住）。
+4. 被时间预算截断的条目**先归还再 `resize`**（原先直接析构，容量一起丢）。
+
+实测：`capHoldMs` 8.2 → **3.0~7.5**，`cpuFps` 63.3~66.4（基线 62.3~63.4）。扩容总量没有显著下降——剩余 miss 来自上面那条结构性原因，不是取槽策略。
+
+**下一步（按收益排序）**：
+
+1. 降低峰值并发才是根治：捕获完立刻把顶点拷进帧级 arena，split 随即还池，使并发降到 1~2（需要把 staging 与 split 生命周期解耦）。
+2. 不做第 1 条的话，命中率会在 80% 附近封顶，`growEmpty` 稳定在 ~480/600 帧。
+
+### 10.6 根治：capture arena —— split 持有窗口缩到「一次捕获」（已上线）
+
+既然池的稳态大小 = 峰值并发在途段数，扩池无用；根因是 split 的持有窗口横跨整个
+`rebuildWorldGeometry`（build → staging → TLAS），一帧捕获 6 段就锁住 6 个槽。
+所以把数据从 split 里搬出来，split 立刻还池。
+
+改动（`Geometry.cpp` / `WorldGeometry.cpp` / `Sections.cpp` / `OrionInternal.h`）：
+
+1. 新增 `CaptureArenaSegment`（`std::span<const Vertex>` 视图）+ 分块 arena：
+   每块 4MB、**段不跨块** ⇒ 块地址稳定，`span` 不会因扩容悬垂；超过一块的段走 bigChunk。
+2. 三个捕获点（捕获线程 / 渲染线程脏段 / forceReset 全量）统一改成：
+   本地 split 填 → `packSectionSplitBucketsLocked` → `captureArenaCommit` →
+   `returnSectionSplitToPool`。split 的持有窗口缩到一次捕获。
+3. 消费链路全部去掉 vector：`CapturedSectionUpdate` / `sectionUpdates` /
+   `PendingSectionUpload` / `rebuildGeometryClass` / `createSectionBLAS` 改用 `std::span`。
+4. arena 复位：staging 拷完之后，`captureArenaTryReset(queued)`——**同时**要求
+   "无写者"（`captureArenaBeginWrite/EndWrite` 包住 commit + 入队）与"队列无在途段"，
+   否则会覆盖还没被消费的段。
+
+实测（DLL `499E29AD`，稳态 + 按键移动触发新区块加载）：
+
+```text
+spHit=600 spMiss=0 spStarve=0 spSize=2
+growBk=0/0/0/0/0/0/0/0   growEmpty=0   growSmall=0
+arenaN=600/窗口  arenaRst=600  arenaChunks=8(~32MB 常驻)  arenaSkip=0
+capHoldMs=0.0
+```
+
+| 指标 | 10.5（max-fit + 96 槽） | 10.6（arena） |
+|---|---|---|
+| 扩容次数 / 600 帧 | ~1100 | **0** |
+| split 池内槽数 | 13~24 | **2** |
+| `spMiss` | 599~966 | **0** |
+| `capHoldMs` | 3.0~7.5 ms | **0.0~0.1 ms** |
+| `workAvgMs` | 7.7~8.7 ms | **1.8~2.2 ms** |
+
+代价：每段多一次 memcpy 进 arena（约 200KB/段，热内存 memcpy 约 3ns/顶点，对比原来
+缺页引发的 300~600ns/顶点仍是两个数量级）；arena 常驻约 32MB（8 块 × 4MB，按需增长、不释放）。
+
+后续注意：`growSmall` 归零意味着 split 的容量已经"一次训到最大"（同一个槽被反复复用），
+`SECTION_SPLIT_POOL_LIMIT` 现在只需覆盖并发（2~8），不必再调大。
+
+### 10.7 一批"确定性"优化（不改变行为，无需跑局验证）
+
+段数上来以后（`meshSec` 1900 → 5500），`rebuildWorldGeometry` 里有四处大容器是**每帧新建**的，
+每帧一次 malloc/free 再加一次首次触碰的缺页；arena 提交则是**每容器一次分配**（一段最多 14 次）。
+这些都不涉及语义，直接改掉：
+
+| 改动 | 位置 | 说明 |
+|---|---|---|
+| `pendingUploads` / `sectionsNeedingBuild` / `orderedSections` / `instances` 改 `static` + `clear()` | `WorldGeometry.cpp` | 容量跨帧保留。`instances` 在 5500 段时是 5500×64B ≈ 352KB，原来每帧 malloc/free 一次 |
+| `captureArenaCommit` 一次分配 + 切片 | `Geometry.cpp` | 原先 14 个容器各自 `allocate`（14 次锁内推进、读时 14 段互不相邻的内存）；改成先算总长（逐段 64B 对齐）→ 一次 `allocate` → 依次 `memcpy`。分配次数 14 → 1，整段连续，build/staging 缓存局部性更好 |
+| arena 块 4MB → 8MB | `Geometry.cpp` | 最大段（约 5 万顶点 + motion + 32B packed）会超过 4MB 而落到 bigChunk，反复 `new/delete`（实测 374 次）；8MB 覆盖后 bigChunk 只作极端兜底 |
+| `g_captureArenaChunks` 改为"当前常驻块数" | `Geometry.cpp` | 原先是累计分配次数，含 bigChunk 的反复分配，读日志时会被误导 |
+
+`rebuildWorldGeometry` 只在渲染线程调用（已有注释约定），`static` 复用不需要加锁；
+四个容器都在函数内声明处 `clear()`，early return 不会残留上一帧数据。
+
+这些改动对行为是等价的，跑局时只应看到 `geometry` 小幅下降（省掉每帧堆分配与缺页），
+`arenaChunks` 的数值口径也变成"常驻块数"。

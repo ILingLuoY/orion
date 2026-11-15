@@ -167,10 +167,10 @@ vec3 glassAlphaBlendSampleVolumeSh(vec3 worldPosition)
         return vec3(0.0);
     }
 
-    const mat4 viewMatrix = inverse(cam.viewInverse);
-    const mat4 projMatrix = inverse(cam.projInverse);
-    const vec4 viewPosition = viewMatrix * vec4(worldPosition, 1.0);
-    const vec4 clipPosition = projMatrix * viewPosition;
+    // 2026-11-09：直接用宿主每帧算好的正变换，不再逐像素两次 inverse(mat4)
+    // （这个 helper 在两张全屏玻璃 pass 里被逐像素调用）。
+    const vec4 viewPosition = cam.viewMatrix * vec4(worldPosition, 1.0);
+    const vec4 clipPosition = cam.projectionMatrix * viewPosition;
 
     if(abs(clipPosition.w) < 1.0e-6)
     {

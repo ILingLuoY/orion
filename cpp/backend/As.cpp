@@ -341,11 +341,63 @@ bool createSectionOpacityMicromap(
     if(!g_ommNativeEnabled || input.subdivisionLevel != kExpectedLevel ||
        input.triangleCount != section.triangleCount ||
        input.knownMicroTriangleCount == 0u ||
-       input.data.size() != static_cast<size_t>(input.triangleCount) *
+       input.data.size() !=                             static_cast<size_t>(input.triangleCount) *
                             kExpectedBytesPerTriangle)
     {
         return false;
     }
+
+    // 2026-11-13：OMM 内部分段计时。单段 ommMs 曾观测 38ms（[RT SECTION SLOW]
+    // frame=9086，34656 顶点），远超"0.9ms 固定 + 0.3µs/三角形"的既有实测曲线。
+    // RAII：任何早退路径也会打出累计值；totalMs>=5ms 才打印。
+    struct OmmSlowTimer
+    {
+        uint32_t tris = 0u;
+        std::chrono::steady_clock::time_point lapStart =
+            std::chrono::steady_clock::now();
+        double dataPoolMs = 0.0;
+        double dataCopyMs = 0.0;
+        double triPoolMs = 0.0;
+        double triCopyMs = 0.0;
+        double sizesMs = 0.0;
+        double storagePoolMs = 0.0;
+        double createMs = 0.0;
+        double scratchPoolMs = 0.0;
+        void lap(double& sink)
+        {
+            const std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now();
+            sink += std::chrono::duration<double, std::milli>(
+                now - lapStart).count();
+            lapStart = now;
+        }
+        ~OmmSlowTimer()
+        {
+            const std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now();
+            const double tailMs = std::chrono::duration<double, std::milli>(
+                now - lapStart).count();
+            const double totalMs =
+                dataPoolMs + dataCopyMs + triPoolMs + triCopyMs + sizesMs +
+                storagePoolMs + createMs + scratchPoolMs + tailMs;
+            if(totalMs >= 5.0)
+            {
+                RTLog(std::string("[OMM SLOW] totalMs=") +
+                    std::to_string(totalMs) +
+                    " tris=" + std::to_string(tris) +
+                    " dataPoolMs=" + std::to_string(dataPoolMs) +
+                    " dataCopyMs=" + std::to_string(dataCopyMs) +
+                    " triPoolMs=" + std::to_string(triPoolMs) +
+                    " triCopyMs=" + std::to_string(triCopyMs) +
+                    " sizesMs=" + std::to_string(sizesMs) +
+                    " storagePoolMs=" + std::to_string(storagePoolMs) +
+                    " createMs=" + std::to_string(createMs) +
+                    " scratchPoolMs=" + std::to_string(scratchPoolMs) +
+                    " tailMs=" + std::to_string(tailMs));
+            }
+        }
+    } ommSlowTimer;
+    ommSlowTimer.tris = input.triangleCount;
 
     const VkBufferUsageFlags inputUsage =
         VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT |
@@ -359,6 +411,7 @@ bool createSectionOpacityMicromap(
         destroySectionOpacityMicromap(section);
         return false;
     }
+    ommSlowTimer.lap(ommSlowTimer.dataPoolMs);
     void* mapped = nullptr;
     check(vkMapMemory(g_device, section.ommDataBinding.memory,
         section.ommDataBinding.memoryOffset, input.data.size(),
@@ -366,6 +419,7 @@ bool createSectionOpacityMicromap(
     std::memcpy(mapped, input.data.data(), input.data.size());
     vkUnmapMemory(g_device, section.ommDataBinding.memory);
     section.ommDataAddress = getBufferDeviceAddress(g_device, section.ommDataBuffer);
+    ommSlowTimer.lap(ommSlowTimer.dataCopyMs);
 
     thread_local std::vector<VkMicromapTriangleEXT> trianglesScratch;
     trianglesScratch.clear();
@@ -388,12 +442,14 @@ bool createSectionOpacityMicromap(
         destroySectionOpacityMicromap(section);
         return false;
     }
+    ommSlowTimer.lap(ommSlowTimer.triPoolMs);
     mapped = nullptr;
     check(vkMapMemory(g_device, section.ommTriangleBinding.memory,
         section.ommTriangleBinding.memoryOffset, triangleBytes,
         0, &mapped), "map Section OMM triangle records failed");
     std::memcpy(mapped, triangles, static_cast<size_t>(triangleBytes));
     vkUnmapMemory(g_device, section.ommTriangleBinding.memory);
+    ommSlowTimer.lap(ommSlowTimer.triCopyMs);
     section.ommTriangleAddress =
         getBufferDeviceAddress(g_device, section.ommTriangleBuffer);
 
@@ -424,6 +480,7 @@ bool createSectionOpacityMicromap(
     sizes.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_SIZES_INFO_EXT;
     getMicromapBuildSizes()(g_device,
         VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &sizes);
+    ommSlowTimer.lap(ommSlowTimer.sizesMs);
     if(sizes.micromapSize == 0u || sizes.buildScratchSize == 0u)
     {
         RTLog("[OMM NATIVE] buildSizes=0 fallback=anyHit");
@@ -440,6 +497,7 @@ bool createSectionOpacityMicromap(
         destroySectionOpacityMicromap(section);
         return false;
     }
+    ommSlowTimer.lap(ommSlowTimer.storagePoolMs);
     VkMicromapCreateInfoEXT createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_MICROMAP_CREATE_INFO_EXT;
     createInfo.buffer = section.ommStorageBuffer;
@@ -447,6 +505,7 @@ bool createSectionOpacityMicromap(
     createInfo.type = VK_MICROMAP_TYPE_OPACITY_MICROMAP_EXT;
     check(getCreateMicromap()(g_device, &createInfo, nullptr,
         &section.opacityMicromap), "create Section opacity micromap failed");
+    ommSlowTimer.lap(ommSlowTimer.createMs);
 
     if(!createPooledBuffer(sizes.buildScratchSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -457,6 +516,7 @@ bool createSectionOpacityMicromap(
         destroySectionOpacityMicromap(section);
         return false;
     }
+    ommSlowTimer.lap(ommSlowTimer.scratchPoolMs);
     section.ommScratchAddress =
         getBufferDeviceAddress(g_device, section.ommScratchBuffer);
     section.hasOpacityMicromap = true;

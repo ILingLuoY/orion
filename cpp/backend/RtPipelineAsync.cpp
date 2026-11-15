@@ -498,3 +498,271 @@ void pollAsyncRtPipelineRebuild()
         RTLogFlushed(text);
     }
 }
+
+// ============================================================
+// 2026-11-09：boot 巨型管线后台编译（与上面的 deferred-op 分片重建互补）：
+// initDeviceHandlesNative 里 main → SBT → K1/K2 整段挪到后台线程顺序执行，
+// 主线程立刻返回继续 BLAS/TLAS/描述符，窗口/菜单不再被 8~20 分钟/条的
+// 驱动 LLVM 冷编冻死。帧路径用 rtBootPipelinesReady() 门控（Frame.cpp 的
+// "pipelinesCompiling" skip），编译完成自动放行。
+//
+// 顺序编不并行：k2d 的 LLVM OOM（见 [[rgen-split-state]]）表明驱动编译器
+// 对内存极其敏感，多条并行只会互相挤爆。
+// ============================================================
+
+#include <thread>
+
+namespace
+{
+
+struct RtBootCompileState
+{
+    std::thread thread;
+    std::atomic<bool> ready{false};
+    std::atomic<bool> inFlight{false};
+    bool started = false;
+    // shader module 句柄从调用方栈上拷进来：调用方（initDeviceHandlesNative）
+    // 启动线程后立刻返回，栈帧作废，线程必须拥有自己的副本。
+    VkShaderModule mods[6] = {};
+};
+
+RtBootCompileState g_rtBootCompile;
+
+void destroyBootShaderModules(VkShaderModule* mods)
+{
+    for(uint32_t i = 0u; i < 6u; ++i)
+    {
+        if(mods[i] != VK_NULL_HANDLE)
+        {
+            vkDestroyShaderModule(g_device, mods[i], nullptr);
+            mods[i] = VK_NULL_HANDLE;
+        }
+    }
+}
+
+void rtBootPipelineCompileWorker()
+{
+    g_rtBootCompile.inFlight.store(true, std::memory_order_release);
+
+    VkShaderModule (&mods)[6] = g_rtBootCompile.mods;
+
+    const auto bootStart = std::chrono::steady_clock::now();
+
+    try
+    {
+        VkPipelineShaderStageCreateInfo stages[6]{};
+
+        stages[0]={
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            nullptr,
+            0,
+            VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+            mods[0],
+            "main",
+            nullptr
+        };
+
+        stages[1]={
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            nullptr,
+            0,
+            VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
+            mods[1],
+            "main",
+            nullptr
+        };
+
+        stages[2]={
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            nullptr,
+            0,
+            VK_SHADER_STAGE_MISS_BIT_KHR,
+            mods[2],
+            "main",
+            nullptr
+        };
+
+        stages[3]={
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            nullptr,
+            0,
+            VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
+            mods[3],
+            "main",
+            nullptr
+        };
+
+        stages[4]={
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            nullptr,
+            0,
+            VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
+            mods[4],
+            "main",
+            nullptr
+        };
+
+        stages[5]={
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            nullptr,
+            0,
+            VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
+            mods[5],
+            "main",
+            nullptr
+        };
+
+        VkRayTracingShaderGroupCreateInfoKHR groups[5]{};
+
+        groups[0]={VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,nullptr,VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR,0,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR};
+
+        groups[1]={VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,nullptr,VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,VK_SHADER_UNUSED_KHR,1,3,VK_SHADER_UNUSED_KHR};
+
+        groups[2]={VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,nullptr,VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR,2,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR};
+
+        groups[3]={VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,nullptr,VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,VK_SHADER_UNUSED_KHR,4,5,VK_SHADER_UNUSED_KHR};
+
+        groups[4]={VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,nullptr,VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,VK_SHADER_UNUSED_KHR,1,3,VK_SHADER_UNUSED_KHR};
+
+        VkRayTracingPipelineCreateInfoKHR pci{VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+        pci.stageCount=6;
+        pci.pStages=stages;
+        pci.groupCount=5;
+        pci.pGroups=groups;
+        pci.maxPipelineRayRecursionDepth=1;
+        pci.layout=g_rayTracingPipelineLayout;
+        if(g_ommNativeEnabled)
+        {
+            pci.flags |=
+                VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+        }
+
+        const VkPipelineCache rtPipelineCache =
+            rtPipelineCacheDisabled()
+                ? VK_NULL_HANDLE
+                : getSharedPipelineCache();
+
+        if(rtPipelineDisableOptimization())
+        {
+            pci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        }
+
+        if(OrionPipelineStatsCaptureEnabled())
+        {
+            pci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+        }
+
+        // 参数与 Device.cpp 同步版逐位一致；成功即落盘在 wrapper 内。
+        check(OrionCreateRayTracingPipelineTimed(
+                  "main",
+                  1u,
+                  &pci,
+                  rtPipelineCache,
+                  &g_rayTracingPipeline),
+              "Failed to create RT pipeline");
+
+        OrionLogPipelineStats("main", g_rayTracingPipeline);
+
+        g_pipelineCachePersistCountdown = 60u;
+        RTLogFlushed(
+            "[RT TRANSLUCENT SPV]"
+            " group3=rt_test_translucent.rchit+rahit"
+            " group4=rt_test.rchit+rahit"
+        );
+
+        destroyBootShaderModules(mods);
+
+        // SBT 只依赖主管线（句柄取自 g_rayTracingPipeline，与 K1/K2 无关），
+        // 所以 main 一成就能建；K1/K2 随后。
+        createRayTracingSBT();
+
+        ensureK1K2Pipelines();
+
+        const double bootMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - bootStart
+            ).count();
+
+        char done[160] = {};
+        std::snprintf(
+            done,
+            sizeof(done),
+            "[RT BOOT] pipelines ready in %.0f ms -- frame gate opens",
+            bootMs
+        );
+        fprintf(stderr, "%s\n", done);
+        fflush(stderr);
+        RTLogFlushed(done);
+
+        g_rtBootCompile.ready.store(true, std::memory_order_release);
+    }
+    catch(const std::exception& error)
+    {
+        destroyBootShaderModules(mods);
+
+        RTLogFlushed(
+            std::string("[RT BOOT] pipeline compile FAILED, RT stays off this "
+                        "session: ") +
+            error.what());
+    }
+    catch(...)
+    {
+        destroyBootShaderModules(mods);
+
+        RTLogFlushed(
+            "[RT BOOT] pipeline compile FAILED (unknown exception), RT stays "
+            "off this session");
+    }
+
+    g_rtBootCompile.inFlight.store(false, std::memory_order_release);
+}
+
+} // namespace
+
+void startRtBootPipelineCompile(VkShaderModule (&mods)[6])
+{
+    if(g_rtBootCompile.started)
+    {
+        return;
+    }
+
+    g_rtBootCompile.started = true;
+
+    for(uint32_t i = 0u; i < 6u; ++i)
+    {
+        g_rtBootCompile.mods[i] = mods[i];
+        mods[i] = VK_NULL_HANDLE;
+    }
+
+    try
+    {
+        g_rtBootCompile.thread =
+            std::thread(rtBootPipelineCompileWorker);
+    }
+    catch(const std::exception& error)
+    {
+        // 线程资源枯竭等极端情况：退回同步路径，宁可冻窗口也不能没有 RT。
+        RTLogFlushed(
+            std::string("[RT BOOT] thread spawn failed, falling back to sync: ") +
+            error.what());
+        rtBootPipelineCompileWorker();
+    }
+}
+
+bool rtBootPipelinesReady()
+{
+    return g_rtBootCompile.ready.load(std::memory_order_acquire);
+}
+
+bool rtBootCompileInFlight()
+{
+    return g_rtBootCompile.inFlight.load(std::memory_order_acquire);
+}
+
+void rtBootDetachCompileThread()
+{
+    if(g_rtBootCompile.thread.joinable())
+    {
+        g_rtBootCompile.thread.detach();
+    }
+}

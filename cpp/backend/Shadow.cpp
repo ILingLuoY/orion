@@ -293,8 +293,286 @@ bool sunShadowSignatureChanged(
 
     return changed;
 }
+// ===========================================================================
+// 2026-11-09：太阳阴影图内容探针（ORION_SUNSHADOW_PROBE=1）
+//
+// 病征（用户）："太阳的体积光穿墙，所有体积光都穿墙"。
+// 解析雾的太阳项（volumetric_fog.glsl 的 rayColor）遮挡**只**来自这张图，所以
+// 只要图里的值是错的，雾就会整片受光。图里存的是"沿太阳方向首个遮挡体距离"
+// （消费者算 depth = extentZ - dot(local, sunDir)，命中判据 depth < stored + bias），
+// 因此：
+//   · 生产者一条都没打中 ⇒ stored 恒 ≈ 320（2×EXTENT_Z）⇒ 处处判定受光；
+//   · 图有梯度 ⇒ 图是好的，问题在消费者/调用参数。
+// 这条日志就是把这两种情况分开：min/mean/max + "无命中占比"。
+// ===========================================================================
+namespace
+{
+    bool sunShadowProbeEnabled()
+    {
+        static const bool cached = []() -> bool
+        {
+            const char* raw = std::getenv("ORION_SUNSHADOW_PROBE");
+            return raw != nullptr && raw[0] == '1';
+        }();
+        return cached;
+    }
+
+    constexpr uint32_t SUN_SHADOW_PROBE_INTERVAL = 120u;
+
+    VkBuffer s_sunShadowProbeBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory s_sunShadowProbeMemory = VK_NULL_HANDLE;
+    float* s_sunShadowProbeMapped = nullptr;
+    uint32_t s_sunShadowProbeCounter = 0u;
+    bool s_sunShadowProbePending = false;
+
+    void sunShadowProbeLog()
+    {
+        if(!s_sunShadowProbePending || s_sunShadowProbeMapped == nullptr)
+        {
+            return;
+        }
+        s_sunShadowProbePending = false;
+
+        const size_t texelCount =
+            static_cast<size_t>(SUN_SHADOW_RESOLUTION) * SUN_SHADOW_RESOLUTION;
+        float lo = 1.0e30f;
+        float hi = -1.0e30f;
+        double sum = 0.0;
+        size_t noHit = 0u;
+        size_t zero = 0u;
+
+        for(size_t i = 0u; i < texelCount; ++i)
+        {
+            const float value = s_sunShadowProbeMapped[i];
+            lo = std::min(lo, value);
+            hi = std::max(hi, value);
+            sum += static_cast<double>(value);
+
+            if(value >= 319.0f)
+            {
+                ++noHit;
+            }
+            if(value <= 0.0f)
+            {
+                ++zero;
+            }
+        }
+
+        // ---- 消费者侧复算（与 sun_shadow.glsl 的 sunShadowVisibilityIn 同口径）----
+        // 图好不好是一回事；雾实际读到什么才是判定"洞穴里被判受光"的关键。
+        // 这里在 CPU 上用**同一张图 + 同一套公式**算相机周围几个点的可见性：
+        //   origin = 相机本身、down6 = 脚下 6 格（应被挡）、up6 = 头上 6 格（洞内应被挡）、
+        //   sun20 = 朝太阳方向 20 格（露天才应受光）
+        // 输出 1/0 + depth + stored，可直接判定是"图错"还是"公式/取位错"。
+        std::string consumeLog;
+
+        if(g_cameraUboMapped != nullptr)
+        {
+            const CameraUBO* probeUbo =
+                static_cast<const CameraUBO*>(g_cameraUboMapped);
+            const float phase = probeUbo->historyParamsPadding1;
+            const float angle = (phase - std::floor(phase)) * 6.28318530718f;
+            float sun[3] = {
+                std::cos(angle),
+                0.81915204429f * std::sin(angle),
+                0.57357643635f * std::sin(angle)
+            };
+            const float sunLength =
+                std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+
+            if(sunLength > 1.0e-8f)
+            {
+                sun[0] /= sunLength;
+                sun[1] /= sunLength;
+                sun[2] /= sunLength;
+
+                // 与 sun_shadow.glsl 的 sunShadowBasis 同口径：
+                //   right = normalize(cross(vec3(0,1,0), sun))
+                //   up    = cross(sun, right)
+                float right[3] = { sun[2], 0.0f, -sun[0] };
+                const float rightLength =
+                    std::sqrt(right[0] * right[0] + right[2] * right[2]);
+
+                if(rightLength > 1.0e-8f)
+                {
+                    right[0] /= rightLength;
+                    right[2] /= rightLength;
+
+                    const float upAxis[3] = {
+                        sun[1] * right[2] - sun[2] * right[1],
+                        sun[2] * right[0] - sun[0] * right[2],
+                        sun[0] * right[1] - sun[1] * right[0]
+                    };
+
+                    const float extentXY = 160.0f;
+                    const float extentZ = 160.0f;
+                    const float nearBias = 0.06f;
+                    const float quantum = 2.0f * extentXY / 256.0f;
+
+                    float camera[3] = {
+                        probeUbo->viewInverse[12],
+                        probeUbo->viewInverse[13],
+                        probeUbo->viewInverse[14]
+                    };
+                    float center[3];
+                    for(int axis = 0; axis < 3; ++axis)
+                    {
+                        center[axis] = std::floor(camera[axis] / quantum) * quantum;
+                    }
+
+                    auto probeAt = [&](float dx, float dy, float dz) -> std::string
+                    {
+                        const float local[3] = {
+                            camera[0] + dx - center[0],
+                            camera[1] + dy - center[1],
+                            camera[2] + dz - center[2]
+                        };
+                        const float u =
+                            (local[0] * right[0] + local[1] * right[1] +
+                             local[2] * right[2]) / (2.0f * extentXY) + 0.5f;
+                        const float v =
+                            (local[0] * upAxis[0] + local[1] * upAxis[1] +
+                             local[2] * upAxis[2]) / (2.0f * extentXY) + 0.5f;
+
+                        if(u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f)
+                        {
+                            return std::string("oob");
+                        }
+
+                        const int tx = std::min(
+                            static_cast<int>(SUN_SHADOW_RESOLUTION) - 1,
+                            std::max(0, static_cast<int>(u * SUN_SHADOW_RESOLUTION)));
+                        const int ty = std::min(
+                            static_cast<int>(SUN_SHADOW_RESOLUTION) - 1,
+                            std::max(0, static_cast<int>(v * SUN_SHADOW_RESOLUTION)));
+                        const float stored = s_sunShadowProbeMapped[
+                            static_cast<size_t>(ty) * SUN_SHADOW_RESOLUTION +
+                            static_cast<size_t>(tx)];
+                        const float depth = extentZ -
+                            (local[0] * sun[0] + local[1] * sun[1] + local[2] * sun[2]);
+                        const bool lit = depth < stored + nearBias;
+
+                        return std::to_string(lit ? 1 : 0) + "/" +
+                            std::to_string(static_cast<int>(depth)) + "/" +
+                            std::to_string(static_cast<int>(stored));
+                    };
+
+                    consumeLog =
+                        " cam=(" + probeAt(0.0f, 0.0f, 0.0f) + ")" +
+                        " down6=(" + probeAt(0.0f, -6.0f, 0.0f) + ")" +
+                        " up6=(" + probeAt(0.0f, 6.0f, 0.0f) + ")" +
+                        " sun20=(" + probeAt(sun[0] * 20.0f, sun[1] * 20.0f,
+                            sun[2] * 20.0f) + ")" +
+                        " sunY=" + std::to_string(sun[1]);
+                }
+            }
+        }
+
+        const double mean = texelCount > 0u ? sum / static_cast<double>(texelCount) : 0.0;
+        const double noHitPercent =
+            100.0 * static_cast<double>(noHit) / static_cast<double>(texelCount);
+        const double zeroPercent =
+            100.0 * static_cast<double>(zero) / static_cast<double>(texelCount);
+
+        RTLogFlushed(
+            std::string("[SUNSHADOW PROBE] n=") + std::to_string(texelCount) +
+            " min=" + std::to_string(lo) +
+            " mean=" + std::to_string(mean) +
+            " max=" + std::to_string(hi) +
+            " noHit%=" + std::to_string(noHitPercent) +
+            " zero%=" + std::to_string(zeroPercent) +
+            " |[vis/depth/stored]" + consumeLog);
+    }
+
+    void recordSunShadowProbe(VkCommandBuffer cmd)
+    {
+        if(!sunShadowProbeEnabled() || cmd == VK_NULL_HANDLE ||
+           g_sunShadowImage == VK_NULL_HANDLE ||
+           g_sunShadowLayout != VK_IMAGE_LAYOUT_GENERAL)
+        {
+            return;
+        }
+
+        if(s_sunShadowProbeBuffer == VK_NULL_HANDLE)
+        {
+            if(g_device == VK_NULL_HANDLE || g_physicalDevice == VK_NULL_HANDLE)
+            {
+                return;
+            }
+
+            const VkDeviceSize bytes =
+                static_cast<VkDeviceSize>(SUN_SHADOW_RESOLUTION) *
+                SUN_SHADOW_RESOLUTION * sizeof(float);
+
+            try
+            {
+                createBuffer(g_device, g_physicalDevice, bytes,
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    s_sunShadowProbeBuffer, s_sunShadowProbeMemory);
+            }
+            catch(...)
+            {
+                RTLog("[SUNSHADOW PROBE] buffer create failed; probe off");
+                s_sunShadowProbeBuffer = VK_NULL_HANDLE;
+                return;
+            }
+
+            if(vkMapMemory(g_device, s_sunShadowProbeMemory, 0u, VK_WHOLE_SIZE, 0u,
+                   reinterpret_cast<void**>(&s_sunShadowProbeMapped)) != VK_SUCCESS)
+            {
+                s_sunShadowProbeMapped = nullptr;
+                return;
+            }
+
+            RTLog("[SUNSHADOW PROBE] ready (1024^2 R32F readback)");
+        }
+
+        if(++s_sunShadowProbeCounter < SUN_SHADOW_PROBE_INTERVAL)
+        {
+            return;
+        }
+        s_sunShadowProbeCounter = 0u;
+
+        VkImageMemoryBarrier toTransfer{};
+        toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toTransfer.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toTransfer.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toTransfer.image = g_sunShadowImage;
+        toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        toTransfer.subresourceRange.levelCount = 1u;
+        toTransfer.subresourceRange.layerCount = 1u;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u, &toTransfer);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1u;
+        region.imageExtent = { SUN_SHADOW_RESOLUTION, SUN_SHADOW_RESOLUTION, 1u };
+        vkCmdCopyImageToBuffer(cmd, g_sunShadowImage, VK_IMAGE_LAYOUT_GENERAL,
+            s_sunShadowProbeBuffer, 1u, &region);
+
+        VkImageMemoryBarrier backToShader = toTransfer;
+        backToShader.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        backToShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u,
+            &backToShader);
+
+        s_sunShadowProbePending = true;
+    }
+}
+
 void recordSunShadowMap(VkCommandBuffer cmd)
 {
+    sunShadowProbeLog();
+    recordSunShadowProbe(cmd);
+
     if(cmd == VK_NULL_HANDLE || !g_sunShadowAvailable.load() ||
        g_sunShadowPipeline == VK_NULL_HANDLE || g_sunShadowSet == VK_NULL_HANDLE ||
        g_sunShadowImage == VK_NULL_HANDLE || g_tlas == VK_NULL_HANDLE ||
@@ -1194,4 +1472,578 @@ void ensureSunShadowNearDescriptor()
 
     RTLog(std::string("[SUNSHADOW-NEAR] 描述符已写 binding79=") +
         (nearReady ? "1024² 近场图" : "回落图集"));
+}
+
+
+// ============================================================================
+// 2026-11-11 太阳可见度屏幕空间滤波（软影 A 方案，形态 1）
+//
+// 动机见 cpp/shaders/rt_sunvis_filter.comp 的头部注释。三段式：
+//   raygen 打 1 条阴影射线 → sunVisRaw（binding 90, 全分辨率）
+//   本模块的 rt_sunvis_filter.comp 在**半分辨率**上按遮挡距离做变半径加权平均
+//     → sunVisHistory[1-historyReadIndex]（binding 91, 两层 ping-pong）
+//   下一帧 raygen 按 MV 重投影采样 sunVisHistory[historyReadIndex]
+//
+// 2026-11-12：**默认启用**（用户要求落实进主代码，不再靠环境变量开启）。
+// 只有显式 `ORION_SUNVIS=0` 才退回旧的 N-tap 太阳盘采样路径 —— 留这个出口只为
+// 出问题时能一次重启定位，正常游玩不需要任何环境变量。
+// 可调量（改这些**不需要重编着色器**，重启客户端即可）：
+//   ORION_SUNVIS_APERTURE     光源角半径(rad)，默认 0.030
+//   ORION_SUNVIS_MAXRADIUS    半分辨率核半径上限(像素)，默认 16
+//   ORION_SUNVIS_DEPTHTOL     深度拒绝比例，默认 0.05
+// 布局口径跟 ss_hybrid/ss_hzb 一致：直接用 g_rayTracingDescriptorSet（set 0），
+// 所以不需要新的 set layout / pool。
+// ============================================================================
+namespace
+{
+uint32_t g_sunVisRenderWidth = 0u;
+uint32_t g_sunVisRenderHeight = 0u;
+uint32_t g_sunVisHalfWidth = 0u;
+uint32_t g_sunVisHalfHeight = 0u;
+
+VkImage g_sunVisRawImage = VK_NULL_HANDLE;
+VkDeviceMemory g_sunVisRawMemory = VK_NULL_HANDLE;
+VkImageView g_sunVisRawView = VK_NULL_HANDLE;
+VkImageLayout g_sunVisRawLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+VkImage g_sunVisHistoryImages[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+VkDeviceMemory g_sunVisHistoryMemories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+VkImageView g_sunVisHistoryViews[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+VkImageLayout g_sunVisHistoryLayouts[2] = {
+    VK_IMAGE_LAYOUT_UNDEFINED,
+    VK_IMAGE_LAYOUT_UNDEFINED};
+
+VkPipelineLayout g_sunVisPipelineLayout = VK_NULL_HANDLE;
+VkPipeline g_sunVisPipeline = VK_NULL_HANDLE;
+VkDescriptorSetLayout g_sunVisPipelineSetLayout = VK_NULL_HANDLE;
+bool g_sunVisPipelineFailed = false;
+
+VkDescriptorSet g_sunVisBoundSet = VK_NULL_HANDLE;
+
+float sunVisEnvFloat(
+    const char* name,
+    float fallback)
+{
+    const char* raw = std::getenv(name);
+
+    if(raw == nullptr || raw[0] == '\0')
+    {
+        return fallback;
+    }
+
+    const float value = static_cast<float>(std::atof(raw));
+
+    return std::isfinite(value) ? value : fallback;
+}
+
+void destroySunVisResourcesLocked()
+{
+    for(int i = 0; i < 2; ++i)
+    {
+        destroyHistoryImage(
+            g_sunVisHistoryImages[i],
+            g_sunVisHistoryMemories[i],
+            g_sunVisHistoryViews[i],
+            g_sunVisHistoryLayouts[i]);
+    }
+
+    destroyHistoryImage(
+        g_sunVisRawImage,
+        g_sunVisRawMemory,
+        g_sunVisRawView,
+        g_sunVisRawLayout);
+
+    g_sunVisRenderWidth = 0u;
+    g_sunVisRenderHeight = 0u;
+    g_sunVisHalfWidth = 0u;
+    g_sunVisHalfHeight = 0u;
+    g_sunVisBoundSet = VK_NULL_HANDLE;
+}
+
+// 建图之后立刻做一次性转换：两张 history 清成 1.0（全亮），raw 转到 GENERAL。
+// 只在创建/分辨率变化时跑，用阻塞提交（与其它 create 函数同量级成本）。
+void sunVisPrimeImages()
+{
+    if(g_rtCommandPool == VK_NULL_HANDLE || g_queue == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkCommandBufferAllocateInfo allocateInfo{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocateInfo.commandPool = g_rtCommandPool;
+    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocateInfo.commandBufferCount = 1u;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+
+    if(vkAllocateCommandBuffers(g_device, &allocateInfo, &cmd) != VK_SUCCESS ||
+       cmd == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    VkImageMemoryBarrier barriers[3]{};
+    const uint32_t count =
+        (g_sunVisRawImage != VK_NULL_HANDLE) ? 3u : 2u;
+
+    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[0].srcAccessMask = 0u;
+    barriers[0].dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].image = g_sunVisRawImage;
+    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barriers[0].subresourceRange.levelCount = 1u;
+    barriers[0].subresourceRange.layerCount = 1u;
+
+    for(int i = 0; i < 2; ++i)
+    {
+        VkImageMemoryBarrier& barrier = barriers[i + 1u];
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = 0u;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = g_sunVisHistoryImages[i];
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1u;
+        barrier.subresourceRange.layerCount = 1u;
+    }
+
+    if(count == 3u)
+    {
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u,
+            0u, nullptr,
+            0u, nullptr,
+            count,
+            barriers);
+    }
+    else
+    {
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u,
+            0u, nullptr,
+            0u, nullptr,
+            2u,
+            barriers + 1);
+    }
+
+    VkClearColorValue litValue{};
+    litValue.float32[0] = 1.0f;
+    litValue.float32[1] = 0.0f;
+    litValue.float32[2] = 0.0f;
+    litValue.float32[3] = 0.0f;
+
+    for(int i = 0; i < 2; ++i)
+    {
+        if(g_sunVisHistoryImages[i] == VK_NULL_HANDLE)
+        {
+            continue;
+        }
+
+        VkImageSubresourceRange range{};
+        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        range.levelCount = 1u;
+        range.layerCount = 1u;
+
+        vkCmdClearColorImage(
+            cmd,
+            g_sunVisHistoryImages[i],
+            VK_IMAGE_LAYOUT_GENERAL,
+            &litValue,
+            1u,
+            &range);
+    }
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1u;
+    submitInfo.pCommandBuffers = &cmd;
+
+    vkQueueWaitIdle(g_queue);
+    vkQueueSubmit(g_queue, 1u, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g_queue);
+
+    vkFreeCommandBuffers(g_device, g_rtCommandPool, 1u, &cmd);
+
+    g_sunVisRawLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    for(int i = 0; i < 2; ++i)
+    {
+        g_sunVisHistoryLayouts[i] = VK_IMAGE_LAYOUT_GENERAL;
+    }
+}
+
+void ensureSunVisPipeline()
+{
+    if(g_sunVisPipeline != VK_NULL_HANDLE &&
+       g_sunVisPipelineSetLayout == g_rayTracingDescriptorSetLayout)
+    {
+        return;
+    }
+
+    if(g_sunVisPipelineFailed)
+    {
+        return;
+    }
+
+    if(g_device == VK_NULL_HANDLE ||
+       g_rayTracingDescriptorSetLayout == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    if(g_sunVisPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_sunVisPipeline, nullptr);
+        g_sunVisPipeline = VK_NULL_HANDLE;
+    }
+
+    if(g_sunVisPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_sunVisPipelineLayout, nullptr);
+        g_sunVisPipelineLayout = VK_NULL_HANDLE;
+    }
+
+    try
+    {
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipelineLayoutInfo.setLayoutCount = 1u;
+        pipelineLayoutInfo.pSetLayouts = &g_rayTracingDescriptorSetLayout;
+
+        check(
+            vkCreatePipelineLayout(
+                g_device,
+                &pipelineLayoutInfo,
+                nullptr,
+                &g_sunVisPipelineLayout),
+            "sun vis pipeline layout failed");
+
+        const std::vector<uint8_t> code =
+            loadSpv("shaders/rt_sunvis_filter.comp.spv");
+
+        VkShaderModule shader = createShaderModule(g_device, code);
+
+        VkPipelineShaderStageCreateInfo stage{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = shader;
+        stage.pName = "main";
+
+        VkComputePipelineCreateInfo pipelineInfo{
+            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = stage;
+        pipelineInfo.layout = g_sunVisPipelineLayout;
+
+        const VkResult result = vkCreateComputePipelines(
+            g_device,
+            getSharedPipelineCache(),
+            1u,
+            &pipelineInfo,
+            nullptr,
+            &g_sunVisPipeline);
+
+        vkDestroyShaderModule(g_device, shader, nullptr);
+
+        if(result != VK_SUCCESS)
+        {
+            throw std::runtime_error("sun vis compute pipeline failed");
+        }
+
+        g_sunVisPipelineSetLayout = g_rayTracingDescriptorSetLayout;
+    }
+    catch(...)
+    {
+        g_sunVisPipelineFailed = true;
+        g_sunVisPipeline = VK_NULL_HANDLE;
+        RTLog("[SUNVIS] 管线创建失败，本会话关闭该 pass");
+    }
+}
+} // namespace
+
+
+bool sunVisEnabled()
+{
+    // 2026-11-12 回退：默认**关**。
+    //
+    // 原因（用户实测"好多噪点"）：这条 A 路径是"1 条 **确定性** 射线 + 空域
+    // 滤波"，而参考实现（Caustica 的 RR-only 路径，见 trace_transport.slang 的
+    // traceDirect / retained_lights.slang 的 angularRadius）用的是
+    // **1 spp 随机太阳盘采样 + DLSS-RR 时域收敛**。没有时域累积时，
+    // 1 条确定性射线的方差是 N tap 平均的 N 倍 ⇒ 必然比原来更噪。
+    // 要显式复测这条路径：ORION_SUNVIS=1。
+    static const bool cached = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_SUNVIS");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return false;
+        }
+
+        return raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+float sunVisAperture()
+{
+    static const float cached =
+        sunVisEnvFloat("ORION_SUNVIS_APERTURE", 0.030f);
+
+    return cached;
+}
+
+float sunVisMaxRadius()
+{
+    static const float cached =
+        sunVisEnvFloat("ORION_SUNVIS_MAXRADIUS", 16.0f);
+
+    return cached;
+}
+
+float sunVisDepthTolerance()
+{
+    static const float cached =
+        sunVisEnvFloat("ORION_SUNVIS_DEPTHTOL", 0.05f);
+
+    return cached;
+}
+
+void createSunVisResources(
+    uint32_t width,
+    uint32_t height)
+{
+    if(!sunVisEnabled() || width == 0u || height == 0u)
+    {
+        return;
+    }
+
+    // 2026-11-12：默认启用后这条早退必须同时确认"描述符仍是当前那一份 set"。
+    // RT 描述符集若被重建（管线/布局变化），旧的 binding 90/91 就悬空了 ——
+    // 只要它变了就整组重建（分辨率不变也重建），比逐帧猜便宜。
+    if(g_sunVisRawImage != VK_NULL_HANDLE &&
+       g_sunVisRenderWidth == width &&
+       g_sunVisRenderHeight == height &&
+       g_sunVisBoundSet == g_rayTracingDescriptorSet &&
+       g_rayTracingDescriptorSet != VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    destroySunVisResourcesLocked();
+
+    const uint32_t halfWidth = std::max(1u, (width + 1u) / 2u);
+    const uint32_t halfHeight = std::max(1u, (height + 1u) / 2u);
+
+    createRRGuideImage(
+        width,
+        height,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        g_sunVisRawImage,
+        g_sunVisRawMemory,
+        g_sunVisRawView,
+        g_sunVisRawLayout);
+
+    g_sunVisRawLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    for(int i = 0; i < 2; ++i)
+    {
+        createRRGuideImage(
+            halfWidth,
+            halfHeight,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            g_sunVisHistoryImages[i],
+            g_sunVisHistoryMemories[i],
+            g_sunVisHistoryViews[i],
+            g_sunVisHistoryLayouts[i]);
+
+        g_sunVisHistoryLayouts[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+
+    if(g_rayTracingDescriptorSet != VK_NULL_HANDLE)
+    {
+        VkDescriptorImageInfo infos[3]{};
+
+        infos[0].imageView = g_sunVisRawView;
+        infos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        infos[1].imageView = g_sunVisHistoryViews[0];
+        infos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        infos[2].imageView = g_sunVisHistoryViews[1];
+        infos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[2]{};
+
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = g_rayTracingDescriptorSet;
+        writes[0].dstBinding = 90u;
+        writes[0].dstArrayElement = 0u;
+        writes[0].descriptorCount = 1u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].pImageInfo = &infos[0];
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = g_rayTracingDescriptorSet;
+        writes[1].dstBinding = 91u;
+        writes[1].dstArrayElement = 0u;
+        writes[1].descriptorCount = 2u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].pImageInfo = &infos[1];
+
+        vkUpdateDescriptorSets(g_device, 2u, writes, 0u, nullptr);
+
+        g_sunVisBoundSet = g_rayTracingDescriptorSet;
+    }
+
+    sunVisPrimeImages();
+
+    ensureSunVisPipeline();
+
+    g_sunVisRenderWidth = width;
+    g_sunVisRenderHeight = height;
+    g_sunVisHalfWidth = halfWidth;
+    g_sunVisHalfHeight = halfHeight;
+
+    RTLogFlushed(
+        "[SUNVIS] enabled raw=" + std::to_string(width) + "x" +
+        std::to_string(height) + " history=" + std::to_string(halfWidth) +
+        "x" + std::to_string(halfHeight) +
+        " aperture=" + std::to_string(sunVisAperture()) +
+        " maxR=" + std::to_string(sunVisMaxRadius()) +
+        " depthTol=" + std::to_string(sunVisDepthTolerance()));
+}
+
+void recordSunVisFilter(VkCommandBuffer cmd)
+{
+    if(!sunVisEnabled() || cmd == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    if(g_sunVisPipeline == VK_NULL_HANDLE ||
+       g_sunVisRawImage == VK_NULL_HANDLE ||
+       g_sunVisBoundSet != g_rayTracingDescriptorSet ||
+       g_sunVisHalfWidth == 0u ||
+       g_sunVisHalfHeight == 0u)
+    {
+        return;
+    }
+
+    // raygen 刚写过 raw（binding 90）⇒ RT → COMPUTE 的可见性。
+    // 两张 history 本帧只写一张，另一张留给 raygen 读，故两张都要把
+    // 上一帧的写完成（SHADER_WRITE → SHADER_WRITE）。
+    VkImageMemoryBarrier before[3]{};
+
+    before[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    before[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    before[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    before[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    before[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[0].image = g_sunVisRawImage;
+    before[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    before[0].subresourceRange.levelCount = 1u;
+    before[0].subresourceRange.layerCount = 1u;
+
+    for(int i = 0; i < 2; ++i)
+    {
+        VkImageMemoryBarrier& barrier = before[i + 1u];
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = g_sunVisHistoryImages[i];
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1u;
+        barrier.subresourceRange.layerCount = 1u;
+    }
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u,
+        0u, nullptr,
+        0u, nullptr,
+        3u,
+        before);
+
+    vkCmdBindPipeline(
+        cmd,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_sunVisPipeline);
+
+    vkCmdBindDescriptorSets(
+        cmd,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_sunVisPipelineLayout,
+        0u,
+        1u,
+        &g_rayTracingDescriptorSet,
+        0u,
+        nullptr);
+
+    vkCmdDispatch(
+        cmd,
+        (g_sunVisHalfWidth + 7u) / 8u,
+        (g_sunVisHalfHeight + 7u) / 8u,
+        1u);
+
+    // 下一帧 raygen 要读 history（binding 91）⇒ COMPUTE → RT 的可见性。
+    VkImageMemoryBarrier after[2]{};
+
+    for(int i = 0; i < 2; ++i)
+    {
+        after[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        after[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        after[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        after[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        after[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        after[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        after[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        after[i].image = g_sunVisHistoryImages[i];
+        after[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        after[i].subresourceRange.levelCount = 1u;
+        after[i].subresourceRange.layerCount = 1u;
+    }
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u,
+        0u, nullptr,
+        0u, nullptr,
+        2u,
+        after);
 }

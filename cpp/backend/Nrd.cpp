@@ -4287,10 +4287,10 @@ void createRRGuideRelaxResources()
 void recordRRGuideRelax(VkCommandBuffer cmd)
 {
     const bool relaxEnabled = g_rrGuideRelaxEnabled.load();
+    // 2026-11-13："远云脱离RR"开关退役，远云 guide 注入不再被它压制
+    //（原条件 (postRr || split) ? 0 : ...；split 是 constexpr 关闭的死分支）。
     const float farCloudDistance =
-        (g_cloudPostRrComposite.load() || cloudFarBandSplitActive())
-            ? 0.0f
-            : std::max(g_rrFarCloudDistance.load(), 0.0f);
+        std::max(g_rrFarCloudDistance.load(), 0.0f);
     const bool farCloudEnabled =
         farCloudDistance > 0.0f &&
         g_volumetricCloudResolvedView != VK_NULL_HANDLE &&

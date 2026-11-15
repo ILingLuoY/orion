@@ -549,20 +549,29 @@ void rebuildLocalLightGpuBuffer()
                 GPULocalLightRecord
                     gpuLight{};
 
+                // 2026-11-09：+0.5 = 方块中心。
+                //
+                // LocalLightRecord 的 worldX/Y/Z 是**方块整数坐标**（VLI 的 voxel
+                // 索引加 section 基址），原样下发等于把光源点放在 8 个方块的公共
+                // 角点上。角点正好落在地形单面壳的**顶点/边**上，而地形网格不是
+                // 水密三角网 —— 从空气打向该角点的遮挡射线有相当比例会从边的缝隙
+                // 里穿过去，于是"灯明明在墙后 / 天花板那一侧，体积光还是被点亮"。
+                // 光源采样的物理位置本来就是体素中心，这一格偏移同时修掉
+                // 0.87 格的距离误差。
                 gpuLight.worldX =
                     static_cast<float>(
                         light.worldX
-                    );
+                    ) + 0.5f;
 
                 gpuLight.worldY =
                     static_cast<float>(
                         light.worldY
-                    );
+                    ) + 0.5f;
 
                 gpuLight.worldZ =
                     static_cast<float>(
                         light.worldZ
-                    );
+                    ) + 0.5f;
 
                 gpuLight.emissionLevel =
                     static_cast<float>(

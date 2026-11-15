@@ -1,8 +1,13 @@
 #ifndef TERRAIN_HEIGHT_GLSL
 #define TERRAIN_HEIGHT_GLSL
 
-const int TERRAIN_HEIGHT_RESOLUTION = 512;
-const float TERRAIN_HEIGHT_TEXEL = 1.0 / 512.0;
+// 2026-11-09：512 -> 128。覆盖范围仍由 TERRAIN_HEIGHT_EXTENT_XY（±256 格）
+// 决定，所以只是纹素从 1 格变 4 格。这是**探测射线数**从 262144/帧降到
+// 16384/帧的唯一改动点；唯一消费者是 volumetric_fog.glsl 的贴地雾高度
+// （低频标量，4 格量化在几米尺度上不可见）。
+// 与 OrionInternal.h 的 TERRAIN_HEIGHT_RESOLUTION 必须同步。
+const int TERRAIN_HEIGHT_RESOLUTION = 128;
+const float TERRAIN_HEIGHT_TEXEL = 1.0 / 128.0;
 
 const float TERRAIN_HEIGHT_EXTENT_XY = 256.0;
 

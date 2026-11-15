@@ -5,6 +5,14 @@
 #include "OrionInternal.h"
 #include "TrackingHooks.h"
 
+#include <mutex>
+
+// 2026-11-09：boot 管线编译搬到后台线程后，"每管线成功即落盘"（wrapper 内
+// PersistSharedPipelineCacheNow，跑在编译线程）与主线程的帧内 maybePersist /
+// 卸载 release 会并发碰同一个 VkPipelineCache 和同一份 blob 文件。
+// 整条缓存路径串行化；recursive 因为 PersistNow 内部还要调 persist。
+static std::recursive_mutex g_pipelineCacheMutex;
+
 std::string ComputeRTPipelineCacheKey()
 {
     const std::string directory =
@@ -376,6 +384,8 @@ void DeleteStalePipelineCaches()
 }
 VkPipelineCache getSharedPipelineCache()
 {
+    std::lock_guard<std::recursive_mutex> lock(g_pipelineCacheMutex);
+
     if(g_pipelineCache != VK_NULL_HANDLE)
     {
         return g_pipelineCache;
@@ -733,17 +743,11 @@ void persistSharedPipelineCache()
 
     fflush(stderr);
 }
-void maybePersistSharedPipelineCache()
+// 2026-11-08：无去抖的同步落盘，供 RT 管线创建包装在每条管线成功后调用。
+// 与 maybePersist 共用"大小去重"判据，避免重复写同一份 blob。
+void PersistSharedPipelineCacheNow()
 {
-    if(g_pipelineCachePersistCountdown > 0u)
-    {
-        --g_pipelineCachePersistCountdown;
-
-        return;
-    }
-
-    g_pipelineCachePersistCountdown =
-        PIPELINE_CACHE_PERSIST_INTERVAL;
+    std::lock_guard<std::recursive_mutex> lock(g_pipelineCacheMutex);
 
     if(g_pipelineCache == VK_NULL_HANDLE || g_device == VK_NULL_HANDLE)
     {
@@ -767,8 +771,24 @@ void maybePersistSharedPipelineCache()
 
     g_pipelineCachePersistedBytes = blobSize;
 }
+void maybePersistSharedPipelineCache()
+{
+    if(g_pipelineCachePersistCountdown > 0u)
+    {
+        --g_pipelineCachePersistCountdown;
+
+        return;
+    }
+
+    g_pipelineCachePersistCountdown =
+        PIPELINE_CACHE_PERSIST_INTERVAL;
+
+    PersistSharedPipelineCacheNow();
+}
 void releaseSharedPipelineCache()
 {
+    std::lock_guard<std::recursive_mutex> lock(g_pipelineCacheMutex);
+
     if(g_pipelineCache != VK_NULL_HANDLE)
     {
         persistSharedPipelineCache();

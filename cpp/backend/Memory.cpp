@@ -366,6 +366,76 @@ void createCameraUBO() {
     ubo->dhFarFieldLight[2] = 1.0f;
     ubo->dhFarFieldLight[3] = 0.0f;
 
+    // 2026-11-09：派生矩阵（viewMatrix / projectionMatrix / viewProj /
+    // prevViewProj）初值取单位阵。首帧 updateCamera 会立刻用真实值覆盖；
+    // 这里只是保证"万一首帧求逆失败"时读到的不是未初始化内容。
+    for(int derivedInitIndex = 0; derivedInitIndex < 16; ++derivedInitIndex)
+    {
+        const float identityEntry = ((derivedInitIndex % 5) == 0) ? 1.0f : 0.0f;
+        ubo->viewMatrix[derivedInitIndex] = identityEntry;
+        ubo->projectionMatrix[derivedInitIndex] = identityEntry;
+        ubo->viewProj[derivedInitIndex] = identityEntry;
+        ubo->prevViewProj[derivedInitIndex] = identityEntry;
+    }
+
+    // ── 本地光源档案表（32 档）──
+    // 2026-11-09：原本是 cpp/shaders/local_light_profile.glsl 里的四张 const 表。
+    // glslang 对"const 数组 + 运行时索引"会生成 indexable 局部数组 ⇒ rgen 里
+    // 768 B/线程的 local memory（vec3[32] + 3 x float[32]，SPIR-V 普查可复现）。
+    // 搬到 UBO 后动态索引变成 OpAccessChain，不再有局部副本。
+    // 顺序必须与 SectionCompilerMixin.classifyLocalLightType() 的映射逐项一致。
+    struct LocalLightProfileEntry
+    {
+        float r, g, b, lumens, range, pointLike;
+    };
+    static const LocalLightProfileEntry kLocalLightProfile[32] = {
+        { 1.0000f, 0.7193f, 0.4766f, 1.0000f, 12.0000f, 0.0f },  //  0  fallback/未分类发光块        3000K
+        { 1.0000f, 0.6387f, 0.2625f, 1.0000f, 11.0000f, 1.0f },  //  1  torch 火把               2000K
+        { 1.0000f, 0.6421f, 0.2890f, 1.1200f, 13.0000f, 1.0f },  //  2  lantern 灯笼             2200K
+        { 1.0000f, 0.6230f, 0.2200f, 1.3000f, 15.0000f, 1.0f },  //  3  campfire 营火            1900K
+        { 1.0000f, 0.6149f, 0.2200f, 1.2000f, 13.0000f, 1.0f },  //  4  fire 火焰                1850K
+        { 0.2200f, 0.7200f, 1.0000f, 0.7800f, 8.0000f, 1.0f },  //  5  soul_torch 灵魂火把        tint
+        { 0.2400f, 0.7600f, 1.0000f, 1.0000f, 10.0000f, 1.0f },  //  6  soul_lantern 灵魂灯笼      tint
+        { 0.2600f, 0.7900f, 1.0000f, 1.1800f, 12.0000f, 1.0f },  //  7  soul_campfire 灵魂营火     tint
+        { 0.2000f, 0.7000f, 1.0000f, 0.9500f, 10.0000f, 1.0f },  //  8  soul_fire 灵魂火          tint
+        { 1.0000f, 0.1600f, 0.0600f, 0.5200f, 6.0000f, 1.0f },  //  9  redstone_torch 红石火把    tint
+        { 1.0000f, 0.3300f, 0.1300f, 1.0500f, 13.0000f, 0.0f },  // 10  redstone_lamp 红石灯      tint
+        { 1.0000f, 0.5708f, 0.2200f, 1.9000f, 26.0000f, 0.0f },  // 11  lava 岩浆                1600K
+        { 1.0000f, 0.5408f, 0.2200f, 0.5000f, 7.0000f, 0.0f },  // 12  magma_block 岩浆块        1450K
+        { 1.0000f, 0.7642f, 0.5677f, 1.4500f, 18.0000f, 0.0f },  // 13  glowstone 荧石           3400K
+        { 1.0000f, 0.9798f, 0.9541f, 1.3500f, 18.0000f, 0.0f },  // 14  sea_lantern 海晶灯        6200K
+        { 1.0000f, 0.6840f, 0.3908f, 1.3500f, 17.0000f, 0.0f },  // 15  shroomlight 菌光体        2500K
+        { 1.0000f, 0.6387f, 0.2625f, 1.1000f, 14.0000f, 0.0f },  // 16  jack_o_lantern 南瓜灯     2000K
+        { 0.8800f, 0.9200f, 1.0000f, 1.2000f, 14.0000f, 1.0f },  // 17  end_rod 末地烛            tint
+        { 0.9000f, 0.9500f, 1.0000f, 2.2000f, 28.0000f, 0.0f },  // 18  beacon 信标              tint
+        { 0.3000f, 0.8600f, 1.0000f, 1.5500f, 20.0000f, 0.0f },  // 19  conduit 潮涌核心           tint
+        { 0.7200f, 0.3000f, 1.0000f, 1.5000f, 18.0000f, 0.0f },  // 20  nether_portal 地狱门      tint
+        { 0.4600f, 0.8600f, 0.5200f, 0.3600f, 5.0000f, 1.0f },  // 21  glow_lichen 发光地衣       tint
+        { 0.6400f, 0.4400f, 1.0000f, 0.4000f, 6.0000f, 1.0f },  // 22  amethyst 紫水晶簇          tint
+        { 1.0000f, 0.6149f, 0.2200f, 0.5500f, 7.0000f, 1.0f },  // 23  candle 蜡烛              1850K
+        { 0.5400f, 0.3200f, 1.0000f, 0.5800f, 8.0000f, 0.0f },  // 24  crying_obsidian 哭泣黑曜石  tint
+        { 0.7400f, 0.4200f, 1.0000f, 1.1000f, 11.0000f, 0.0f },  // 25  respawn_anchor 重生锚     tint
+        { 1.0000f, 0.6230f, 0.2200f, 0.8500f, 9.0000f, 0.0f },  // 26  furnace_lit 熔炉点燃       1900K
+        { 1.0000f, 0.7071f, 0.4509f, 1.3500f, 16.0000f, 0.0f },  // 27  froglight 蛙明灯          2900K
+        { 1.0000f, 0.6230f, 0.2200f, 0.2800f, 4.0000f, 1.0f },  // 28  brewing_stand 酿造台      1900K
+        { 0.7800f, 0.8400f, 0.5000f, 0.3200f, 5.0000f, 1.0f },  // 29  cave_vines 洞穴藤蔓        tint
+        { 0.8600f, 0.8000f, 0.6200f, 0.0600f, 2.0000f, 1.0f },  // 30  brown_mushroom 棕色蘑菇    tint
+        { 0.6000f, 0.4600f, 1.0000f, 0.3600f, 6.0000f, 0.0f },  // 31  enchanting_table 附魔台   tint
+    };
+
+    for(int profileIndex = 0; profileIndex < 32; ++profileIndex)
+    {
+        const LocalLightProfileEntry& entry = kLocalLightProfile[profileIndex];
+        ubo->localLightProfileA[profileIndex * 4 + 0] = entry.r;
+        ubo->localLightProfileA[profileIndex * 4 + 1] = entry.g;
+        ubo->localLightProfileA[profileIndex * 4 + 2] = entry.b;
+        ubo->localLightProfileA[profileIndex * 4 + 3] = entry.lumens;
+        ubo->localLightProfileB[profileIndex * 4 + 0] = entry.range;
+        ubo->localLightProfileB[profileIndex * 4 + 1] = entry.pointLike;
+        ubo->localLightProfileB[profileIndex * 4 + 2] = 0.0f;
+        ubo->localLightProfileB[profileIndex * 4 + 3] = 0.0f;
+    }
+
     ubo->historyParamsPadding0 =
         g_pomDepth.load();
 
@@ -388,6 +458,21 @@ void createCameraUBO() {
     ubo->giHalfParams[1] = 0.0f;
     ubo->giHalfParams[2] = 0.0f;
     ubo->giHalfParams[3] = 0.0f;
+
+    // 2026-11-09：次级射线跳过 POM的出厂值 = 开（见 pomSecondarySkipEnabled）。
+    ubo->pomSecondaryParams[0] = 1.0f;
+
+    // 2026-11-13：雾光学默认值（1,1,1,1 = 默认涡流、不偏色）
+    ubo->fogOpticsParams[0] = 1.0f;
+    ubo->fogOpticsParams[1] = 1.0f;
+    ubo->fogOpticsParams[2] = 1.0f;
+    ubo->fogOpticsParams[3] = 1.0f;
+
+    // 2026-11-13：玻璃光学焦散默认值写入已删除（设置整体回退）；
+    // glassCausticParams 字段保留占位（无读者）。
+    ubo->pomSecondaryParams[1] = 0.0f;
+    ubo->pomSecondaryParams[2] = 0.0f;
+    ubo->pomSecondaryParams[3] = 0.0f;
 
     // 2026-11-02 屏幕空间降级链（SSR + SSPT）：出厂关闭
     ubo->ssHybridParams[0] = 0.0f;

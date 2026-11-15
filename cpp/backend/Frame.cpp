@@ -5,6 +5,134 @@
 #include "OrionInternal.h"
 #include "TrackingHooks.h"
 
+// 2026-11-14：卡死探针 —— 当前帧录制阶段（0=帧外 2=几何重建前 3=几何重建后）。
+// 定义放在文件作用域，绝不能插进 `extern "C"` 与 JNIEXPORT 之间（会把函数
+// 变成 C++ 链接，导出名带修饰，JNI 解析失败）。
+std::atomic<int> g_rtFramePhase{0};
+
+
+// ============================================================================
+// 2026-11-09：CameraUBO 派生矩阵（把 raygen 里的 4 次 mat4 inverse() 搬到 CPU）
+//
+// raygen 每个像素原本要算 inverse(viewInverse)、inverse(projInverse)、
+// inverse(prevViewInverse*prevProjInverse)、inverse(viewInverse*projInverse)
+// 四个 4x4 求逆。它们只依赖相机矩阵，是**帧常量**，每像素重算等于把同一份
+// 结果算 200 万遍，还会给那个 8000 行的 megakernel 添 4 个 16 寄存器的中间量。
+//
+// 存储约定与 GLSL mat4 一致：列主序，元素索引 [col * 4 + row]。
+// 自检：orionMat4SelfCheck() 会在第一帧打印 V * V⁻¹ 与单位阵的最大偏差，
+// 约定写错时这里会立刻报错，而不是让运动矢量静默错位成整屏鬼影。
+// ============================================================================
+static void orionMulMat4(const float* a, const float* b, float* out)
+{
+    for(int c = 0; c < 4; ++c)
+    {
+        for(int r = 0; r < 4; ++r)
+        {
+            double sum = 0.0;
+            for(int k = 0; k < 4; ++k)
+            {
+                sum += static_cast<double>(a[k * 4 + r]) *
+                       static_cast<double>(b[c * 4 + k]);
+            }
+            out[c * 4 + r] = static_cast<float>(sum);
+        }
+    }
+}
+
+// 列主序 4x4 求逆（Gauss-Jordan + 部分主元）。返回 false 表示奇异。
+static bool orionInvertMat4(const float* m, float* out)
+{
+    double a[4][8];
+    for(int r = 0; r < 4; ++r)
+    {
+        for(int c = 0; c < 4; ++c)
+        {
+            a[r][c] = static_cast<double>(m[c * 4 + r]);
+        }
+        for(int c = 0; c < 4; ++c)
+        {
+            a[r][4 + c] = (r == c) ? 1.0 : 0.0;
+        }
+    }
+
+    for(int col = 0; col < 4; ++col)
+    {
+        int pivot = col;
+        double best = std::fabs(a[col][col]);
+        for(int r = col + 1; r < 4; ++r)
+        {
+            const double candidate = std::fabs(a[r][col]);
+            if(candidate > best)
+            {
+                best = candidate;
+                pivot = r;
+            }
+        }
+        if(best < 1.0e-12)
+        {
+            return false;
+        }
+        if(pivot != col)
+        {
+            for(int c = 0; c < 8; ++c)
+            {
+                const double tmp = a[col][c];
+                a[col][c] = a[pivot][c];
+                a[pivot][c] = tmp;
+            }
+        }
+        const double invPivot = 1.0 / a[col][col];
+        for(int c = 0; c < 8; ++c)
+        {
+            a[col][c] *= invPivot;
+        }
+        for(int r = 0; r < 4; ++r)
+        {
+            if(r == col) continue;
+            const double factor = a[r][col];
+            if(factor == 0.0) continue;
+            for(int c = 0; c < 8; ++c)
+            {
+                a[r][c] -= factor * a[col][c];
+            }
+        }
+    }
+
+    for(int r = 0; r < 4; ++r)
+    {
+        for(int c = 0; c < 4; ++c)
+        {
+            out[c * 4 + r] = static_cast<float>(a[r][4 + c]);
+        }
+    }
+    return true;
+}
+
+// 首帧一次性自检：m * m⁻¹ 应为单位阵。
+static void orionMat4SelfCheck(const float* forward, const float* inverse)
+{
+    static bool done = false;
+    if(done) return;
+    done = true;
+
+    float product[16];
+    orionMulMat4(forward, inverse, product);
+
+    float maxError = 0.0f;
+    for(int i = 0; i < 16; ++i)
+    {
+        const float expected = ((i % 5) == 0) ? 1.0f : 0.0f;
+        maxError = std::max(maxError, std::fabs(product[i] - expected));
+    }
+
+    std::fprintf(
+        stderr,
+        "[RT CAMMAT] self-check m*m^-1 maxErr=%.3e (expect < 1e-4) %s\n",
+        static_cast<double>(maxError),
+        (maxError < 1.0e-4f) ? "OK" : "MISMATCH");
+    std::fflush(stderr);
+}
 
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
@@ -30,6 +158,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     jfloat waterSurfaceY,
     jfloat cameraInWater)
 {
+    // 2026-11-14：GPU 卡死看门狗心跳（见 OrionInternal.h 的探针说明）。
+    rtHangHeartbeatTick();
+
     if (!g_cameraUboMapped) return;
     sharcProbeTick();
 
@@ -150,6 +281,47 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     );
 
     g_hasPrevCameraInverse = true;
+
+    // 派生矩阵：viewMatrix / projectionMatrix / viewProj / prevViewProj。
+    // 全部由本帧已经写进 UBO 的四个逆矩阵推出，取值与 raygen 里原来的
+    // inverse(...) 一致（只差 float 舍入），因此不改变 MV / 深度的数学含义。
+    {
+        float curView[16];
+        float curProj[16];
+        float prevView[16];
+        float prevProj[16];
+
+        const bool invertOk =
+            orionInvertMat4(ubo->viewInverse, curView) &&
+            orionInvertMat4(ubo->projInverse, curProj) &&
+            orionInvertMat4(ubo->prevViewInverse, prevView) &&
+            orionInvertMat4(ubo->prevProjInverse, prevProj);
+
+        if(invertOk)
+        {
+            std::memcpy(ubo->viewMatrix, curView, sizeof(ubo->viewMatrix));
+            std::memcpy(ubo->projectionMatrix, curProj, sizeof(ubo->projectionMatrix));
+
+            // 正变换：prevViewProj = P_prev * V_prev
+            //   （inverse(V⁻¹ * P⁻¹) = P * V，与原 shader 表达式同值）
+            orionMulMat4(curProj, curView, ubo->viewProj);
+            orionMulMat4(prevProj, prevView, ubo->prevViewProj);
+
+            orionMat4SelfCheck(curView, ubo->viewInverse);
+        }
+        else
+        {
+            static bool singularReported = false;
+            if(!singularReported)
+            {
+                singularReported = true;
+                std::fprintf(stderr,
+                    "[RT CAMMAT] matrix inversion failed (singular); "
+                    "keeping previous derived matrices\n");
+                std::fflush(stderr);
+            }
+        }
+    }
 
 #ifndef RTX_CAMERA_PREV_MATRIX_PROBE
 #define RTX_CAMERA_PREV_MATRIX_PROBE 1
@@ -350,12 +522,51 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->sssParams[0] =
         g_sssMode.load();
 
+    // 2026-11-11 太阳可见度滤波的可调量（Shadow.cpp 的 rt_sunvis_filter.comp）。
+    // .y = 光源角半径(rad) / .z = 半分辨率核半径上限(px) / .w = 深度拒绝比例。
+    // ⚠ `.y == 0` 是 rgen 侧的**关闭开关**（sunVisibilityFilterActive =
+    // cam.sssParams.y > 1e-6）：滤波 pass 没开时必须写 0，否则 raygen 会走
+    // "只打 1 条射线 + 读没人写的 history 图"的路径 ⇒ 影子整片错乱。
+    // 全部来自 ORION_SUNVIS_* 环境变量（函数内部静态缓存，每帧只读常量）。
+    // 2026-11-12：`.y` 现在是**随机太阳盘采样**的孔径（Caustica 的 RR-only
+    // 路径用它，见 rgen_main_body.glsl 的随机方向段），所以**始终**写真实值；
+    // `.z/.w` 只有屏幕空间滤波（已停用）用，仍按开关写 0。
+    const bool sunVisOn =
+        sunVisEnabled();
+
+    ubo->sssParams[1] =
+        sunVisAperture();
+    ubo->sssParams[2] =
+        sunVisOn ? sunVisMaxRadius() : 0.0f;
+    ubo->sssParams[3] =
+        sunVisOn ? sunVisDepthTolerance() : 0.0f;
+
     ubo->giHalfParams[0] =
         (giHalfEnabled() && g_giHalfView != VK_NULL_HANDLE) ? 1.0f : 0.0f;
     ubo->giHalfParams[1] =
         (giHalfEnabled() && giHalfRotateEnabled()) ? 1.0f : 0.0f;
     ubo->giHalfParams[2] = giNoPomEnabled() ? 1.0f : 0.0f;
     ubo->giHalfParams[3] = glossyRoughLodEnabled() ? 1.0f : 0.0f;
+
+    // 2026-11-09：次级射线（反射/水体/玻璃后）跳过 POM。
+    // 依据：material_resolve.glsl 只要 materialId<=0.5 且带法线数据就调
+    // traceParallax()，判据里**没有射线用途**；glossy 一条路径最多 18 步，
+    // 每步一次 POM ⇒ 单像素上限约 18 x 288 次随机 texelFetch。
+    // 开门方式与 GI 那条一致：置 state bit17，命中侧走既有早退分支。
+    ubo->pomSecondaryParams[0] = pomSecondarySkipEnabled() ? 1.0f : 0.0f;
+
+    // 2026-11-13：雾光学（x=平流雾涡流强度，yzw=波长透射权重）
+    ubo->fogOpticsParams[0] = g_fogCurlStrength.load();
+    ubo->fogOpticsParams[1] = g_fogTintR.load();
+    ubo->fogOpticsParams[2] = g_fogTintG.load();
+    ubo->fogOpticsParams[3] = g_fogTintB.load();
+    // 2026-11-13：玻璃光学焦散总开关已删除（用户要求整体回退焦散）；
+    // glassCausticParams 字段保留占位（无读者）。
+    // y：glossy 反射层数按粗糙度/距离收敛（rgen_glossy.glsl 消费）
+    ubo->pomSecondaryParams[1] = glossyStepLodEnabled() ? 1.0f : 0.0f;
+    // z：远场材质 LOD 起始距离（0=关）；w：次级射线最小材质（1=跳过 _n）
+    ubo->pomSecondaryParams[2] = matFarLodDistance();
+    ubo->pomSecondaryParams[3] = matSecondaryMinimalEnabled() ? 1.0f : 0.0f;
 
     // 2026-11-02 屏幕空间降级链。x = SSPT 射程（0..12 区块，0 = 关），
     // y = SSR 射程上限（0 = 关；硬性下限 12 由 ss_hybrid.comp 逐像素判）。
@@ -364,14 +575,34 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     // z = RT 光泽射线开关（1 = 开）。rgen 读到 < 0.5 就整段跳过那条 GGX
     // 反射射线，镜面交给 SSR/SSPT —— 见 rt_test.rgen 的对应门控。
     ubo->ssHybridParams[2] = g_ssRtGlossy.load() > 0.5f ? 1.0f : 0.0f;
-    ubo->ssHybridParams[3] = 0.0f;
+    // w = SSR 区块下限（2026-11-15「性能模式」用；0 ⇒ 着色器回落到 12）。
+    ubo->ssHybridParams[3] =
+        std::clamp(g_ssrFloorChunks.load(), 0.0f, 64.0f);
+
+    // 2026-11-15「性能模式」分档：x = RT 射程(6 区块)，y = 弹射分界(4 区块)，
+    // z = 开关。非性能模式 x 写 0（着色器据此走旧判据）。
+    {
+        const bool perfMode = g_performanceMode.load() != 0u;
+
+        ubo->perfBandParams[0] = perfMode
+            ? std::clamp(g_perfRtBandChunks.load(), 0.0f, 32.0f)
+            : 0.0f;
+        ubo->perfBandParams[1] =
+            std::clamp(g_perfBounceBandChunks.load(), 0.0f, 32.0f);
+        ubo->perfBandParams[2] = perfMode ? 1.0f : 0.0f;
+        // w：远场贴图降档起点（格，0=关）。material_resolve.glsl 消费
+        // （2026-11-15：8 区块以外材质贴图按距离抬 mip，默认 128）。
+        ubo->perfBandParams[3] = matTexFarLodDistance();
+    }
 
     ubo->giRayParams[0] = static_cast<float>(giNearRateLevel());
     // 2026-11-04 A1：y = GI 时域重投影开关（rgen_gi_temporal.glsl 读 >0.5）。
     // y/z/w 此前恒 0，借 y 不动 UBO 布局；ORION_GI_TEMPORAL=0 回旧路径。
     ubo->giRayParams[1] = giTemporalEnabled() ? 1.0f : 0.0f;
-    ubo->giRayParams[2] = 0.0f;
-    ubo->giRayParams[3] = 0.0f;
+    // z：GI 可见性门控（太阳全遮蔽 + 局部光 cell 无灯 ⇒ 不发 GI 射线）
+    ubo->giRayParams[2] = giVisibilityGateEnabled() ? 1.0f : 0.0f;
+    // w：glossy 反射链的俄罗斯轮盘（rgen_glossy.glsl 消费）
+    ubo->giRayParams[3] = glossyRrEnabled() ? 1.0f : 0.0f;
 
     populateHpParams(ubo);
 
@@ -413,6 +644,44 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     }
     ubo->sparseParams[3] =
         g_sparseHistoryValid.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+
+    // =====================================================================
+    // 2026-11-13 月相：宿主侧累计"天数"
+    //
+    // Java 只给当天的相位（overworldTimePhase，0..1），没有天数计数器，
+    // 所以这里用与下面末地那段同一个思路：**跨过 0/1 边界算一天**。
+    //   相位 0 = 满月（与改动前"永远满月"逐位衔接）
+    //   8 天一轮，与原版月相一致
+    // 时间倒退（/time set 或换维度）时把累计值往回拨，不会崩坏。
+    // 深夜 20 分钟/天 ⇒ 一次游戏会话里通常只前进 0/1 个相位，符合原版节奏。
+    // =====================================================================
+    static double moonDayAccumulator = 0.0;
+    static double moonPreviousPhase = -1.0;
+    {
+        const double currentPhase = static_cast<double>(overworldTimePhase);
+
+        if(moonPreviousPhase >= 0.0)
+        {
+            const double delta = currentPhase - moonPreviousPhase;
+
+            if(delta < -0.5)
+            {
+                moonDayAccumulator += 1.0;
+            }
+            else if(delta > 0.5)
+            {
+                moonDayAccumulator -= 1.0;
+            }
+        }
+
+        moonPreviousPhase = currentPhase;
+    }
+    {
+        double phase8 = moonDayAccumulator;
+        phase8 -= std::floor(phase8 / 8.0) * 8.0;
+        // sssParams[2] 目前无人读（屏幕空间太阳滤波已停用），这里当"月相"用。
+        ubo->sssParams[2] = static_cast<float>(phase8 / 8.0);
+    }
 
     double sunPhaseForThisDimension = static_cast<double>(overworldTimePhase);
     {
@@ -555,6 +824,17 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     populateGalaxyParams(ubo->galaxyParams);
     populateGodRayParams(ubo->godRayParams);
     populateGroundMistParams(ubo->godRayParams + 4);
+
+    // 2026-11-13：湿度时间包络（约 3 秒时间常数）→ godRayParams0.z（空闲车道）。
+    // 目的：雨停/开始时，"雾顶硬边"与"平流雾出现"不要在一帧内跳变。
+    // 必须写在 populateGodRayParams 之后（那个函数会把 [2] 清 0）。
+    {
+        const float rainTarget = std::min(std::max(ubo->weatherParams[0], 0.0f), 1.0f);
+        float envelope = g_fogWetnessEnvelope.load();
+        envelope += (rainTarget - envelope) * 0.00554f;   // τ≈3s @60fps
+        g_fogWetnessEnvelope.store(envelope);
+        ubo->godRayParams[2] = envelope;
+    }
     populateRainWallParams(ubo->rainWallParams);
     populateWaterStyleParams(ubo->waterStyleParams);
     populateHighCloudParams(ubo->highCloudParams);
@@ -879,6 +1159,10 @@ static void orionCaptureDeterministicFrameHash()
     vkDestroyBuffer(g_device, buffer, nullptr);
 }
 
+// 2026-11-14：阶段标记的**定义**必须放在 extern "C" 之外。
+// 之前误插到 `extern "C"` 与 JNIEXPORT 函数之间，把 C 链接抢走 ⇒ 导出名变成
+// C++ 修饰名（?Java_...@@YAX...）⇒ JNI 解析不到 ⇒ UnsatisfiedLinkError，
+// 游戏起不来。
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     JNIEnv* env,
@@ -1383,6 +1667,15 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
         return;
     }
 
+    // 2026-11-09：boot 巨型管线后台编译期间整帧跳过（口径同 notInWorld）。
+    // 冷编一条 8~20 分钟，期间 vanilla/菜单照常出图；编完 rtBootPipelinesReady
+    // 置位自动放行。热缓存时线程亚秒完成，此处只是第一二帧的空窗。
+    if (!rtBootPipelinesReady())
+    {
+        logFrameSkip("pipelinesCompiling", "");
+        return;
+    }
+
 
     ++g_perfL10FrameSerial;
 
@@ -1602,10 +1895,43 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     {
         if(g_entityRebuildRequested.exchange(false, std::memory_order_acq_rel))
         {
+            // 2026-11-09：动态层（实体/手/粒子/局部光）此前**无条件**触发
+            // 整世界重建（绕过下面那条 6 帧间隔）⇒ 实体一动就每帧全量遍历
+            // section + 全表 sort。实测（939 个样本）：geometry 段 100% 是
+            // rebuild，中位 2.96 ms、p90 13.6 ms、max 43 ms，而 TLAS/上传
+            // 等"other"只有 0.01 ms。
+            // 这里给它一个独立节流窗口（默认 2 帧 ≈ 30 Hz），未到期就把请求
+            // 放回去，不丢更新。回退：ORION_DYN_REBUILD_INTERVAL=1 ⇒ 逐帧重建。
+            static const uint32_t dynRebuildInterval = []()
+            {
+                const char* raw = std::getenv("ORION_DYN_REBUILD_INTERVAL");
+                const long parsed = raw ? std::strtol(raw, nullptr, 10) : 2L;
+                if(parsed < 1L) return 1u;
+                if(parsed > 60L) return 60u;
+                return static_cast<uint32_t>(parsed);
+            }();
+            static uint64_t lastDynRebuildFrame = 0u;
+
+            const bool dynRebuildDue =
+                lastDynRebuildFrame == 0u ||
+                g_perfL10FrameSerial >= lastDynRebuildFrame + dynRebuildInterval;
+
+            if(!dynRebuildDue)
+            {
+                g_entityRebuildRequested.store(true, std::memory_order_release);
+            }
+            else
+            {
+            lastDynRebuildFrame = g_perfL10FrameSerial;
+
             const auto rtxRebuildCallBegin = std::chrono::steady_clock::now();
+
+            g_rtFramePhase.store(2, std::memory_order_relaxed);
 
             const bool rtxRebuildDone =
                 rebuildWorldGeometry(SECTION_REBUILD_MAX_SECTIONS_PER_BATCH);
+
+            g_rtFramePhase.store(3, std::memory_order_relaxed);
 
             rtxGeometryRebuildMs += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - rtxRebuildCallBegin).count();
@@ -1613,6 +1939,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
             if(!rtxRebuildDone)
             {
                 g_entityRebuildRequested.store(true, std::memory_order_release);
+            }
             }
         }
         else
@@ -1652,8 +1979,12 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
         {
             const auto rtxRebuildCallBegin = std::chrono::steady_clock::now();
 
+            g_rtFramePhase.store(2, std::memory_order_relaxed);
+
             const bool rtxRebuildDone =
                 rebuildWorldGeometry(SECTION_REBUILD_MAX_SECTIONS_PER_BATCH);
+
+            g_rtFramePhase.store(3, std::memory_order_relaxed);
 
             rtxGeometryRebuildMs += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - rtxRebuildCallBegin).count();
@@ -1686,6 +2017,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
             commandBufferHandle
         );
 
+    rtCheckpoint(cmd, "frame:enter");
+
     if(g_cameraUboBuffer != VK_NULL_HANDLE)
     {
         vkCmdUpdateBuffer(
@@ -1705,9 +2038,16 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
         cameraBarrier.buffer = g_cameraUboBuffer;
         cameraBarrier.offset = 0u;
         cameraBarrier.size = sizeof(CameraUBO);
+        // 2026-11-09：dst 从 ALL_COMMANDS 收到"真正读 CameraUBO 的两个 stage"。
+        // 依据：camera_ubo.glsl 的 36 个 include 全是 .comp 与 RT（.rgen/.rchit/
+        // .rahit/.rmiss/.rcall），没有任何顶点/片元着色器声明这个块；UBO 也只被
+        // RT 描述符集与各 compute 描述符集绑定（Vli.cpp:705、Clouds/Water/Sky/
+        // Shadow/Glass/Nrd 的 cameraInfo）。ALL_COMMANDS 会把队列里所有后续工作
+        // 串在这条 barrier 后面，而实际依赖只有这两个 stage。
         vkCmdPipelineBarrier(cmd,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0u, 0u, nullptr, 1u,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u,
             &cameraBarrier, 0u, nullptr);
     }
 
@@ -1748,7 +2088,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
                 rtxGeometryPhaseBegin
             ).count();
 
-        if(rtxGeometryPhaseMs >= 15.0)
+        // 2026-11-09：阈值 15 -> 2 ms。geometry 段在正常游玩中约 3~4.5 ms，
+        // 原先只在 >=15 ms 时打印 ⇒ 平时一条都看不到，无法判断这 4.5 ms 里
+        // "rebuild（世界几何重建）"与"other（TLAS/上传/裁剪）"各占多少。
+        if(rtxGeometryPhaseMs >= 2.0)
         {
             RTLog(
                 "[RT PHASE SLOW] frame=" +
@@ -2506,6 +2849,13 @@ if(!g_dlssGFeatureInitialized)
     );
 
 
+    // 2026-11-14：稀疏反射的时域历史（binding 92）。
+    createGlossyHistoryImage(
+        renderWidth,
+        renderHeight
+    );
+
+
     createGlassAlphaBlendImages(
         renderWidth,
         renderHeight
@@ -2538,6 +2888,13 @@ if(g_dlssOutputImage == VK_NULL_HANDLE ||
             renderHeight
         );
     }
+
+    // 2026-11-11 太阳可见度滤波的资源（ORION_SUNVIS=1 才建；内部自门控）。
+    // 必须在描述符集存在之后、本帧录制之前：它要往 binding 90/91 写视图。
+    createSunVisResources(
+        renderWidth,
+        renderHeight
+    );
 
 
     if(g_dlssDepthImage == VK_NULL_HANDLE ||
@@ -2879,6 +3236,9 @@ if(rrGuideBarrierCount > 0)
     // 2026-11-04 A1：GI 时域历史 clear + 帧内屏障（needsClear 只在重建帧为真）。
     prepareGiTemporalHistoryImages(cmd);
 
+    // 2026-11-14：反射时域历史的 clear（只在重建帧）+ 帧内屏障。
+    prepareGlossyHistoryImage(cmd);
+
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SETUP);
 
     perfL10CpuPhaseAdvance(PERF_L10_CPU_P_WATER);
@@ -2891,20 +3251,11 @@ if(rrGuideBarrierCount > 0)
 
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WFFT);
 
+    // 2026-11-09：这里原本还有三个恒不录制的分支 —— recordWaterFoam 的 #if 0
+    // 死块、kWATER_CAUSTIC_PASS_ENABLED（OrionInternal.h 里恒 false）包住的
+    // recordWaterCaustics，以及它们隔出的两个空 timestamp scope（WCAUS / CAUS）。
+    // 全部删除：真实在跑的是 recordWaterCausticMap（water_caustic_map.comp）。
     recordWaterCausticMap(cmd);
-
-#if 0
-    recordWaterFoam(cmd);
-#endif
-
-    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WCAUS);
-
-    if(kWATER_CAUSTIC_PASS_ENABLED)
-    {
-        recordWaterCaustics(cmd);
-    }
-
-    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_CAUS);
 
     perfL10CpuPhaseAdvance(PERF_L10_CPU_P_RT);
 
@@ -2922,23 +3273,15 @@ if(rrGuideBarrierCount > 0)
         return ms;
     };
     {
+        // 2026-11-13 "远云脱离RR"开关退役（开启档把云合成写进 RR 的输入图，
+        // 关回旧档时污染持久历史导致黑屏，见 recordCloudComposite 删除说明）。
+        // 云固定在 render 分辨率渲染、RR 之前合成（旧档）。
         uint32_t cloudPassWidth = renderWidth;
         uint32_t cloudPassHeight = renderHeight;
         const uint32_t cloudQuality = g_cloudQuality.load();
         const uint32_t cloudDownscale = cloudQuality == 0u ? 4u : (cloudQuality == 2u ? 1u : 2u);
-        const bool postRrCloud =
-            g_cloudPostRrComposite.load() &&
-            g_dlssOutputWidth > 0u && g_dlssOutputHeight > 0u;
-        if(postRrCloud)
-        {
-            cloudPassWidth = std::max(1u, g_dlssOutputWidth / cloudDownscale);
-            cloudPassHeight = std::max(1u, g_dlssOutputHeight / cloudDownscale);
-        }
-        else
-        {
-            cloudPassWidth = std::max(1u, cloudPassWidth / cloudDownscale);
-            cloudPassHeight = std::max(1u, cloudPassHeight / cloudDownscale);
-        }
+        cloudPassWidth = std::max(1u, cloudPassWidth / cloudDownscale);
+        cloudPassHeight = std::max(1u, cloudPassHeight / cloudDownscale);
 
         const uint32_t cloudFloorPercent = g_cloudResFloorPercent.load();
         if(cloudFloorPercent > 0u &&
@@ -2968,6 +3311,7 @@ if(rrGuideBarrierCount > 0)
 
     recordSharcZeroFillIfNeeded(cmd);
 recordSharcUpdate(cmd, renderWidth, renderHeight);
+    rtCheckpoint(cmd, "frame:post-sharc-update");
     rtSpikeSharc = rtMark();
 
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SHARCUP);
@@ -3002,6 +3346,7 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
 
 
     setPerfL10GpuRenderSize(renderWidth, renderHeight);
+    rtCheckpoint(cmd, "frame:sky-atmo");
     recordSkyAtmosphere(cmd);
 
     recordVolumeRestir(cmd, renderWidth, renderHeight);
@@ -3009,6 +3354,7 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
 
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SKY);
 
+    rtCheckpoint(cmd, "frame:gi-half");
     recordGiHalfPass(cmd, renderWidth, renderHeight);
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_GI);
 
@@ -3034,6 +3380,7 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
 
     // 2026-11-05 B：K1(主视线)→landing→K2(传输) 两发（2026-11-06 起默认开，ORION_K1_K2=0 回退）；
     // 未启用/管线失败时回退单发主管线，路径与旧版逐位一致。
+    rtCheckpoint(cmd, "frame:trace-start");
     if(!traceK1K2(
            cmd,
            renderWidth,
@@ -3051,12 +3398,21 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
             1
         );
     }
+    rtCheckpoint(cmd, "frame:trace-done");
     rtSpikeTrace = rtMark();
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_TRACE);
 
+    // 2026-11-11 太阳可见度滤波（ORION_SUNVIS=1，默认关）：上一步的 raygen 已经把
+    // (可见度, 遮挡距离, 线性 viewZ) 写进 binding 90，这里在半分辨率上按遮挡距离
+    // 做变半径加权平均 → binding 91 的 ping-pong，供**下一帧** raygen 重投影采样。
+    // 关闭时立刻返回，不录任何命令。
+    recordSunVisFilter(cmd);
+
     recordGlassAlphaBlend(cmd, renderWidth, renderHeight);
 
+    rtCheckpoint(cmd, "frame:sharc-resolve");
     recordSharcResolve(cmd);
+    rtCheckpoint(cmd, "frame:post-sharc-resolve");
     rtSpikeSharcResolve = rtMark();
 
     // 2026-11-02 屏幕空间降级链（SSR + SSPT）。挂点在这里的理由：
@@ -3069,6 +3425,8 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
         renderWidth,
         renderHeight
     );
+
+    rtCheckpoint(cmd, "frame:post-sshybrid");
 
     {
         const auto rtPhaseEnd = std::chrono::steady_clock::now();
@@ -3106,14 +3464,9 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
     }
 #endif
 
-    if(g_directAtrousEnabled)
-    {
-        recordDirectAtrous(
-            cmd,
-            renderWidth,
-            renderHeight
-        );
-    }
+    // 2026-11-09：这里原本是 if(g_directAtrousEnabled){ recordDirectAtrous(...) }。
+    // 该标志在 State.cpp 里被初始化为 false，全工程没有任何赋值点 ⇒ 分支恒不执行，
+    // 已删除（recordDirectAtrous 的定义保留，供将来重接 NRD 时使用）。
 
     if(kNrdLocalDiEnabled && !g_directAtrousReady && g_nrdReady)
     {
@@ -3260,6 +3613,8 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
     // 之后 ⇒ 下一帧 SSR/SSPT 拿到的辐射源是降噪过的色，不是 1spp 噪声。
     // 体积云在 2915 之后才合成，所以历史色里不含云（已知、可接受：
     // 云的贡献在反射里本来就被 RR 当低置信度处理）。
+    rtCheckpoint(cmd, "frame:post-nrd");
+
     recordSSHybridHistoryCopy(cmd);
 
     // 2026-11-01：ReSTIR 屏幕积分必须在本帧 recordVolumetricClouds 里的
@@ -3268,9 +3623,15 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
     // 贴墙、转头时重投影/遮挡都是上一帧的，看起来就像光从墙后拖出来。
     // 这里同时满足两个前提：vol_restir 链已在 recordVolumeRestir() 跑完，
     // 且本帧深度已由 RT pass 写好（composite 要用它算 march 距离）。
+    rtCheckpoint(cmd, "frame:post-ssh-copy");
+
     recordVolumeRestirScreenComposite(cmd);
 
+    rtCheckpoint(cmd, "frame:post-volrestir");
+
     recordVolumetricClouds(cmd);
+
+    rtCheckpoint(cmd, "frame:post-clouds");
 
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_CLOUD);
 
@@ -4858,8 +5219,6 @@ sl::ResourceTag outputTag(
                 true;
         }
 
-    recordCloudComposite(cmd);
-
 
         if(dlssResult != sl::Result::eOk)
         {
@@ -4911,6 +5270,8 @@ sl::ResourceTag outputTag(
         g_hasPrevCameraMatrices =
             true;
 
+
+rtCheckpoint(cmd, "frame:post-rr");
 
 writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_DLSS);
 
@@ -5045,16 +5406,47 @@ rrStableToPost.subresourceRange.baseArrayLayer = 0;
 rrStableToPost.subresourceRange.layerCount = 1;
 
 
-VkImageMemoryBarrier preDisplayBarriers[2] =
-{
-    rrToSDRPost,
-    rrStableToPost
-};
+// 2026-11-15：测光 v2 直方图要读反投影深度（天空判定）与云 resolve（区分云/
+// 天空）。两者在 slEvaluate 期间也会被 SL 读写，这里显式再做一次
+// ALL_COMMANDS → COMPUTE 的可见性转换。
+VkImageMemoryBarrier rrDepthToAe{};
+rrDepthToAe.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+rrDepthToAe.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+rrDepthToAe.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+rrDepthToAe.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+rrDepthToAe.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+rrDepthToAe.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+rrDepthToAe.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+rrDepthToAe.image = g_dlssDepthImage;
+rrDepthToAe.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+rrDepthToAe.subresourceRange.baseMipLevel = 0;
+rrDepthToAe.subresourceRange.levelCount = 1;
+rrDepthToAe.subresourceRange.baseArrayLayer = 0;
+rrDepthToAe.subresourceRange.layerCount = 1;
 
-const uint32_t preDisplayBarrierCount =
-    (g_rrStableRadianceImage != VK_NULL_HANDLE)
-        ? 2u
-        : 1u;
+VkImageMemoryBarrier rrCloudResolvedToAe = rrDepthToAe;
+rrCloudResolvedToAe.image = g_volumetricCloudResolvedImage;
+
+VkImageMemoryBarrier preDisplayBarriers[4];
+
+uint32_t preDisplayBarrierCount = 0u;
+
+preDisplayBarriers[preDisplayBarrierCount++] = rrToSDRPost;
+
+if(g_rrStableRadianceImage != VK_NULL_HANDLE)
+{
+    preDisplayBarriers[preDisplayBarrierCount++] = rrStableToPost;
+}
+
+if(g_dlssDepthImage != VK_NULL_HANDLE)
+{
+    preDisplayBarriers[preDisplayBarrierCount++] = rrDepthToAe;
+}
+
+if(g_volumetricCloudResolvedImage != VK_NULL_HANDLE)
+{
+    preDisplayBarriers[preDisplayBarrierCount++] = rrCloudResolvedToAe;
+}
 
 
 vkCmdPipelineBarrier(
@@ -5088,6 +5480,10 @@ vkCmdPipelineBarrier(
 
     if(aeActive)
     {
+        // 深度/云 resolve 的视图可能在本帧刚重建（窗口缩放、云资源重建），
+        // 这里只在句柄变化时重写描述符。
+        updateAeHistogramMeteringBindings();
+
         const std::chrono::steady_clock::time_point aeNow =
             std::chrono::steady_clock::now();
 
@@ -5198,6 +5594,20 @@ vkCmdPipelineBarrier(
 
         aePush.trimHigh =
             g_aeTrimHigh;
+
+        // 2026-11-15：必须与 rr_ae_histogram.comp 的 logMin/logMax 一致，
+        // 否则直方图 bin 索引与这里的 binCenter 换算会错位（EV 直接算错）。
+        aePush.logMin =
+            AE_LOG2_MIN;
+
+        aePush.logMax =
+            AE_LOG2_MAX;
+
+        aePush.transitionDistance =
+            g_aeTransitionEv;
+
+        aePush.pad0 =
+            0;
 
         aePush.enabled =
             g_aeEnabled.load()
@@ -5310,7 +5720,10 @@ vkCmdPipelineBarrier(
         );
 
 
-        if(g_aeEnabled.load())
+        // 深度/云 resolve 未就绪时不能派发（binding 2/3 还没有有效视图）。
+        if(g_aeEnabled.load() &&
+           g_dlssDepthView != VK_NULL_HANDLE &&
+           g_volumetricCloudResolvedView != VK_NULL_HANDLE)
         {
             vkCmdBindPipeline(
                 cmd,
@@ -5332,6 +5745,42 @@ vkCmdPipelineBarrier(
 
                 0,
                 nullptr
+            );
+
+
+            AeHistogramPushConstants aeHistPush{};
+
+            aeHistPush.logMin =
+                AE_LOG2_MIN;
+
+            aeHistPush.logMax =
+                AE_LOG2_MAX;
+
+            aeHistPush.centerWeight =
+                g_aeCenterWeight;
+
+            aeHistPush.skyWeight =
+                g_aeSkyWeight;
+
+            aeHistPush.cloudWeight =
+                g_aeCloudWeight;
+
+            aeHistPush.skyDepthEps =
+                AE_SKY_DEPTH_EPS;
+
+
+            vkCmdPushConstants(
+                cmd,
+
+                g_aeHistogramLayout,
+
+                VK_SHADER_STAGE_COMPUTE_BIT,
+
+                0,
+
+                sizeof(AeHistogramPushConstants),
+
+                &aeHistPush
             );
 
 
@@ -5366,7 +5815,13 @@ vkCmdPipelineBarrier(
                 << " avgLogLuma=" << g_aeStateCpu[2]
                 << " samples="
                 << reinterpret_cast<const uint32_t*>(g_aeStateCpu)[3]
-                << " maxEV=" << g_aeMaxEV;
+                << " maxEV=" << g_aeMaxEV
+                << " log=[" << AE_LOG2_MIN << "," << AE_LOG2_MAX << "]"
+                << " trim=[" << g_aeTrimLow << "," << g_aeTrimHigh << "]"
+                << " cw=" << g_aeCenterWeight
+                << " skyW=" << g_aeSkyWeight
+                << " cloudW=" << g_aeCloudWeight
+                << " transition=" << g_aeTransitionEv;
 
             RTLog(aeStateLog.str());
         }
@@ -6174,6 +6629,8 @@ vkCmdPipelineBarrier(
 
 g_dlssOutputLayout =
     VK_IMAGE_LAYOUT_GENERAL;
+
+    rtCheckpoint(cmd, "frame:end");
 
     logFrameDoneHeartbeat();
 

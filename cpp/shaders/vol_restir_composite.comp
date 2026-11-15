@@ -68,17 +68,41 @@ float sceneDistanceForDepth(vec2 ndc, float depthValue)
     return length(sceneViewPosition.xyz / sceneViewPosition.w);
 }
 
+// 2026-11-09 P3：步进抖动用的 interleaved gradient noise（[0,1)）。
+// 32 步的等距采样会在屏幕上留下同心层状 banding；每像素 + 每帧偏移一次步进相位，
+// 层状被打散成高频噪点，由 DLSS-RR / TAA 在时域收敛。成本 3 次乘加。
+float volStepJitter(ivec2 pixel, uint frame)
+{
+    const float ign = fract(52.9829189 * fract(
+        dot(vec2(pixel), vec2(0.06711056, 0.00583715))));
+    // 帧间再叠一个黄金比序列，保证任意 3~5 帧内相位铺满。
+    const float temporal = fract(float(frame) * 0.61803398875);
+    return fract(ign + temporal);
+}
+
 void main()
 {
-    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    // 2026-11-09 P1：半分辨率（2×2 共享一次 march）。
+    //
+    // 依据：radiance 来自 froxel 体积，横向粒度就是 8 像素；原来逐像素重新
+    // 裁剪 scene depth 的精度基本是浪费。2×2 后 march 次数降 4×，而体积场
+    // 本身的分辨率远粗于 2 像素，观感差异集中在轮廓一两个像素。
+    //
+    // 关键安全性：共享 march 用的是 2×2 内**最近的** sceneDistance（dMin），
+    // 因此永远不会把前景之后的雾画到前景前面 —— 只会让背景侧"少一点雾"。
+    const int downscale = clamp(pc.grid.w, 1, 2);
+
     ivec2 size = imageSize(volCompositeOut);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy) * downscale;
 
     if(any(greaterThanEqual(pixel, size)))
     {
         return;
     }
 
-    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    ivec2 blockCenter = min(pixel + ivec2(downscale / 2), size - ivec2(1));
+
+    vec2 uv = (vec2(blockCenter) + 0.5) / vec2(size);
     vec2 ndc = uv * 2.0 - 1.0;
     ndc.y = -ndc.y;
 
@@ -93,8 +117,20 @@ void main()
     vec3 cameraForward = -normalize(cam.viewInverse[2].xyz);
     float cosAngle = max(dot(worldDirection, cameraForward), 1.0e-3);
 
-    float depthValue = textureLod(sceneDepth, uv, 0.0).r;
-    float sceneDistance = sceneDistanceForDepth(ndc, depthValue);
+    // 2×2 内取最近深度：宁可在轮廓背面少画雾，也不让雾越过前景。
+    float sceneDistance = 1.0e30;
+    for(int oy = 0; oy < downscale; ++oy)
+    {
+        for(int ox = 0; ox < downscale; ++ox)
+        {
+            ivec2 tap = min(pixel + ivec2(ox, oy), size - ivec2(1));
+            vec2 tapUv = (vec2(tap) + 0.5) / vec2(size);
+            vec2 tapNdc = tapUv * 2.0 - 1.0;
+            tapNdc.y = -tapNdc.y;
+            sceneDistance = min(sceneDistance,
+                sceneDistanceForDepth(tapNdc, textureLod(sceneDepth, tapUv, 0.0).r));
+        }
+    }
 
     float nearPlane = max(cam.cameraParams.x, 1.0e-3);
     float maxViewZ = max(pc.params.x, nearPlane + 1.0);
@@ -160,9 +196,13 @@ void main()
     vec3 transmittance = vec3(1.0);
     float previousViewZ = nearPlane;
 
+    // 2026-11-09 P3：逐像素 + 逐帧的步进相位偏移（见 volStepJitter 注释）。
+    const float stepJitter = volStepJitter(blockCenter, cam.frameCount);
+
     for(int step = 1; step <= stepCount; ++step)
     {
-        float sliceT = float(step) / float(stepCount);
+        float sliceT = clamp((float(step) - stepJitter) / float(stepCount),
+            1.0e-4, 1.0);
         float viewZ = nearPlane + pow(sliceT, depthExponent) * maxViewZ;
 
         if(viewZ > marchViewZ)
@@ -205,5 +245,14 @@ void main()
     // 整体变暗、雾看起来更厚，贴近雾区的物体会比远处更黑。这与 Remix 的
     // 做法（preintegratedRadiance + scene*T 一次性合成）也不一致。
     const float alpha = 1.0;
-    imageStore(volCompositeOut, pixel, vec4(accumulated, alpha));
+
+    // 2026-11-09 P1：把这一块的结果写给 2×2 全部分辨率像素（march 只做一次）。
+    for(int oy = 0; oy < downscale; ++oy)
+    {
+        for(int ox = 0; ox < downscale; ++ox)
+        {
+            ivec2 tap = min(pixel + ivec2(ox, oy), size - ivec2(1));
+            imageStore(volCompositeOut, tap, vec4(accumulated, alpha));
+        }
+    }
 }

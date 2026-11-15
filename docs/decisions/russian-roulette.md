@@ -78,3 +78,66 @@ survival = max(1 - term, 0.20)
    始终开）；本工程的 RR 挂在 `cam.rtSampleParams.y`（用户开关）后面，关掉就换了一个
    估计量 ⇒ 噪声分布变了，而 DLSS RR 的历史是按某一种分布调的。这是**已知的估计量
    不连续性**，暂不改动（关 RR 有 2026-10-07 实测的 −5.9ms 收益），但要登记为取舍。
+
+---
+
+## 2026-11-07 GitHub 调研：RTXPT / Remix 的现行公式与本工程的差异
+
+### RTXPT（NVIDIA-RTX/RTXPT，2025，`Rtxpt/Shaders/PathTracer/PathTracer.hlsli` 的
+`HandleRussianRoulette`）——**与本工程同源**
+
+```hlsl
+const float rrVal = sqrt(Luminance(path.GetThp()));   // "closer to perceptual"
+// a milder version of Falcor's Russian Roulette
+float prob = saturate(0.85 - rrVal);
+prob = prob * prob;
+prob = saturate(prob + max(0, vertexIndex / maxBounceLimit - 0.4));
+if (sampleNext1D < prob) terminate;  // 否则 thpRuRuCorrection = 1/(1-prob)
+```
+
+即：**本工程的 `(0.85-√T)² + 弹射坡道(0.4)` 就是 RTXPT 的生产公式**（常数逐一相同）。
+真正的差异只有两处：
+
+| 项 | RTXPT | 本工程 |
+|---|---|---|
+| 度量 | BT.709 亮度（再开方） | max(r,g,b)（再开方；2026-10-23 刻意选择，防饱和色失衡） |
+| 下限 | 无（prob 可到 1 ⇒ survival→0，权重无上界） | 0.20 地板（最大 5×，2026-10-09 的方差收敛） |
+
+### Remix（dxvk-remix main，2026，`rtx/algorithm/integrator.slangh` 的
+`calculateRussianRouletteContinueProbability`）——**新增的东西**
+
+- 双模式 `RussianRouletteMode`：
+  - `ThroughputBased`（默认）：`min(BT709Luminance(fullThroughput × continuationThroughput),
+    russianRouletteMaxContinueProbability)`；
+  - `SpecularBased`：`lerp(russianRouletteDiffuseContinueProbability=0.1,
+    russianRouletteSpecularContinueProbability=0.98, specularWeight)`，其中
+    `specularWeight = (1-perceptualRoughness) × saturate(russianRouletteDistanceFactor=0.1 /
+    hitDistance)`（不透明漫反射 lobe 权重 0、非不透明材质权重 1）。定位是"低粗糙度 +
+    短命中距离的镜面细节多追"。
+- **`russianRouletteMaxContinueProbability = 0.9`**：survival 永远 ≤0.9 ⇒ 任何路径每跳都有
+  ≥10% 概率终止。选项文本明说这是防"镜面房间无限路径"，并注明"RR 太激进会让 warp 里
+  线程没活干、伤 occupancy，除非配合 SER"（本工程 GI 恰好全程 SER，该约束成立）。
+- **`russianRoulette1stBounceMinContinueProbability = 0.6`**：第一跳的下限，理由是"对
+  denoiser 来说一个弱样本好过一个缺失样本"。
+- `pathMinBounces=1` / `pathMaxBounces=4`（可配，本工程用 giBounceLimit + 坡道等效）。
+- 掷骰用**蓝噪声**（`getNextSampleBlueNoise`）；`<=` 比较保证 p=0 必终止；补偿除法带
+  `kThroughputClampedDivisionMaximum=65000` 上限。
+
+### 本工程的可落地清单（按性价比；全部要进跑批 A/B）
+
+1. **蓝噪声掷骰**：把 `pcg_hash(seed ^ 0x9e3779b9)` 换成现成的
+   `glassBlueNoiseSample(pixel, frameCount, index)`（binding 76 + R2 偏移 + min 钳制，
+   `rt_test.rgen:404-424`，与 Remix `getNextSampleBlueNoise` 同口径）。终止/存活的空间
+   分布变蓝噪声 ⇒ DLSS-RR 时域累积里的"孤立亮点"减少，直接对着 2026-10-09 那次
+   "静止噪点"的根因。均值不变，只改分布。
+   ✅ **已落地 2026-11-07**（`rgen_main_body.glsl` GI 回路 RR 块，宏
+   `GI_RR_BLUE_NOISE` 默认 1，回退 = 编 SPV 时 `-DGI_RR_BLUE_NOISE=0`；
+   seedIndex = `diffuseBounceCount + 37`，每弹射一档 R2 相位、与玻璃选层链错开）。
+   14 个 rgen 变体已重编并四处同步（run / src / build / cpp），审计 0 漂移。
+   **画面对比（静止时噪点是否变细）仍属跑批验证项**。
+2. **survival 上限 0.9**（Remix 同名参数）：现在 T ≥ 0.7225 的亮路径完全不终止；加上限
+   后平均路径长度下降、代价是亮路径每跳多背 ≤1.11× 权重。需 A/B。
+3. **第一跳地板 0.6**：本工程常跑 giBounces=1 ⇒ 第一跳就是唯一跳，RR 本来就不触发；
+   只有把 GI 弹射数调回 2+ 时才有意义。暂不动。
+4. **SpecularBased 模式**：本工程 GI 回路是余弦漫反射 + 薄壁玻璃，没有"镜面 lobe 继续
+   追踪"的分支，暂不移植；将来若把 glossy 并进 GI 路径再评估。

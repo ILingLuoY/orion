@@ -5,6 +5,8 @@
 #include "OrionInternal.h"
 #include "TrackingHooks.h"
 
+#include <cstdlib>
+
 
 
 
@@ -21,6 +23,26 @@ std::mutex g_rtLogMutex;
 
 namespace
 {
+float aeEnvFloat(const char* name, float fallback)
+{
+    const char* raw = std::getenv(name);
+
+    if(raw == nullptr || *raw == '\0')
+    {
+        return fallback;
+    }
+
+    char* end = nullptr;
+    const float value = std::strtof(raw, &end);
+
+    if(end == raw)
+    {
+        return fallback;
+    }
+
+    return value;
+}
+
 struct RTXTerminateInstaller
 {
     RTXTerminateInstaller()
@@ -242,6 +264,20 @@ VkImage g_volumetricCloudHistoryDepthImage = VK_NULL_HANDLE;
 VkDeviceMemory g_volumetricCloudHistoryDepthMemory = VK_NULL_HANDLE;
 VkImageView g_volumetricCloudHistoryDepthView = VK_NULL_HANDLE;
 VkSampler g_volumetricCloudSampler = VK_NULL_HANDLE;
+// 2026-11-15：体积雾 froxel 重构的资源。
+VkImage g_fogFroxelDensityImage = VK_NULL_HANDLE;
+VkDeviceMemory g_fogFroxelDensityMemory = VK_NULL_HANDLE;
+VkImageView g_fogFroxelDensityView = VK_NULL_HANDLE;
+VkImage g_fogScreenColorImage = VK_NULL_HANDLE;
+VkDeviceMemory g_fogScreenColorMemory = VK_NULL_HANDLE;
+VkImageView g_fogScreenColorView = VK_NULL_HANDLE;
+VkImage g_fogScreenDistImage = VK_NULL_HANDLE;
+VkDeviceMemory g_fogScreenDistMemory = VK_NULL_HANDLE;
+VkImageView g_fogScreenDistView = VK_NULL_HANDLE;
+VkPipeline g_fogFroxelDensityPipeline = VK_NULL_HANDLE;
+VkPipelineLayout g_fogFroxelDensityPipelineLayout = VK_NULL_HANDLE;
+VkPipeline g_fogFroxelCompositePipeline = VK_NULL_HANDLE;
+VkPipelineLayout g_fogFroxelCompositePipelineLayout = VK_NULL_HANDLE;
 VkImageLayout g_volumetricCloudLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 VkImageLayout g_volumetricCloudHistoryLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 VkImageLayout g_volumetricCloudResolvedLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -261,7 +297,6 @@ VkDescriptorPool g_volumetricCloudDescriptorPool = VK_NULL_HANDLE;
 VkDescriptorSet g_volumetricCloudRenderSet = VK_NULL_HANDLE;
 VkDescriptorSet g_volumetricCloudResolveSet = VK_NULL_HANDLE;
 VkDescriptorSet g_volumetricCloudCompositeSet = VK_NULL_HANDLE;
-VkImageView g_volumetricCloudCompositeTargetView = VK_NULL_HANDLE;
 VkPipelineLayout g_volumetricCloudRenderPipelineLayout = VK_NULL_HANDLE;
 VkPipelineLayout g_volumetricCloudResolvePipelineLayout = VK_NULL_HANDLE;
 VkPipelineLayout g_volumetricCloudCompositePipelineLayout = VK_NULL_HANDLE;
@@ -653,8 +688,30 @@ float g_aeMinEV = -4.0f;
 float g_aeMaxEV = 1.0f;
 float g_aeAdaptUpRate = 1.5f;
 float g_aeAdaptDownRate = 3.0f;
-float g_aeTrimLow = 0.02f;
-float g_aeTrimHigh = 0.98f;
+float g_aeTrimLow = aeEnvFloat("ORION_AE_TRIM_LOW", 0.15f);
+float g_aeTrimHigh = aeEnvFloat("ORION_AE_TRIM_HIGH", 0.90f);
+
+// 2026-11-15：测光权重（可用环境变量覆盖，方便不进 UI 做 A/B）。
+// 参考 UE 的 Exposure Metering Mask：中心加权用程序化径向权重，天空/云用
+// 反投影深度 + 云覆盖率区分。
+float g_aeCenterWeight =
+    aeEnvFloat("ORION_AE_CENTER_WEIGHT", AE_DEFAULT_CENTER_WEIGHT);
+float g_aeSkyWeight =
+    aeEnvFloat("ORION_AE_SKY_WEIGHT", AE_DEFAULT_SKY_WEIGHT);
+float g_aeCloudWeight =
+    aeEnvFloat("ORION_AE_CLOUD_WEIGHT", AE_DEFAULT_CLOUD_WEIGHT);
+float g_aeTransitionEv =
+    aeEnvFloat("ORION_AE_TRANSITION_EV", AE_DEFAULT_TRANSITION_EV);
+
+// 2026-11-15：云合成 shoulder 的现场旋钮（不需要重新编译就能 A/B）。
+//   ORION_CLOUD_SHOULDER_STRENGTH：白点公式里的曝光强度指数。
+//      <0（默认）= 跟随下游曝光口径（SDR: g_postExposureStrength / HDR: 0.6）；
+//      1.0 = 2026-11-15 之前的旧口径 exp2(-currentEV)（白点更大、云更暗更压）。
+//   ORION_CLOUD_SHOULDER_SCALE：白点整体倍率，<1 压暗云、>1 提亮云。
+float g_cloudShoulderStrength =
+    aeEnvFloat("ORION_CLOUD_SHOULDER_STRENGTH", -1.0f);
+float g_cloudShoulderScale =
+    aeEnvFloat("ORION_CLOUD_SHOULDER_SCALE", 1.0f);
 VkBuffer g_aeHistogramBuffer = VK_NULL_HANDLE;
 VkDeviceMemory g_aeHistogramMemory = VK_NULL_HANDLE;
 VkBuffer g_aeStateBuffer = VK_NULL_HANDLE;
@@ -749,6 +806,16 @@ VkImageLayout g_giTemporalHistoryLayouts[2] =
 uint32_t g_giTemporalHistoryWidth = 0u;
 uint32_t g_giTemporalHistoryHeight = 0u;
 bool g_giTemporalHistoryNeedsClear = false;
+
+// 2026-11-14：稀疏反射的时域历史（binding 92）。单张 rgba16f、渲染分辨率，
+// 无 ping-pong —— 每个 invocation 只读写自己那一个 texel，没有跨像素依赖。
+VkImage g_glossyHistoryImage = VK_NULL_HANDLE;
+VkDeviceMemory g_glossyHistoryMemory = VK_NULL_HANDLE;
+VkImageView g_glossyHistoryView = VK_NULL_HANDLE;
+VkImageLayout g_glossyHistoryLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+uint32_t g_glossyHistoryWidth = 0u;
+uint32_t g_glossyHistoryHeight = 0u;
+bool g_glossyHistoryNeedsClear = true;
 
 
 VkImage g_alphaBlendGbufferImage = VK_NULL_HANDLE;
@@ -1094,8 +1161,14 @@ std::atomic<float> g_cloudThickness{2100.0f};
 std::atomic<float> g_cloudCoverage{0.48f};
 std::atomic<float> g_cloudDensity{2.40f};
 std::atomic<float> g_cloudDetailStrength{0.14f};
-std::atomic<float> g_cloudWindSpeed{10.0f};
-std::atomic<float> g_cloudEvolution{0.80f};
+// 2026-11-15「性能模式」：SSR 区块下限（0 ⇒ 着色器回落到 12）。
+std::atomic<float> g_ssrFloorChunks{12.0f};
+
+// 2026-11-15「性能模式」：RT 射程（区块）、弹射分界（区块）、总开关。
+std::atomic<float> g_perfRtBandChunks{6.0f};
+std::atomic<float> g_perfBounceBandChunks{4.0f};
+std::atomic<uint32_t> g_performanceMode{0u};
+
 std::atomic<uint32_t> g_cloudQuality{1u};
 std::atomic<float> g_cloudSize{1.0f};
 std::atomic<float> g_cloudDistribution{0.50f};
@@ -1118,7 +1191,6 @@ std::atomic<float> g_planeCloudOctaves{5.0f};
 std::atomic<float> g_planeCloudFadeDistance{100000.0f};
 std::atomic<float> g_planeCloudBrightness{1.0f};
 std::atomic<uint32_t> g_cloudResFloorPercent{0u};
-std::atomic<bool> g_cloudPostRrComposite{true};
 std::atomic<float> g_cloudFarStepDensity{0.45f};
 std::atomic<bool> g_cloudFadeFollowsRrMode{true};
 std::atomic<float> g_cloudTwoTierStep{1.0f};
@@ -1162,13 +1234,12 @@ std::atomic<float> g_cloudPhiBoundaryConfidence{1.0f};
 std::atomic<float> g_cloudPhiMsBuildScale{1.0f};
 std::atomic<float> g_cloudPhiCompress{1.5f};
 std::atomic<float> g_cloudPhiConeRatio{2.0f};
-std::atomic<float> g_cloudSourceOdScale{1.0f};
-std::atomic<float> g_cloudSourceCurvePow{1.0f};
-std::atomic<float> g_cloudAoUpwardScale{1.0f};
-std::atomic<float> g_cloudSunsetAmbientTint{0.6f};
 std::atomic<float> g_cloudBottomSmoothHeight{0.22f};
 std::atomic<float> g_cloudBottomSmoothPow{1.0f};
 std::atomic<float> g_cloudTwoTierThreshold{0.004f};
+// 2026-11-13 审计 ⑤：光步侵蚀细节（cloudShapeParams.w）。原来 JNI 丢掉第 4 分量、
+// Settings 恒写 0，而 volumetric_clouds_v5.comp:325 在读 ⇒ 滑条死档。
+std::atomic<float> g_cloudLightStepErosion{1.0f};
 std::atomic<float> g_cloudMoonStrength{1.0f};
 std::atomic<float> g_cloudMoonPhase{1.0f};
 std::atomic<float> g_cloudDetailScale{1.0f};
@@ -1178,10 +1249,6 @@ std::atomic<float> g_cloudAmbientTopMul{1.0f};
 std::atomic<float> g_cloudAmbientBottomMul{1.0f};
 std::atomic<float> g_cloudAmbientSunSide{0.35f};
 std::atomic<float> g_cloudAmbientHueFollow{1.0f};
-std::atomic<float> g_cloudSkyHueCool{0.65f};
-std::atomic<float> g_cloudSkyHueEnergy{0.50f};
-std::atomic<float> g_cloudSkyDirStrength{0.0f};
-std::atomic<float> g_cloudAmbientUnify{0.0f};
 std::atomic<float> g_cloudGroundAlbedo{0.20f};
 std::atomic<float> g_cloudGroundBounce{1.0f};
 std::atomic<float> g_cloudSunlightResidual{0.0f};
@@ -1190,10 +1257,6 @@ std::atomic<float> g_cloudScatterTint{0.35f};
 std::atomic<float> g_cloudMsOctaves{2.0f};
 std::atomic<float> g_cloudMsAttenuation{0.5f};
 std::atomic<float> g_cloudMsEccentricity{0.5f};
-std::atomic<float> g_cloudSunPathReddening{0.6f};
-std::atomic<float> g_cloudAtmExtinction{1.0f};
-std::atomic<float> g_cloudPowderMode{1.0f};
-std::atomic<float> g_fogDynamicLightStrength{1.0f};
 std::atomic<float> g_fogGroundAnchorStrength{1.0f};
 std::atomic<float> g_fogSkyAmbientStrength{1.0f};
 std::atomic<float> g_fogTemporalJitterStrength{1.0f};
@@ -1201,11 +1264,7 @@ std::atomic<bool> g_cloudFogLightDescriptorsReady{false};
 VkDescriptorSet g_cloudFogLightSetBound = VK_NULL_HANDLE;
 VkBuffer g_cloudFogLightListBound = VK_NULL_HANDLE;
 VkBuffer g_cloudFogLightGridBound = VK_NULL_HANDLE;
-std::atomic<float> g_cloudSkyVisStrength{0.0f};
-std::atomic<float> g_cloudSkyVisSteps{0.0f};
 std::atomic<float> g_cloudTemporalDamp{0.0f};
-std::atomic<float> g_cloudBottomOcclusion{0.0f};
-std::atomic<float> g_cloudAerialStrength{0.0f};
 std::atomic<float> g_groundAerialStrength{0.0f};
 std::atomic<float> g_groundAerialOcclusion{0.0f};
 std::atomic<float> g_cloudProfileType{0.25f};
@@ -1271,8 +1330,30 @@ std::atomic<bool> g_fogGroundMistEnabled{true};
 std::atomic<float> g_fogGroundMistHeight{1.0f};
 std::atomic<float> g_fogGroundMistExtinction{0.15f};
 std::atomic<float> g_fogGroundMistDistance{48.0f};
+// 2026-11-10：平流雾滚动速度（格/秒）。0 由 shader 视为"用默认 1.35"。
+std::atomic<float> g_fogGroundMistSpeed{1.35f};
+
+// 2026-11-13：湿度时间包络（约 3 秒时间常数），避免雨停瞬间雾顶/平流雾跳变。
+std::atomic<float> g_fogWetnessEnvelope{0.0f};
+
+// 2026-11-13：雾光学（fogOpticsParams）：x=平流雾涡流强度，yzw=波长透射权重。
+std::atomic<float> g_fogCurlStrength{1.0f};
+std::atomic<float> g_fogTintR{1.0f};
+std::atomic<float> g_fogTintG{1.0f};
+std::atomic<float> g_fogTintB{1.0f};
+
+// 2026-11-13：玻璃光学焦散总开关已删除（用户要求整体回退焦散）。
+
+// 2026-11-11：雨波纹（水面 + 地面水洼共用同一个解析场）。
+// 打包进 godRayParams2.w（唯一空闲车道，见 populateGroundMistParams）。
+std::atomic<float> g_rainRippleSize{1.0f};
+std::atomic<float> g_rainRippleStrength{1.0f};
+
+// 2026-11-11：云隙光（crepuscular rays）。落在 cloudParams4.y/.z/.w 三条空车道。
+std::atomic<bool> g_cloudGapEnabled{true};
+std::atomic<float> g_cloudGapStrength{1.0f};   // 云层光学厚度倍率
+std::atomic<float> g_cloudGapWidth{0.5f};      // 缝宽偏置（越大洞越大）
 // 2026-10-31：g_fogWisp* 四项随"雨天地面雾浪"整链删除（用户实测无效果）。
-std::atomic<float> g_fogRainMediumMix{1.0f};
 float g_cloudWorldAnchorX = 0.0f;
 float g_cloudWorldAnchorZ = 0.0f;
 float g_cloudWorldAnchorDimension = 0.0f;
@@ -1549,6 +1630,8 @@ float g_dynamicCaptureCameraZ = 0.0f;
 bool g_entityFrameOpen = false;
 bool g_particleFrameOpen = false;
 std::atomic<bool> g_entityRebuildRequested{false};
+// 2026-11-12 实例化第 2 步：mesh key → N 组 3×4 行主序实例矩阵（见 OrionInternal.h）
+std::unordered_map<uint64_t, std::vector<float>> g_entityMeshInstances;
 uint64_t g_lastDynamicRTASUpdateFrame = UINT64_MAX;
 bool g_dynamicRTASUpdatePending = false;
 uint64_t g_lastLocalPlayerASUpdateFrame = UINT64_MAX;
@@ -1807,6 +1890,15 @@ uint64_t g_sectionASCreateCalls = 0u;
 uint64_t g_sectionASRetireCalls = 0u;
 double g_sectionASCreateMs = 0.0;
 double g_sectionASRetireMs = 0.0;
+double g_sectionBuildBufMs = 0.0;
+double g_sectionBuildVkBufMs = 0.0;
+double g_sectionBuildPrepMs = 0.0;
+double g_sectionBuildOmmMs = 0.0;
+double g_sectionBuildReqMs = 0.0;
+double g_sectionBuildSizesMs = 0.0;
+double g_sectionBuildMemMs = 0.0;
+double g_sectionBuildAsMs = 0.0;
+double g_sectionBuildAddrMs = 0.0;
 uint64_t g_sectionASRebuildSameTris = 0u;
 uint64_t g_sectionASRefitCandidateHits = 0u;
 uint64_t g_sectionASRefitHits = 0u;
@@ -1886,6 +1978,18 @@ VkStridedDeviceAddressRegionKHR g_k2iRaygenRegion{};
 VkStridedDeviceAddressRegionKHR g_k2iMissRegion{};
 VkStridedDeviceAddressRegionKHR g_k2iHitRegion{};
 VkStridedDeviceAddressRegionKHR g_k2iCallableRegion{};
+// ④ K2-D 再拆分（默认开，ORION_K2_SPLIT2=0 回退到 ③ 的 K2-D/K2-I 两腿）：
+// K2-SUN（水+太阳直射/GGX/SSS/RTAO）+ K2-LOC（局部光/水面反射太阳/GGX 镜面）
+VkPipeline g_k2sunPipeline = VK_NULL_HANDLE;
+VkPipeline g_k2locPipeline = VK_NULL_HANDLE;
+VkStridedDeviceAddressRegionKHR g_k2sunRaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunMissRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunHitRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunCallableRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locRaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locMissRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locHitRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locCallableRegion{};
 VkImage g_k2DirectImage = VK_NULL_HANDLE;
 VkDeviceMemory g_k2DirectMemory = VK_NULL_HANDLE;
 VkImageView g_k2DirectView = VK_NULL_HANDLE;

@@ -174,7 +174,15 @@ vec4 sampleVolumetricClouds(vec3 rayOriginKm, vec3 rayDir, vec3 sunDir) {
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
 
-    int steps = 24; // 增加采样步数，保证云层细腻
+    // 2026-11-09：这条 fallback 行军**只服务次级射线** —— 调用点在同文件
+    // :1358 被 `purpose != RT_PURPOSE_PRIMARY_SKY` 包着（主视图天空的云由
+    // volumetric_clouds_v5.comp 合成）。所以 24 步的"细腻"在这里是白付：
+    // 反射/玻璃后的云最终还要被 RR 重投影 + 低分辨率重建。降到 8 步。
+    // 回退：-DCLOUD_SECONDARY_FALLBACK_STEPS=24。
+#ifndef CLOUD_SECONDARY_FALLBACK_STEPS
+#define CLOUD_SECONDARY_FALLBACK_STEPS 8
+#endif
+    int steps = CLOUD_SECONDARY_FALLBACK_STEPS;
     // 2026-09-30 远处云马赛克修复（与 volumetric_clouds.comp 同步）：
     // 掠射弦长钳到 48km，避免固定 24 步摊在几十公里上出块状马赛克。
     endDistance = min(endDistance, startDistance + 48000.0);
@@ -421,6 +429,9 @@ vec4 sampleVolumetricClouds(vec3 rayOrigin, vec3 rayDir, vec3 sunDir) {
     // 高层平面云（2026-10-02 C 档，双层球壳薄板）：与主管线同源。反射路径传
     // pixelAngle=0（不做噪声 mip 预过滤，沿用旧档观感），sunDir 已是月亮/太阳
     // 的受光方向，可直接作 lightDir。
+    // 2026-11-13（用户拍板）：撤销 11-12 的"传真实每像素角尺寸"改动，回到
+    // pixelAngle=0 旧档观感。已知代价：t≈100km 处 mip0 噪声在次级射线上混叠
+    // （speckle / 圆云团被直线切开）。
     float highDistance;
     vec4 highCloud = sampleHighCloud(rayOrigin, rayDir, sunDir, 0.0, highDistance);
     scattering += transmittance * highCloud.rgb;
@@ -793,6 +804,23 @@ vec3 evaluateMoonSurface(vec3 rayDir, vec3 moonDir, float limbCosine)
     vec3 reference = abs(moonDir.y) > 0.95 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
     vec3 moonRight = normalize(cross(reference, moonDir));
     vec3 moonUp = cross(moonDir, moonRight);
+
+    // 2026-11-13 天平动：真实月球对地球有 ±8° 的摆动，所以每晚看到的月面
+    // 朝向略有不同。没有天数计数器，用相位（cam.sssParams.z）代替：8 天一轮，
+    // 摆动 ±5.7°。幅度用 MOON_LIBRATION 调，0 = 关。
+#ifndef MOON_LIBRATION
+#define MOON_LIBRATION 0.10
+#endif
+    {
+        float moonLibAngle =
+            MOON_LIBRATION * sin(6.28318530718 * clamp(cam.sssParams.z, 0.0, 1.0));
+        float moonLibCos = cos(moonLibAngle);
+        float moonLibSin = sin(moonLibAngle);
+        vec3 moonRightBeforeLibration = moonRight;
+
+        moonRight = moonRight * moonLibCos + moonUp * moonLibSin;
+        moonUp = moonUp * moonLibCos - moonRightBeforeLibration * moonLibSin;
+    }
     float radiusSin = max(sqrt(max(1.0 - limbCosine * limbCosine, 0.0)), 1.0e-4);
     vec2 local = vec2(dot(rayDir, moonRight), dot(rayDir, moonUp)) / radiusSin;
     float r = length(local);
@@ -802,6 +830,31 @@ vec3 evaluateMoonSurface(vec3 rayDir, vec3 moonDir, float limbCosine)
     }
     // Spherical warp: without it the crater field stretches at the limb.
     vec3 samplePosition = vec3(local, sqrt(max(1.0 - r * r, 0.0)));
+
+    // =====================================================
+    // 2026-11-13 月相（真实明暗界线）
+    //
+    // 改动前这里永远是满月（见文件里 "the moon is always full here" 的注释）。
+    // 现在按 cam.sssParams.z（宿主累计的 0..1 相位）给一个**球面明暗界线**：
+    //   · 相位 0   ⇒ 照明方向 = -moonDir ⇒ 整面全亮 = 满月，与旧行为逐位衔接；
+    //   · 相位 0.5 ⇒ 照明方向 = +moonDir ⇒ 背面 ⇒ 新月（只剩地照）；
+    //   · 中间相位自动得到上/下弦的椭圆界线（因为用的是球面法线点乘）。
+    // 地照（earthshine）：新月时盘面不全黑，留一点点（真实约 1e-4，这里给
+    // 可见但很暗的 MOON_EARTHSHINE），否则"月亮消失"会让人以为坏了。
+    // 回退：把 moonLit 恒置 1.0 即逐位回到改动前。
+    // =====================================================
+#ifndef MOON_EARTHSHINE
+#define MOON_EARTHSHINE 0.035
+#endif
+
+    float moonPhase = clamp(cam.sssParams.z, 0.0, 1.0);
+    float moonPhaseAngle = 6.28318530718 * moonPhase;
+
+    // 照明方向（月亮局部坐标：x = moonRight, y = moonUp, z = moonDir）
+    vec3 moonSunLocal = vec3(sin(moonPhaseAngle), 0.0, -cos(moonPhaseAngle));
+
+    // 界线软一点（真实月面界线在地影里本来就有几度过渡）
+    // moonLit 在下面 albedo 之后才求值（齿状界线要用到月面噪声）。
     float maria = smoothstep(0.40, 0.66, fbm3D(samplePosition * 2.3 + 5.0));
     float mottle = fbm3D(samplePosition * 7.0 + 23.0);
     float rays = smoothstep(0.74, 0.96, fbm3D(samplePosition * 12.0 + 71.0));
@@ -809,7 +862,23 @@ vec3 evaluateMoonSurface(vec3 rayDir, vec3 moonDir, float limbCosine)
         0.22, 1.0);
     // Crisp limb (6% of the radius) instead of the sun's very soft feather, so
     // the moon reads as a solid body rather than as another glow.
-    return vec3(albedo * smoothstep(1.0, 0.94, r));
+    // 2026-11-13 齿状明暗界线：用同一套月面噪声当**微法线扰动**，让环形山
+    // 边缘先被照亮（参考实现靠 bump map 达到同样效果）。这是 14 px 下"真"与
+    // "假"的主要差别 —— 光滑椭圆界线一眼就是假的。
+    // 幅度 MOON_TERMINATOR_BUMP，0 = 回到光滑界线。
+#ifndef MOON_TERMINATOR_BUMP
+#define MOON_TERMINATOR_BUMP 0.07
+#endif
+    float moonBumpOffset =
+        (mottle - 0.5) * 2.0 * MOON_TERMINATOR_BUMP;
+
+    float moonLit = smoothstep(
+        -0.03,
+        0.03,
+        dot(samplePosition, moonSunLocal) + moonBumpOffset);
+    moonLit = max(moonLit, MOON_EARTHSHINE);
+
+    return vec3(albedo * moonLit * smoothstep(1.0, 0.94, r));
 }
 
 
@@ -851,13 +920,39 @@ void main() {
     vec3 glowColor = sunElevation >= 0.0
         ? vec3(1.0, 0.82, 0.55)
         : vec3(0.42, 0.54, 0.95);
+
+    // 2026-11-13：低太阳的**色相偏移**（真实日落变红）。
+    // 源数据是 sky_sun_common.glsl 的物理基色（Kasten 气团 × 逐通道光学厚度），
+    // 归一到最大通道 ⇒ 只取色相、不改亮度（亮度仍由 diskScale 决定）。
+    if(sunElevation >= 0.0)
+    {
+        vec3 sunRefractionTint =
+            skySunPhysicalBaseColor(max(sunElevation, 0.0));
+        sunRefractionTint /= max(
+            max(sunRefractionTint.r, sunRefractionTint.g),
+            max(sunRefractionTint.b, 1.0e-4));
+
+        diskColor *= sunRefractionTint;
+        glowColor *= sunRefractionTint;
+    }
     // 太阳视觉滑杆：以默认值 (1.20, 0.18, 0.53°) 归一，默认时与旧固定值完全一致。
     // 夜晚改为月亮基准亮度：太阳盘 20.0 会直接过曝成白球，月亮用接近真实
     // 反照率的 0.85（≈ 太阳表面的 4%），使月面细节能留在显示范围内。
     float diskScale = cam.skyParams0.x *
         (sunElevation >= 0.0 ? 20.0 / 1.20 : MOON_DISK_LUMINANCE / 1.20);
+    // 2026-11-13：低太阳**增强光晕**。"日落时太阳看起来更大"的真正来源是眩光
+    // 变大，而不是角直径变化（真实变化 < 3%）。地平线附近最多 ×3.2，
+    // 正午恒 1.0 ⇒ 默认观感不变。回退：SUN_LOW_GLOW_BOOST = 0.0。
+#ifndef SUN_LOW_GLOW_BOOST
+#define SUN_LOW_GLOW_BOOST 2.2
+#endif
+    float sunLowGlowBoost = (sunElevation >= 0.0)
+        ? (1.0 + SUN_LOW_GLOW_BOOST *
+            (1.0 - smoothstep(0.0, 0.35, sunElevation)))
+        : 1.0;
+
     float glowScale = cam.skyParams0.y *
-        (sunElevation >= 0.0 ? 0.4 / 0.18 : 0.2 / 0.18);
+        (sunElevation >= 0.0 ? 0.4 / 0.18 : 0.2 / 0.18) * sunLowGlowBoost;
 
     vec3 zenithColor = vec3(0.12, 0.28, 0.58);
     vec3 horizonColor = vec3(0.48, 0.62, 0.82);
@@ -973,12 +1068,31 @@ void main() {
     //   2.29° / 1.15° 的**半径**（直径约 4.6°）—— 主世界的滑杆刻度"0.53"
     //   不是度数，那边画出来的日盘比 1.9° 的地球还大。末地直接按真实角半径
     //   取 cos 阈值，才是"14 px 的小圆盘"。0.85 倍收成 ≈1.5 像素软边。
+    // 2026-11-13：主世界也按**真实角直径**取 cos 阈值 —— 滑杆标签就是
+    // "太阳角直径（度）"，范围 0.10~2.00。旧档 1-(1-0.9992)*sizeScale² 在
+    // 默认 0.53 时 acos = 2.29° 半径（直径 4.6°），比真实大 8.7 倍，
+    // 这正是"太阳看起来假/像贴纸"的主因。末地分支本来就是真实角半径。
+    float sunHalfAngle =
+        max(0.5 * radians(sunDiameterDegrees), 1.0e-4);
+
+    // 2026-11-13：月亮与太阳**解耦**。原版 MC 的月亮本来就远大于真实角直径，
+    // 而上一轮把两者都改成真实角直径后月亮只剩 ~14 px（用户："又小"）。
+    // 这里给月亮单独倍率：默认 3.0 ⇒ 太阳 0.53° 时约 42 px。
+#ifndef MOON_SIZE_MULTIPLIER
+#define MOON_SIZE_MULTIPLIER 3.0
+#endif
+    float moonHalfAngle =
+        max(sunHalfAngle * MOON_SIZE_MULTIPLIER, 1.0e-4);
+
+    float moonDiskInner =
+        cos(moonHalfAngle * 0.85);
+
     float diskOuter = isEnd
         ? cos(END_SUN_ANGULAR_RADIUS)
-        : 1.0 - (1.0 - 0.9992) * sizeScale * sizeScale;
+        : cos(sunHalfAngle);
     float diskInner = isEnd
         ? cos(END_SUN_ANGULAR_RADIUS * 0.85)
-        : 1.0 - (1.0 - 0.9998) * sizeScale * sizeScale;
+        : cos(sunHalfAngle * 0.85);
     // 非末地恒 1.0（乘 1.0 在 IEEE 下逐位精确），主世界/下界不受影响。
     float endIlluminanceScale = isEnd
         ? pow(clamp(cam.skyParams0.z, 0.0, 90.0) / END_SUN_DIAMETER_DEGREES, 2.0)
@@ -994,12 +1108,113 @@ void main() {
     // the procedural lunar surface (the moon is always full here, because the
     // sun and the moon are exactly opposite in this cycle model).
     // P1 雨天：日盘/月面随雨隐没（0.15 ≈ 原版"雨中看不见日月"）。
+    // =====================================================
+    // 2026-11-13 日盘形状：limb darkening + 地平线压扁
+    //
+    // 1) limb darkening：真实日面边缘亮度只有中心的 ~45%（视线穿过的光球层
+    //    路径更斜、温度更低）。只作用于**白天那一支**；月面不加（见上）。
+    // 2) 地平线压扁：大气折射让天体在低仰角看起来是椭圆，竖直方向最多压到
+    //    ~0.86。只在**盘面判定**上用压缩后的夹角，日冕瓣仍用原始 sunDot，
+    //    避免把 ±8° 的瓣也一起拉变形。
+    // 回退：SUN_DISK_LIMB_DARKENING = 1.0 且 SUN_DISK_HORIZON_SQUASH = 0.0
+    //       即逐位回到改动前。
+    // =====================================================
+#ifndef SUN_DISK_LIMB_DARKENING
+#define SUN_DISK_LIMB_DARKENING 1.0
+#endif
+#ifndef SUN_DISK_HORIZON_SQUASH
+#define SUN_DISK_HORIZON_SQUASH 0.14
+#endif
+
+    float sunDiskRadial =
+        clamp((sunDot - diskOuter) / max(diskInner - diskOuter, 1.0e-6), 0.0, 1.0);
+
+    // 中心 1.0 -> 边缘 0.45（smoothstep 让过渡集中在盘的外半圈）
+    // 2026-11-13：物理临边昏暗（Eddington 二次律，逐通道）
+    //     I(ρ)/I(0) = 1 - u1(1-μ) - u2(1-μ)²，  μ = sqrt(1-ρ²)
+    // 蓝光衰减更强 ⇒ 边缘自然偏红。系数取可见光的常见值。
+    // 旧档 smoothstep 在 ρ=0.5 时给 0.73，而真实是 0.94 —— 那是"球状渐变"，
+    // 正是"看着像个球"的来源。
+    float sunDiskRho = clamp(1.0 - sunDiskRadial, 0.0, 1.0);
+    float sunDiskMu = sqrt(max(1.0 - sunDiskRho * sunDiskRho, 0.0));
+    vec3 sunLimbU1 = vec3(0.35, 0.40, 0.50);
+    vec3 sunLimbU2 = vec3(0.48, 0.50, 0.53);
+    vec3 sunLimbProfile = vec3(1.0)
+        - sunLimbU1 * (1.0 - sunDiskMu)
+        - sunLimbU2 * (1.0 - sunDiskMu) * (1.0 - sunDiskMu);
+
+    vec3 sunLimbDarkening =
+        mix(vec3(1.0), sunLimbProfile, SUN_DISK_LIMB_DARKENING);
+
+    // =====================================================
+    // 2026-11-13 自查修正：limb **上下不对称**
+    //
+    // 参考实现（caustica_minecraft_overworld_sky.slang:57）：
+    //   "lower limb by several stops relative to its upper one"
+    // 机制是低仰角时视线穿过更厚的大气 ⇒ 日面的**下缘**先被消光压下去。
+    // 上面那个径向项是对称的，出不来这个味道。
+    // 做法：在径向项上再乘一个"盘内竖直位置"的权重，并按太阳高度淡入
+    // （高太阳时视路径对称，不对称应当消失）。
+    // 回退：SUN_DISK_LIMB_ASYMMETRY = 0.0。
+    // =====================================================
+#ifndef SUN_DISK_LIMB_ASYMMETRY
+#define SUN_DISK_LIMB_ASYMMETRY 1.0
+#endif
+
+    if(SUN_DISK_LIMB_ASYMMETRY > 0.0)
+    {
+        // 盘内角半径（≈ sqrt(1-diskOuter²)），把竖直偏移归一化到 -1..1。
+        float sunDiskAngularRadius =
+            sqrt(max(1.0 - diskOuter * diskOuter, 1.0e-8));
+
+        float sunDiskVertical = clamp(
+            dot(rayDir - sunDir, vec3(0.0, 1.0, 0.0)) /
+                max(sunDiskAngularRadius, 1.0e-5),
+            -1.0, 1.0);
+
+        // -1（下缘）压到 0.45，+0.35 以上回到 1.0。
+        float sunLimbAsymmetry =
+            mix(0.45, 1.0, smoothstep(-1.0, 0.35, sunDiskVertical));
+
+        // 太阳高度 0.05..0.45 rad 之间淡出（高太阳不该有上下差）。
+        sunLimbAsymmetry = mix(
+            1.0,
+            sunLimbAsymmetry,
+            smoothstep(0.45, 0.05, sunElevation) * SUN_DISK_LIMB_ASYMMETRY);
+
+        sunLimbDarkening *= sunLimbAsymmetry;
+    }
+
+    float sunElevation01 =
+        clamp(sunElevation / 0.45, 0.0, 1.0);
+
+    float sunSquash =
+        1.0 - SUN_DISK_HORIZON_SQUASH *
+            (1.0 - smoothstep(0.0, 1.0, sunElevation01));
+
+    float sunDiskDot = sunDot;
+
+    if(SUN_DISK_HORIZON_SQUASH > 0.0 && sunSquash < 0.9999)
+    {
+        vec3 diskRel = rayDir - sunDir;
+        float diskRelUp = dot(diskRel, vec3(0.0, 1.0, 0.0));
+        vec3 diskRelSide = diskRel - vec3(0.0, 1.0, 0.0) * diskRelUp;
+
+        // 竖直偏移按 1/squash 放大 ⇒ 同样角偏移被判为"更靠外" ⇒ 盘变扁。
+        sunDiskDot = max(dot(
+            normalize(sunDir + diskRelSide +
+                vec3(0.0, 1.0, 0.0) * (diskRelUp / max(sunSquash, 0.2))),
+            sunDir), 0.0);
+    }
+
     vec3 sunDisk = isEnd
         // 2026-10-07 末地太阳/月亮盘退役：末地的天体只剩光源球（下面）。
         ? vec3(0.0)
         : sunElevation >= 0.0
-            ? (diskColor * endIlluminanceScale) * smoothstep(diskOuter, diskInner, sunDot) * diskScale
-            : (diskColor * endIlluminanceScale) * evaluateMoonSurface(rayDir, sunDir, diskInner) * diskScale;
+            ? (diskColor * endIlluminanceScale) *
+                smoothstep(diskOuter, diskInner, sunDiskDot) *
+                sunLimbDarkening * diskScale
+            : (diskColor * endIlluminanceScale) * evaluateMoonSurface(rayDir, sunDir, moonDiskInner) * diskScale;
     sunDisk *= rainCelestial;
     // 月食：可见盘整体消失（全食时 sunDot 的 softstep 值再乘 0 —— 抗锯齿边缘
     // 也一起收掉，不会留下"细线太阳"）。

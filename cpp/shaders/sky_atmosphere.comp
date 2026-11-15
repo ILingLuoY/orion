@@ -275,8 +275,76 @@ void main()
     //   w = 雨天/雷暴天空压暗倍率（下面 0.55 / 0.35 / 雷暴染色的整体强度）
     const float nightSkyScale = cam.skyModelParams.z > 0.0 ? cam.skyModelParams.z : 1.0;
     const float rainSkyScale = cam.skyModelParams.w > 0.0 ? cam.skyModelParams.w : 1.0;
-    float nightAmount = smoothstep(-0.03, -0.35, sunElevationB);
+    // =====================================================
+    // 2026-11-13 拂晓（日出前）的"天似亮非亮"
+    //
+    // 改动前：底光 smoothstep(-0.03,-0.35,sunElevation) 按高度角**线性**淡入、
+    // 各向同性、单一色。物理散射在 -6° 后已掉到 1% 量级，于是整个
+    // -2°..-18° 被一片均匀灰蓝主导 ⇒ 没有层次、没有色相演进、没有方位性。
+    //
+    // 现在按三个物理锚点重写：
+    //   ① 衰减用沉深(sunDepression)的**指数**：-3°→.32 / -6°→.10 /
+    //      -12°→.009 / -18°→.001，正好覆盖真实的 3~4 个数量级；
+    //   ② 色相按沉深分段：0~4° 暖橙 → 4~9° 玫瑰/紫 → 9~16° 深蓝 → 夜色；
+    //      **清晨侧偏紫（PREDAWN），黄昏侧偏红**（与 sky_model_common.glsl
+    //      的 TWILIGHT_* 同值，这里内联是为了本 TU 不依赖那个头）；
+    //   ③ 地平线/天顶分离 + 朝太阳方位加权 ⇒ 头顶先沉、地平线留一条带。
+    //
+    // 与直射光的配合：太阳沉到地平线以下时 skyModelSunColor 已经返回冷蓝、
+    // 直射能量归零（2026-11-13 修），所以这一时段"亮的是天、暗的是地"——
+    // 那正是"似亮非亮"的本质。
+    // 调法：SKY_TWILIGHT_STRENGTH 控整体亮度（0 = 关闭，逐位回到改动前）；
+    //       SKY_TWILIGHT_FALLOFF  控衰减速度（越小退得越快）。
+    // =====================================================
+#ifndef SKY_TWILIGHT_STRENGTH
+#define SKY_TWILIGHT_STRENGTH 0.55
+#endif
+#ifndef SKY_TWILIGHT_FALLOFF
+#define SKY_TWILIGHT_FALLOFF 0.045
+#endif
+
+    // 夜间底光：**晚一点**才接手。原来 -1.7° 就开始加，会把余晖带子提前冲平。
+    float nightAmount = smoothstep(0.05, 0.32, sunElevationB < 0.0 ? -sunElevationB : 0.0);
     radiance += vec3(0.30, 0.42, 0.85) * 0.05 * nightAmount * nightSkyScale;
+
+    if(SKY_TWILIGHT_STRENGTH > 0.0 && sunElevationB < 0.0)
+    {
+        float sunDepression = -sunElevationB;
+
+        float twilightFalloff =
+            exp(-sunDepression / max(SKY_TWILIGHT_FALLOFF, 1.0e-3));
+
+        // 上升侧(清晨) vs 下降侧(黄昏)：与 sky_model_common.glsl 的
+        // twilightEveningWeight() 同式（cos(2π·phase) < 0 表示已过正午）。
+        float eveningWeight = smoothstep(
+            0.20, -0.20, cos(fract(cam.historyParams.w) * 6.28318530718));
+
+        // 与 sky_model_common.glsl:129-131 同值：
+        //   DAWN (1.00,0.48,0.24) / DUSK (1.00,0.45,0.08) / PREDAWN (0.62,0.50,0.86)
+        vec3 hueLow = mix(vec3(1.00, 0.48, 0.24), vec3(1.00, 0.45, 0.08), eveningWeight);
+        vec3 hueMid = mix(vec3(0.62, 0.50, 0.86), vec3(0.95, 0.42, 0.30), eveningWeight);
+        vec3 hueHigh = vec3(0.30, 0.40, 0.86);
+
+        // 0~4° / 4~9° / 9° 以上（rad）
+        vec3 twilightHue = sunDepression < 0.070
+            ? mix(hueLow, hueMid, smoothstep(0.0, 0.070, sunDepression))
+            : (sunDepression < 0.157
+                ? mix(hueMid, hueHigh, smoothstep(0.070, 0.157, sunDepression))
+                : hueHigh);
+
+        // 地平线权重：仰角 12.6° 内衰减到 1/e。
+        float horizonWeight = exp(-abs(direction.y) / 0.22);
+
+        // 方位权重：只有朝太阳方位的那一侧拿到满亮度。
+        vec3 sunAzimuth = normalize(vec3(sunDirB.x, 1.0e-4, sunDirB.z));
+        vec3 dirAzimuth = normalize(vec3(direction.x, 1.0e-4, direction.z));
+        float azimuthGain = pow(
+            max(dot(dirAzimuth, sunAzimuth) * 0.5 + 0.5, 0.0), 3.0);
+
+        radiance += twilightHue * twilightFalloff *
+            (0.12 + 0.88 * horizonWeight * azimuthGain) *
+            SKY_TWILIGHT_STRENGTH * nightSkyScale;
+    }
     radiance += SKY_LUT_SKY_EXTRA_SCALE * (
         evaluateAurora(direction, sunElevationB));
     float rainSky = clamp(cam.weatherParams.x * rainSkyScale, 0.0, 1.0);
@@ -286,6 +354,61 @@ void main()
         mix(1.0, 0.35, rainSky) *
         mix(vec3(1.0), vec3(0.72, 0.78, 0.86), thunderSky);
     radiance += lightningFlashEnvelope() * vec3(1.6, 1.75, 2.0);
+    // =====================================================
+    // 2026-11-13 彩虹（主虹 + 霓）
+    //
+    // 以**反日点**（-sunDirB）为圆心按夹角取环：主虹 42°、霓 51°。
+    // 色散用每通道错开中心角模拟（主虹红在外、霓红在内）。
+    // 出现条件：
+    //   · 有雨（rainSky）——没有雨滴就没有折射；
+    //   · 太阳在地平线上且不太高（> 42° 时反日点落到地平线下，主虹不可见）；
+    //   · 只在地平线以上（direction.y > 0）。
+    // 强度用 SKY_RAINBOW_STRENGTH 调；它是**加性**项，随雨量线性淡入/淡出。
+    // 回退：设 0.0 即整段失效（编译期常量）。
+    // =====================================================
+#ifndef SKY_RAINBOW_STRENGTH
+// 2026-11-13 重标定：不再是"乘天空 luma"的倍率，而是**辐亮度本身**的系数
+// （旧的有效峰值 ≈ 0.60 × skyLuma ≈ 0.18，这里取 0.15 与之相当）。
+#define SKY_RAINBOW_STRENGTH 0.15
+#endif
+    if(SKY_RAINBOW_STRENGTH > 0.0 &&
+       rainSky > 1.0e-3 &&
+       direction.y > 0.0 &&
+       sunElevationB > 0.0)
+    {
+        float antiSunAngle =
+            acos(clamp(dot(direction, -sunDirB), -1.0, 1.0));
+
+        // 主虹：42° 附近（红 42.4 / 绿 41.4 / 蓝 40.5 度）
+        vec3 primaryCenter = vec3(0.740, 0.723, 0.707);
+        // 霓：51° 附近，色序相反（红 50.9 / 绿 51.7 / 蓝 52.5 度）
+        vec3 secondaryCenter = vec3(0.888, 0.902, 0.916);
+
+        vec3 primaryBand = exp(-pow(
+            (antiSunAngle - primaryCenter) / vec3(0.010), vec3(2.0)));
+        vec3 secondaryBand = exp(-pow(
+            (antiSunAngle - secondaryCenter) / vec3(0.014), vec3(2.0)));
+
+        // 主虹内侧偏亮、外侧偏暗（真实彩虹的 Alexander 暗带在两者之间）
+        float alexanderDip =
+            1.0 - 0.55 * exp(-pow((antiSunAngle - 0.815) / 0.022, 2.0));
+
+        // 太阳越低，反日点越高、可见的虹弧越长
+        float lowSunVisibility =
+            smoothstep(0.75, 0.05, sunElevationB);
+
+        vec3 bow =
+            (primaryBand + secondaryBand * 0.28) * alexanderDip *
+            lowSunVisibility * rainSky;
+
+        // 2026-11-13 修正（自查）：彩虹是**散射的太阳光**，亮度正比于太阳辐照，
+        // 与本像素当前的天空亮度无关。旧版乘 skyLuma ⇒ 黄昏偏暗、正午偏亮，
+        // 缩放方向是反的。这里改为固定辐亮度系数 + 低太阳增强（路径更长、
+        // 色散更明显），与像素亮度解耦。
+        // 夜里不会误亮：上面已经要求 sunElevationB > 0。
+        radiance += bow * SKY_RAINBOW_STRENGTH * lowSunVisibility;
+    }
+
     radiance = clamp(radiance * cam.skyParams1.z, 0.0, 8.0);
     float rCam = length(cameraKm);
     float muSun = dot(cameraKm, sunDirB) / rCam;

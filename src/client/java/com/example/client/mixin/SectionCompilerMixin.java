@@ -340,8 +340,14 @@ public class SectionCompilerMixin {
     }
 
 
+    @Inject(method = "compile", at = @At("HEAD"))
+    private void onCompileHead(SectionPos sectionPos, net.minecraft.client.renderer.chunk.RenderSectionRegion region, com.mojang.blaze3d.vertex.VertexSorting vertexSorting, net.minecraft.client.renderer.SectionBufferBuilderPack builders, CallbackInfoReturnable<SectionCompiler.Results> cir) {
+        com.example.client.latency.InteractionLatencyProbe.noteCompileStart(sectionPos);
+    }
+
     @Inject(method = "compile", at = @At("RETURN"))
     private void onCompileReturn(SectionPos sectionPos, net.minecraft.client.renderer.chunk.RenderSectionRegion region, com.mojang.blaze3d.vertex.VertexSorting vertexSorting, net.minecraft.client.renderer.SectionBufferBuilderPack builders, CallbackInfoReturnable<SectionCompiler.Results> cir) {
+        com.example.client.latency.InteractionLatencyProbe.noteCompileReturn(sectionPos);
         SectionCompiler.Results results = cir.getReturnValue();
         if (results == null) return;
 

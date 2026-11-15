@@ -202,7 +202,7 @@ PERF_L10_TIME_STALL("tlasQueueIdle", check(
 << "[RT INIT] TLAS BUILD COMPLETE\n";
 }
 VkDescriptorSetLayout createRTDescriptorSetLayout(){
-    VkDescriptorSetLayoutBinding b[90]{};
+    VkDescriptorSetLayoutBinding b[93]{};
 
     b[0].binding=0; b[0].descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; b[0].descriptorCount=1; b[0].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     b[1].binding=1; b[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; b[1].descriptorCount=1; b[1].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_COMPUTE_BIT;
@@ -756,6 +756,32 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[89].descriptorCount = 1;
     b[89].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
+    // 2026-11-11 太阳可见度屏幕空间滤波（软影 A 方案，形态 1）：
+    //   90 = sunVisRaw（全分辨率 rgba16f，raygen 写 / 滤波 comp 读）
+    //   91 = sunVisHistory[2]（半分辨率 rgba16f，ping-pong：滤波 comp 写
+    //        1-historyReadIndex，下一帧 raygen 读翻转后的同一 index）
+    // 两个都是 STORAGE_IMAGE；后置 comp（ss_hybrid / ss_hzb / 本滤波）共用
+    // g_rayTracingDescriptorSet，所以不需要新的 set layout / pool。
+    b[90].binding = 90;
+    b[90].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[90].descriptorCount = 1;
+    b[90].stageFlags =
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+
+    b[91].binding = 91;
+    b[91].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[91].descriptorCount = 2;
+    b[91].stageFlags =
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+
+    // 2026-11-14：稀疏反射的时域历史（rgen 读上一帧反射 / 活跃像素写回）。
+    // 非活跃像素不跑 GGX 射线但保留上一帧结果 ⇒ 不再出现"0 / 1-rate"二值方波，
+    // 修掉反射逐帧闪动。资源由 Sharc.cpp 的 createGlossyHistoryImage 绑定。
+    b[92].binding = 92;
+    b[92].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[92].descriptorCount = 1;
+    b[92].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
     // D1：材质 callable 也读这套描述符（landing 槽位回传）。stageFlags 不参与
     // 管线布局兼容性判定，全量放行不影响既有管线（spv 无 callable 阶段照常工作）。
     for(auto& entry : b)
@@ -765,7 +791,7 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
 
     VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     static_assert(
-        sizeof(b) / sizeof(b[0]) == 90u,
+        sizeof(b) / sizeof(b[0]) == 93u,
         "RT descriptor set layout: update this assert together with b[]"
     );
     ci.bindingCount = static_cast<uint32_t>(sizeof(b) / sizeof(b[0]));

@@ -297,8 +297,12 @@ uniform image2D giHalfImage;
 // 走 landing 槽位的 d 字段（见 rgen_k1_landing.glsl 的 *_GlossyExtra）。
 // 前提：SAMPLES_PER_FRAME == 1（同像素多样本会互相覆写，当前宿主恒 1）。
 // 仅 K2-D/K2-I 两个变体声明 ⇒ 其余变体 spv 逐字节不变。binding 89。
+// 2026-11-12 ④ K2-D 再拆分：K2-D → K2-SUN（水+太阳直射/GGX/SSS/RTAO，写本图）
+// + K2-LOC（局部光/水面反射太阳/GGX 镜面，**load-add-store 复用本图**），
+// K2-I 照旧整图载入 ⇒ 不需要新 binding/新图像。
 // ============================================================================
-#if defined(ORION_K2_DIRECT_STAGE) || defined(ORION_K2_INDIRECT_STAGE)
+#if defined(ORION_K2_DIRECT_STAGE) || defined(ORION_K2_INDIRECT_STAGE) \
+    || defined(ORION_K2_DIRECT_SUN_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)
 layout(binding = 89, set = 0, rgba32f)
 uniform image2D k2DirectImage;
 #endif
@@ -367,6 +371,14 @@ uniform image2D glassAlphaBlendVolumeImage;
 // =====================================================
 layout(binding = 78, set = 0, r8ui)
 uniform readonly uimage2D sparseActiveMaskImage;
+
+// =====================================================
+// 2026-11-14 稀疏反射的时域历史（宿主 binding 92，rgba16f，渲染分辨率）。
+// 活跃像素写本帧反射结果，非活跃像素读上一帧结果 ⇒ 不出现 0/1-rate 方波。
+// 每个 invocation 只读写自己那一个 texel，无需 ping-pong。
+// =====================================================
+layout(binding = 92, set = 0, rgba16f)
+uniform image2D glossyHistoryImage;
 
 // =====================================================
 // 2026-11-01 档 2：近场太阳阴影图（宿主 binding 79）。
@@ -482,6 +494,18 @@ vec3 rrGlassPaneTransmissionFilter = vec3(1.0);
 // 2026-09-30 实测（用户侧）：置 0 后玻璃里的均匀颗粒**没有任何变化** ⇒ 它不是
 // 水汽里那层"空间离散白点"的来源，或至少不是用户场景里的那一份。基线回 1，
 // 避免白付镜面本地光兜底的代价；嫌疑改判见 DBG_KILL_VLI_EMITTER 处的记载。
+//
+// 2026-11-12 复测改判：用户报"阳光直射下玻璃反射出现块尺度三角亮斑"。bake 里存了
+// 太阳 NEE，而 evaluateOpaqueSurfaceRadiance 又算一遍太阳 NEE ⇒ 双计；bake 按块面
+// 量化 ⇒ 亮斑按块/三角分布、且只在有太阳时显形（夜里 bake 太阳项≈0 ⇒ 干净）。
+// 09-30 那次 A/B 的变量是"水汽均匀颗粒"，与本次"阳光三角亮斑"不同，不能外推。
+// 故默认置 0 与 rmiss 每像素角尺寸修复同轮验收；若亮斑仍在再回 1。
+//
+// 2026-11-13（用户拍板）：回 1。置 0 的两天里用户报"所有半透明体反射都没了"
+// ——legacy 两项（发射体辉光 + bake 直射）住在全半透明共用的
+// traceGlassSceneReflectionOneRay 里，是反射观感的主体；剩下的纯 Fresnel
+// 镜像（正入射 ~4%、VPT_GLASS_MAX_FRESNEL=0.35 钳制）观感上等于没有。
+// 已知代价：阳光直射下 bake 太阳双计的块尺度三角亮斑随 legacy 一起回来。
 #ifndef GI_GLASS_REFLECTION_LEGACY
 #define GI_GLASS_REFLECTION_LEGACY 1
 #endif
@@ -804,7 +828,26 @@ uint perfL10Stage()
     // 探针，见 tracePrimaryGlossyReflectionRadiance）。主机侧 Perf.cpp 的
     // alt:/pin: 解析已改用 PERF_L10_ABLATION_STAGE_COUNT 取模，这个 clamp
     // 是最后一处要手改的地方。
-    return clamp(cam.perfAblationStage.x, 0u, 35u);
+    // 2026-11-07：上限 35 -> 38（36/37/38 = SER 探针 flags / RR 0.9 上限 / SER 键精简）。
+    // 必须同步 OrionInternal.h 的 PERF_L10_ABLATION_STAGE_COUNT 与名字表。
+    return clamp(cam.perfAblationStage.x, 0u, 38u);
+}
+
+// 2026-11-07：三档 SER/RR 的 A/B 臂。base（stage 0）下三个谓词恒 false，
+// 与改动前逐位相同；置档后只改该臂自己那一个变量。
+bool perfL10SerProbeSecondaryFlags()
+{
+    return perfL10Stage() == 36u;
+}
+
+bool perfL10RrCapNeg90()
+{
+    return perfL10Stage() == 37u;
+}
+
+bool perfL10SerKeyMinimal()
+{
+    return perfL10Stage() == 38u;
 }
 
 bool perfL10DisableRtao()
@@ -1025,6 +1068,13 @@ bool giRouletteEnabledForVariant()
 // 可见性 / 水面 GGX / 焦散），每处省 3 次遍历 ⇒ 水像素最多省 9 次。2 步会在
 // RT+DLSS 下让透射太阳亮带随波面逐帧跳动，3 是积分误差与步数的折中。
 // 回退 = WATER_SUN_MARCH_STEPS 改回 6（远场 1 步与诊断 stage12 不变）。
+//
+// 2026-11-15：透射随水深重构后，远档 1 步**不再改变透射数值**——
+// rgen_water_sun.glsl 的 sun march 现在 (a) 水下段按整段真实距离
+// Beer-Lambert 吸收（不再钳 2.0），(b) "最后一步完成 Water->Air 出射即
+// 返回累积透射"而不是判 0。单水柱场景近档/远档逐位一致；本设置只决定
+// 多界面水柱 / 玻璃堆场景的积分精度，不再钳制透射观感（用户诉求：透射
+// 统一随水深，浅清深浊）。
 #ifndef WATER_SUN_MARCH_STEPS
 #define WATER_SUN_MARCH_STEPS 3
 #endif
@@ -5052,7 +5102,17 @@ vec2 evaluateRainPuddleRippleGradient(vec2 worldXZ)
     // All rain-impact dimensions are 40% smaller than the current dense
     // field.  The matching frequency preserves the same ring count in the
     // reduced footprint.
-    const float CELL_SIZE = 0.432;
+    // 2026-11-11：UI 旋钮（与水面同口径）。godRayParams2.w = size + strength*8。
+    const float packedRipple = cam.godRayParams2.w;
+    float rippleSize = 1.0;
+    float rippleStrength = 1.0;
+    if(packedRipple > 0.0)
+    {
+        rippleStrength = clamp(floor(packedRipple / 8.0 + 1.0e-4), 0.0, 3.0);
+        const float rawSize = packedRipple - rippleStrength * 8.0;
+        rippleSize = clamp(rawSize <= 0.0 ? 1.0 : rawSize, 0.25, 4.0);
+    }
+    const float CELL_SIZE = 0.432 * rippleSize;
     const float RING_SPEED = 0.336;
     const float RING_FREQUENCY = 66.66667;
     float time = uintBitsToFloat(cam.padding);
@@ -5088,7 +5148,7 @@ vec2 evaluateRainPuddleRippleGradient(vec2 worldXZ)
     // footprint.  This remains a nine-cell analytic evaluation with no extra
     // ray, texture, allocation, or dispatch cost.
     // 2026-10-03（用户要求）：雨滴涟漪可见度 ×2（RAIN_VISIBILITY_GAIN）。
-    return gradient * (0.060 * rain) * RAIN_VISIBILITY_GAIN;
+    return gradient * (0.060 * rain * rippleStrength) * RAIN_VISIBILITY_GAIN;
 }
 
 // -------------------------------------------------------------------------
@@ -5295,9 +5355,23 @@ vec3 getTimeDrivenSkyLightColorRaw()
         float twilight = smoothstep(-0.22, -0.005, elevation);
         vec3 twilightTint = mix(TWILIGHT_DAWN_TINT, TWILIGHT_DUSK_TINT,
             twilightEveningWeight());
-        return mix(vec3(0.46, 0.56, 1.00), twilightTint, twilight * 0.72);
+
+        // 2026-11-13（用户定案）：夜间直射光**完全不含暮色**。
+        // 日落之后的暖色全部由天空 LUT 的散射承担；直射光只剩月光。
+        // 这样与云/体积光（volumetric_clouds_v3/v5、volumetric_light，那里
+        // dayAmount 直接抹掉暮色项）逐位同口径，不再出现"地形暖、云冷"。
+        // 同时给一个"月亮越高越银白、越低越深蓝"的色阶：低仰角时视线穿过更厚
+        // 的大气（消光偏蓝移）+ 人眼在暗处的浦肯野效应。
+        // 与 sky_model_common.glsl 的 skyModelMoonColor 同一份（单一真源）。
+        vec3 moonColor = skyModelMoonColor(elevation);
+
+        return moonColor;
 #else
-        return vec3(0.46, 0.56, 1.00);
+        float moonHeightFlat = clamp(-elevation, 0.0, 1.0);
+        return mix(
+            vec3(0.44, 0.56, 1.00),
+            vec3(0.74, 0.82, 1.00),
+            smoothstep(0.0, 0.55, moonHeightFlat));
 #endif
     }
 
@@ -5352,6 +5426,25 @@ vec3 getTimeDrivenSkyLightColor()
     color += AURORA_LIGHT_COLOR *
         (AURORA_AMBIENT_STRENGTH * clamp(cam.auroraParams.x, 0.0, 1.0) *
          clamp(cam.auroraParams.y, 0.0, 3.0) * auroraNight);
+
+    // =====================================================
+    // 2026-11-13 月相调光（氛围）
+    //
+    // 月亮被照亮的比例 = (1 + cos(2π·相位)) / 2 ⇒ 满月 1、弦月 0.5、新月 0。
+    // 乘在**天空光颜色**上等价于按比例压暗月光直射：新月夜不再是"满月亮度
+    // 但没有月亮"。留一个下限 MOON_PHASE_LIGHT_FLOOR，避免新月夜彻底漆黑
+    // （真实夜里还有星光与气辉，观感上也需要一个底）。
+    // 回退：-DMOON_PHASE_LIGHT_FLOOR=1.0 即关闭。
+    // =====================================================
+#ifndef MOON_PHASE_LIGHT_FLOOR
+#define MOON_PHASE_LIGHT_FLOOR 0.35
+#endif
+
+    if(getTimeDrivenSunElevation() < 0.0)
+    {
+        color *= skyModelMoonPhaseDim(cam.sssParams.z, MOON_PHASE_LIGHT_FLOOR);
+    }
+
     return color;
 }
 
@@ -5723,10 +5816,10 @@ bool vptReprojectPreviousPixel(
         return false;
     }
 
-    mat4 previousWorldToView = inverse(cam.prevViewInverse);
-    mat4 previousViewToClip = inverse(cam.prevProjInverse);
-    vec4 previousClip = previousViewToClip *
-        previousWorldToView * vec4(worldPosition, 1.0);
+    // 2026-11-09：上一帧 world→clip 直接用宿主算好的 cam.prevViewProj
+    // （= inverse(prevProjInverse) * inverse(prevViewInverse)），
+    // 不再每像素两次 inverse(mat4)。
+    vec4 previousClip = cam.prevViewProj * vec4(worldPosition, 1.0);
     if(previousClip.w <= 1.0e-5)
     {
         return false;
@@ -6495,12 +6588,8 @@ vec3 evaluateVPTCandidateDirectTemporal(
 #endif
     float historyCap = VPT_TRANSPARENT_HISTORY_FRAMES;
 #if VPT_TRANSPARENT_MOTION_CAP
-    mat4 slipPreviousWorldToClip =
-        inverse(cam.prevProjInverse) *
-        inverse(cam.prevViewInverse);
-    mat4 slipCurrentWorldToClip =
-        inverse(cam.projInverse) *
-        inverse(cam.viewInverse);
+    mat4 slipPreviousWorldToClip = cam.prevViewProj;
+    mat4 slipCurrentWorldToClip = cam.viewProj;
     vec4 slipPreviousClip =
         slipPreviousWorldToClip * vec4(matchPosition, 1.0);
     vec4 slipCurrentClip =

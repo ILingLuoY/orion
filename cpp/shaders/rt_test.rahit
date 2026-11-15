@@ -44,6 +44,27 @@ const uint RT_STATE_PURPOSE_MASK       = 0x7u;
 const uint RT_PURPOSE_CLASSIFY          = 1u;
 const uint RT_PURPOSE_PASSTHROUGH      = 4u;
 const uint RT_PURPOSE_GLASS_VISIBILITY = 5u;
+
+#ifndef GLASS_VISIBILITY_COVERAGE_CAUSTIC
+// 2026-11-13④：可见性链（太阳软影/AO/雨/本地光共用这条 any-hit）的覆盖率
+// 焦散——与太阳 march（rgen_water_sun.glsl GLASS_CAUSTIC_LEVEL）同一物理
+// 口径：平板玻璃无会聚（波前 Jacobian≡1），观感 = 贴图 alpha 对光源的逐纹
+// 素裁剪。清玻璃心部 a=0 直通、边框/条纹 a≈1 走薄片滤光。染色/致密体的
+// alpha 是整片透射率而非二值覆盖率，不混入。
+// ⚠ 自创设计（无参考实现），复用 2026-11-02 相机重写档"贴图 alpha 只当
+// 覆盖率"的同一语义（Caustica GLASS_COVERAGE 条款）。
+// 2026-11-13⑦：宏定义提到 TU 顶部——any-hit 前段的"廉价早退"块在
+// GLASS_VISIBILITY 分支之前就要用它（下方后一个 #ifndef 会因已定义而跳过）。
+// 回退：-DGLASS_VISIBILITY_COVERAGE_CAUSTIC=0。
+// 2026-11-13（用户拍板）：玻璃光学焦散**整体回退**，默认置 0 ⇒ 可见性链
+// （太阳软影/AO/雨/本地光）逐位回到焦散前档：清玻璃走通用薄片滤光
+// （含 10-24 起的"整片压暗"旧观感），④⑤⑦⑧ 全部编译掉。
+#define GLASS_VISIBILITY_COVERAGE_CAUSTIC 0
+#endif
+#ifndef GLASS_CAUSTIC_LIFT
+// 2026-11-13⑧：与 rgen_water_sun.glsl 的同名宏同值同义（阴影底 + 图案亮化）。
+#define GLASS_CAUSTIC_LIFT 0.5
+#endif
 const uint RT_PURPOSE_PRIMARY_SKY       = 7u;
 // 2026-10-25 阶段 D：主射线透射段（单条射线 + any-hit 逐面累乘）。
 const uint RT_PURPOSE_PRIMARY_TRANSMISSION = 8u;
@@ -135,6 +156,14 @@ layout(buffer_reference, scalar) buffer Vertices {
 // 解包后仍返回老的 48B Vertex ⇒ 下游 materialId/pad1/pad2 使用点零改动。
 // 编译期开关必须与 C++ 的 SECTION_VERTEX_32B_ENABLED 一致。
 // =====================================================
+
+// 2026-11-12：实例变换（实例化第一步）。必须定义在 #if SECTION_VERTEX_32B 之前：
+// 32B 与 48B 两条顶点路径都要用它。恒等实例下与旧行为数学等价。
+vec3 rtObjectToWorld(vec3 localPosition)
+{
+    return gl_ObjectToWorldEXT * vec4(localPosition, 1.0);
+}
+
 #if SECTION_VERTEX_32B
 struct SectionVertex32
 {
@@ -156,9 +185,10 @@ Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
         const SectionVertex32 packed = SectionVertices32(addr).v[index];
 
         Vertex unpacked;
-        unpacked.x = packed.x;
-        unpacked.y = packed.y;
-        unpacked.z = packed.z;
+        const vec3 world = rtObjectToWorld(vec3(packed.x, packed.y, packed.z));
+        unpacked.x = world.x;
+        unpacked.y = world.y;
+        unpacked.z = world.z;
         unpacked.u = packed.u;
         unpacked.v = packed.v;
         unpacked.r = float(packed.color & 0xFFu) / 255.0;
@@ -174,12 +204,22 @@ Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
         return unpacked;
     }
 
-    return Vertices(addr).v[index];
+    Vertex raw = Vertices(addr).v[index];
+    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
+    raw.x = world.x;
+    raw.y = world.y;
+    raw.z = world.z;
+    return raw;
 }
 #else
 Vertex loadSectionVertex(uint64_t addr, uint /*stride*/, uint index)
 {
-    return Vertices(addr).v[index];
+    Vertex raw = Vertices(addr).v[index];
+    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
+    raw.x = world.x;
+    raw.y = world.y;
+    raw.z = world.z;
+    return raw;
 }
 #endif
 
@@ -659,6 +699,34 @@ void main() {
         getRayPurpose(payload.state) == RT_PURPOSE_PASSTHROUGH;
 
 
+    // =====================================================
+    // 2026-11-13⑦：可见性链清玻璃的**廉价早退**（图集 texelFetch 之前）。
+    // 焦散开关关（cam.glassCausticParams.x <= 0.5）时，GLASS_VISIBILITY 分支
+    // 会对清玻璃执行"当空气"忽略；但图集采样在用途分派之前 ⇒ 每片被忽略的
+    // 清玻璃面都要白付一次 texelFetch。判据与下方同名块完全同源
+    // （materialId < 2.05 && glassVertexFactorIsFaceShade ⇒ 没注入染料），
+    // 这里提前退出，行为逐位等价：同样跳过 tint 累乘、跳过面预算，
+    // payload.glassAlpha = 1.0 照抄 GLASS_VISIBILITY 块的雨洼语义。
+    // 焦散开时不触发——覆盖率合成需要 atlasSample.a。
+    // =====================================================
+#if GLASS_VISIBILITY_COVERAGE_CAUSTIC
+    if(getRayPurpose(payload.state) == RT_PURPOSE_GLASS_VISIBILITY &&
+        cam.glassCausticParams.x <= 0.5 &&
+        materialId >= 2.0 && materialId < 2.05)
+    {
+        const vec3 visVertexColorRgb =
+            vec3(v0.r, v0.g, v0.b) * barycentrics.x +
+            vec3(v1.r, v1.g, v1.b) * barycentrics.y +
+            vec3(v2.r, v2.g, v2.b) * barycentrics.z;
+        if(glassVertexFactorIsFaceShade(visVertexColorRgb))
+        {
+            payload.glassAlpha = 1.0;
+            ignoreIntersectionEXT;
+            return;
+        }
+    }
+#endif
+
     // 提取顶点颜色 / Alpha 与图集颜色 / Alpha。
     // The alpha test defines the visible cutout silhouette.  It must
     // use the same unfiltered base-atlas texel as closest-hit, otherwise
@@ -1074,7 +1142,15 @@ if(
         payload.glassAlpha = 1.0;
 
 #ifndef GI_CLEAR_GLASS_VISIBILITY_AS_AIR
-#define GI_CLEAR_GLASS_VISIBILITY_AS_AIR 1
+// 2026-11-13④（用户要求"本地光只做覆盖率合成，看着像焦散就行"）：默认置 0
+// —— 可见性链里清玻璃不再直接当空气忽略，改走下方 isLightExitFace 的覆盖
+// 率焦散合成 mix(1, 薄片, a)：心部 a=0 直通（10-24"当空气"修复的痛点——
+// 整体压暗 8%~50% 且随面朝向走——由覆盖率口径解决），边框/条纹 a≈1 走薄片
+// 滤光 ⇒ 火把/灯笼/太阳软影透过清玻璃出现 sprite 透光图案。与太阳 march
+// （rgen_water_sun.glsl GLASS_CAUSTIC_LEVEL）同一物理口径。染色玻璃（含白/
+// 灰染料，色值不等于四档 shade）不受影响。
+// 回退：-DGI_CLEAR_GLASS_VISIBILITY_AS_AIR=1 恢复清玻璃当空气。
+#define GI_CLEAR_GLASS_VISIBILITY_AS_AIR 0
 #endif
 #if GI_CLEAR_GLASS_VISIBILITY_AS_AIR
         // =====================================================
@@ -1230,14 +1306,54 @@ if(
                     1.0
                 );
 
-            payload.albedoPacked = packAlbedoUnorm(unpackAlbedoUnorm(payload.albedoPacked) * (
+            vec3 visSheetTransmission =
                 glassSheetTransmissionScalarF(
                     glassTint,
                     glassCosTheta
                 ) *
                 getTransparentProfileTransmissionAnyHit(
                     getTransparentProfileFromRawMaterialId(materialId)
-                )));
+                );
+
+#ifndef GLASS_VISIBILITY_COVERAGE_CAUSTIC
+// 2026-11-13④：可见性链（太阳软影/AO/雨/本地光共用这条 any-hit）的覆盖率
+// 焦散——与太阳 march（rgen_water_sun.glsl GLASS_CAUSTIC_LEVEL）同一物理
+// 口径：平板玻璃无会聚（波前 Jacobian≡1），观感 = 贴图 alpha 对光源的逐纹
+// 素裁剪。清玻璃心部 a=0 直通、边框/条纹 a≈1 走薄片滤光。染色/致密体的
+// alpha 是整片透射率而非二值覆盖率，不混入。
+// ⚠ 自创设计（无参考实现），复用 2026-11-02 相机重写档"贴图 alpha 只当
+// 覆盖率"的同一语义（Caustica GLASS_COVERAGE 条款）。
+// 回退：-DGLASS_VISIBILITY_COVERAGE_CAUSTIC=0。
+#define GLASS_VISIBILITY_COVERAGE_CAUSTIC 1
+#endif
+#if GLASS_VISIBILITY_COVERAGE_CAUSTIC
+            if(materialId < 2.05 &&
+                glassVertexFactorIsFaceShade(vertexColor.rgb))
+            {
+                // 2026-11-13⑤：运行时 UI 开关（cam.glassCausticParams.x）。
+                // 开 = 覆盖率焦散；关 = 逐位恢复 2026-10-24 的"当空气"档
+                // （本体不贡献滤光，直接忽略该面——与旧 AS_AIR 早退同语义）。
+                if(cam.glassCausticParams.x > 0.5)
+                {
+                    // 2026-11-13⑧：与太阳 march 同步——阴影底 + 图案亮化
+                    // （纯覆盖率的心部直通会让本地光透过玻璃毫无图案感）。
+                    const float visSheetAlpha =
+                        clamp(atlasSample.a * vertexColor.a, 0.0, 1.0);
+                    visSheetTransmission =
+                        visSheetTransmission +
+                        (vec3(1.0) - visSheetTransmission) *
+                            ((1.0 - visSheetAlpha) * GLASS_CAUSTIC_LIFT);
+                }
+                else
+                {
+                    ignoreIntersectionEXT;
+                    return;
+                }
+            }
+#endif
+
+            payload.albedoPacked = packAlbedoUnorm(unpackAlbedoUnorm(payload.albedoPacked) * (
+                visSheetTransmission));
         }
 
 

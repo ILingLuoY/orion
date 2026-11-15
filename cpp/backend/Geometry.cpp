@@ -159,8 +159,12 @@ void probeSerSupport()
             : (g_serFeatureSupported
                 ? (g_serHardwareReordering
                     ? "SER3Eligible"
-                    : "SERNoReorderHintPlainRaygen")
+                    : "SERHitObjectOnlyNoReorderHint")
                 : "fallbackTraceRay"))
+        // 2026-11-07：variant 是"实际会不会加载 *_ser.rgen.spv"，与硬件重排提示
+        // 解耦（规范只把重排当提示；见 Settings.cpp serRequireReorderHint）。
+        << " variant=" << (serShaderVariantWanted() ? 1 : 0)
+        << " requireReorder=" << (serRequireReorderHint() ? 1 : 0)
         << " extNv=" << (g_serNvAdvertised ? 1 : 0)
         << " hintNv=" << (g_serNvHintReorder ? 1 : 0);
     RTLog(log.str());
@@ -503,43 +507,136 @@ uint64_t chunkPayloadDigest64(
 //
 // 语义：碰撞概率 2^-64；万一碰撞，该层几何晚一帧更新（下一帧内容变化即自愈，
 // 静态实体本来也不变）。这里换的是"判等成本"，不是判等结论的精度来源。
-uint64_t hashVertexPayload(
-    const std::vector<Vertex>& payload
-)
+namespace
 {
-    uint64_t hash =
-        0x9E3779B97F4A7C15ull ^
-        static_cast<uint64_t>(payload.size());
+// 4 路 FNV 的区间版本：只读 [begin, end)。begin 必须 32B 对齐（分块由下方保证）。
+uint64_t hashVertexBytesRange(
+    const uint8_t* bytes,
+    size_t begin,
+    size_t end)
+{
+    uint64_t h0 = 0x9E3779B97F4A7C15ull;
+    uint64_t h1 = 0xC2B2AE3D27D4EB4Full;
+    uint64_t h2 = 0x165667B19E3779F9ull;
+    uint64_t h3 = 0x27D4EB2F165667C5ull;
 
-    const uint8_t* const bytes =
-        reinterpret_cast<const uint8_t*>(payload.data());
+    size_t offset = begin;
 
-    const size_t totalBytes =
-        payload.size() * sizeof(Vertex);
+    while(offset + 32u <= end)
+    {
+        uint64_t w0 = 0u;
+        uint64_t w1 = 0u;
+        uint64_t w2 = 0u;
+        uint64_t w3 = 0u;
 
-    size_t offset = 0u;
+        std::memcpy(&w0, bytes + offset + 0u, sizeof(w0));
+        std::memcpy(&w1, bytes + offset + 8u, sizeof(w1));
+        std::memcpy(&w2, bytes + offset + 16u, sizeof(w2));
+        std::memcpy(&w3, bytes + offset + 24u, sizeof(w3));
 
-    while(offset + 8u <= totalBytes)
+        h0 = (h0 ^ w0) * 0x100000001B3ull;
+        h1 = (h1 ^ w1) * 0x100000001B3ull;
+        h2 = (h2 ^ w2) * 0x100000001B3ull;
+        h3 = (h3 ^ w3) * 0x100000001B3ull;
+
+        offset += 32u;
+    }
+
+    while(offset + 8u <= end)
     {
         uint64_t word = 0u;
         std::memcpy(&word, bytes + offset, sizeof(word));
 
-        hash ^= word;
-        hash *= 0x100000001B3ull;
-        hash ^= hash >> 29u;
+        h0 = (h0 ^ word) * 0x100000001B3ull;
 
         offset += 8u;
     }
 
     uint64_t tail = 0u;
 
-    for(size_t i = 0u; offset + i < totalBytes; ++i)
+    for(size_t i = 0u; offset + i < end; ++i)
     {
         tail |= static_cast<uint64_t>(bytes[offset + i]) << (8u * i);
     }
 
-    hash ^= tail;
-    hash *= 0x100000001B3ull;
+    uint64_t hash = h0;
+    hash *= 0x100000001B3ull; hash ^= h1;
+    hash *= 0x100000001B3ull; hash ^= h2;
+    hash *= 0x100000001B3ull; hash ^= h3;
+    hash *= 0x100000001B3ull; hash ^= tail;
+
+    return hash;
+}
+} // namespace
+
+uint64_t hashVertexPayload(
+    const std::vector<Vertex>& payload
+)
+{
+    const uint8_t* const bytes =
+        reinterpret_cast<const uint8_t*>(payload.data());
+
+    const size_t totalBytes =
+        payload.size() * sizeof(Vertex);
+
+    // 2026-11-12：分块并行。
+    // 实测该函数在物品密集区稳定 30.4ms/帧（~107MB ⇒ 3.5GB/s），4 路 FNV 已消除
+    // 乘法依赖链，剩下的是单核读吞吐，因此按 32B 对齐切 4 块、3 个 worker + 本线程。
+    // 分块规则固定 ⇒ 哈希确定；输出值与旧的串行版本不同，但只用于自比较。
+    constexpr size_t kParts = 4u;
+
+    if(totalBytes < (4u << 20))
+    {
+        uint64_t hash = 0x9E3779B97F4A7C15ull ^
+            static_cast<uint64_t>(payload.size());
+
+        hash ^= hashVertexBytesRange(bytes, 0u, totalBytes);
+        hash *= 0x100000001B3ull;
+        hash ^= hash >> 32u;
+
+        return hash;
+    }
+
+    const size_t chunkBytes =
+        ((totalBytes / kParts) + 31u) & ~static_cast<size_t>(31u);
+
+    uint64_t part[kParts] = {};
+    std::thread workers[kParts - 1u];
+
+    for(size_t partIndex = 0u; partIndex + 1u < kParts; ++partIndex)
+    {
+        const size_t partBegin = partIndex * chunkBytes;
+        const size_t partEnd =
+            std::min(partBegin + chunkBytes, totalBytes);
+
+        workers[partIndex] = std::thread(
+            [&part, bytes, partIndex, partBegin, partEnd]()
+            {
+                part[partIndex] =
+                    hashVertexBytesRange(bytes, partBegin, partEnd);
+            });
+    }
+
+    part[kParts - 1u] = hashVertexBytesRange(
+        bytes,
+        std::min((kParts - 1u) * chunkBytes, totalBytes),
+        totalBytes);
+
+    for(std::thread& worker : workers)
+    {
+        worker.join();
+    }
+
+    uint64_t hash = 0x9E3779B97F4A7C15ull ^
+        static_cast<uint64_t>(payload.size());
+
+    for(size_t partIndex = 0u; partIndex < kParts; ++partIndex)
+    {
+        hash ^= part[partIndex];
+        hash *= 0x100000001B3ull;
+        hash ^= hash >> 29u;
+    }
+
     hash ^= hash >> 32u;
 
     return hash;
@@ -815,17 +912,35 @@ bool captureTimeGateEnabled()
 
     return enabled;
 }
-namespace
-{
 // 2026-11-07f：捕获路径的"冷分配"计数（诊断用）。
 // 只在 destination 容量不足、必须扩容时累加。
 uint64_t g_captureGrowCount = 0ull;
 uint64_t g_captureGrowBytes = 0ull;
-}
+
+// 2026-11-07g：按桶拆分——一次扩容到底发生在哪个桶，决定是池没命中
+// 还是只命中了一个偏小的 buffer。
+//   0 opaque / 1 alpha / 2 water / 3 ommCutout /
+//   4 entity / 5 localPlayer / 6 particle / 7 other
+constexpr size_t CAPTURE_GROW_BUCKET_COUNT = 8u;
+uint64_t g_captureGrowBucketCount[CAPTURE_GROW_BUCKET_COUNT] = {};
+uint64_t g_captureGrowBucketBytes[CAPTURE_GROW_BUCKET_COUNT] = {};
+
+// 2026-11-07h：扩容前 destination 是不是空的。这是"池没命中/拿到空壳"
+// 与"命中了但槽偏小"的唯一判据，决定下一步是改取槽策略还是改池布局。
+uint64_t g_captureGrowFromEmpty = 0ull;
+uint64_t g_captureGrowFromSmall = 0ull;
+
+// 2026-11-13: water layer (layerId == 3) vertices whose vertex material
+// marker was not 1 and had to be forced to 1.  See the layer 3 branch of
+// geometryCaptureSectionLocked for the full explanation.  After this fix the
+// counter must stay 0 on a healthy build -- a non-zero value means the
+// upstream vertex writer never emitted marker 1 for that face at all.
+uint64_t g_waterLayerMarkerFixVertices = 0ull;
 
 void geometryAppendSectionVertices(
     std::vector<Vertex>& destination,
-    const std::vector<Vertex>& source
+    const std::vector<Vertex>& source,
+    int bucket
 )
 {
     if(source.empty())
@@ -843,8 +958,28 @@ void geometryAppendSectionVertices(
 
         // 2026-11-07f：这次填充必须新分配。
         ++g_captureGrowCount;
-        g_captureGrowBytes +=
-            (targetCapacity - destination.capacity()) * sizeof(Vertex);
+        const uint64_t grownBytes =
+            static_cast<uint64_t>(
+                (targetCapacity - destination.capacity()) * sizeof(Vertex));
+        g_captureGrowBytes += grownBytes;
+
+        // 2026-11-07g：分桶归因。
+        const size_t bucketSlot =
+            (bucket >= 0 &&
+             static_cast<size_t>(bucket) < CAPTURE_GROW_BUCKET_COUNT)
+                ? static_cast<size_t>(bucket)
+                : CAPTURE_GROW_BUCKET_COUNT - 1u;
+        ++g_captureGrowBucketCount[bucketSlot];
+        g_captureGrowBucketBytes[bucketSlot] += grownBytes;
+
+        if(destination.capacity() == 0u)
+        {
+            ++g_captureGrowFromEmpty;
+        }
+        else
+        {
+            ++g_captureGrowFromSmall;
+        }
 
         destination.reserve(targetCapacity);
     }
@@ -1004,11 +1139,11 @@ void geometryCaptureSectionLocked(
 
         if(layerEntry.first == LOCAL_PLAYER_RT_LAYER_KEY)
         {
-            geometryAppendSectionVertices(split.localPlayer, layerEntry.second);
+            geometryAppendSectionVertices(split.localPlayer, layerEntry.second, 5);
         }
-        else if(layerEntry.first == ENTITY_RT_LAYER_KEY)
+        else if(isEntityRtLayerKey(layerEntry.first))
         {
-            geometryAppendSectionVertices(split.entity, layerEntry.second);
+            geometryAppendSectionVertices(split.entity, layerEntry.second, 4);
             if((mvLayerMask & 1u) != 0u)
             {
                 geometryAppendSectionMotion(
@@ -1020,7 +1155,7 @@ void geometryCaptureSectionLocked(
         }
         else if(layerEntry.first == PARTICLE_RT_LAYER_KEY)
         {
-            geometryAppendSectionVertices(split.particle, layerEntry.second);
+            geometryAppendSectionVertices(split.particle, layerEntry.second, 6);
             if((mvLayerMask & 2u) != 0u)
             {
                 geometryAppendSectionMotion(
@@ -1032,7 +1167,7 @@ void geometryCaptureSectionLocked(
         }
         else if(layerId == 0u)
         {
-            geometryAppendSectionVertices(split.opaque, layerEntry.second);
+            geometryAppendSectionVertices(split.opaque, layerEntry.second, 0);
         }
         else if(layerId == 1u)
         {
@@ -1045,18 +1180,69 @@ void geometryCaptureSectionLocked(
                 ommIt->second.triangleCount == layerEntry.second.size() / 3u;
             if(validOmm)
             {
-                geometryAppendSectionVertices(split.ommCutout, layerEntry.second);
+                geometryAppendSectionVertices(split.ommCutout, layerEntry.second, 3);
                 split.ommInput = ommIt->second;
                 split.hasOmmInput = true;
             }
             else
             {
-                geometryAppendSectionVertices(split.alpha, layerEntry.second);
+                geometryAppendSectionVertices(split.alpha, layerEntry.second, 1);
             }
         }
         else if(layerId == 3u)
         {
-            geometryAppendSectionVertices(split.water, layerEntry.second);
+            // =====================================================
+            // 2026-11-13: water layer identity overrides the vertex marker.
+            //
+            // Symptom (user report): a suspended water column / waterfall
+            // has a textured, sun-reactive but fully OPAQUE blue side face,
+            // while the horizontal bottom/top face of the same water body is
+            // correctly transparent.  The only difference between the two in
+            // this code base is the vertex material marker: horizontal faces
+            // carry marker 1 -> RT_HIT_WATER, vertical faces carry something
+            // else -> materialId 0 -> RT_HIT_OPAQUE -> shaded as opaque
+            // terrain with the water sprite colour.
+            //
+            // Why forcing it here is unambiguous: layer 3 is the dedicated
+            // water layer.  Routing already sends the WHOLE layer into
+            // split.water (SECTION_AS_CLASS_WATER -> WATER hit group), so by
+            // construction every triangle of this layer is a water interface.
+            // Faces whose marker already is 1 are bit-identical.
+            //
+            // A/B: revert to the single geometryAppendSectionVertices call.
+            // =====================================================
+            const size_t waterBegin =
+                split.water.size();
+            geometryAppendSectionVertices(split.water, layerEntry.second, 2);
+            const size_t waterEnd =
+                split.water.size();
+
+            uint64_t markerFixed = 0ull;
+            for(size_t index = waterBegin; index < waterEnd; ++index)
+            {
+                if(split.water[index].materialId != 1.0f)
+                {
+                    split.water[index].materialId = 1.0f;
+                    ++markerFixed;
+                }
+            }
+
+            if(markerFixed > 0ull)
+            {
+                g_waterLayerMarkerFixVertices += markerFixed;
+
+                // Report at most once per 4096 vertices so the log stays
+                // readable while still proving the marker really was missing.
+                static uint64_t reportedVertices = 0ull;
+                if(g_waterLayerMarkerFixVertices - reportedVertices >= 4096ull)
+                {
+                    reportedVertices = g_waterLayerMarkerFixVertices;
+                    RTLog(
+                        "[RT WATER LAYER] forced materialId=1 total=" +
+                        std::to_string(g_waterLayerMarkerFixVertices) +
+                        " vertices (water layer marker was not 1)");
+                }
+            }
         }
         else
         {
@@ -1092,6 +1278,258 @@ void geometryCaptureSectionLocked(
 }
 
 // ---------------------------------------------------------------------------
+// 2026-11-07i：捕获结果的帧级 arena（见 OrionInternal.h 的 CaptureArenaSegment）。
+//
+// 目的：把 split 的持有窗口从"整个 rebuildWorldGeometry"缩短到"一次捕获"。
+// 数据在捕获点 memcpy 进 arena 后 split 立刻还池，池的稳态大小就不再被
+// 峰值并发钉死（此前实测池只有 13~24 个槽、命中率 80%）。
+//
+// 分块分配（块 4MB、段不跨块）：块地址稳定，所以 build/staging 期间持有的
+// span 不会因为扩容而悬垂。超过一块的段单独分配 bigChunk。
+// ---------------------------------------------------------------------------
+uint64_t g_captureArenaSegments = 0u;
+uint64_t g_captureArenaBytes = 0u;
+uint64_t g_captureArenaResets = 0u;
+uint64_t g_captureArenaSkipResets = 0u;
+uint64_t g_captureArenaChunks = 0u;
+uint64_t g_captureArenaEpoch = 1u;
+uint64_t g_captureArenaStaleSegments = 0u;
+
+namespace
+{
+// 2026-11-07k：4MB -> 8MB。一段"顶点 + 运动矢量 + 32B packed"在最大段
+// （约 5 万顶点）下会超过 4MB，于是每次都走 bigChunk（new/delete 反复 churn，
+// 实测 arenaChunks 累计 374 次）。8MB 覆盖绝大多数段，bigChunk 只留极端兜底。
+constexpr size_t CAPTURE_ARENA_CHUNK_BYTES = 8u << 20;
+
+struct CaptureArena
+{
+    std::vector<std::unique_ptr<uint8_t[]>> chunks;
+    std::vector<std::unique_ptr<uint8_t[]>> bigChunks;
+    size_t writeChunk = 0u;
+    size_t writeOffset = 0u;
+
+    void reset()
+    {
+        writeChunk = 0u;
+        writeOffset = 0u;
+        bigChunks.clear();
+    }
+
+    void* allocate(size_t bytes)
+    {
+        if(bytes == 0u)
+        {
+            return nullptr;
+        }
+
+        constexpr size_t ARENA_ALIGNMENT = 64u;
+        const size_t aligned = (bytes + ARENA_ALIGNMENT - 1u) &
+            ~(ARENA_ALIGNMENT - 1u);
+
+        if(aligned > CAPTURE_ARENA_CHUNK_BYTES)
+        {
+            std::unique_ptr<uint8_t[]> big(new uint8_t[aligned]);
+            void* const pointer = big.get();
+            bigChunks.push_back(std::move(big));
+
+            // 诊断口径 = 当前常驻块数（不是累计分配次数）。
+            g_captureArenaChunks = chunks.size() + bigChunks.size();
+            return pointer;
+        }
+
+        if(writeChunk >= chunks.size())
+        {
+            chunks.emplace_back(new uint8_t[CAPTURE_ARENA_CHUNK_BYTES]);
+        }
+
+        if(writeOffset + aligned > CAPTURE_ARENA_CHUNK_BYTES)
+        {
+            // 段不跨块，换下一块。
+            ++writeChunk;
+            writeOffset = 0u;
+
+            if(writeChunk >= chunks.size())
+            {
+                chunks.emplace_back(new uint8_t[CAPTURE_ARENA_CHUNK_BYTES]);
+            }
+        }
+
+        uint8_t* const pointer = chunks[writeChunk].get() + writeOffset;
+        writeOffset += aligned;
+        g_captureArenaChunks = chunks.size() + bigChunks.size();
+        return pointer;
+    }
+};
+
+std::mutex g_captureArenaMutex;
+CaptureArena g_captureArena;
+uint32_t g_captureArenaWriters = 0u;
+}
+
+namespace
+{
+// 2026-11-07k：一次分配、切片拷贝。原先每个容器各自 allocate 一次，
+// 一段最多 14 次分配（锁内推进 14 次、读时 14 个互不相邻的区域）。
+// 合并成一次后：分配次数 14 -> 1，且整段数据连续，build/staging 的
+// 缓存局部性也更好。
+constexpr size_t CAPTURE_ARENA_PIECE_ALIGNMENT = 64u;
+
+inline size_t captureArenaAlignedBytes(size_t bytes)
+{
+    return (bytes + CAPTURE_ARENA_PIECE_ALIGNMENT - 1u) &
+        ~(CAPTURE_ARENA_PIECE_ALIGNMENT - 1u);
+}
+
+template<typename T>
+size_t captureArenaPlanPiece(
+    const std::vector<T>& source,
+    size_t& totalBytes)
+{
+    const size_t offset = totalBytes;
+    totalBytes += captureArenaAlignedBytes(source.size() * sizeof(T));
+    return offset;
+}
+
+template<typename T>
+void captureArenaCopyPiece(
+    const std::vector<T>& source,
+    uint8_t* base,
+    size_t offset,
+    std::span<const T>& out)
+{
+    if(source.empty())
+    {
+        out = std::span<const T>{};
+        return;
+    }
+
+    T* const destination = reinterpret_cast<T*>(base + offset);
+    std::memcpy(destination, source.data(), source.size() * sizeof(T));
+    out = std::span<const T>(destination, source.size());
+}
+}
+
+CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
+{
+    std::lock_guard<std::mutex> lock(g_captureArenaMutex);
+
+    CaptureArenaSegment segment;
+    segment.arenaEpoch = g_captureArenaEpoch;
+    segment.ommInput = split.ommInput;
+    segment.hasOmmInput = split.hasOmmInput;
+
+    size_t totalBytes = 0u;
+
+    const size_t opaqueOffset =
+        captureArenaPlanPiece(split.opaque, totalBytes);
+    const size_t ommOffset =
+        captureArenaPlanPiece(split.ommCutout, totalBytes);
+    const size_t alphaOffset =
+        captureArenaPlanPiece(split.alpha, totalBytes);
+    const size_t waterOffset =
+        captureArenaPlanPiece(split.water, totalBytes);
+    const size_t entityOffset =
+        captureArenaPlanPiece(split.entity, totalBytes);
+    const size_t localPlayerOffset =
+        captureArenaPlanPiece(split.localPlayer, totalBytes);
+    const size_t particleOffset =
+        captureArenaPlanPiece(split.particle, totalBytes);
+
+    const size_t entityMotionOffset =
+        captureArenaPlanPiece(split.entityMotion, totalBytes);
+    const size_t localPlayerMotionOffset =
+        captureArenaPlanPiece(split.localPlayerMotion, totalBytes);
+    const size_t particleMotionOffset =
+        captureArenaPlanPiece(split.particleMotion, totalBytes);
+
+    const size_t opaquePackedOffset =
+        captureArenaPlanPiece(split.opaquePacked, totalBytes);
+    const size_t ommPackedOffset =
+        captureArenaPlanPiece(split.ommCutoutPacked, totalBytes);
+    const size_t alphaPackedOffset =
+        captureArenaPlanPiece(split.alphaPacked, totalBytes);
+    const size_t waterPackedOffset =
+        captureArenaPlanPiece(split.waterPacked, totalBytes);
+
+    if(totalBytes == 0u)
+    {
+        ++g_captureArenaSegments;
+        return segment;
+    }
+
+    uint8_t* const base =
+        static_cast<uint8_t*>(g_captureArena.allocate(totalBytes));
+
+    captureArenaCopyPiece(split.opaque, base, opaqueOffset, segment.opaque);
+    captureArenaCopyPiece(split.ommCutout, base, ommOffset, segment.ommCutout);
+    captureArenaCopyPiece(split.alpha, base, alphaOffset, segment.alpha);
+    captureArenaCopyPiece(split.water, base, waterOffset, segment.water);
+    captureArenaCopyPiece(split.entity, base, entityOffset, segment.entity);
+    captureArenaCopyPiece(
+        split.localPlayer, base, localPlayerOffset, segment.localPlayer);
+    captureArenaCopyPiece(
+        split.particle, base, particleOffset, segment.particle);
+
+    captureArenaCopyPiece(
+        split.entityMotion, base, entityMotionOffset, segment.entityMotion);
+    captureArenaCopyPiece(
+        split.localPlayerMotion,
+        base,
+        localPlayerMotionOffset,
+        segment.localPlayerMotion);
+    captureArenaCopyPiece(
+        split.particleMotion, base, particleMotionOffset, segment.particleMotion);
+
+    captureArenaCopyPiece(
+        split.opaquePacked, base, opaquePackedOffset, segment.opaquePacked);
+    captureArenaCopyPiece(
+        split.ommCutoutPacked, base, ommPackedOffset, segment.ommCutoutPacked);
+    captureArenaCopyPiece(
+        split.alphaPacked, base, alphaPackedOffset, segment.alphaPacked);
+    captureArenaCopyPiece(
+        split.waterPacked, base, waterPackedOffset, segment.waterPacked);
+
+    g_captureArenaBytes += totalBytes;
+
+    ++g_captureArenaSegments;
+
+    return segment;
+}
+
+void captureArenaBeginWrite()
+{
+    std::lock_guard<std::mutex> lock(g_captureArenaMutex);
+    ++g_captureArenaWriters;
+}
+
+void captureArenaEndWrite()
+{
+    std::lock_guard<std::mutex> lock(g_captureArenaMutex);
+
+    if(g_captureArenaWriters != 0u)
+    {
+        --g_captureArenaWriters;
+    }
+}
+
+bool captureArenaTryReset(size_t inFlightSegments)
+{
+    std::lock_guard<std::mutex> lock(g_captureArenaMutex);
+
+    if(g_captureArenaWriters != 0u || inFlightSegments != 0u)
+    {
+        ++g_captureArenaSkipResets;
+        return false;
+    }
+
+    g_captureArena.reset();
+    ++g_captureArenaResets;
+    ++g_captureArenaEpoch;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // 2026-11-06r：split 缓冲池（见 OrionInternal.h 的说明）。
 // 池本身用一把独立的小锁：生产者在捕获线程、消费者在渲染线程，
 // 都不持有 g_chunkMutex 之外的东西，不会与区块锁形成嵌套。
@@ -1100,20 +1538,87 @@ namespace
 {
 std::mutex g_sectionSplitPoolMutex;
 std::vector<SectionGeometrySplit> g_sectionSplitPool;
-constexpr size_t SECTION_SPLIT_POOL_LIMIT = 24u;
+// 2026-11-07h：24 -> 32 -> 96。真实并发 = 捕获线程一次唤醒连捕的段数
+// （队列上限 GEOMETRY_CAPTURE_MAX_QUEUED=256，每段独占一个槽直到渲染线程消费）
+// + 渲染线程每帧捕获的段数。实测 spMiss 586 / 600 帧、池被打到 0，
+// 说明槽位远少于在途段数。单槽上限约 200KB~1MB ⇒ 96 槽 ≈ 20~96MB 常驻，
+// 换来的是稳态不再每次捕获都走系统分配器。
+constexpr size_t SECTION_SPLIT_POOL_LIMIT = 96u;
+
+// 按总容量打分，用于 max-fit 取槽。
+size_t sectionSplitPoolScore(const SectionGeometrySplit& split)
+{
+    return split.opaque.capacity() +
+        split.ommCutout.capacity() +
+        split.alpha.capacity() +
+        split.water.capacity() +
+        split.entity.capacity() +
+        split.localPlayer.capacity() +
+        split.particle.capacity();
+}
 }
 
-SectionGeometrySplit takeSectionSplitFromPool()
+// 2026-11-07g：split 池本身的命中统计（此前完全不可见，
+// 日志里的 poolHit/poolMiss 是 SectionMemory 显存池，不是这个池）。
+// 定义在文件作用域（非匿名 namespace），供 counters 行读取。
+uint64_t g_sectionSplitPoolTakeHits = 0u;
+uint64_t g_sectionSplitPoolTakeMisses = 0u;
+uint64_t g_sectionSplitPoolReturns = 0u;
+uint64_t g_sectionSplitPoolReturnRejects = 0u;
+uint64_t g_sectionSplitPoolReturnDrops = 0u;
+uint64_t g_sectionSplitPoolSize = 0u;
+uint64_t g_sectionSplitPoolStarveSkips = 0u;
+
+bool tryTakeSectionSplitFromPool(SectionGeometrySplit& out)
 {
     std::lock_guard<std::mutex> lock(g_sectionSplitPoolMutex);
 
     if(g_sectionSplitPool.empty())
     {
+        ++g_sectionSplitPoolTakeMisses;
+        g_sectionSplitPoolSize = 0u;
+        return false;
+    }
+
+    // 2026-11-07g：max-fit 取槽。原先取 LIFO 末尾那个 = 随机 slot，
+    // 而 section 顶点数分布很宽（几十 ~ 上万），随机 slot 的容量只有约
+    // 2/3 概率够 ⇒ 实测命中率 93% 但每次捕获仍 resize 1.13 次
+    // （growBk 合计 1184 / captured 1045）。取容量最大的槽后，大段总命中；
+    // 小段用大 buffer 不浪费——这些槽位本来就要常驻复用。
+    size_t bestIndex = 0u;
+    size_t bestScore = sectionSplitPoolScore(g_sectionSplitPool[0]);
+    for(size_t poolIndex = 1u; poolIndex < g_sectionSplitPool.size(); ++poolIndex)
+    {
+        const size_t score = sectionSplitPoolScore(g_sectionSplitPool[poolIndex]);
+        if(score > bestScore)
+        {
+            bestScore = score;
+            bestIndex = poolIndex;
+        }
+    }
+
+    ++g_sectionSplitPoolTakeHits;
+    out = std::move(g_sectionSplitPool[bestIndex]);
+    // 注意不要自移动赋值：MSVC 的 vector move assignment 会先释放目标再窃取源，
+    // 同一对象上执行会让容量凭空消失。
+    if(bestIndex + 1u != g_sectionSplitPool.size())
+    {
+        g_sectionSplitPool[bestIndex] = std::move(g_sectionSplitPool.back());
+    }
+    g_sectionSplitPool.pop_back();
+    g_sectionSplitPoolSize = g_sectionSplitPool.size();
+    return true;
+}
+
+SectionGeometrySplit takeSectionSplitFromPool()
+{
+    SectionGeometrySplit split;
+
+    if(!tryTakeSectionSplitFromPool(split))
+    {
         return SectionGeometrySplit{};
     }
 
-    SectionGeometrySplit split = std::move(g_sectionSplitPool.back());
-    g_sectionSplitPool.pop_back();
     return split;
 }
 void returnSectionSplitToPool(SectionGeometrySplit&& split)
@@ -1130,13 +1635,7 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
 
     if(!hasCapacity)
     {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(g_sectionSplitPoolMutex);
-
-    if(g_sectionSplitPool.size() >= SECTION_SPLIT_POOL_LIMIT)
-    {
+        ++g_sectionSplitPoolReturnRejects;
         return;
     }
 
@@ -1157,7 +1656,39 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
     split.hasOmmInput = false;
     split.ommInput = OmmCutoutInput{};
 
+    std::lock_guard<std::mutex> lock(g_sectionSplitPoolMutex);
+
+    if(g_sectionSplitPool.size() >= SECTION_SPLIT_POOL_LIMIT)
+    {
+        // 2026-11-07h：池满时"以大换小"。原先直接丢弃——刚训练好的大槽被扔掉，
+        // 下一个大段又要冷分配（growSmall 的主要来源之一）。
+        size_t weakestIndex = 0u;
+        size_t weakestScore = sectionSplitPoolScore(g_sectionSplitPool[0]);
+        for(size_t poolIndex = 1u; poolIndex < g_sectionSplitPool.size(); ++poolIndex)
+        {
+            const size_t score = sectionSplitPoolScore(g_sectionSplitPool[poolIndex]);
+            if(score < weakestScore)
+            {
+                weakestScore = score;
+                weakestIndex = poolIndex;
+            }
+        }
+
+        if(sectionSplitPoolScore(split) <= weakestScore)
+        {
+            ++g_sectionSplitPoolReturnDrops;
+            return;
+        }
+
+        ++g_sectionSplitPoolReturns;
+        g_sectionSplitPool[weakestIndex] = std::move(split);
+        g_sectionSplitPoolSize = g_sectionSplitPool.size();
+        return;
+    }
+
+    ++g_sectionSplitPoolReturns;
     g_sectionSplitPool.push_back(std::move(split));
+    g_sectionSplitPoolSize = g_sectionSplitPool.size();
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,12 +1771,23 @@ void geometryCaptureWorkerLoop()
     // 2026-10-31：pendingPack 提到循环外复用。捕获频率已经按"有活立刻续跑"
     // 提高（一秒几百轮），每轮重新分配一个 vector 就成了噪音；容量保留，
     // 每轮末尾 clear()。
-    std::vector<CapturedSectionUpdate> pendingPack;
+    //
+    // 2026-11-07i：元素改为 PendingCapture——split 只在"填 → 打包 → commit"
+    // 这段时间里活着，之后立刻还池；队列里传的是 arena 视图。
+    struct PendingCapture
+    {
+        uint64_t spatialKey = 0u;
+        SectionGeometrySplit split;
+        CaptureArenaSegment segment;
+    };
+    std::vector<PendingCapture> pendingPack;
 
     for(;;)
     {
         bool capturedAnything = false;
         bool moreWorkAvailable = false;
+        // 2026-11-07h：本轮唤醒因 split 池空而中止（不再冷分配）。
+        bool poolStarved = false;
         bool nearestOrderUsed = false;
         size_t dirtyKeysAtScan = 0u;
         uint64_t orderScanMicros = 0u;
@@ -1456,10 +1998,38 @@ void geometryCaptureWorkerLoop()
 
                     const uint64_t spatialKey =
                         candidates[candidateIndex].key;
-                    CapturedSectionUpdate update;
+
+                    // 2026-11-07h：池空时不冷分配，直接结束本轮唤醒，把 dirty key
+                    // 留给 4ms 后的下一次唤醒（下次唤醒时渲染线程多半已归还）。
+                    // 一次冷分配 ≈ 200KB 新页，是 capHoldMs 的主要成分。
+                    SectionGeometrySplit pooledSplit;
+
+                    // 兜底：连续 32 次唤醒都取不到槽（在途 split 长期占满池，
+                    // 例如刚进世界时捕获线程一次唤醒连捕上百段），允许一次
+                    // 冷分配，避免世界加载被无限期饿住。
+                    static uint32_t sPoolStarveWakes = 0u;
+
+                    if(!tryTakeSectionSplitFromPool(pooledSplit))
+                    {
+                        ++g_sectionSplitPoolStarveSkips;
+
+                        if(++sPoolStarveWakes < 32u)
+                        {
+                            poolStarved = true;
+                            break;
+                        }
+
+                        sPoolStarveWakes = 0u;
+                    }
+                    else
+                    {
+                        sPoolStarveWakes = 0u;
+                    }
+
+                    PendingCapture update;
                     update.spatialKey = spatialKey;
                     // 2026-11-06r：从池里取热 buffer，避免每段新建 vector 的缺页。
-                    update.split = takeSectionSplitFromPool();
+                    update.split = std::move(pooledSplit);
                     const auto sectionCaptureStart =
                         std::chrono::steady_clock::now();
                     ULONG64 sectionCaptureCyclesStart = 0ull;
@@ -1502,6 +2072,7 @@ void geometryCaptureWorkerLoop()
 
                 moreWorkAvailable =
                     taken > 0u &&
+                    !poolStarved &&
                     !g_dirtySectionKeys.empty() &&
                     ((g_capturedSections.size() - g_capturedSectionsHead) <
                         GEOMETRY_CAPTURE_MAX_QUEUED);
@@ -1524,20 +2095,35 @@ void geometryCaptureWorkerLoop()
 
         if(!pendingPack.empty())
         {
-            for(CapturedSectionUpdate& update : pendingPack)
+            for(PendingCapture& update : pendingPack)
             {
                 packSectionSplitBucketsLocked(update.spatialKey, update.split);
+            }
+
+            // 2026-11-07i：搬进 arena 后立刻还池。split 的持有窗口到此为止，
+            // 不再横跨到渲染线程消费完（那是池稳态只有 13~24 个槽的根因）。
+            captureArenaBeginWrite();
+
+            for(PendingCapture& update : pendingPack)
+            {
+                update.segment = captureArenaCommit(update.split);
+                returnSectionSplitToPool(std::move(update.split));
             }
 
             {
                 std::lock_guard<std::mutex> capturedLock(
                     g_capturedSectionsMutex);
 
-                for(CapturedSectionUpdate& update : pendingPack)
+                for(PendingCapture& update : pendingPack)
                 {
-                    g_capturedSections.push_back(std::move(update));
+                    CapturedSectionUpdate entry;
+                    entry.spatialKey = update.spatialKey;
+                    entry.segment = update.segment;
+                    g_capturedSections.push_back(std::move(entry));
                 }
             }
+
+            captureArenaEndWrite();
 
             pendingPack.clear();
             capturedAnything = true;

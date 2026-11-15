@@ -144,6 +144,109 @@ int giNearRateLevel()
 // K1/K2 拆分实测下它是噪点源（开=静止不收敛+运动扭曲，关=干净，A/B 定案），
 // 且用户当前不需要任何时域复用。1 = 开（rgen 走 EMA 历史路径）。
 // 关 = rgen 走逐位旧路径：交错补偿 + 跳过帧 indirectLight=0。
+// 2026-11-10：GI 可见性门控 —— **默认关闭**。
+//
+// 原始动机：太阳全遮蔽且附近无局部光的区域，一次反弹的期望为 0，射线是纯浪费。
+// 但实现出来的判据是错的："太阳照不到"不等于"没有间接光"——背光面、屋檐下、
+// 树荫里仍然有**天空光**的间接照明，而那正是 GI 要算的东西；局部光检查也覆盖
+// 不到天空光。用户实测表现为块状、边界生硬的变暗。
+//
+// 且收益上限很小：noGi 消融测得 GI 总共只占 trace 段的 1.1ms。
+// 正确判据应当是"半球天空可见度"，需要额外射线或专用通道，另立项。
+//
+// 保留实现仅供实验：ORION_GI_VISIBILITY_GATE=1 才启用。
+// 2026-11-10 A/B：次级射线最小材质（跳过 _n，保留 albedo/_s ⇒ 金属色与粗糙度不变）
+bool matSecondaryMinimalEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_MAT_SECONDARY_MINIMAL");
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// 2026-11-10 A/B：远场材质 LOD 起始距离（0 = 关闭；shader 内 32→+16 格淡出）
+float matFarLodDistance()
+{
+    static const float cached = []()
+    {
+        const char* raw = std::getenv("ORION_MAT_FAR_LOD");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            // 2026-11-12：默认改为**关闭**（0）。原默认 32 格会带来三个确定可见的
+            // 副作用：①反射变钝（_s 被跳过后粗糙度/金属码退化为常量）
+            // ②32→48 格出现可辨认的分层 ③_s.a 是 LabPBR 自发光掩码，跳过后
+            // 远处光源方块不再发光。而它的收益从未单独实测（估算 0.5~1 ms），
+            // 交换不划算。需要时：ORION_MAT_FAR_LOD=96（单位是**格**，96=6 区块）。
+            return 0.0f;
+        }
+        const float v = static_cast<float>(std::atof(raw));
+        return v < 0.0f ? 0.0f : v;
+    }();
+
+    return cached;
+}
+
+// 2026-11-15 远场贴图降档起点（单位**格**；0 = 关）。
+// shader 侧 material_resolve.glsl：起点起每 32 格抬 1 级 mip，封顶 +3，
+// albedo/normal/specular 通道全部保留采样（不复现旧 ORION_MAT_FAR_LOD 硬跳档
+// 的反射变钝/分层/远处灯不亮副作用）。默认 128 格 = 8 区块（用户指定）。
+float matTexFarLodDistance()
+{
+    static const float cached = []()
+    {
+        const char* raw = std::getenv("ORION_MAT_TEX_FAR_LOD");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 128.0f;
+        }
+        const float v = static_cast<float>(std::atof(raw));
+        return v < 0.0f ? 0.0f : v;
+    }();
+
+    return cached;
+}
+
+bool giVisibilityGateEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_GI_VISIBILITY_GATE");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// 2026-11-10：glossy 反射链的俄罗斯轮盘（无偏，只换方差）。
+// 依据：trace 段 16.12ms 中反射链占 6.5ms（noGlossy 消融），而该路径此前
+// 确定性跑满、没有 RR。回退：ORION_GLOSSY_RR=0。
+bool glossyRrEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_GLOSSY_RR");
+        return raw != nullptr && raw[0] != '\0' && raw[0] == '1';
+    }();
+
+    return cached;
+}
+
+// 2026-11-10：glossy 镜面弹射层数按粗糙度/首次命中距离收敛。
+// 回退：ORION_GLOSSY_STEP_LOD=0。
+bool glossyStepLodEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_GLOSSY_STEP_LOD");
+        return raw != nullptr && raw[0] != '\0' && raw[0] == '1';
+    }();
+
+    return cached;
+}
+
 bool giTemporalEnabled()
 {
     static const bool cached = []()
@@ -187,6 +290,21 @@ bool giNoPomEnabled()
     {
         const char* raw = std::getenv("ORION_GI_NO_POM");
         return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// 2026-11-09：次级射线（反射 / 水体 / 玻璃后）跳过 POM。
+// 出厂**开**（env 未设即 true）：POM 是厘米级位移，只对主射线的近处掠射有意义；
+// 反射里再跑一遍意味着每条 glossy 路径最多 18 步 x 288 次 texelFetch。
+// 回退：ORION_POM_SECONDARY=0 ⇒ 次级命中恢复视差（逐位回到改动前）。
+bool pomSecondarySkipEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_POM_SECONDARY");
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
     }();
 
     return cached;
@@ -303,6 +421,38 @@ bool k1k2SplitEnabled()
     return cached;
 }
 
+// 2026-11-07 SER 门控口径（对齐规范与官方示例）：
+//   `VK_EXT_ray_tracing_invocation_reorder` 的
+//   rayTracingInvocationReorderReorderingHint **只是提示**——报 MODE_NONE 时
+//   reorderThread* 退化为 no-op，但 hit object 本身照常可用
+//   （Khronos Vulkan-Samples `ray_tracing_invocation_reorder` 的 README
+//   "向后兼容行为" 一节：无硬件支持时 reorderThreadEXT 为 no-op，hit object
+//   仍正常工作）。原先的加载条件额外要求 MODE_REORDER，等于在没报重排提示的
+//   设备上把 hitObject 查询类用法（AO/阴影跳过 shader dispatch）一起关掉。
+//   默认改成只看特性；需要旧口径时 ORION_SER_REQUIRE_REORDER=1。
+bool serRequireReorderHint()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_SER_REQUIRE_REORDER");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// 是否加载 *_ser.rgen.spv。本机 hardwareReorder=1 ⇒ 改口径前后结果相同，
+// 差异只出现在报 MODE_NONE 的设备上（那里现在会用 hitObject 但重排是 no-op）。
+bool serShaderVariantWanted()
+{
+    if(!g_serEnabled.load() || !g_serFeatureSupported)
+    {
+        return false;
+    }
+
+    return !serRequireReorderHint() || g_serHardwareReordering;
+}
+
 // ③ K2 传输段再拆分：K1→K2D(直射级)→K2I(间接级) 三发。
 // 2026-11-06 落盘为默认开（叠加 SER 恢复后 trace 稳态 5.62ms，GPU 帧 8.41ms）；
 // ORION_K2_SPLIT=0 仅作紧急回退口，正常启动无需任何 env。
@@ -311,6 +461,21 @@ bool k2DirectIndirectSplitEnabled()
     static const bool cached = []()
     {
         const char* raw = std::getenv("ORION_K2_SPLIT");
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// ④ K2-D 再拆分：K2-D → K2-SUN（水+太阳直射/GGX/SSS/RTAO）+ K2-LOC（局部光/
+// 水面反射太阳/GGX 镜面）+ K2-I 四发。动机：k2d 是最坏编译单元（2026-11-12
+// 实测 26.3min 冷编，k2i 仅 91.8s），驱动并行粒度=per-stage，劈不开单 stage
+// ⇒ 只能切单元。默认开；ORION_K2_SPLIT2=0 回退 ③ 的 K2-D/K2-I 两腿。
+bool k2ThreeSplitEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_K2_SPLIT2");
         return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
     }();
 
@@ -339,14 +504,25 @@ float sparseSamplingRateEffective()
         return 0.0f;
     }
 
-    // 2026-11-02：A/B 专用直通开关。Remix 的 calculateSamplingRate 会按
+    // 2026-11-02：直通开关（跳过分辨率折算）。Remix 的 calculateSamplingRate 会按
     // (参考像素数 / 实际 RT 输出像素数)^0.69 折算，小窗口/低内部分辨率下这个
     // 系数能到十几倍 —— ORION_SPARSE_RATE=50 会被折成 >0.75 然后被下面的
     // "rate > kMaxSamplingRate ⇒ 归 0" 直接关掉（实测 285x160 时 effective=0）。
-    // 做 A/B 时需要两臂拿到同一个确定的有效率，所以给一条跳过折算的路。
+    //
+    // 2026-11-08：**默认改为直通**（原先需 ORION_SPARSE_RATE_RAW=1 才生效）。
+    // 理由：本工程恒以远低于 2227x1238 的内部分辨率渲染再上采样（实测 707x376，
+    // 折算系数 5.02），任何 >14% 的请求都会被放大过 0.75 然后归 0 ——
+    // 结果是设置页「稀疏渲染采样率」这一项在任何档位下都等于关闭
+    // （日志 4163 条 [SPARSE-DIAG] 全是 effective=0.000000）。
+    // 直通后 UI 的百分比就是真实采样率；恢复 Remix 折算口径设
+    // ORION_SPARSE_RATE_RAW=0。
     static const bool rawRate = []() {
         const char* raw = std::getenv("ORION_SPARSE_RATE_RAW");
-        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+        if(raw != nullptr && raw[0] != '\0' && raw[0] == '0')
+        {
+            return false;
+        }
+        return true;
     }();
     if(rawRate)
     {
@@ -389,8 +565,8 @@ float sparseSamplingRateEffective()
 bool cloudFarBandSplitActive()
 {
     constexpr bool kEnableFarBandSplit = false;
+    // 2026-11-13：原第二项 !g_cloudPostRrComposite.load() 随开关退役删除。
     return kEnableFarBandSplit &&
-        !g_cloudPostRrComposite.load() &&
         g_rrFarCloudDistance.load() > 0.0f &&
         g_cloudResFloorPercent.load() > 0u;
 }
@@ -453,24 +629,29 @@ void populateCloudParams(float* params)
     params[8] = quality == 0u ? 48.0f : (quality == 2u ? 72.0f : 56.0f);
     params[9] = quality == 0u ? 10.0f : (quality == 2u ? 16.0f : 12.0f);
     params[10] = g_cloudSilver.load();
-    params[11] = g_cloudPostRrComposite.load()
-        ? 0.90f
-        : (quality == 0u ? 0.72f : (quality == 2u ? 0.80f : 0.74f));
+    params[11] = quality == 0u ? 0.72f : (quality == 2u ? 0.80f : 0.74f);
     params[12] = g_cloudWorldAnchorX;
     params[13] = g_cloudWorldAnchorZ;
     params[14] = g_cloudSize.load();
     params[15] = g_cloudDistribution.load();
     params[16] = g_cloudBaseFeather.load();
-    // 2026-10-31：雾浪车道（cloudParams4.y/.z/.w）已无着色器消费者，
-    // 但仍占 std140 位置，显式写 0 以保持"未使用 = 0"的契约。
-    params[17] = 0.0f;
-    params[18] = 0.0f;
-    params[19] = 0.0f;
+    // 2026-11-11：原"雨天地面雾浪"占位车道，改作云隙光三件套
+    //（消费方 volumetric_fog.glsl: cloudGapTransmittance）。
+    //   y = 开关, z = 云层光学厚度倍率（强度）, w = 缝宽偏置
+    params[17] = g_cloudGapEnabled.load() ? 1.0f : 0.0f;
+    params[18] = std::max(g_cloudGapStrength.load(), 0.0f);
+    params[19] = std::min(std::max(g_cloudGapWidth.load(), 0.0f), 1.0f);
     params[20] = g_cloudType.load();
     params[21] = g_cloudErosionScale.load();
     params[22] = g_cloudSunlightStrength.load();
     params[23] = g_cloudPowderStrength.load();
     params[24] = g_cloudFarStepDensity.load();
+    // 2026-11-07 复核：cloudParams6.y/.z 的**实际消费者是步数覆盖**，
+    // 不是"太阳红化 / 云顶拉伸"（这两个 atomic 的名字是历史误名）：
+    //   volumetric_clouds_v5.comp:159-162  stepsOverride = cloudParams6.y
+    //   volumetric_clouds_v5.comp:172-175  shadowSteps  = cloudParams6.z
+    // 界面上的「光线步进 / 阴影步进」滑条就是写这两个 lane，是对的。
+    // （tyndall_cloud_field.glsl:138 把 .z 当"顶部拉伸"用，是旧路径的残留解读。）
     params[25] = g_cloudSunReddening.load();
     params[26] = g_cloudTopStretch.load();
     params[27] = g_cloudDetileStrength.load();
@@ -629,7 +810,9 @@ void populateGalaxyParams(float* params)
 //   [8]   视线 march 步数 g_godRaySteps
 //   [9]   云影 march 采样数 g_godRayOcclusionSamples
 //   [10]  保留，写 0（2026-10-06 前的雾内自阴影标定，随设置删除）
-//   [11]  雨天换介质总闸（g_fogRainMediumMix；旧 Rayleigh 通道已退役，当前不读）
+//   [11]  保留，写 0（2026-11-07 死设置清理：原「雨天换介质」g_fogRainMediumMix，
+//          旧 Rayleigh 通道退役后 volumetric_light.comp 只读 godRayParams2 的
+//          .x/.y，.w 零读取；UI 滑条也已不存在 ⇒ atomic 已删）
 // godRayParams1 的其余位保留。**数组仍是 12 个 float、起点仍是偏移 640**：
 // rainWallParams 紧跟在 688，缩短这个块会把后面所有参数整体平移，静默污染
 // 水墙与水色读取。
@@ -655,7 +838,7 @@ void populateGodRayParams(float* params)
     params[8] = static_cast<float>(g_godRaySteps.load());
     params[9] = static_cast<float>(g_godRayOcclusionSamples.load());
     params[10] = 0.0f;
-    params[11] = g_fogRainMediumMix.load();
+    params[11] = 0.0f;
 }
 
 // 旧档贴地薄雾。写的是 godRayParams 的 [4..7]（调用方传 +4 的偏移）。
@@ -666,6 +849,24 @@ void populateGroundMistParams(float* params)
     params[1] = g_fogGroundMistHeight.load();
     params[2] = g_fogGroundMistExtinction.load();
     params[3] = g_fogGroundMistDistance.load();
+
+    // 2026-11-10：平流雾滚动速度 → godRayParams2.z（= godRayParams[10]）。
+    // 本函数的入参是 &godRayParams[4]，所以 params[6] 正好落在 [10]。
+    // 消费方：volumetric_fog.glsl 的 rollingFogDensity（<=0 时回落到默认 1.35）。
+    params[6] = std::max(g_fogGroundMistSpeed.load(), 0.0f);
+
+    // 2026-11-11：雨波纹旋钮打包进 godRayParams2.w（= godRayParams[11]，params[7]）。
+    //   w = size + strength * 8   （size 0.25~4，strength 0~3）
+    // 消费方：rchit_helpers_water.glsl / material_common.glsl 的
+    //         rainImpactRippleGradient（水面与地面共用同一个解析场）。
+    // 这是该 vec4 里唯一空闲的车道（.x/.y 归旧体积光，.z 归平流雾速度）。
+    {
+        const float rippleSize =
+            std::min(std::max(g_rainRippleSize.load(), 0.25f), 4.0f);
+        const float rippleStrength =
+            std::min(std::max(g_rainRippleStrength.load(), 0.0f), 3.0f);
+        params[7] = rippleSize + rippleStrength * 8.0f;
+    }
 }
 
 // 高层平面云（2026-10-02 清理）：该层已整层退役，参数侧全部移除 ⇒ 这里恒定写 0
@@ -728,12 +929,19 @@ void populateCloudPhiParams(float* params)
 
 // 参考重构（2026-10-02）受光逻辑的三个尺度量。4 个 lane 写到
 // CameraUBO.cloudLightParams（偏移 1088 尾块）。0/负值语义见该结构体注释。
+//
+// 2026-11-07 死设置清理：v3→v4→v5 云模型迁移后，`cloudLightParams` 在
+// cpp/shaders 里**只剩声明、零读取**（唯一消费者早已是 v5，
+// Settings.cpp 旧注释里写的 volumetric_clouds_v4.comp 也已退役）。
+// 对应 UI 滑条在更早一次改版里就没了控件，只剩存档/JNI/atomic 三层残留。
+// 四个 atomic 已删；这里显式写 0 保持 std140 偏移与
+// "未使用 = 0" 的契约（同 cloudParams4 尾块的处理）。
 void populateCloudLightParams(float* params)
 {
-    params[0] = g_cloudSourceOdScale.load();
-    params[1] = g_cloudSourceCurvePow.load();
-    params[2] = g_cloudAoUpwardScale.load();
-    params[3] = g_cloudSunsetAmbientTint.load();
+    params[0] = 0.0f;
+    params[1] = 0.0f;
+    params[2] = 0.0f;
+    params[3] = 0.0f;
 }
 
 // 参考重构（2026-10-02）云底软化 + 两级步进阈值。4 个 lane 写到
@@ -743,7 +951,8 @@ void populateCloudShapeParams(float* params)
     params[0] = g_cloudBottomSmoothHeight.load();
     params[1] = g_cloudBottomSmoothPow.load();
     params[2] = g_cloudTwoTierThreshold.load();
-    params[3] = 0.0f;
+    // 2026-11-13 审计 ⑤：原来恒写 0 ⇒ volumetric_clouds_v5.comp:325 读到的永远是 0。
+    params[3] = g_cloudLightStepErosion.load();
 }
 
 // 参考重构（2026-10-02）物理月光项。4 个 lane 写到 CameraUBO.cloudMoonParams
@@ -792,12 +1001,16 @@ void populateCloudMsParams2(float* params)
     params[2] = g_cloudMsAttenuation.load();
     params[3] = g_cloudMsEccentricity.load();
 }
+// 2026-11-07 死设置清理：`cloudLightParams2` 四个 lane 在 cpp/shaders 里零读取
+// （只剩 camera_ubo.glsl 声明）。其中"光粉强度"不是死项 —— 同一个
+// g_cloudPowderStrength 还写进 cloudParams[23]（上面 populateCloudParams），
+// 那条路是 v5 的真实消费者，所以该 atomic 保留。这里四 lane 全写 0。
 void populateCloudLightParams2(float* params)
 {
-    params[0] = g_cloudSunPathReddening.load();
-    params[1] = g_cloudAtmExtinction.load();
-    params[2] = g_cloudPowderMode.load();
-    params[3] = g_cloudPowderStrength.load();
+    params[0] = 0.0f;
+    params[1] = 0.0f;
+    params[2] = 0.0f;
+    params[3] = 0.0f;
 }
 void populateCloudProfileParams(float* params)
 {
@@ -822,11 +1035,14 @@ void populateFogExtrasParams(float* params)
     // 2026-11-01：ReSTIR 体积光接管局部光照明之后，解析雾里那条动态光项必须关掉。
     // 它没有任何可见性射线：volumetric_fog.glsl 只在"视线 24 格处"收集一次灯表，
     // 然后对每个 march 步按距离/相位相加 ⇒ 墙那边的火把会照亮墙这边的雾（漏光），
-    // 并且与 ReSTIR 的同一份照明双计。滑杆保留（读档/UI 不动），但不再生效。
+    // 并且与 ReSTIR 的同一份照明双计。
+    //
+    // 2026-11-07 死设置清理：界面上早已没有这根滑条，atomic 已删。但**不能常量写 0**：
+    // 原逻辑在「ReSTIR 体积光关闭」时这项是活的（值 = g_fogDynamicLightStrength，
+    // 出厂 1.0）⇒ 这里保留原来的门控，用常量 1.0 代表出厂值，行为不变。
     params[0] = (volRestirEnabled() != 0u)
         ? 0.0f
-        : (g_cloudFogLightDescriptorsReady.load()
-            ? g_fogDynamicLightStrength.load() : 0.0f);
+        : (g_cloudFogLightDescriptorsReady.load() ? 1.0f : 0.0f);
     params[1] = g_fogGroundAnchorStrength.load();
     params[2] = g_fogSkyAmbientStrength.load();
     params[3] = g_fogTemporalJitterStrength.load();
@@ -835,19 +1051,30 @@ void populateFogExtrasParams(float* params)
 // 2026-10-10：云时域 / 天光质量旋钮
 //（CameraUBO.cloudTemporalParams，偏移 1392）。
 // 2026-10-16：.w 从"保留写 0"升格为**底部遮蔽强度**（见上面 atomic 的注释）。
+//
+// 2026-11-07 死设置清理：只有 .z（时域阻尼）有消费者
+// （volumetric_cloud_resolve.comp:182）。x/y/w 三个（天光可见性强度、
+// 天光可见性步数、云底遮蔽）在全部 cpp/shaders 里零读取，UI 控件也早已
+// 移除 ⇒ 三个 atomic 已删，这里写 0 保持 std140 偏移。
 void populateCloudTemporalParams(float* params)
 {
-    params[0] = g_cloudSkyVisStrength.load();
-    params[1] = g_cloudSkyVisSteps.load();
+    params[0] = 0.0f;
+    params[1] = 0.0f;
     params[2] = g_cloudTemporalDamp.load();
-    params[3] = g_cloudBottomOcclusion.load();
+    params[3] = 0.0f;
 }
 
 // 2026-10-10 借鉴（CameraUBO.cloudAerialParams，偏移 1408）。
 // #1 云后空气透视强度 / #2 地面大气透视强度 + 遮挡衰减。.w 保留写 0。
+//
+// 2026-11-07 死设置清理：.x（云后大气透视强度）唯一的读取点是退役模型
+// volumetric_clouds_v3.comp:294，而 v3 只在运行时存在 cloud_v3.flag 标记文件
+// 时才启用（volumetricCloudV3Requested，本文件顶部）⇒ 默认档下一个永远
+// 不生效的滑条。UI 滑条已摘除、atomic 已删，.x 写 0。
+// .y/.z 是活的（rt_test.rgen 的地面大气透视 + 遮挡衰减）。
 void populateCloudAerialParams(float* params)
 {
-    params[0] = g_cloudAerialStrength.load();
+    params[0] = 0.0f;
     params[1] = g_groundAerialStrength.load();
     params[2] = g_groundAerialOcclusion.load();
     params[3] = 0.0f;
@@ -856,12 +1083,15 @@ void populateCloudAerialParams(float* params)
 // 2026-10-14 日落天光修正（CameraUBO.cloudSkyHueParams，偏移 1472）。
 // x 天光冷化强度 / y 天光能量衰减强度。
 // 2026-10-17：z 方向性天光强度 / w 顶底性质统一强度（原为保留，写 0）。
+//
+// 2026-11-07 死设置清理：整块在 cpp/shaders 里只剩 camera_ubo.glsl:107 的
+// 声明、零读取（v5 云模型没有接这四项）。四个 atomic 已删，整块写 0。
 void populateCloudSkyHueParams(float* params)
 {
-    params[0] = g_cloudSkyHueCool.load();
-    params[1] = g_cloudSkyHueEnergy.load();
-    params[2] = g_cloudSkyDirStrength.load();
-    params[3] = g_cloudAmbientUnify.load();
+    params[0] = 0.0f;
+    params[1] = 0.0f;
+    params[2] = 0.0f;
+    params[3] = 0.0f;
 }
 
 // 2026-10-15 云地面反射与视觉回退参数（CameraUBO.cloudPhysicsParams，偏移 1488）。

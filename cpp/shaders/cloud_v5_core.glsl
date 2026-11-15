@@ -1,6 +1,24 @@
 #ifndef CLOUD_HP_CORE_GLSL
 #define CLOUD_HP_CORE_GLSL
 
+// =====================================================
+// 2026-11-10 体积云受光两项：
+//   CLOUD_GROUND_BOUNCE  地面反弹照亮云底（0 = 关 = 旧档）。
+//     物理：阳光打到地面 → 按地面反照率反射 → 上行照亮云底。
+//     术语本来就有（groundAlbedo/groundBounce 字段一直在，但零消费者）。
+//     参数来自 cloudPhysicsParams.x（地面反照率 0..0.8）/ .y（反弹强度 0..1），
+//     这两条 UI 滑条此前也是死的（无着色器读取）。
+//   CLOUD_LIGHT_REUSE    光步跨视步复用的步长（出厂 2 = 现有行为）。
+//     实现位置在 hpEvaluateCloud 的 view march（lightStride）。
+//     调大 = 少做光 march、性能更好、云内明暗过渡更平滑（插值拖尾）。
+// =====================================================
+#ifndef CLOUD_GROUND_BOUNCE
+#define CLOUD_GROUND_BOUNCE 1
+#endif
+#ifndef CLOUD_LIGHT_REUSE
+#define CLOUD_LIGHT_REUSE 2.0
+#endif
+
 const float HP_WEATHER_TILE = 96000.0;
 const float HP_BASE_TILE    = 8000.0;
 const float HP_EROSION_TILE = 1400.0;
@@ -166,7 +184,7 @@ HPCloudConfig hpDefaultConfig()
     c.scatterCurvePow = 1.0;
 
     c.lightErosion = 0.0;
-    c.lightReuse = 2.0;
+    c.lightReuse = CLOUD_LIGHT_REUSE;
     c.coneRatio = HP_CONE_RATIO;
     return c;
 }
@@ -579,6 +597,17 @@ void hpEvaluateCloudStep(float density, float localHeight, float slabH, float h,
     float upwardAO = exp(-zenithOD * max(cfg.aoUpwardScale, 0.0));
     vec3 ambientTerm = cfg.ambientTop * upwardAO
         + cfg.ambientBottom * (1.0 - hpSaturate(h));
+#if CLOUD_GROUND_BOUNCE
+    // 2026-11-10：地面反弹照亮云底。取 h 的平方衰减（越靠云底越强），
+    // 并按太阳高度角调制（太阳落山后地面几乎无反射光）；
+    // groundAlbedo ∈ [0,0.8]、groundBounce ∈ [0,1] 来自 UI 的两条滑条。
+    {
+        float toGround = 1.0 - hpSaturate(h);
+        float sunUp = max(cfg.sunDir.y, 0.0);
+        ambientTerm += cfg.groundAlbedo * cfg.groundBounce * cfg.sunColor
+            * sunUp * toGround * toGround;
+    }
+#endif
     integScatt += ambientTerm * scatterSourceAmount;
 
     inScattering += integScatt * transmittance;
