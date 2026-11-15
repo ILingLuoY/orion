@@ -77,6 +77,7 @@ Java 的 `-D` 传不进去（`build.gradle` 里的 `vmArg` 也到不了游戏 JV
 | `ORION_SL_FEATURES` | `all` | Streamline 特性子集（`all` 或逗号分隔的特性名） |
 | `ORION_AS_REFIT` | 关（看标记文件） | `1` = 进程内恒开 Section BLAS refit；不设则看 `<gameDir>/as_refit.on` 标记文件（**热切换**，只影响之后的重建） |
 | `ORION_BLOOM_SKIP_ZERO` | **开**（默认即新行为；与"闸门默认=旧行为"惯例不同，原因：strength=0 时 Bloom 对最终像素数学贡献为 0，composite shader 本就整屏早退，跳过链无画质代价） | Bloom 强度 `g_postBloomStrength <= 0` 时，`recordBloom` 入口直接返回，不录制 prefilter + 4 级降采样 + 3 级升采样 + composite 共 9 个 dispatch；强度每帧读 atomic，0→非 0 当帧正常录制并懒建资源。`0` = 恢复照旧录制整条链 |
+| `ORION_CLOUD_SKIP_WHEN_OFF` | **开**（默认即新行为；与"闸门默认=旧行为"惯例不同，原因：云开关关闭时 shader 内部本就早退，整条云链对画面贡献为 0） | `g_cloudEnabled=false` 时 `recordVolumetricClouds` 跳过云影图 / sunVis 体积 / 雾 froxel / march / resolve / 历史 copy / 云合成；下游 AE 直方图与 RR guide-relax 仍采样 resolved/depth，故在开关关闭的那一帧一次性清空两图（resolved `{0,0,0,1}`、depth `{1e6,0,0,0}`，只清一次，不每帧清）；godRay 块与云开关无关，照常执行。`0` = 恢复照旧录制整条云链 |
 
 ## D. 实验特性（默认关，用于评估与采价）
 

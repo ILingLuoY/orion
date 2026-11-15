@@ -3718,6 +3718,98 @@ void recordFogFroxelPasses(VkCommandBuffer cmd)
 
 void recordVolumetricClouds(VkCommandBuffer cmd)
 {
+    // 闸门 ORION_CLOUD_SKIP_WHEN_OFF（默认开）：g_cloudEnabled=false 时跳过整条
+    // 云链（云影图 / sunVis 体积 / 雾 froxel / march / resolve / 历史 copy / 云合成）。
+    // 下游仍有两个消费者在云关闭后采样云图：AE 测光直方图（resolved.a 判云/天空，
+    // rr_ae_histogram.comp:117-122）与 RR guide-relax（resolved+depth，
+    // rr_guide_relax.comp:107-116）。跳过链后这些图会停在上一帧旧内容，因此在
+    // enabled→disabled 的那一帧补一次清空（只一次，不每帧清）：resolved 写成
+    // {0,0,0,1}（a=1 = 透射率 1 = 无云，两处 shader 均据此判无云），depth 写成
+    // {1000000,0,0,0}（远到 guide-relax 的 farCloudDistance 条件不成立）。
+    // 雾屏幕图 / 历史图只被云链内部 descriptor set 绑定，下游无消费者，不清。
+    // 回退：ORION_CLOUD_SKIP_WHEN_OFF=0 恢复照旧录制整条链。
+    static const bool skipWhenOff = []()
+    {
+        const char* raw = std::getenv("ORION_CLOUD_SKIP_WHEN_OFF");
+        return !(raw != nullptr && raw[0] == '0');
+    }();
+
+    const bool cloudActive = !(skipWhenOff && !g_cloudEnabled.load());
+    static bool s_cloudWasActive = true;
+    static bool s_cloudClearedWhileOff = false;
+
+    if(!cloudActive)
+    {
+        if(cmd != VK_NULL_HANDLE &&
+           (!s_cloudWasActive || !s_cloudClearedWhileOff) &&
+           g_volumetricCloudResolvedImage != VK_NULL_HANDLE &&
+           g_volumetricCloudDepthImage != VK_NULL_HANDLE)
+        {
+            // 一次性清空 resolved + depth，防止下游读到上一帧云残留。
+            VkImageMemoryBarrier offBarriers[2]{};
+            for(uint32_t i = 0u; i < 2u; ++i)
+            {
+                offBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                offBarriers[i].oldLayout = (i == 0u ? g_volumetricCloudResolvedLayout
+                                                    : g_volumetricCloudDepthLayout);
+                offBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                offBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                offBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                offBarriers[i].srcAccessMask =
+                    offBarriers[i].oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                    ? 0u : VK_ACCESS_SHADER_READ_BIT;
+                offBarriers[i].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                offBarriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                offBarriers[i].subresourceRange.levelCount = 1u;
+                offBarriers[i].subresourceRange.layerCount = 1u;
+            }
+            offBarriers[0].image = g_volumetricCloudResolvedImage;
+            offBarriers[1].image = g_volumetricCloudDepthImage;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+                2u, offBarriers);
+
+            const VkClearColorValue emptyResolved{{0.0f, 0.0f, 0.0f, 1.0f}};
+            vkCmdClearColorImage(cmd, g_volumetricCloudResolvedImage,
+                VK_IMAGE_LAYOUT_GENERAL, &emptyResolved, 1u,
+                &offBarriers[0].subresourceRange);
+            const VkClearColorValue emptyDepth{{1000000.0f, 0.0f, 0.0f, 0.0f}};
+            vkCmdClearColorImage(cmd, g_volumetricCloudDepthImage,
+                VK_IMAGE_LAYOUT_GENERAL, &emptyDepth, 1u,
+                &offBarriers[1].subresourceRange);
+
+            for(uint32_t i = 0u; i < 2u; ++i)
+            {
+                offBarriers[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                offBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            }
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+                2u, offBarriers);
+            g_volumetricCloudResolvedLayout = VK_IMAGE_LAYOUT_GENERAL;
+            g_volumetricCloudDepthLayout = VK_IMAGE_LAYOUT_GENERAL;
+            s_cloudClearedWhileOff = true;
+        }
+
+        s_cloudWasActive = false;
+
+        if(cmd != VK_NULL_HANDLE)
+        {
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SNEAR);
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_HEIGHT);
+        }
+    }
+    else
+    {
+        s_cloudWasActive = true;
+        s_cloudClearedWhileOff = false;
+    }
+
+    maybeHotReloadVolumetricCloudShaders();
+
+    if(cloudActive)
+    {
     // 2026-11-12：先烘云影图与太阳可见性体积，雾在同一条 command buffer 后面读。
     recordCloudShadowMap(cmd);
 
@@ -3730,7 +3822,6 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
     recordFogFroxelPasses(cmd);
     rtCheckpoint(cmd, "cloud:fogfroxel");
 
-    maybeHotReloadVolumetricCloudShaders();
     if(cmd == VK_NULL_HANDLE || g_volumetricCloudRenderPipelineV3 == VK_NULL_HANDLE ||
        g_volumetricCloudResolvePipeline == VK_NULL_HANDLE ||
        g_volumetricCloudCompositePipeline == VK_NULL_HANDLE)
@@ -3986,6 +4077,7 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
 
         rtCheckpoint(cmd, "cloud:composite");
     }
+    } // if(cloudActive)：云链结束；下方 godRay 块只依赖 godRay 图与 TLAS，与云开关无关，保持无条件执行。
 
     // 2026-11-01：这里原来整块被 `volRestirEnabled() == 0u` 门控 —— 于是 ReSTIR
     // 一开，god_ray_composite 也一起被跳过，而它是**唯一**把 g_godRayTargetImage
