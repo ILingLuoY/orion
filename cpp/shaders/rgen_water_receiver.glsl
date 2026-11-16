@@ -1134,22 +1134,20 @@ if(hitMaterialId >= 2.5)
                             10000.0
                         );
 
-                        bool receiverSunVisCommitted = false;
                         int receiverSunVisGuard = 0;
                         // 防死循环上限（参照 volumetric_fog.glsl 的 proceedGuard）。
+                        // 2026-11-16 修正：committed 交点必须在查询终止后读，不能在
+                        // 循环体里判（TerminateOnFirstHit 命中即终止 ⇒ 循环体可能一次
+                        // 都不进 ⇒ 恒判未命中 ⇒ 水体恒判能见到太阳）。
                         while(rayQueryProceedEXT(receiverSunVisQuery) &&
-                              ++receiverSunVisGuard < 32)
+                              ++receiverSunVisGuard < 32) {}
+                        if(rayQueryGetIntersectionTypeEXT(receiverSunVisQuery, true) !=
+                            gl_RayQueryCommittedIntersectionNoneEXT)
                         {
-                            if(rayQueryGetIntersectionTypeEXT(receiverSunVisQuery, true) !=
-                                gl_RayQueryCommittedIntersectionNoneEXT)
-                            {
-                                hit.hitDistance =
-                                    rayQueryGetIntersectionTEXT(receiverSunVisQuery, true);
-                                receiverSunVisCommitted = true;
-                                break;
-                            }
+                            hit.hitDistance =
+                                rayQueryGetIntersectionTEXT(receiverSunVisQuery, true);
                         }
-                        if(!receiverSunVisCommitted)
+                        else
                         {
                             hit.hitDistance = -1.0;
                         }

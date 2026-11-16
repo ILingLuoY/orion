@@ -1189,20 +1189,18 @@ float traceWaterReflectedSun(
             10000.0
         );
 
-        bool glossSunVisCommitted = false;
         int glossSunVisGuard = 0;
         // 防死循环上限（参照 volumetric_fog.glsl 的 proceedGuard）。
-        while(rayQueryProceedEXT(glossSunVisQuery) && ++glossSunVisGuard < 32)
+        // 2026-11-16 修正：committed 交点必须在查询终止后读，不能在循环体里判
+        // （TerminateOnFirstHit 命中即终止，循环体可能一次都不进 ⇒ 恒判未命中 ⇒
+        // 水面永远被当成晒着太阳）。
+        while(rayQueryProceedEXT(glossSunVisQuery) && ++glossSunVisGuard < 32) {}
+        if(rayQueryGetIntersectionTypeEXT(glossSunVisQuery, true) !=
+            gl_RayQueryCommittedIntersectionNoneEXT)
         {
-            if(rayQueryGetIntersectionTypeEXT(glossSunVisQuery, true) !=
-                gl_RayQueryCommittedIntersectionNoneEXT)
-            {
-                hit.hitDistance = rayQueryGetIntersectionTEXT(glossSunVisQuery, true);
-                glossSunVisCommitted = true;
-                break;
-            }
+            hit.hitDistance = rayQueryGetIntersectionTEXT(glossSunVisQuery, true);
         }
-        if(!glossSunVisCommitted)
+        else
         {
             hit.hitDistance = -1.0;
         }

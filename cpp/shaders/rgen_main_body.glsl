@@ -2654,21 +2654,19 @@ for(
             maxDist
         );
 
-        bool aoVisCommitted = false;
         int aoVisProceedGuard = 0;
         // 防死循环上限（参照 volumetric_fog.glsl 的 proceedGuard）：TLAS 未绑定/失效
         // 时 rayQueryProceedEXT 可能一直返回 true ⇒ GPU 侧无限循环 ⇒ TDR。
-        while(rayQueryProceedEXT(aoVisQuery) && ++aoVisProceedGuard < 32)
+        // 2026-11-16 修正：committed 交点只有在查询终止后才可读，不能在 Proceed 循环
+        // 体里判——TerminateOnFirstHit 下一旦命中就终止，循环体可能一次都不进，那样
+        // 永远读不到 committed，AO 会恒判"无遮挡"。必须在循环结束后统一读。
+        while(rayQueryProceedEXT(aoVisQuery) && ++aoVisProceedGuard < 32) {}
+        if(rayQueryGetIntersectionTypeEXT(aoVisQuery, true) !=
+            gl_RayQueryCommittedIntersectionNoneEXT)
         {
-            if(rayQueryGetIntersectionTypeEXT(aoVisQuery, true) !=
-                gl_RayQueryCommittedIntersectionNoneEXT)
-            {
-                hit.hitDistance = rayQueryGetIntersectionTEXT(aoVisQuery, true);
-                aoVisCommitted = true;
-                break;
-            }
+            hit.hitDistance = rayQueryGetIntersectionTEXT(aoVisQuery, true);
         }
-        if(!aoVisCommitted)
+        else
         {
             hit.hitDistance = -1.0;
         }
