@@ -454,6 +454,22 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->perfSerAb[1] = g_perfL10SerVisToggle;
     ubo->perfSerAb[2] = g_perfL10SerRadToggle;
     ubo->perfSerAb[3] = g_perfL10SerPrimToggle;
+
+    // 2026-11-16：可见性射线 inline ray query 可选臂闸门（ORION_VIS_QUERY，4 位掩码）。
+    //   bit0 = AO 点位 / bit1 = 水面太阳点位 / bit2 = 水体入口太阳点位；默认 0 =
+    //   全部走既有 traceRayEXT（旧行为）。按 env-switches.md 约定只读一次，改完重启
+    //   客户端生效；回退：不设或 =0 即旧路径。逐点位独立开关、独立回退。
+    static const uint32_t visQueryMask = []()
+    {
+        const char* raw = std::getenv("ORION_VIS_QUERY");
+        const long parsed = raw ? std::strtol(raw, nullptr, 10) : 0L;
+        if(parsed < 0L) return 0u;
+        return static_cast<uint32_t>(parsed) & 0x7u;
+    }();
+    ubo->visQueryAb[0] = (visQueryMask & 0x1u) != 0u ? 1u : 0u;
+    ubo->visQueryAb[1] = (visQueryMask & 0x2u) != 0u ? 1u : 0u;
+    ubo->visQueryAb[2] = (visQueryMask & 0x4u) != 0u ? 1u : 0u;
+    ubo->visQueryAb[3] = 0u;
     ubo->dhFarFieldParams[0] = dhTexturesAvailable() ? 1.0f : 0.0f;
     ubo->dhFarFieldParams[1] = dhFarFieldMatrixAvailable() ? 1.0f : 0.0f;
     ubo->dhFarFieldParams[2] = g_dhFarFieldNear;
@@ -587,8 +603,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
         ubo->perfBandParams[0] = perfMode
             ? std::clamp(g_perfRtBandChunks.load(), 0.0f, 32.0f)
             : 0.0f;
-        ubo->perfBandParams[1] =
-            std::clamp(g_perfBounceBandChunks.load(), 0.0f, 32.0f);
+        // y：弹射分界。环境变量优先（ORION_GI_BOUNCE_BAND，A/B 用：设 32 ≈
+        // 关闭分档），否则用 UI 值。
+        const float bandOverride = giBounceBandChunksOverride();
+        ubo->perfBandParams[1] = std::clamp(
+            bandOverride >= 0.0f ? bandOverride : g_perfBounceBandChunks.load(),
+            0.0f,
+            32.0f);
         ubo->perfBandParams[2] = perfMode ? 1.0f : 0.0f;
         // w：远场贴图降档起点（格，0=关）。material_resolve.glsl 消费
         // （2026-11-15：8 区块以外材质贴图按距离抬 mip，默认 128）。
@@ -730,6 +751,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
         g_waterSimLastSurfaceY = static_cast<float>(waterSurfaceY);
     }
 
+    // 2026-11-16：近水探针值每帧都记（水里 = 真水柱顶面；岸上 = 96 格
+    // 探针结果或 playerY-1000 哨兵），供焦散图近水门使用。
+    g_waterNearbySurfaceY = static_cast<float>(waterSurfaceY);
+
     if(g_waterSimPlayerStateValid &&
        nowInWater != g_waterSimPlayerWasInWater)
     {
@@ -821,6 +846,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     populateCloudParams(ubo->cloudParams);
     populateSkyParams(ubo->skyParams);
     populateSkyModelParams(ubo->skyModelParams);
+    populateMoonParams(ubo->moonParams);
+    populateFogMoodParams(ubo->fogMoodParams);
     populateGalaxyParams(ubo->galaxyParams);
     populateGodRayParams(ubo->godRayParams);
     populateGroundMistParams(ubo->godRayParams + 4);
@@ -1163,6 +1190,8 @@ static void orionCaptureDeterministicFrameHash()
 // 之前误插到 `extern "C"` 与 JNIEXPORT 函数之间，把 C 链接抢走 ⇒ 导出名变成
 // C++ 修饰名（?Java_...@@YAX...）⇒ JNI 解析不到 ⇒ UnsatisfiedLinkError，
 // 游戏起不来。
+std::atomic<bool> g_slOutputFreshThisFrame{false};
+
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     JNIEnv* env,
@@ -2016,6 +2045,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
         reinterpret_cast<VkCommandBuffer>(
             commandBufferHandle
         );
+
+    g_slOutputFreshThisFrame.store(false, std::memory_order_relaxed);
 
     rtCheckpoint(cmd, "frame:enter");
 
@@ -3296,6 +3327,40 @@ if(rrGuideBarrierCount > 0)
             cloudPassHeight = std::min(
                 std::max(cloudPassHeight, floorHeight), g_dlssOutputHeight);
         }
+        // 2026-11-16：远云脱离 RR 后，云层会被**直接**放大到显示分辨率。
+        // 若云 pass 仍按（超性能档下很小的）渲染分辨率跑，只是把"RR 糊一层"
+        // 换成"双线性糊一层"。这里按显示分辨率的固定比例给云兜底分辨率。
+        //   ORION_CLOUD_FARBAND_RES：0..1，默认 0.5；0 表示不兜底（保持旧尺寸）。
+        if(cloudFarBandSplitActive())
+        {
+            static const double s_fraction = []() -> double
+            {
+                const char* raw = std::getenv("ORION_CLOUD_FARBAND_RES");
+
+                if(raw == nullptr)
+                {
+                    // 2026-11-16 性能：默认 0.33（≈3x 上采样时的渲染分辨率）。
+                    // 0.5 更锐但云 pass 约 +2.8ms；0 完全不加分辨率（零成本）。
+                    return 0.33;
+                }
+
+                const double value = std::atof(raw);
+
+                return (value > 0.0 && value <= 1.0) ? value : 0.0;
+            }();
+
+            if(s_fraction > 0.0 && g_dlssOutputWidth > 0u && g_dlssOutputHeight > 0u)
+            {
+                const uint32_t targetWidth = static_cast<uint32_t>(
+                    static_cast<double>(g_dlssOutputWidth) * s_fraction + 0.5);
+                const uint32_t targetHeight = static_cast<uint32_t>(
+                    static_cast<double>(g_dlssOutputHeight) * s_fraction + 0.5);
+
+                cloudPassWidth = std::max(cloudPassWidth, targetWidth);
+                cloudPassHeight = std::max(cloudPassHeight, targetHeight);
+            }
+        }
+
         createVolumetricCloudPipeline(cloudPassWidth, cloudPassHeight);
     }
     rtSpikeCloudPipe = rtMark();
@@ -5261,6 +5326,9 @@ sl::ResourceTag outputTag(
         }
 
 
+        // 2026-11-16：evaluate 走到了这一行 ⇒ 输出可信（eOk 才会继续往下）。
+        g_slOutputFreshThisFrame.store(true, std::memory_order_relaxed);
+
         g_prevCameraViewToWorld =
             currentCameraViewToWorld;
 
@@ -5272,6 +5340,11 @@ sl::ResourceTag outputTag(
 
 
 rtCheckpoint(cmd, "frame:post-rr");
+
+    // 2026-11-16：远带云在 RR 之后按显示分辨率合成。
+    recordCloudFarBandComposite(cmd);
+
+    rtCheckpoint(cmd, "frame:cloud-farband");
 
 writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_DLSS);
 

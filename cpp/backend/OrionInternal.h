@@ -592,6 +592,32 @@ struct CameraUBO {
     //   z = 性能模式开关（1 = 开）
     //   w = 远场贴图降档起点（格，0 = 关；material_resolve.glsl 的距离 mip 坡道）
     float perfBandParams[4];
+
+    // ── 2026-11-16 月光两旋钮（追加在末尾，与 camera_ubo.glsl 顺序一致）
+    //   x = 月光能量地板（新月夜 = 满月的这一比例；0 = 纯物理，只剩环境光）
+    //   y = 白天月亮亮度（占夜间基准的比例；1 = 不压暗）
+    //   z = 有效性标记（1 = 宿主已写入本块）；shader 用它区分"旧 DLL 未写"，
+    //       未写时回落到编译期默认值，避免升级顺序错误导致新月夜全黑
+    //   w = 保留（写 0）
+    // 消费方：rt_test.rgen（月光能量）/ rt_test.rmiss（月盘亮度）
+    float moonParams[4];
+
+    // ── 2026-11-16 雾外观（追加在末尾，与 camera_ubo.glsl 顺序一致）
+    //   x = 雾形态强度 0..2（0 = 均匀灰膜旧档，1 = 出厂团块）
+    //   y = 晨雾峰值倍率 1..3（1 = 不增强，1.75 = 出厂；复活 g_fogDawnBoost）
+    //   z/w = 保留（写 0）
+    // 消费方：fog_froxel_density.comp（形态调制 + 时段密度倍率）
+    float fogMoodParams[4];
+
+    // ── 2026-11-16 可见性射线 inline query 可选臂闸门（追加在末尾，与
+    // camera_ubo.glsl 顺序一致；中间插入会平移全部已读偏移）
+    //   [0] = bit0 AO 可见性点位（rgen_main_body.glsl 的 RTAO 探针）
+    //   [1] = bit1 水面太阳可见性点位（rgen_glossy.glsl）
+    //   [2] = bit2 水体入口太阳可见性点位（rgen_water_receiver.glsl）
+    //   [3] = 保留（写 0）
+    // 默认全 0 = 既有 RT pipeline traceRayEXT 路径（逐位旧行为）；本机跑不了客户端、
+    // 未做画面 A/B，等价是代码证出来的，所以默认关。宿主：ORION_VIS_QUERY 掩码。
+    uint32_t visQueryAb[4];
 };
 static_assert(offsetof(CameraUBO, cloudParams) == 448,
     "cloudParams must stay at offset 448: shaders place it right after weatherParams");
@@ -782,9 +808,25 @@ static_assert(offsetof(CameraUBO, perfBandParams) == 3088,
     "perfBandParams must start at 3088, immediately after glassCausticParams: "
     "2026-11-15 the 'performance mode' distance bands (RT range / bounce split) "
     "are appended at the tail; ss_hybrid.comp and rgen_main_body.glsl read it");
-static_assert(sizeof(CameraUBO) == 3104,
+static_assert(offsetof(CameraUBO, fogMoodParams) == 3120,
+    "fogMoodParams must start at 3120, immediately after moonParams: "
+    "2026-11-16 the fog shape strength (lane x) and dawn mist peak (lane y) are "
+    "appended at the tail; fog_froxel_density.comp reads them via camera_ubo.glsl");
+static_assert(offsetof(CameraUBO, visQueryAb) == 3136,
+    "visQueryAb must start at 3136, immediately after fogMoodParams: "
+    "2026-11-16 the visibility-ray inline-query optional-arm bitmask is appended "
+    "at the tail; rgen_main_body/rgen_glossy/rgen_water_receiver read the lanes");
+static_assert(offsetof(CameraUBO, moonParams) == 3104,
+    "moonParams must start at 3104, immediately after perfBandParams: "
+    "2026-11-16 the two moonlight knobs (lane x = new-moon light floor, "
+    "lane y = daylight moon dim, lane z = validity flag) are appended at the "
+    "tail; rt_test.rgen and rt_test.rmiss read them via camera_ubo.glsl");
+static_assert(sizeof(CameraUBO) == 3152,
     "CameraUBO size must match the std140 size of the shaders' CameraProperties "
-    "block (3040 -> 3056 when 2026-11-09 pomSecondaryParams was appended; "
+    "block (3136 -> 3152 when 2026-11-16 visQueryAb was appended at the tail; "
+    "3120 -> 3136 when 2026-11-16 fogMoodParams was appended at the tail; "
+    "3104 -> 3120 when 2026-11-16 moonParams was appended at the tail; "
+    "3040 -> 3056 when 2026-11-09 pomSecondaryParams was appended; "
     "2016 -> 3040 when the 32-entry local-light profile tables "
     "(2 x vec4[32]) were appended at the tail; 1760 -> 2016 when the four derived "
     "matrices "
@@ -830,12 +872,9 @@ struct WaterSimEntityUBO
 };
 struct WaterSimImpulseEvent { float x, z, strength; };
 inline constexpr bool kWATER_CAUSTIC_PASS_ENABLED = false;
-inline constexpr bool kWATER_DETAIL_NORMAL_ENABLED = false;
 inline constexpr uint32_t WATER_CAUSTIC_RESOLUTION = 256u;
 inline constexpr float WATER_CAUSTIC_UPDATE_SECONDS = 1.0f / 30.0f;
 inline constexpr float WATER_CAUSTIC_NEAR_WATER_Y_RANGE = 32.0f;
-inline constexpr uint32_t WATER_DETAIL_NORMAL_RESOLUTION = 256u;
-inline constexpr uint32_t WATER_DETAIL_NORMAL_MIP_LEVELS = 9u;
 inline constexpr uint32_t CLOUD_SHAPE_NOISE_RESOLUTION = 64u;
 inline constexpr uint32_t CLOUD_CURL_NOISE_RESOLUTION = 64u;
 inline constexpr uint32_t CLOUD_BASE_NOISE_RESOLUTION = 64u;
@@ -851,7 +890,10 @@ inline constexpr uint32_t VOL_FROXEL_DOWNSCALE = 8u;
 inline constexpr uint32_t VOL_RESTIR_DOWNSCALE = 4u;
 // 2026-11-15：体积雾 froxel 重构（密度 3D + 屏幕合成）。
 inline constexpr uint32_t FOG_FROXEL_DEPTH = 64u;
-inline constexpr uint32_t FOG_FROXEL_DOWNSCALE = 4u;
+// 2026-11-15：4 → 2。4 时头顶的雾被切成 4px 的马赛克块（composite 逐格 imageLoad
+// 无插值）；加密一倍后块 2px，在雾的柔和底子上基本看不出来。单格射线数同时
+// 4 → 2（见 fog_froxel_light.comp），总射线量持平。
+inline constexpr uint32_t FOG_FROXEL_DOWNSCALE = 2u;
 // 2026-11-04：16 -> 32。
 //
 // 病灶（用户报"ReSTIR 体积光穿墙"）：composite 只有 16 步，却要跨
@@ -2701,6 +2743,7 @@ bool giVisibilityGateEnabled();
 bool matSecondaryMinimalEnabled();
 float matFarLodDistance();
 float matTexFarLodDistance();
+float giBounceBandChunksOverride();
 bool glossyRrEnabled();
 bool glossyStepLodEnabled();
 bool pomSecondarySkipEnabled();
@@ -2724,6 +2767,10 @@ float effectiveCloudFarFadeDistance();
 void populateCloudParams(float* params);
 void populateSkyParams(float* params);
 void populateSkyModelParams(float* params);
+// 2026-11-16 月光两旋钮（x = 地板 y = 白天月亮亮度 z = 有效性标记 1）
+void populateMoonParams(float* params);
+// 2026-11-16 雾外观（x = 形态强度 y = 晨雾峰值倍率）
+void populateFogMoodParams(float* params);
 void populateGalaxyParams(float* params);
 void populateGodRayParams(float* params);
 void populateGroundMistParams(float* params);
@@ -3488,9 +3535,6 @@ void destroyVLIResources();
 void updateRTOutputDescriptor();
 void updateWaterSimulationRayDescriptor();
 void updateWaterCausticRayDescriptor();
-void updateWaterDetailNormalRayDescriptor();
-void createWaterDetailNormalResources();
-void destroyWaterDetailNormalResources();
 void createEntityPbrFallbackResources();
 void destroyEntityPbrFallbackResources();
 uint32_t cloudNoiseHash(uint32_t value);
@@ -3563,6 +3607,14 @@ bool volumetricCloudBindingsMatchCurrentSizes(
 VkSampler volDepthSampler();
 void createVolumetricCloudResources(uint32_t width, uint32_t height);
 void createVolumetricCloudPipeline(uint32_t width, uint32_t height);
+
+// 2026-11-16：远带云在 slEvaluate 之后按显示分辨率合成（距离分带）。
+void recordCloudFarBandComposite(VkCommandBuffer cmd);
+
+// 2026-11-16：本帧 RR/SR 是否真的写出了新的放大输出。
+// eWarnOutOfVRAM 时 slEvaluate 不报错但会沿用上一帧输出，此时做后合成
+// 会把云重复叠加（越来越亮），所以远带合成必须先看这个标志。
+extern std::atomic<bool> g_slOutputFreshThisFrame;
 uint64_t cloudSpvStampOf(const char* relative);
 uint64_t cloudSpvStampAll();
 void hotReloadVolumetricCloudPipelines();
@@ -4043,6 +4095,11 @@ extern float g_waterSimPendingImpulseX;
 extern float g_waterSimPendingImpulseZ;
 extern float g_waterSimPendingImpulseStrength;
 extern float g_waterSimLastSurfaceY;
+// 2026-11-16：焦散近水门的"玩家附近水面 Y"。Java 侧玩家不在水里时喂
+// 96 格近水探针的结果（找到水柱顶面 Y，找不到 = playerY-1000 哨兵），
+// 每帧都更新；与 g_waterSimLastSurfaceY（只在下水时更新、离开水后冻结）
+// 分开，专供焦散图两处近水判据使用。不经 UBO，避免动 shader 布局。
+extern float g_waterNearbySurfaceY;
 extern bool g_waterSimOriginValid;
 extern float g_waterSimOriginX;
 extern float g_waterSimOriginZ;
@@ -4131,8 +4188,16 @@ extern VkImageView g_fogScreenColorView;
 extern VkImage g_fogScreenDistImage;
 extern VkDeviceMemory g_fogScreenDistMemory;
 extern VkImageView g_fogScreenDistView;
+extern VkImage g_fogFroxelShadowImage;
+extern VkDeviceMemory g_fogFroxelShadowMemory;
+extern VkImageView g_fogFroxelShadowView;
 extern VkPipeline g_fogFroxelDensityPipeline;
 extern VkPipelineLayout g_fogFroxelDensityPipelineLayout;
+extern VkPipeline g_fogFroxelLightPipeline;
+extern VkPipelineLayout g_fogFroxelLightPipelineLayout;
+extern VkPipeline g_fogScreenApplyPipeline;
+extern VkPipelineLayout g_fogScreenApplyPipelineLayout;
+void recordFogScreenApply(VkCommandBuffer cmd);
 extern VkPipeline g_fogFroxelCompositePipeline;
 extern VkPipelineLayout g_fogFroxelCompositePipelineLayout;
 void recordFogFroxelPasses(VkCommandBuffer cmd);
@@ -4330,10 +4395,6 @@ extern VkPipelineLayout g_skyAtmospherePipelineLayout;
 extern VkPipeline g_skyAtmospherePipeline;
 extern VkImageLayout g_skyScatteringLayout;
 extern VkImageLayout g_skyTransmittanceLayout;
-extern VkImage g_waterDetailNormalImage;
-extern VkDeviceMemory g_waterDetailNormalMemory;
-extern VkImageView g_waterDetailNormalView;
-extern VkSampler g_waterDetailNormalSampler;
 extern VkImage g_waterCausticImage;
 extern VkDeviceMemory g_waterCausticMemory;
 extern VkImageView g_waterCausticView;
@@ -5084,6 +5145,13 @@ extern std::atomic<float> g_skyModelScale;
 //   g_skyRainDim      = 雨天/雷暴天空压暗倍率（0 = 不压暗，1 = 出厂，>1 更狠）
 extern std::atomic<float> g_skyNightAmbient;
 extern std::atomic<float> g_skyRainDim;
+// 2026-11-16 月光两旋钮（车道 = CameraUBO.moonParams.x / .y），设置界面经
+// Java_com_example_vulkan_NativeVulkan_setMoonSettings 下发。
+extern std::atomic<float> g_moonLightFloor;
+extern std::atomic<float> g_moonDaylightDim;
+// 2026-11-16 雾外观：形态强度（车道 = CameraUBO.fogMoodParams.x）。
+// g_fogDawnBoost 早就有定义（State.cpp），此前**零读者**，现在接进 fogMoodParams.y。
+extern std::atomic<float> g_fogShapeStrength;
 extern std::atomic<float> g_auroraStrength;
 extern std::atomic<float> g_auroraBrightness;
 extern std::atomic<float> g_auroraFlowSpeed;

@@ -194,3 +194,30 @@
     // 消费方：cpp/shaders/ss_hybrid.comp（距离分档）、rgen_main_body.glsl（弹射分档）、
     //         material_resolve.glsl（远场贴图 mip）
     vec4 perfBandParams;
+
+    // ── moonParams ──（2026-11-16 追加在末尾，与 OrionInternal.h 顺序一致）
+    //   x = 月光能量地板（新月夜 = 满月的这一比例；0 = 纯物理，只剩环境光）
+    //   y = 白天月亮亮度（占夜间基准的比例；1 = 不压暗）
+    //   z = 有效性标记（1 = 宿主已写入本块）。消费方必须走 z > 0.5 判定：
+    //       旧 DLL 不写这一块 ⇒ 全 0 ⇒ 回落编译期默认值，否则新月夜全黑。
+    //   w = 保留
+    vec4 moonParams;
+
+    // ── fogMoodParams ──（2026-11-16 追加在末尾，与 OrionInternal.h 顺序一致）
+    //   x = 雾形态强度 0..2（0 = 均匀灰膜旧档，1 = 出厂团块）
+    //   y = 晨雾峰值倍率 1..3（1 = 不增强，1.75 = 出厂）
+    //   z/w = 保留
+    // 消费方：fog_froxel_density.comp
+    vec4 fogMoodParams;
+
+    // ── visQueryAb ──（2026-11-16 追加在末尾，与 OrionInternal.h 顺序一致）
+    // 可见性射线 inline ray query 可选臂的按位闸门。默认全 0 = 走既有 RT pipeline
+    // traceRayEXT（逐位旧行为）；本机跑不了客户端、未做画面 A/B，等价是代码证出来
+    // 的，所以默认关。每 lane 一个点位，互不影响：
+    //   x = bit0 AO 可见性点位（rgen_main_body.glsl 的 RTAO 探针）
+    //   y = bit1 水面太阳可见性点位（rgen_glossy.glsl）
+    //   z = bit2 水体入口太阳可见性点位（rgen_water_receiver.glsl）
+    //   w = 保留（宿主写 0）
+    // 宿主：环境变量 ORION_VIS_QUERY（4 位掩码），每帧写入。
+    // 消费方：上述三个 rgen 点位各自的 query 臂（#if RTAO_VISIBILITY_EARLYOUT 包着）。
+    uvec4 visQueryAb;
