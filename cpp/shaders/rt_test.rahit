@@ -37,6 +37,8 @@ uniform image2D glassAlphaBlendLightImage;
 #include "glass_dielectric_common.glsl"
 #include "glass_thinwall_common.glsl"
 #include "glass_chain_common.glsl"
+// RT 阶段三计数器（hits lane = any-hit 调用次数），整段由 ORION_RT_STAGE_COUNTERS 裁掉。
+#include "rt_stage_counters.glsl"
 
 layout(location = 0) rayPayloadInEXT HitPayload payload;
 
@@ -525,6 +527,12 @@ vec3 glassSheetTransmissionScalarF(
 }
 
 void main() {
+
+    // RT 计数器：any-hit 被派发调用即计一次（一条射线在遍历中可触发多次，每次
+    // 调用各计一次）。每次 invocation 至多一次 atomicAdd。
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntHitAccepted();
+    #endif
 
 #if RTAO_VISIBILITY_EARLYOUT
     // AO 可见性探针：写回命中距离后立即返回（见文件头 RTAO 修复注释）

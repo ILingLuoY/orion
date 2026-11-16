@@ -2112,6 +2112,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
 
     beginPerfL10RayStats(cmd);
 
+    // RT 阶段三计数器：与 RayStats 同侧，在 trace 时间戳对之外清零/起槽。
+    beginRtStageCounters(cmd);
+
     {
         const double rtxGeometryPhaseMs =
             std::chrono::duration<double, std::milli>(
@@ -3516,6 +3519,9 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
     perfL10CpuPhaseAdvance(PERF_L10_CPU_P_CLOUD);
 
     endPerfL10RayStats(cmd);
+
+    // RT 阶段三计数器：帧尾把设备缓冲拷进 ring staging（trace 边界之后）。
+    endRtStageCounters(cmd);
 
 #if NRD_LOCAL_DI_CONFIDENCE
     if(kNrdLocalDiEnabled)

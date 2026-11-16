@@ -751,7 +751,8 @@ void createRayTracingDescriptorPoolAndSet()
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 },
         // 2026-11-05 B：+1 = K1/K2 landing SSBO（binding 88，21 → 22）。
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 22 }
+        // 2026-11-16：+1 = RT 阶段三计数器 SSBO（binding 93，22 → 23；仅总闸开时写）。
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 23 }
     };
     VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pi.maxSets = 1;

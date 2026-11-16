@@ -17,6 +17,8 @@
 
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
+// RT 阶段三计数器（hits lane = 半透明命中组 closest-hit），整段由开关裁掉。
+#include "rt_stage_counters.glsl"
 layout(location = 0) rayPayloadInEXT HitPayload payload;
 
 const uint RT_STATE_PURPOSE_MASK       = 0x7u;
@@ -1378,6 +1380,11 @@ vec3 materialRayDirection = vec3(0.0, 0.0, -1.0);
 
 void main()
 {
+    // RT 计数器：半透明命中组 closest-hit 派发执行即计一次。每次 invocation 至多一次 atomicAdd。
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntHitAccepted();
+    #endif
+
     // 2026-10-21 根因修复（同 rt_test.rchit 的说明）：生产模式必须先把命中身份与
     // hitT 播种进 ray payload，否则 resolveHitMaterialGlass() 会拿陈旧身份索引
     // sectionVertexAddressBuffer（无边界检查）⇒ 垃圾指针 ⇒ GPU 挂死。

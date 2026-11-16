@@ -98,6 +98,9 @@ const float WATER_EXTINCTION_DISTANCE =
         else
 #endif
         {
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntRayIssued();
+            #endif
             traceRayEXT(
                 topLevelAS, secondaryTraverseFlags(), 0xff, 0, 0, 0,
                 currentOrigin, 0.001, currentDirection, 10000.0, 0
@@ -471,6 +474,9 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColor();
         else
 #endif
         {
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntRayIssued();
+            #endif
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
@@ -524,6 +530,9 @@ if(payload.hitDistance < 0.0)
         else
 #endif
         {
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntRayIssued();
+            #endif
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
@@ -1123,6 +1132,9 @@ if(hitMaterialId >= 2.5)
                     if(cam.visQueryAb.z != 0u)
                     {
                         rayQueryEXT receiverSunVisQuery;
+                        #ifdef ORION_RT_STAGE_COUNTERS
+                        rtCntRayIssued();
+                        #endif
                         rayQueryInitializeEXT(
                             receiverSunVisQuery,
                             topLevelAS,
@@ -1171,6 +1183,9 @@ if(hitMaterialId >= 2.5)
                     else
 #endif
                     {
+                        #ifdef ORION_RT_STAGE_COUNTERS
+                        rtCntRayIssued();
+                        #endif
                         traceRayEXT(
                             topLevelAS,
                             gl_RayFlagsTerminateOnFirstHitEXT |

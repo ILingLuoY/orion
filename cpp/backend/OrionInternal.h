@@ -1517,6 +1517,21 @@ struct PerfL10RayStatsSlot
 };
 
 // ============================================================================
+// 2026-11-16：RT 阶段三计数器（rays issued / hits accepted / material evals）。
+// 车道顺序与着色器 rt_stage_counters.glsl 的 RtStageCounters 缓冲严格同序。
+// 总闸 ORION_RT_STAGE_COUNTERS，默认 0：关闭时 C++ 不建缓冲、不清零、不回读、
+// 不打 [RT STAGE CNT] 行；着色器侧整段由编译期宏裁掉，与基线逐位可比。
+inline constexpr uint32_t PERF_RT_STAGE_CNT_COUNT = 3u;
+inline constexpr uint32_t PERF_RT_STAGE_CNT_RING_SIZE = 8u;
+
+enum RtStageCounterIndex : uint32_t
+{
+    RT_STAGE_CNT_RAYS_ISSUED = 0u,
+    RT_STAGE_CNT_HITS_ACCEPTED,
+    RT_STAGE_CNT_MATERIAL_EVALS
+};
+
+// ============================================================================
 // 2026-10-29（P2a）：PBR 图集「按 sprite 生成 mip」—— ORION_PBR_SPRITE_MIP（默认开）
 //
 // 病灶：图集是一张连续纹理，sprite 之间没有 padding。整图 box（vkCmdBlitImage 逐级
@@ -2907,6 +2922,17 @@ void beginPerfL10RayStats(
     VkCommandBuffer commandBuffer
 );
 void endPerfL10RayStats(
+    VkCommandBuffer commandBuffer
+);
+// RT 阶段三计数器：缓冲生命周期 / 帧头收尾 / 帧尾拷贝，挂点与 RayStats 同侧，
+// 全部在 trace 时间戳对之外。
+bool perfRtStageCountersEnabled();
+void destroyRtStageCounters();
+bool ensureRtStageCounters();
+void beginRtStageCounters(
+    VkCommandBuffer commandBuffer
+);
+void endRtStageCounters(
     VkCommandBuffer commandBuffer
 );
 uint64_t makeSectionKey(
@@ -5392,6 +5418,16 @@ extern uint64_t g_perfL10RayStatsWindowFrames;
 extern uint32_t g_perfL10RayStatsActiveSlot;
 extern PerfL10RayStatsSlot
     g_perfL10RayStatsSlots[PERF_L10_RAY_STAT_RING_SIZE];
+// RT 阶段三计数器设备缓冲 / host-visible staging / 窗口汇总。
+extern VkBuffer g_rtStageCntBuffer;
+extern VkDeviceMemory g_rtStageCntMemory;
+extern VkBuffer g_rtStageCntStagingBuffer;
+extern VkDeviceMemory g_rtStageCntStagingMemory;
+extern uint32_t* g_rtStageCntStagingMapped;
+extern uint64_t g_rtStageCntSums[PERF_RT_STAGE_CNT_COUNT];
+extern uint32_t g_rtStageCntActiveSlot;
+extern PerfL10RayStatsSlot
+    g_rtStageCntSlots[PERF_RT_STAGE_CNT_RING_SIZE];
 extern VkBuffer g_textureUploadStaging;
 extern VkDeviceMemory g_textureUploadStagingMemory;
 extern void* g_textureUploadStagingMapped;

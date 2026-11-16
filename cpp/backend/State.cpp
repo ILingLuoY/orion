@@ -1540,6 +1540,16 @@ uint64_t g_perfL10RayStatsWindowFrames = 0u;
 uint32_t g_perfL10RayStatsActiveSlot = 0u;
 PerfL10RayStatsSlot
     g_perfL10RayStatsSlots[PERF_L10_RAY_STAT_RING_SIZE]{};
+// RT 阶段三计数器（2026-11-16）。默认总闸关闭：这些句柄保持 null，不建资源。
+VkBuffer g_rtStageCntBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_rtStageCntMemory = VK_NULL_HANDLE;
+VkBuffer g_rtStageCntStagingBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_rtStageCntStagingMemory = VK_NULL_HANDLE;
+uint32_t* g_rtStageCntStagingMapped = nullptr;
+uint64_t g_rtStageCntSums[PERF_RT_STAGE_CNT_COUNT]{};
+uint32_t g_rtStageCntActiveSlot = 0u;
+PerfL10RayStatsSlot
+    g_rtStageCntSlots[PERF_RT_STAGE_CNT_RING_SIZE]{};
 VkBuffer g_textureUploadStaging = VK_NULL_HANDLE;
 VkDeviceMemory g_textureUploadStagingMemory = VK_NULL_HANDLE;
 void* g_textureUploadStagingMapped = nullptr;

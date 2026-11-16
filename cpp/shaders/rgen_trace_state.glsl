@@ -55,6 +55,10 @@ void serTraceRay(
     uint hint
 )
 {
+    // RT 计数器：SER 漏斗入口计一次射线（与下方 fallback 的 traceRayEXT 臂一一对应）。
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntRayIssued();
+    #endif
     // Perf-L10.9 - the group lane that enabled this call doubles as the SER
     // mode, so a single module can measure every stage of the hit-object
     // sequence against each other in one session:
@@ -397,6 +401,9 @@ vec3 traceVptLocalLightVisibility(
     // [12] 本地光可见性射线（traceVptLocalLightVisibility 的真实发射点）。
     perfRayStatAdd(12u, 1u);
 
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntRayIssued();
+    #endif
     traceRayEXT(
         topLevelAS,
         gl_RayFlagsTerminateOnFirstHitEXT |

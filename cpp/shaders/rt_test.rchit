@@ -15,6 +15,8 @@
 
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
+// RT 阶段三计数器（hits lane），整段由 ORION_RT_STAGE_COUNTERS 裁掉。
+#include "rt_stage_counters.glsl"
 layout(location = 0) rayPayloadInEXT HitPayload payload;
 
 const uint RT_STATE_PURPOSE_MASK       = 0x7u;
@@ -307,6 +309,12 @@ layout(std430, binding = 17, set = 0) readonly buffer LocalLightBuffer
 
 void main()
 {
+    // RT 计数器：closest-hit 被硬件派发执行即计一次（含 purpose-5 可见性探针；
+    // 提前 return 的 invocation 同样计入）。每次 invocation 至多一次 atomicAdd。
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntHitAccepted();
+    #endif
+
     // 2026-11-11 太阳可见度（软影 A 方案，形态 1）：
     // 这条射线只需要"遮挡物距离"，把 gl_HitTEXT 写进 payload 后立刻返回，
     // **不进材质解析**。它替代了原来"整条射线都 SkipClosestHitShader"的做法

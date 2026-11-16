@@ -1803,6 +1803,366 @@ void endPerfL10RayStats(
     slot.frameSerial = g_perfL10FrameSerial;
 }
 
+// ============================================================================
+// 2026-11-16：RT 阶段三计数器（rays issued / hits accepted / material evals）。
+//
+// 车道顺序（与着色器 rt_stage_counters.glsl 的 RtStageCounters 缓冲同序）：
+//   [0] RT_STAGE_CNT_RAYS_ISSUED    rgen 发出的 traceRayEXT / serTraceRay 漏斗 /
+//                                    inline rayQuery 次数（主射线与次级弹射合并）。
+//   [1] RT_STAGE_CNT_HITS_ACCEPTED  rchit / rahit 命中组被硬件派发执行的次数。
+//                                    硬件不暴露遍历步数，本计数不是 traversal steps。
+//   [2] RT_STAGE_CNT_MATERIAL_EVALS K2 callable 材质解析在调用方被调用的次数。
+//
+// 同步纪律（硬约束）：
+//   · 清零 / 回读 / 映射 / barrier 全部录在 begin/end 钩子，与 RayStats 同侧，
+//     在 trace 的时间戳对（writePerfL10GpuBoundary B_TRACE_*）之外。
+//   · 设备缓冲每帧在 begin 清零（scratch 复用）；CPU 侧 sums 跨 PERF_L10_GPU_WINDOW_FRAMES
+//     帧累计，窗口收尾对齐同一 60 帧常量。
+//   · 回读走 8 槽环形 staging：槽位复用（约 8 帧后）才折进 sums，device-local 写 +
+//     host-visible 拷回；不 vkQueueWaitIdle，不在当前帧 fence 上阻塞。
+//   · 总闸 ORION_RT_STAGE_COUNTERS 默认 0：关闭时不建缓冲、不清零、不回读、不打本行。
+// ============================================================================
+namespace
+{
+    VkDeviceSize rtStageCntBytes()
+    {
+        return PERF_RT_STAGE_CNT_COUNT * sizeof(uint32_t);
+    }
+
+    // 本窗口已折进 sums 的帧数 + 已收尾窗口序号（只在 CPU 侧记账）。
+    uint64_t g_rtStageCntWindowFrames = 0u;
+    uint64_t g_rtStageCntClosedWindows = 0u;
+}
+
+bool perfRtStageCountersEnabled()
+{
+    static const bool enabled = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_RT_STAGE_COUNTERS");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return false;
+        }
+
+        return !(raw[0] == '0' || raw[0] == 'f' || raw[0] == 'F');
+    }();
+
+    return enabled;
+}
+
+void destroyRtStageCounters()
+{
+    if(
+        g_rtStageCntStagingMapped != nullptr &&
+        g_rtStageCntStagingMemory != VK_NULL_HANDLE
+    )
+    {
+        vkUnmapMemory(g_device, g_rtStageCntStagingMemory);
+    }
+    g_rtStageCntStagingMapped = nullptr;
+
+    if(g_rtStageCntStagingBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_rtStageCntStagingBuffer, nullptr);
+    }
+    if(g_rtStageCntStagingMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_rtStageCntStagingMemory, nullptr);
+    }
+    if(g_rtStageCntBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_rtStageCntBuffer, nullptr);
+    }
+    if(g_rtStageCntMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_rtStageCntMemory, nullptr);
+    }
+
+    g_rtStageCntStagingBuffer = VK_NULL_HANDLE;
+    g_rtStageCntStagingMemory = VK_NULL_HANDLE;
+    g_rtStageCntBuffer = VK_NULL_HANDLE;
+    g_rtStageCntMemory = VK_NULL_HANDLE;
+
+    for(uint32_t i = 0u; i < PERF_RT_STAGE_CNT_COUNT; ++i)
+    {
+        g_rtStageCntSums[i] = 0u;
+    }
+    g_rtStageCntActiveSlot = 0u;
+    for(PerfL10RayStatsSlot& slot : g_rtStageCntSlots)
+    {
+        slot = {};
+    }
+    g_rtStageCntWindowFrames = 0u;
+    g_rtStageCntClosedWindows = 0u;
+}
+
+bool ensureRtStageCounters()
+{
+    if(g_rtStageCntBuffer != VK_NULL_HANDLE)
+    {
+        return true;
+    }
+
+    if(
+        g_device == VK_NULL_HANDLE ||
+        g_physicalDevice == VK_NULL_HANDLE ||
+        g_rayTracingDescriptorSet == VK_NULL_HANDLE
+    )
+    {
+        return false;
+    }
+
+    const VkDeviceSize cntBytes = rtStageCntBytes();
+    const VkDeviceSize stagingBytes =
+        cntBytes * PERF_RT_STAGE_CNT_RING_SIZE;
+
+    createBuffer(
+        g_device,
+        g_physicalDevice,
+        cntBytes,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        g_rtStageCntBuffer,
+        g_rtStageCntMemory
+    );
+
+    createBuffer(
+        g_device,
+        g_physicalDevice,
+        stagingBytes,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        g_rtStageCntStagingBuffer,
+        g_rtStageCntStagingMemory
+    );
+
+    const VkResult mapResult = vkMapMemory(
+        g_device,
+        g_rtStageCntStagingMemory,
+        0,
+        stagingBytes,
+        0,
+        reinterpret_cast<void**>(&g_rtStageCntStagingMapped)
+    );
+
+    if(mapResult != VK_SUCCESS)
+    {
+        g_rtStageCntStagingMapped = nullptr;
+
+        RTLog(
+            "[RT STAGE CNT] stagingMap=" +
+            std::to_string(static_cast<int>(mapResult))
+        );
+
+        destroyRtStageCounters();
+
+        return false;
+    }
+
+    // 绑定到 RT 描述符集 binding 93（STORAGE_BUFFER，rgen / closest-hit / any-hit）。
+    VkDescriptorBufferInfo cntInfo{};
+    cntInfo.buffer = g_rtStageCntBuffer;
+    cntInfo.offset = 0;
+    cntInfo.range = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet cntWrite{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    };
+    cntWrite.dstSet = g_rayTracingDescriptorSet;
+    cntWrite.dstBinding = 93;
+    cntWrite.descriptorCount = 1;
+    cntWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    cntWrite.pBufferInfo = &cntInfo;
+
+    vkUpdateDescriptorSets(
+        g_device,
+        1,
+        &cntWrite,
+        0,
+        nullptr
+    );
+
+    RTLog(
+        "[RT STAGE CNT] buffer=ready bytes=" +
+        std::to_string(static_cast<unsigned long long>(cntBytes)) +
+        " ring=" +
+        std::to_string(PERF_RT_STAGE_CNT_RING_SIZE)
+    );
+
+    return true;
+}
+
+void beginRtStageCounters(
+    VkCommandBuffer commandBuffer
+)
+{
+    if(!perfRtStageCountersEnabled())
+    {
+        (void)commandBuffer;
+        return;
+    }
+
+    if(!ensureRtStageCounters())
+    {
+        return;
+    }
+
+    const uint32_t slotIndex =
+        static_cast<uint32_t>(
+            g_perfL10FrameSerial %
+            PERF_RT_STAGE_CNT_RING_SIZE
+        );
+
+    g_rtStageCntActiveSlot = slotIndex;
+
+    PerfL10RayStatsSlot& slot = g_rtStageCntSlots[slotIndex];
+
+    // 槽位复用（约 8 帧前的拷贝）才折进窗口 sums：此时 GPU 早已写完，无需等待。
+    if(slot.used && g_rtStageCntStagingMapped != nullptr)
+    {
+        const uint32_t* sample =
+            g_rtStageCntStagingMapped +
+            static_cast<size_t>(slotIndex) * PERF_RT_STAGE_CNT_COUNT;
+
+        for(uint32_t i = 0u; i < PERF_RT_STAGE_CNT_COUNT; ++i)
+        {
+            g_rtStageCntSums[i] += sample[i];
+        }
+
+        ++g_rtStageCntWindowFrames;
+
+        if(g_rtStageCntWindowFrames >= PERF_L10_GPU_WINDOW_FRAMES)
+        {
+            ++g_rtStageCntClosedWindows;
+
+            RTLog(
+                "[RT STAGE CNT]"
+                " frame=" + std::to_string(g_perfL10FrameSerial) +
+                " win=" + std::to_string(g_rtStageCntClosedWindows - 1u) +
+                " rays=" + std::to_string(
+                    g_rtStageCntSums[RT_STAGE_CNT_RAYS_ISSUED]) +
+                " hits=" + std::to_string(
+                    g_rtStageCntSums[RT_STAGE_CNT_HITS_ACCEPTED]) +
+                " mateval=" + std::to_string(
+                    g_rtStageCntSums[RT_STAGE_CNT_MATERIAL_EVALS]) +
+                " frames=" + std::to_string(PERF_L10_GPU_WINDOW_FRAMES)
+            );
+
+            for(uint32_t i = 0u; i < PERF_RT_STAGE_CNT_COUNT; ++i)
+            {
+                g_rtStageCntSums[i] = 0u;
+            }
+
+            g_rtStageCntWindowFrames = 0u;
+        }
+
+        slot = {};
+    }
+
+    // 设备缓冲本帧 scratch 清零：fill + barrier 录在 begin 钩子，trace 边界之外。
+    const VkDeviceSize cntBytes = rtStageCntBytes();
+
+    vkCmdFillBuffer(
+        commandBuffer,
+        g_rtStageCntBuffer,
+        0,
+        cntBytes,
+        0u
+    );
+
+    VkBufferMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = g_rtStageCntBuffer;
+    barrier.offset = 0;
+    barrier.size = cntBytes;
+
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0,
+        0,
+        nullptr,
+        1,
+        &barrier,
+        0,
+        nullptr
+    );
+}
+
+void endRtStageCounters(
+    VkCommandBuffer commandBuffer
+)
+{
+    if(!perfRtStageCountersEnabled())
+    {
+        (void)commandBuffer;
+        return;
+    }
+
+    if(
+        g_rtStageCntBuffer == VK_NULL_HANDLE ||
+        g_rtStageCntStagingBuffer == VK_NULL_HANDLE
+    )
+    {
+        return;
+    }
+
+    const VkDeviceSize cntBytes = rtStageCntBytes();
+
+    VkBufferMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = g_rtStageCntBuffer;
+    barrier.offset = 0;
+    barrier.size = cntBytes;
+
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        nullptr,
+        1,
+        &barrier,
+        0,
+        nullptr
+    );
+
+    VkBufferCopy copy{};
+    copy.srcOffset = 0;
+    copy.dstOffset =
+        cntBytes * static_cast<VkDeviceSize>(g_rtStageCntActiveSlot);
+    copy.size = cntBytes;
+
+    vkCmdCopyBuffer(
+        commandBuffer,
+        g_rtStageCntBuffer,
+        g_rtStageCntStagingBuffer,
+        1,
+        &copy
+    );
+
+    PerfL10RayStatsSlot& slot =
+        g_rtStageCntSlots[g_rtStageCntActiveSlot];
+
+    slot.used = true;
+    slot.frameSerial = g_perfL10FrameSerial;
+}
+
 // 2026-10-10 入口闸门的总闸。ORION_REBUILD_FENCE_GATE=0 退回旧行为（无限等上一批的
 // fence），用于 A/B 对照与快速回退 —— 这样这条改动不需要重新编译就能关掉。
 bool sectionRebuildFenceGateEnabled()

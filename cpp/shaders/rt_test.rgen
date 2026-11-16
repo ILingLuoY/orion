@@ -935,6 +935,10 @@ void perfRayStatAdd(uint index, uint value)
     }
 }
 
+// RT 阶段三计数器（rays / hits / material evals）。整段由编译期宏
+// ORION_RT_STAGE_COUNTERS 裁掉；缺省关闭时与基线逐位可比。口径见该头文件。
+#include "rt_stage_counters.glsl"
+
 bool perfL10DisableVoxelDda()
 {
     return perfL10Stage() == 16u;

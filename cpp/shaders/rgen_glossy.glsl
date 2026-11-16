@@ -242,6 +242,9 @@ for(
         else
 #endif
         {
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntRayIssued();
+            #endif
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
@@ -1087,6 +1090,9 @@ float traceWaterReflectedSun(
     else
 #endif
     {
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
         traceRayEXT(
             topLevelAS,
             secondaryTraverseFlags(),
@@ -1178,6 +1184,9 @@ float traceWaterReflectedSun(
     if(cam.visQueryAb.y != 0u)
     {
         rayQueryEXT glossSunVisQuery;
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
         rayQueryInitializeEXT(
             glossSunVisQuery,
             topLevelAS,
@@ -1225,6 +1234,9 @@ float traceWaterReflectedSun(
     else
 #endif
     {
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
         traceRayEXT(
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT |

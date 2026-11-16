@@ -32,6 +32,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
 
         destroyPerfL10RayStats();
 
+        destroyRtStageCounters();
+
         releaseAllRetirementSlots();
 
         destroySectionRetirementFences();

@@ -430,6 +430,9 @@ if(cam.perfSerAb.y != 0u)
 else
 #endif
 {
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntRayIssued();
+    #endif
     traceRayEXT(
         topLevelAS,
     gl_RayFlagsCullBackFacingTrianglesEXT,
@@ -1499,6 +1502,9 @@ if (matId > 0.5 && matId < 2.5) {
 #define SER_PROBE_SECONDARY_FLAGS 0
 #endif
                         hitObjectEXT probeObject;
+                        #ifdef ORION_RT_STAGE_COUNTERS
+                        rtCntRayIssued();
+                        #endif
                         hitObjectTraceRayEXT(
                             probeObject,
                             topLevelAS,
@@ -1534,6 +1540,9 @@ if (matId > 0.5 && matId < 2.5) {
                     else
 #endif
                     {
+                        #ifdef ORION_RT_STAGE_COUNTERS
+                        rtCntRayIssued();
+                        #endif
                         traceRayEXT(
                             topLevelAS,
                             secondaryTraverseFlags(),
@@ -2643,6 +2652,9 @@ for(
         perfRayStatAdd(9u, 1u);
 
         rayQueryEXT aoVisQuery;
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
         rayQueryInitializeEXT(
             aoVisQuery,
             topLevelAS,
@@ -2689,6 +2701,9 @@ for(
         // [9] 真实发出的 AO 射线（perfSerAb.w=1 时整条 trace 被跳过，不计）
         perfRayStatAdd(9u, 1u);
 
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
         traceRayEXT(
             topLevelAS,
 
@@ -3415,6 +3430,9 @@ for (int si = 0;
     else
 #endif
     {
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
         traceRayEXT(
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT |
@@ -3750,6 +3768,9 @@ if(
     else
 #endif
     {
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
         traceRayEXT(
             topLevelAS,
             rainExposureSoftFlags,
@@ -3854,6 +3875,9 @@ if(
             else
 #endif
             {
+                #ifdef ORION_RT_STAGE_COUNTERS
+                rtCntRayIssued();
+                #endif
                 traceRayEXT(
                     topLevelAS,
                     rainExposureSoftFlags,
@@ -4434,6 +4458,9 @@ if(matId > 0.2 && matId < 0.45)
         // purpose 7 = 天空 miss：rmiss 跳过 24 步体积云行军，只回天空辐亮度。
         // 透射光因此不含云（云影由太阳穿叶项的 shadowTransmittance 承担）。
         hit.state = makeTraceState(RT_PURPOSE_PRIMARY_SKY);
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
         traceRayEXT(
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT |
@@ -5763,9 +5790,15 @@ while(
                     }
                     else
                     {
+                        #ifdef ORION_RT_STAGE_COUNTERS
+                        rtCntRayIssued();
+                        #endif
                         traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
                     }
 #else
+                    #ifdef ORION_RT_STAGE_COUNTERS
+                    rtCntRayIssued();
+                    #endif
                     traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
 #endif
                     }
@@ -8449,6 +8482,9 @@ if (cam.dhFarFieldParams.x > 0.5
                     hit.hitDistance = 1.0;
                     hit.state = makeTraceState(RT_PURPOSE_FULL);
 
+                    #ifdef ORION_RT_STAGE_COUNTERS
+                    rtCntRayIssued();
+                    #endif
                     traceRayEXT(
                         topLevelAS,
                         secondaryTraverseFlags(),
@@ -8948,4 +8984,10 @@ if(sparseWriteImage)
 }
 } // B：K1/K2 输出尾部作用域（K1 = !anyLandingStored，K2 = ptLandingActive，主变体恒真）
 #endif // ORION_K2_DIRECT_STAGE（③：公共尾段/compose/guide/输出归 K2-I）
+
+// RT 计数器：main 末尾统一把本 invocation 的局部射线/材质计数落盘（至多两次
+// atomicAdd）。提前 return 的分支不会走到这里，其未flush 的计数不计入窗口汇总。
+#ifdef ORION_RT_STAGE_COUNTERS
+rtCntFlushRgen();
+#endif
 }

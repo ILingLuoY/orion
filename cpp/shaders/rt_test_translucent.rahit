@@ -37,6 +37,8 @@ uniform image2D glassAlphaBlendLightImage;
 #include "glass_dielectric_common.glsl"
 #include "glass_thinwall_common.glsl"
 #include "glass_chain_common.glsl"
+// RT 阶段三计数器（hits lane = 半透明 any-hit），整段由 ORION_RT_STAGE_COUNTERS 裁掉。
+#include "rt_stage_counters.glsl"
 
 layout(location = 0) rayPayloadInEXT HitPayload payload;
 
@@ -565,6 +567,11 @@ float traceExitGlassPOMShadow(
 #endif  // 2026-10-11 玻璃焦散（R14 出射面 POM 彩色光斑）退役
 
 void main() {
+
+    // RT 计数器：半透明 any-hit 派发调用即计一次。每次 invocation 至多一次 atomicAdd。
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntHitAccepted();
+    #endif
 
     // 2026-10-09：表项 16B，地址取 .xy。
     // 2026-10-21 地形 32B：.w = 该段顶点步长（32/48），取顶点按它分派。
