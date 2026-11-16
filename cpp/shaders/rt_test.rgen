@@ -5,6 +5,10 @@
 #extension GL_GOOGLE_include_directive : require
 
 #extension GL_EXT_ray_tracing : require
+// 2026-11-16：purpose==3 可见性点位的 inline ray query 可选臂（rgen_main_body /
+// rgen_glossy / rgen_water_receiver）需要 ray query 类型与内建；运行时由
+// cam.visQueryAb 闸门决定走 query 臂还是既有 traceRayEXT 臂，默认全关。
+#extension GL_EXT_ray_query : require
 // 2026-10-30 方案 A：次级辐射射线要用 gl_RayFlagsForceOpacityMicromap2StateEXT，
 // glslang 要求显式请求该扩展（否则报 "required extension not requested"）。
 #extension GL_EXT_opacity_micromap : require
@@ -1090,8 +1094,16 @@ int perfL10MarchSteps(vec3 worldPos)
     {
         return WATER_SUN_MARCH_STEPS;
     }
+    // 2026-11-16：远档 1 → 2 步。11-15 的"耗尽即返回透射"修复假设
+    // "出射后剩余是明确的天空直线"，但岸边遮挡物正好在这段空气直线里：
+    // 远档 1 步 = 水里穿出水面就耗尽，出水面后的空气段**从未查过** ⇒
+    // 岸边物体投在浅水水底/焦散上的影子整片漏光（离水面近=近档 3 步
+    // 有一步撞岸上物体 ⇒ 阴影出现；离远=远档 ⇒ 阴影消失，用户实测报告）。
+    // 2 步 = 出水后补一跳：miss ⇒ 返回同一透射（单水柱近/远档仍逐位
+    // 一致），撞不透明 ⇒ 正确阴影，撞到新水界面 ⇒ 走"仍在水中耗尽"的
+    // 保守 0（与近档同语义）。回退 = 改回 1。
     return distance(worldPos, cam.viewInverse[3].xyz) > farDistance
-        ? 1 : WATER_SUN_MARCH_STEPS;
+        ? 2 : WATER_SUN_MARCH_STEPS;
 }
 
 // Stage 13: halve every distance-LOD threshold.  The tier chain was measured
@@ -4664,6 +4676,45 @@ float getTimeDrivenSunElevation()
         sin(fract(cam.historyParams.w) * TWO_PI);
 }
 
+// =============================================================================
+// 2026-11-16 月亮方向（与 sky_model_common.glsl 的
+// moonEclipticDirectionAt / moonDecalPhase01 同式；本文件在那个头 include
+// 之前就要用它，只能内联 —— **改一处必须改另一处**）。
+//
+// 月相 = cam.sssParams.z：0 = 满月（偏移 +0.5 圈，与旧 -sunDirection 等价）、
+// 0.5 = 新月（偏移 0 圈，与太阳重合）。
+// 定义位置必须在**第一个调用点之前**（getClearTimeDrivenSkyLightRadianceScale）。
+// =============================================================================
+float getTimeDrivenMoonElevation()
+{
+    const float TWO_PI = 6.28318530718;
+#if END_ORB_ENABLE
+    // 末地光源球固定天顶（与太阳同一向量，旧行为）。
+    if(abs(cam.weatherParams.z - 3.0) < 0.25)
+    {
+        return 1.0;
+    }
+#endif
+    float moonAngle = fract(
+        fract(cam.historyParams.w) + cam.sssParams.z + 0.5) * TWO_PI;
+    return SOLAR_LATITUDE_35_COS * sin(moonAngle);
+}
+
+vec3 getTimeDrivenMoonDirection()
+{
+    const float TWO_PI = 6.28318530718;
+#if END_ORB_ENABLE
+    if(abs(cam.weatherParams.z - 3.0) < 0.25)
+    {
+        return vec3(0.0, 1.0, 0.0);
+    }
+#endif
+    float moonAngle = fract(
+        fract(cam.historyParams.w) + cam.sssParams.z + 0.5) * TWO_PI;
+    return normalize(vec3(cos(moonAngle), SOLAR_LATITUDE_35_COS * sin(moonAngle),
+        SOLAR_LATITUDE_35_SIN * sin(moonAngle)));
+}
+
 float getOverworldRainStrength()
 {
     return abs(cam.weatherParams.z - 1.0) < 0.25
@@ -5284,6 +5335,21 @@ float c3CloudSunTransmittanceUncached(vec3 worldPos, vec3 sunDirection)
 #endif
 }
 
+// 月光能量地板的**编译期默认值**：只在宿主未写 CameraUBO.moonParams 时使用
+//（旧 DLL）。实际值由 UI 车道 cam.moonParams.x 下发，见 moonLightFloorUi()。
+#ifndef MOON_LIGHT_FLOOR
+#define MOON_LIGHT_FLOOR 0.35
+#endif
+
+// 2026-11-16 月光地板的 UI 车道。z 是有效性标记：旧 DLL 不写这块（全 0）⇒
+// 回落到编译期默认值，避免"只换 shader 不换 DLL"时新月夜全黑。
+float moonLightFloorUi()
+{
+    return cam.moonParams.z > 0.5
+        ? clamp(cam.moonParams.x, 0.0, 1.0)
+        : MOON_LIGHT_FLOOR;
+}
+
 float getClearTimeDrivenSkyLightRadianceScale()
 {
     float elevation = getTimeDrivenSunElevation();
@@ -5291,9 +5357,35 @@ float getClearTimeDrivenSkyLightRadianceScale()
     // and atmospheric traversal still use the true 35-degree-latitude angle.
     float normalizedCycleElevation =
         abs(elevation) / SOLAR_LATITUDE_35_COS;
-    return elevation >= 0.0
-        ? normalizedCycleElevation * TIME_DRIVEN_SUN_NOON_SCALE
-        : normalizedCycleElevation * TIME_DRIVEN_MOON_NOON_SCALE;
+    if(elevation >= 0.0)
+    {
+        return normalizedCycleElevation * TIME_DRIVEN_SUN_NOON_SCALE;
+    }
+    // =====================================================
+    // 2026-11-16 月光能量改为「月亮真实高度 × 照亮比例」。
+    //
+    // 旧式 abs(sunElevation)/cos35 成立的前提是"月亮恒在太阳正对面" ——
+    // 那时月亮高度恰好等于太阳下沉深度，拿 |e| 冒充月亮高度是对的。
+    // 月亮按月相沿日轨移动之后这个前提没了：月亮可能高悬天顶，也可能已经
+    // 落在地平线下（新月前后），必须用真实高度。
+    //
+    // 照亮比例 = 0.5 + 0.5·cos(2π·月相)（0 = 新月、1 = 满月），与
+    // skyModelMoonPhaseDim() 同源。满月当空时本式 = 旧的 moonLight
+    //（月亮高度≈|e|、照亮比例=1），所以出厂月相下观感与改动前一致。
+    // =====================================================
+    const float TWO_PI = 6.28318530718;
+    float moonLightFraction = clamp(
+        getTimeDrivenMoonElevation() / SOLAR_LATITUDE_35_COS, 0.0, 1.0);
+    float moonIllumination = 0.5 + 0.5 * cos(
+        TWO_PI * clamp(cam.sssParams.z, 0.0, 1.0));
+    float moonLight = clamp(moonLightFraction * moonIllumination, 0.0, 1.0);
+    // 2026-11-16 自查修正：地板用 mix 而不是 max。
+    //   max(l, floor) 会让月亮从地平线升到 16.6° 这一段能量恒定在地板档
+    //   （观感："月亮升高了但没变亮"，且 C1 不连续）。
+    //   mix(floor, 1, l) ⇒ 月落时给地板、升起来按高度连续上升，
+    //   满月高空 l=1 时严格 = 1.0（与改动前逐位一致）。
+    float moonLightWithFloor = mix(moonLightFloorUi(), 1.0, moonLight);
+    return moonLightWithFloor * TIME_DRIVEN_MOON_NOON_SCALE;
 }
 
 float getTimeDrivenSkyLightRadianceScale()
@@ -5316,11 +5408,12 @@ float getTimeDrivenSkyLightRadianceScale()
 
 vec3 getTimeDrivenSkyLightDirection()
 {
-    // At night the physical light source is the moon, opposite the sun and
-    // therefore above the horizon.  This prevents below-world "sun" rays.
+    // 2026-11-16：白天用太阳、夜间用**真实的月亮位置**。
+    // 旧实现夜间返回 -sunDirection()，即"月亮永远在太阳正对面"（永远满月、
+    // 白天天上没有月亮）。现在月亮按月相沿日轨移动 ⇒ 满月时与旧值等价。
     return getTimeDrivenSunElevation() >= 0.0
         ? getTimeDrivenSunDirection()
-        : -getTimeDrivenSunDirection();
+        : getTimeDrivenMoonDirection();
 }
 
 // 黎明与黄昏的色相是分开的。旧版只看高度角，太阳上升与下降经过同一高度时
@@ -5363,7 +5456,10 @@ vec3 getTimeDrivenSkyLightColorRaw()
         // 同时给一个"月亮越高越银白、越低越深蓝"的色阶：低仰角时视线穿过更厚
         // 的大气（消光偏蓝移）+ 人眼在暗处的浦肯野效应。
         // 与 sky_model_common.glsl 的 skyModelMoonColor 同一份（单一真源）。
-        vec3 moonColor = skyModelMoonColor(elevation);
+        // 2026-11-16：色阶参数从"太阳下沉深度"改成**月亮真实高度** ——
+        // 月亮按月相移动后两者不再互为相反数。skyModelMoonColor 的参数语义是
+        // "负的仰角"（内部取 -param），所以这里传 -moonElevation。
+        vec3 moonColor = skyModelMoonColor(-getTimeDrivenMoonElevation());
 
         return moonColor;
 #else
@@ -5394,6 +5490,9 @@ vec3 getTimeDrivenSkyLightColorRaw()
     // 日照金山：黎明/日落两相对直射阳光做金色高饱和（天空/云/反射四处
     // 消费点同步接入），早晨/下午/中午平滑退场，正午标定不动。
     vec3 lightColor = mix(base, twilightTint, sunset * 0.72);
+    // 2026-11-16 午后暖光：与 sky_model_common.glsl 的 skyModelSunColor 同式
+    // 同序（先暖光、后金山），否则地形与云会在下午出现色温接缝。
+    lightColor = skySunAfternoonWarmth(lightColor, elevation);
     return skySunGoldenTint(lightColor, elevation);
 #else
     return mix(base, twilightTint, sunset * 0.72);
