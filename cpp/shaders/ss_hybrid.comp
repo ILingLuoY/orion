@@ -771,8 +771,16 @@ void main()
         }
     }
 
+    const vec4 diffuseAlbedoSample = imageLoad(diffuseAlbedoImage, pixel);
+    if(diffuseAlbedoSample.a > 0.5)
+    {
+        // Translucent/glass pixel (rrDeltaCrossedFlag == 1.0): already has exact RT
+        // reflection and does not write ssIndirectTermImage/ssSpecularTermImage.
+        imageStore(sceneColor, pixel, vec4(max(color, vec3(0.0)), 1.0));
+        return;
+    }
     const vec3 diffuseAlbedo =
-        clamp(imageLoad(diffuseAlbedoImage, pixel).rgb, 0.0, 1.0);
+        clamp(diffuseAlbedoSample.rgb, 0.0, 1.0);
     const vec3 specularAlbedo =
         max(imageLoad(specularAlbedoImage, pixel).rgb, vec3(0.0));
 

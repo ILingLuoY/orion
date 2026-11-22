@@ -1,7 +1,5 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// 2026-11-15：体积雾的太阳遮挡改 inline ray query 真值（binding 16 = TLAS）。
-#extension GL_EXT_ray_query : require
 
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -16,66 +14,31 @@ layout(set = 0, binding = 2) uniform sampler3D cloudCurlNoise;
 layout(rgba16f, set = 0, binding = 3) uniform writeonly image2D cloudOutput;
 layout(rg32f, set = 0, binding = 4) uniform writeonly image2D cloudDepthOutput;
 layout(set = 0, binding = 5) uniform sampler2D sceneDepth;
-layout(set = 0, binding = 6) uniform sampler2D sunShadowMap;
-layout(set = 0, binding = 7) uniform sampler2D terrainHeightMap;
-layout(set = 0, binding = 8) uniform sampler2D sunShadowMapFar;
 layout(set = 0, binding = 9) uniform sampler3D baseTex;
 layout(set = 0, binding = 10) uniform sampler3D cloudWorley;
 layout(set = 0, binding = 11) uniform sampler2D cloudAtlas;
-// 2026-11-12：云影图（rt_cloud_shadow.comp 烘的 256² 太阳透射率，覆盖 ±512 格）。
-// 雾的云隙光查这张图 ⇒ 光柱与真实云隙对齐。
-layout(set = 0, binding = 14) uniform sampler2D cloudShadowMap;
-// 2026-11-15：太阳遮挡真值（L2）。体积雾的每个 march 样本直接朝太阳打一条
-// inline ray，命中即遮挡 —— 取代原先"阴影图 + 无数据启发式 + S1 体积"三层拼接。
-// binding 15 的 S1 体积保留在布局里（不采样），需要回退时把 VFOG_SUN_RAY 换成
-// VFOG_SUN_VOLUME 即可。
-layout(set = 0, binding = 16) uniform accelerationStructureEXT fogTlas;
-// 2026-11-15：froxel 雾的屏幕空间结果（fog_froxel_composite.comp 写入）。
-layout(set = 0, binding = 21) uniform sampler2D fogScreenColor;
-layout(set = 0, binding = 22) uniform sampler2D fogScreenDist;
+layout(set = 0, binding = 29) uniform sampler2D skyScatteringLut;
 #include "cloud_bevy_core.glsl"
+// 2026-11-21 统一风场：cam 已在上方 CameraProperties 块声明完毕。
+#include "wind_common.glsl"
 #include "cloud_v5_core.glsl"
 
 const float V4_EMPTY = 1000000.0;
 const float V4_PI = 3.14159265;
 
-// volumetric_fog.glsl 需要这个符号（v1/v2/v3 都在 include 之前定义）
-float hgPhase(float cosine, float g)
-{
-    float g2 = g * g;
-    float d = max(1.0e-4, 1.0 + g2 - 2.0 * g * cosine);
-    return (1.0 - g2) / (4.0 * V4_PI * d * sqrt(d));
-}
-
 #include "sky_model_common.glsl"
 #include "sky_sun_common.glsl"
 #include "clear_sky_aerial.glsl"
 #include "tyndall_cloud_field.glsl"
-#include "high_cloud_field.glsl"
+#include "cloud_cirrus_v5.glsl"
 
-#define TERRAIN_HEIGHT_CONSUMER 1
-#include "terrain_height.glsl"
-
-#define SUN_SHADOW_FAR_MAP 1
-#define SUN_SHADOW_CONSUMER 1
-#define SUN_SHADOW_PCF_TAPS_4 1
-#define SUN_SHADOW_FOG_UNION 1
-// 2026-11-03：与 rt_test.rgen:1221 同一处修复 —— sunShadowJitter() 默认用
-// cam.frameCount 做种子，于是雾里每个 march 步的阴影图采样偏移**逐帧随机**。
-// 体积雾没有自己的时域累积，日落/日出时 god ray 最强，表现为"雾里的暗带/
-// 光柱每帧抖"。改成只按 sampleIndex（= march 步）哈希：偏移恒定，不再逐帧变。
-#define SUN_SHADOW_FRAME_SEED 0
-// 2026-11-09：雾的太阳遮挡把"生产者未命中"判为**无数据（暗）**而不是受光。
-// 只用宏在本 TU 打开：rt_test.rgen 不含这个宏，SPV 与之前逐字节一致，
-// 所以不会触发 RTPSO 冷编。
-#define SUN_SHADOW_TREAT_NO_HIT_AS_NO_DATA 1
-// 2026-11-12：本 TU 有 binding 14（云影图），雾的云隙光改查它。
-#define VFOG_CLOUD_SHADOW_MAP 1
-// 太阳遮挡用射线真值（binding 16 = TLAS）。没有这条 binding 的 TU（v3）走阴影图。
-#define VFOG_SUN_RAY 1
-#include "sun_shadow.glsl"
-
-#include "volumetric_fog.glsl"
+vec2 cloudDirectionToEquirect(vec3 dir)
+{
+    const float TWO_PI = 6.28318530718;
+    float u = fract(atan(dir.z, dir.x) / TWO_PI);
+    float v = asin(clamp(dir.y, -1.0, 1.0)) / 3.14159265359 + 0.5;
+    return vec2(u, v);
+}
 
 float v4HG(float cosine, float g)
 {
@@ -83,6 +46,67 @@ float v4HG(float cosine, float g)
     float d = max(1.0e-4, 1.0 + g2 - 2.0 * g * cosine);
     return (1.0 - g2) / (4.0 * V4_PI * d * sqrt(d));
 }
+
+// ===========================================================================
+// 2026-11-20 夜间月光氛围（用户要求："提高一下月光的氛围感，云应该被月光照亮"）
+//
+// 病灶：夜里云的直射项 = moonColor × 4% 正午能量 × 单次散射相位。相位是 g=0.85
+// 的前向瓣（峰值 ~6.5、背向 ~5e-3），环境项又几乎为 0（skyColor 在夜间已被
+// daylight 压到 8%，再乘 1.5）⇒ 整层云只剩「正对月亮的那一小片」有亮度，
+// 其余塌成全黑：观感不像月夜，像云上挖了个洞。
+//
+// 三处补偿（全部只在夜间权重 moonDirectAmount>0 时生效，白天逐位不变）：
+//   ① 相位地板：让背月面保留各向同性散射基底（真实月夜的云是被多次散射点亮的，
+//      不该只有前向银边）。
+//   ② 月光环境项：把「月光作为天光」加进 ambientTop/Bottom（云顶多、云底少，
+//      因为月光的入射方向朝上），让整层云带月蓝色，而不是纯黑剪影。
+//   ③ 直射能量微抬：月光在云内的多次散射让有效反照率高于单次估计
+//      （CLOUD_MOONLIGHT_ENERGY_SCALE）。
+//
+// 调参入口（都是编译期宏；改完重编本 SPV 即可热重载，不必重启）：
+//   -DCLOUD_MOONLIGHT_ENERGY_SCALE=1.0   ⇒ 关闭 ③
+//   -DCLOUD_MOON_PHASE_FLOOR=0.0         ⇒ 关闭 ①
+//   -DCLOUD_MOON_AMBIENT_SCALE=0.0       ⇒ 关闭 ②
+// ===========================================================================
+#ifndef CLOUD_MOONLIGHT_ENERGY_SCALE
+#define CLOUD_MOONLIGHT_ENERGY_SCALE 4.0
+#endif
+#ifndef CLOUD_MOON_PHASE_FLOOR
+#define CLOUD_MOON_PHASE_FLOOR 0.45
+#endif
+#ifndef CLOUD_MOON_AMBIENT_SCALE
+#define CLOUD_MOON_AMBIENT_SCALE 0.45
+#endif
+// 夜间云天光地板（与月亮是否在地平线上无关，随太阳高度连续淡入）
+#ifndef CLOUD_NIGHT_AMBIENT
+#define CLOUD_NIGHT_AMBIENT 0.07
+#endif
+// 云底分到的月光环境比例（月光自上而下 ⇒ 云底只吃到一部分漫射）。
+#ifndef CLOUD_MOON_AMBIENT_BOTTOM
+#define CLOUD_MOON_AMBIENT_BOTTOM 0.35
+#endif
+
+// ===========================================================================
+// 2026-11-20 云的大气透视（用户要求："我想让云色随大气散射"）
+//
+// 现状（改前）：云的直射色走 skyModelSunColor*（含 skySunPhysicalBaseColor 的
+// airmass 消光 + 暮色调色板）、环境色走 clearSkyInscatter，**受光**确实随大气
+// 散射变；但云体本身没有空气层 —— 地形有 applyClearSkyAerialPerspective，
+// 云没有。于是远处的云（几百~上万格）在黄昏/清晨仍保持"自己的"灰白色，
+// 而它背后的山与天空已经被染成橙色/蓝紫色 ⇒ 云像贴在天上的贴纸。
+//
+// v3 退役档里本来有这段（volumetric_clouds_v3.comp:317-334），v5 重构时丢了。
+// 这里按 v3 的口径补回：沿视线取云的体积代表点做高度密度、用视线方向的解析
+// 晴空 in-scatter 做空气色，按**云的总不透明度**混合（薄边过渡自然、厚云内
+// 部不会被空气洗白）。
+//
+// 强度来自 CameraUBO.cloudAerialParams.x（宿主 2026-11-07 按"死设置"写死 0；
+// 取 max 保留通道，将来接通滑条就能覆盖默认值）。
+// 回退：-DCLOUD_AERIAL_BASE_STRENGTH=0
+// ===========================================================================
+#ifndef CLOUD_AERIAL_BASE_STRENGTH
+#define CLOUD_AERIAL_BASE_STRENGTH 0.5
+#endif
 
 void storeEmpty(ivec2 pixel)
 {
@@ -134,21 +158,76 @@ float cloudSunVisibilityFromConfig(HPCloudConfig cfg)
     return exp(-opticalDepth);
 }
 
+void storeTileDepth(ivec2 tileOrigin, ivec2 tileSpan, ivec2 size, vec4 depthVal)
+{
+    for(int dy = 0; dy < tileSpan.y; ++dy)
+    for(int dx = 0; dx < tileSpan.x; ++dx)
+    {
+        ivec2 p = tileOrigin + ivec2(dx, dy);
+        if(p.x < size.x && p.y < size.y)
+        {
+            imageStore(cloudDepthOutput, p, depthVal);
+        }
+    }
+}
+
+void storeEmptyTile(ivec2 tileOrigin, ivec2 tileSpan, ivec2 size)
+{
+    for(int dy = 0; dy < tileSpan.y; ++dy)
+    for(int dx = 0; dx < tileSpan.x; ++dx)
+    {
+        ivec2 p = tileOrigin + ivec2(dx, dy);
+        if(p.x < size.x && p.y < size.y)
+        {
+            imageStore(cloudOutput, p, vec4(0.0, 0.0, 0.0, 1.0));
+            imageStore(cloudDepthOutput, p, vec4(V4_EMPTY, V4_EMPTY, 0.0, 0.0));
+        }
+    }
+}
+
 void main()
 {
-    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(cloudOutput);
-    if(any(greaterThanEqual(pixel, size))) return;
+    int temporalMode = clamp(int(cam.cloudTemporalParams.x + 0.5), 0, 2);
+
+    ivec2 tileOrigin;
+    ivec2 tileSpan;
+    ivec2 pixel;
+    if(temporalMode == 0)
+    {
+        if(any(greaterThanEqual(gid, size))) return;
+        tileOrigin = gid;
+        tileSpan = ivec2(1, 1);
+        pixel = gid;
+    }
+    else if(temporalMode == 1)
+    {
+        tileOrigin = ivec2(gid.x * 2, gid.y);
+        tileSpan = ivec2(2, 1);
+        if(tileOrigin.x >= size.x || tileOrigin.y >= size.y) return;
+        int parity = int((uint(gid.y) ^ cam.frameCount) & 1u);
+        pixel = ivec2(min(tileOrigin.x + parity, size.x - 1), tileOrigin.y);
+    }
+    else
+    {
+        tileOrigin = gid * 2;
+        tileSpan = ivec2(2, 2);
+        if(tileOrigin.x >= size.x || tileOrigin.y >= size.y) return;
+        const ivec2 bayer2x2[4] = ivec2[4](
+            ivec2(0, 0), ivec2(1, 1), ivec2(1, 0), ivec2(0, 1)
+        );
+        pixel = min(tileOrigin + bayer2x2[cam.frameCount & 3u], size - ivec2(1));
+    }
 
     bool cloudDeckEnabled = cam.cloudParams1.w >= 0.5;
     bool highCloudEnabled = cam.highCloudParams0.x >= 0.5;
     const bool overworldDimension = abs(cam.weatherParams.z - 1.0) < 0.25;
     cloudDeckEnabled = cloudDeckEnabled && overworldDimension;
     highCloudEnabled = highCloudEnabled && overworldDimension;
-    const bool fogWanted = cam.cloudParams7.x >= 0.5;
-    if(!cloudDeckEnabled && !highCloudEnabled && !fogWanted)
+    if(!cloudDeckEnabled && !highCloudEnabled)
     {
-        storeEmpty(pixel);
+        storeEmptyTile(tileOrigin, tileSpan, size);
         return;
     }
 
@@ -167,54 +246,113 @@ void main()
         const vec2 sceneTexel = (vec2(pixel) + 0.5) / vec2(size) * sceneSize;
         const ivec2 base = ivec2(floor(sceneTexel - 0.5));
         const ivec2 limit = ivec2(sceneSize) - ivec2(1, 1);
-        float nearest = 1.0;
+        // Reversed-Z: 0.0 = sky/far, 1.0 = near -> max() picks the closest surface.
+        float nearest = 0.0;
         for(int oy = 0; oy < 2; ++oy)
         for(int ox = 0; ox < 2; ++ox)
         {
-            nearest = min(nearest, texelFetch(sceneDepth,
+            nearest = max(nearest, texelFetch(sceneDepth,
                 clamp(base + ivec2(ox, oy), ivec2(0, 0), limit), 0).r);
         }
         rawSceneDepth = nearest;
     }
     float sceneDistance = sceneDistanceForDepth(ndc, rawSceneDepth);
 
+    // Lossless early-out for opaque ground/terrain below the cloud deck: skips sky LUTs, march, and cirrus.
+    float cloudBottomY = max(cam.cloudParams0.x, 1.0);
+    if(cameraPosition.y < cloudBottomY && sceneDistance < (cloudBottomY - cameraPosition.y) - 2.0)
+    {
+        storeEmptyTile(tileOrigin, tileSpan, size);
+        return;
+    }
+
     vec3 lightDir0 = sunDirection();
     float sunElevation = lightDir0.y;
-    vec3 lightDirection = sunElevation >= 0.0 ? lightDir0 : -lightDir0;
+    // 2026-11-16：夜间光源 = 真实月亮位置（按月相沿日轨移动），不再是 -sunDir。
+    vec3 moonLightDir0 = moonEclipticDirectionAt(
+        moonDecalPhase01(cam.historyParams.w, cam.sssParams.z));
+    // =====================================================================
+    // 2026-11-19 直射光「太阳 → 月亮」交接连续化（修用户报告的
+    // "云在夕阳到夜晚的某一段时间光照会突然跳变"）
+    //
+    // 旧式：方向在 sunElevation >= 0 处硬翻，颜色用 dayAmount(±0.03) 混；
+    // 而 dayAmount 在翻转点只有 0.5 ⇒ 云的直射能量还剩 0.75（满档 1.5）
+    // 时就整束换了方向/颜色 ⇒ 亮度、前向散射、银边、云影方向同时跳变。
+    // 新式：交接点下移到太阳沉到地平线下 0.05（≈2.9°），两侧能量在该点
+    // 同时归零 ⇒ 硬切换不可见。权重函数在 sky_model_common.glsl（单一真源，
+    // 光柱/体积雾/云 v3 共用同一组）。
+    // 回退：把下面三行换回 mix(..., dayAmount) + `sunElevation >= 0.0`。
+    // =====================================================================
+    float sunDirectAmount = skyDirectSunAmount(sunElevation);
+    float moonDirectAmount = skyDirectMoonAmount(sunElevation);
+    bool sunIsDirectLight = skyDirectIsSun(sunElevation);
+    vec3 lightDirection = sunIsDirectLight ? lightDir0 : moonLightDir0;
+    // dayAmount 语义不变（±0.03 的环境/雾/月相权重），与直射光交接解耦。
     float dayAmount = smoothstep(-0.03, 0.03, sunElevation);
     float elevationMagnitude = abs(sunElevation) / 0.81915204429;
+    // 月光高度归一用月亮自己的高度（见 volumetric_light.comp 同段注释）。
+    float moonElevationMagnitude =
+        clamp(moonLightDir0.y / 0.81915204429, 0.0, 1.0);
     float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
 
     // 2026-11-13：夜间色改调共享的 skyModelMoonColor（原来硬编码 0.46,0.56,1.00
-    // ⇒ 与地形分裂）。
-    vec3 directLightColor = mix(skyModelMoonColor(sunElevation),
-        skyModelSunColor(lightDirection, 0.5), dayAmount);
-    float directLightEnergy = mix(1.5 * (0.05 / 1.22077458876) * elevationMagnitude,
-        1.5, dayAmount) * clamp(cam.cloudParams5.z, 0.0, 3.0);
+    // ⇒ 与地形分裂）。2026-11-16：参数改为月亮高度（该函数收"负仰角"）。
+    // 2026-11-19：太阳侧用**连续版**阳光色 —— skyModelSunColor() 在 sun<0 处
+    // 硬返回月蓝，若在交接带里用它，能量还有一大截时颜色就已经换了（跳变根源）。
+    vec3 directLightColor = sunIsDirectLight
+        ? skyModelSunColorContinuous(lightDir0, 0.5)
+        : skyModelMoonColor(-moonLightDir0.y);
+    float directLightEnergy = (
+        1.5 * sunDirectAmount +
+        1.5 * (0.05 / 1.22077458876) * moonElevationMagnitude * moonDirectAmount *
+            CLOUD_MOONLIGHT_ENERGY_SCALE
+    ) * clamp(cam.cloudParams5.z, 0.0, 3.0);
     float moonStrength = cam.cloudMoonParams.x >= 0.0 ? cam.cloudMoonParams.x : 1.0;
     float moonPhase = cam.cloudMoonParams.y >= 0.0 ? cam.cloudMoonParams.y : 1.0;
-    vec3 sunColor = directLightColor * directLightEnergy *
-        mix(1.0, moonStrength * clamp(moonPhase, 0.0, 1.0), 1.0 - dayAmount);
+    float sunsetWarmthKnob = clamp(cam.cloudSkyHueParams.z, 0.0, 2.0);
+    float goldenWindow = smoothstep(-0.07, 0.02, sunElevation)
+        * (1.0 - smoothstep(0.08, 0.26, sunElevation));
+    vec3 warmBoost = mix(vec3(1.0), vec3(1.24, 0.90, 0.68),
+        goldenWindow * clamp(sunsetWarmthKnob, 0.0, 1.0))
+        * (1.0 + max(sunsetWarmthKnob - 1.0, 0.0) * goldenWindow * vec3(0.35, 0.14, 0.04));
 
-    // 2026-11-13：与地形同源的月相调光（cam.sssParams.z 由宿主按天数累计）。
-    sunColor *= mix(1.0, skyModelMoonPhaseDim(cam.sssParams.z, 0.35), 1.0 - dayAmount);
+    vec3 sunColor = directLightColor * directLightEnergy * warmBoost *
+        mix(1.0, moonStrength * clamp(moonPhase, 0.0, 1.0), moonDirectAmount);
+    sunColor *= mix(1.0, skyModelMoonPhaseDim(cam.sssParams.z, 0.35), moonDirectAmount);
 
-    float daylight = mix(0.08, 1.0, smoothstep(-0.10, 0.25, sunElevation));
-    float skyScale = daylight * clamp(elevationMagnitude, 0.0, 1.0);
-    vec3 sunSideDir = normalize(vec3(lightDirection.x, 0.20, lightDirection.z));
-    vec3 antiSunDir = normalize(vec3(-lightDirection.x, 0.20, -lightDirection.z));
-    vec3 radianceZenith = clearSkyInscatter(vec3(0.0, 1.0, 0.0), sunElevation, lightDirection,
-        directLightColor, skyScale, mix(1.0, 0.20, rain), vec3(1.0));
-    vec3 radianceSunSide = clearSkyInscatter(sunSideDir, sunElevation, lightDirection,
-        directLightColor, skyScale, mix(1.0, 0.20, rain), vec3(1.0));
-    vec3 radianceAntiSun = clearSkyInscatter(antiSunDir, sunElevation, lightDirection,
-        directLightColor, skyScale, mix(1.0, 0.20, rain), vec3(1.0));
-    float wZ = v4HG(dot(worldDirection, vec3(0.0, 1.0, 0.0)), 0.25);
-    float wS = v4HG(dot(worldDirection, sunSideDir), 0.25);
-    float wA = v4HG(dot(worldDirection, antiSunDir), 0.25);
-    vec3 skyColor = (radianceZenith * wZ + radianceSunSide * wS + radianceAntiSun * wA) /
-        max(wZ + wS + wA, 1.0e-4);
-    skyColor *= clamp(cam.cloudParams5.w, 0.0, 3.0);
+    float moonAmbientGain = clamp(moonStrength * (1.0 / 3.0), 0.0, 1.5) *
+        clamp(moonPhase, 0.0, 1.0);
+    vec3 moonSkyAmbient = skyModelMoonColor(-moonLightDir0.y) *
+        moonElevationMagnitude * moonDirectAmount * moonAmbientGain *
+        mix(1.0, skyModelMoonPhaseDim(cam.sssParams.z, 0.35), moonDirectAmount);
+
+    float skyLightIntensity = clamp(cam.cloudParams5.w, 0.0, 3.0);
+    vec3 skyZenithColor;
+    vec3 skySunSideColor;
+    vec3 skyRayColor;
+    if(cam.skyParams1.y >= 0.5)
+    {
+        skyZenithColor = max(textureLod(skyScatteringLut,
+            cloudDirectionToEquirect(vec3(0.0, 1.0, 0.0)), 0.0).rgb, vec3(0.0));
+        skySunSideColor = max(textureLod(skyScatteringLut,
+            cloudDirectionToEquirect(normalize(vec3(lightDir0.x, 0.14, lightDir0.z))),
+            0.0).rgb, vec3(0.0));
+        skyRayColor = max(textureLod(skyScatteringLut,
+            cloudDirectionToEquirect(worldDirection), 0.0).rgb, vec3(0.0));
+    }
+    else
+    {
+        float daylightFb = mix(0.08, 1.0, smoothstep(-0.10, 0.25, sunElevation));
+        float skyScaleFb = daylightFb * clamp(elevationMagnitude, 0.0, 1.0);
+        vec3 sunSideDirFb = normalize(vec3(lightDirection.x, 0.20, lightDirection.z));
+        skyZenithColor = clearSkyInscatter(vec3(0.0, 1.0, 0.0), sunElevation, lightDirection,
+            directLightColor, skyScaleFb, mix(1.0, 0.20, rain), vec3(1.0));
+        skySunSideColor = clearSkyInscatter(sunSideDirFb, sunElevation, lightDirection,
+            directLightColor, skyScaleFb, mix(1.0, 0.20, rain), vec3(1.0));
+        skyRayColor = clearSkyInscatter(worldDirection, sunElevation, lightDirection,
+            directLightColor, skyScaleFb, mix(1.0, 0.20, rain), vec3(1.0));
+    }
+    vec3 skyColor = mix(skyZenithColor, skySunSideColor, 0.25) * skyLightIntensity;
 
     BevyCloudConfig cfg;
     cfg.baseScale = max(cam.cloudParams3.z, 0.05) * 1.0;
@@ -276,19 +414,22 @@ void main()
         vec3 origin = vec3(cameraPosition.x - anchorXZ.x,
             cameraPosition.y + cfg.planetRadius,
             cameraPosition.z - anchorXZ.y);
+        float thunderAmount = clamp(cam.weatherParams.y, 0.0, 1.0);
+        float weatherCoupling = clamp(cam.cloudSkyHueParams.w, 0.0, 2.0);
+        float stormBuild = clamp((rainAmount * 0.85 + thunderAmount * 0.70) * weatherCoupling, 0.0, 1.4);
+
         HPCloudConfig hp = hpDefaultConfig();
+        // 2026-11-21 统一风场：HP 云平流方向接 cam.windParams.x（无效回落出厂）。
+        hp.windDir = windDirXZ();
         hp.bottomHeight = cfg.bottomHeight;
         hp.topHeight = cfg.topHeight;
         hp.planetRadius = cfg.planetRadius;
-        // 2026-11-10：**雨天聚云**。原来 HP 路径（v5 真正走的路径）直接取用户覆盖率，
-        // 完全忽略 rain，于是下雨时云不铺满；而旧 Bevy 路径（cfg.coverage）一直有
-        // `mix(coverage, 0.98, rain*0.9)` 的耦合，所以这条只在 Bevy 档生效。
-        // 这里把同一口径搬到 HP 路径 —— 与 cfg.coverage 完全同式，便于两档对齐。
-        hp.coverage = clamp(mix(cam.cloudParams0.z, 0.98, rainAmount * 0.9), 0.0, 1.0);
-        hp.densityMult = 0.004 * clamp(cam.cloudParams0.w, 0.05, 10.0);
+        hp.coverage = clamp(mix(cam.cloudParams0.z, 0.96, clamp(stormBuild * 0.9, 0.0, 1.0)), 0.0, 1.0);
+        hp.densityMult = 0.004 * clamp(cam.cloudParams0.w, 0.05, 10.0) * (1.0 + stormBuild * 0.40);
         hp.noiseScale = max(cam.cloudParams3.z, 0.05);
         hp.detailScale = clamp(cam.cloudParams6.w, 0.1, 12.0) / 10.0;
         hp.detailStrength = clamp(cam.cloudParams5.y, 0.0, 2.0);
+        hp.typeBias = clamp(cam.cloudParams5.x + stormBuild * 0.25, 0.0, 1.0);
         hp.wispyWeight = 0.45;
         hp.billowyWeight = 0.45;
         hp.detailStrengthCu   = cam.hpShapeA.x >= 0.0 ? cam.hpShapeA.x : hp.detailStrengthCu;
@@ -309,27 +450,9 @@ void main()
         hp.scCellThickStr     = cam.hpShapeD.w >= 0.0 ? cam.hpShapeD.w : hp.scCellThickStr;
         hp.forwardEcc         = cam.hpLightA.x >= 0.0 ? cam.hpLightA.x : hp.forwardEcc;
         hp.backwardEcc        = cam.hpLightA.y >= 0.0 ? cam.hpLightA.y : hp.backwardEcc;
-        // phi_fwd 三参的权威来源是 HP 面板滑条（hpLightA/hpLightB）；
-        // cloudMsParams（早期工厂值，GUI 无入口）只在 HP 未设（<0）时回落。
-        // 原优先级反着写：工厂值 3.4/2.0/0.5 把 HP[18][19][20] 三条滑条压死，
-        // 且 3.4 超出参考建议范围（0.1~2.0）。
-        hp.phiFwdIntensity = cam.hpLightA.z >= 0.0 ? cam.hpLightA.z
-            : (cam.cloudMsParams.x > 0.0 ? cam.cloudMsParams.x : hp.phiFwdIntensity);
-        hp.phiFwdDepthPow = cam.hpLightA.w >= 0.0 ? cam.hpLightA.w
-            : (cam.cloudMsParams.y > 0.0 ? cam.cloudMsParams.y : hp.phiFwdDepthPow);
-        hp.phiFwdDepthBias = cam.hpLightB.x != 0.0 ? cam.hpLightB.x : cam.cloudMsParams.z;
-        hp.phiFwdCompress     = cam.hpLightB.y >= 0.0 ? cam.hpLightB.y : hp.phiFwdCompress;
-        // 边界受光置信度 / MS 建立速率：cloudPhiParams 从 10-02 起一直下发，
-        // 但 v5 从未读取 —— 参考的边界 wrap 光照特性实际处于"永远关闭"。
-        // 负值=回落 hpDefaultConfig（与 Java 侧 A/B 通道约定一致）。
-        hp.phiFwdBoundary = cam.cloudPhiParams.x >= 0.0
-            ? clamp(cam.cloudPhiParams.x, 0.0, 1.0) : hp.phiFwdBoundary;
-        hp.phiFwdMSBuild = cam.cloudPhiParams.y > 0.0 ? cam.cloudPhiParams.y : hp.phiFwdMSBuild;
-        // 锥形步长比率 A/B 通道（≤0 = 回落参考宏 2.0）
+        hp.phiFwdIntensity    = 0.0;
         hp.coneRatio = cam.cloudPhiParams.w > 0.0
-            ? clamp(cam.cloudPhiParams.w, 1.05, 8.0) : 2.0;
-        // 光步侵蚀细节开关（cloudShapeParams.w，性能优先默认关）：开 = 光步也做
-        // erosion 采样（参考行为，自阴影带细节，云 pass +~40%）；关 = 跳过。
+            ? clamp(cam.cloudPhiParams.w, 1.15, 4.0) : 2.0;
         hp.lightErosion = cam.cloudShapeParams.w > 0.5 ? 1.0 : 0.0;
         hp.scatterODScale     = cam.hpLightB.z >= 0.0 ? cam.hpLightB.z : hp.scatterODScale;
         hp.scatterCurvePow    = cam.hpLightB.w >= 0.0 ? cam.hpLightB.w : hp.scatterCurvePow;
@@ -344,39 +467,83 @@ void main()
         float lightOverrideHP = cam.cloudParams6.z;
         hp.lightSteps = lightOverrideHP > 0.9
             ? int(clamp(lightOverrideHP, 4.0, 12.0))
-            : 8;
+            : (cam.cloudParams2.x < 56.0 ? 4 : 6);
         hp.msOctaves = cam.ueCloudA.x >= 0.0 ? int(clamp(cam.ueCloudA.x, 1.0, 3.0)) : 3;
-        hp.msAttenuation = cam.ueCloudA.z >= 0.0 ? clamp(cam.ueCloudA.z, 0.1, 1.0) : 0.5;
-        hp.msContribution = cam.ueCloudA.y >= 0.0 ? clamp(cam.ueCloudA.y, 0.05, 1.0) : 0.5;
-        hp.luminanceScale = cam.ueCloudA.w >= 0.0 ? cam.ueCloudA.w : 3.0;
+        hp.msAttenuation = cam.ueCloudA.z >= 0.0 ? clamp(cam.ueCloudA.z, 0.1, 1.0) : 0.45;
+        hp.msContribution = cam.ueCloudA.y >= 0.0 ? clamp(cam.ueCloudA.y, 0.05, 1.0) : 0.55;
+        hp.luminanceScale = cam.ueCloudA.w >= 0.0 ? cam.ueCloudA.w : 1.0;
         hp.sunDir = cfg.sunDir;
         hp.sunColor = cfg.sunColor;
-        // 云顶环境光倍率：cloudAmbientParams.x 从 10-02 起下发但从未被读取，
-        // 这里接通（≤0 回落 1.5）。云底仍用 0.15 固定近似（参考用的是 SH 向下的
-        // 地面反弹辐亮度，本仓无该探针——见决策文档受光差距清单）。
-        hp.ambientTop = skyColor * (cam.cloudAmbientParams.x > 0.0
-            ? clamp(cam.cloudAmbientParams.x, 0.1, 4.0) : 1.5);
-        hp.ambientBottom = skyColor * 0.15;
-        // 2026-11-10：地面反弹（受光）。这两个 lane 此前**没有任何着色器读取**
-        // （cloudPhysicsParams 只有声明），对应 UI 的「地面反照率 / 地面反射强度」
-        // 两条滑条因此一直是死的。现在接进 core 的 ambientTerm。
+
+        float ambTopMul = cam.cloudAmbientParams.x > 0.0
+            ? clamp(cam.cloudAmbientParams.x, 0.1, 4.0) : 1.0;
+        // 夜间地板：太阳沉到地平线下后连续淡入，月相只做轻微调光。
+        float nightness = 1.0 - smoothstep(-0.14, 0.03, sunElevation);
+        vec3 nightAmbientFloor = skyModelMoonColor(-0.35) * (CLOUD_NIGHT_AMBIENT * nightness
+            * skyModelMoonPhaseDim(cam.sssParams.z, 0.55) * max(skyLightIntensity, 0.25));
+        hp.ambientBiasDir = lightDir0;
+        hp.ambientTop = min(skyZenithColor, vec3(1.5)) * (0.42 * skyLightIntensity * ambTopMul)
+            + moonSkyAmbient * CLOUD_MOON_AMBIENT_SCALE + nightAmbientFloor;
+        hp.ambientSunSide = min(skySunSideColor, vec3(1.8)) * (0.48 * skyLightIntensity * ambTopMul)
+            + moonSkyAmbient * CLOUD_MOON_AMBIENT_SCALE + nightAmbientFloor;
+        hp.ambientBottom = mix(skyZenithColor, skySunSideColor, 0.25) * (0.14 * skyLightIntensity)
+            + moonSkyAmbient * (CLOUD_MOON_AMBIENT_SCALE * CLOUD_MOON_AMBIENT_BOTTOM)
+            + nightAmbientFloor * 0.6;
+
+        hp.phaseFloor = max(clamp(cam.cloudPhysicsParams.w, 0.0, 1.0),
+            moonDirectAmount * CLOUD_MOON_PHASE_FLOOR);
         hp.groundAlbedo = vec3(clamp(cam.cloudPhysicsParams.x, 0.0, 0.8));
         hp.groundBounce = clamp(cam.cloudPhysicsParams.y, 0.0, 1.0);
         hp.viewDistance = clamp(cfg.viewDistance, 4000.0, 60000.0);
-        // 远处淡出起点：HP 面板"远处淡出起点"（hpMiscA.z）优先，未设回落主面板
-        // 同名滑条（cfg.fadeStart）。原来的无条件 0.75 硬编码把两条滑条都压死。
         hp.fadeStart = cam.hpMiscA.z >= 0.0 ? cam.hpMiscA.z : cfg.fadeStart;
         hp.time = cfg.time;
-        float ingnHP = fract(52.9829189 * fract(dot(vec2(pixel),
-            vec2(0.06711056, 0.00583715))));
-        hp.jitter = fract(ingnHP);
-        // 2026-11-11：把云层几何与覆盖率交给雾，由雾逐 march 步算云隙透射率
-    //（云隙光）。全局标量已被替换 —— 那样只会整片变暗、看不到光柱。
-    cloudGapParamsForFog = vec4(hp.bottomHeight, hp.topHeight,
-        clamp(hp.coverage, 0.0, 1.0), max(hp.densityMult, 0.0));
 
-    march = hpTraceVolumetricRay(origin, worldDirection, min(sceneDistance, cfg.viewDistance),
-            hp, cloudAtlas, baseTex, cloudWorley, cloudDistance, hpMeanDistance);
+        // Uncorrelated integer pixel hash + 1D low-discrepancy temporal sequences (eliminates IGN 2x3 lattice dots).
+        uvec2 qHash = uvec2(pixel) * uvec2(1664525u, 1013904223u) + uvec2(1013904223u, 1664525u);
+        qHash.x += qHash.y * 1664525u;
+        qHash.y += qHash.x * 1664525u;
+        qHash ^= qHash >> 16u;
+        uint frameMod = cam.frameCount & 255u;
+        float seedRay = float((qHash.x ^ qHash.y) & 0xFFFFu) * (1.0 / 65536.0);
+        float seedLight = float(((qHash.x + qHash.y * 374761393u) >> 16u) & 0xFFFFu) * (1.0 / 65536.0);
+        hp.jitter = fract(seedRay + 0.61803398875 * float(frameMod));
+        hp.lightJitter = fract(seedLight + 0.7548776662 * float(frameMod));
+
+        // New weather, micro-detail, and atmospheric controls via reused UBO lanes.
+        hp.powderEffect = clamp(cam.cloudLightParams2.x, 0.0, 2.0);
+        hp.silverStrength = clamp(cam.cloudParams2.z, 0.0, 1.0);
+        hp.silverSpread = clamp(cam.cloudLightParams2.y, 0.0, 2.0);
+        hp.baseErosion = clamp(cam.cloudLightParams2.w, 0.0, 1.5);
+        hp.stormDarkness = clamp(cam.cloudSkyHueParams.x, 0.0, 2.0)
+            * (0.45 + 0.55 * clamp(stormBuild + 0.35, 0.0, 1.5));
+        hp.sunsetWarmth = sunsetWarmthKnob;
+        hp.weatherCoupling = weatherCoupling;
+
+        // Volumetric in-cloud sheet lightning inside thunderstorm cells.
+        float lightningUser = clamp(cam.cloudSkyHueParams.y, 0.0, 3.0);
+        float boltEnv = lightningFlashEnvelope() * lightningUser;
+        if(boltEnv > 0.01)
+        {
+            float boltCell = floor(float(cam.frameCount) * (1.0 / 60.0) * 1.6);
+            float h1 = fract(sin(boltCell * 127.1 + 31.7) * 43758.5453);
+            float h2 = fract(sin(boltCell * 269.5 + 183.3) * 43758.5453);
+            float h3 = fract(sin(boltCell * 419.2 + 91.1) * 43758.5453);
+            float angle = h1 * 6.2831853;
+            float radius = mix(350.0, 1900.0, h2);
+            vec2 camAltXZ = cameraPosition.xz - anchorXZ;
+            float boltY = mix(hp.bottomHeight + 120.0, hp.topHeight - 120.0, h3);
+            hp.lightningPos = vec3(
+                camAltXZ.x + cos(angle) * radius,
+                boltY,
+                camAltXZ.y + sin(angle) * radius);
+            hp.lightningColor = vec3(1.65, 1.95, 2.85) * boltEnv;
+        }
+
+        cloudGapParamsForFog = vec4(hp.bottomHeight, hp.topHeight,
+            clamp(hp.coverage, 0.0, 1.0), max(hp.densityMult, 0.0));
+
+        march = hpTraceVolumetricRay(origin, worldDirection, min(sceneDistance, cfg.viewDistance),
+                hp, cloudAtlas, baseTex, cloudWorley, cloudDistance, hpMeanDistance);
     }
 
     float opacity = clamp(1.0 - march.a, 0.0, 1.0);
@@ -386,69 +553,41 @@ void main()
     float highPixelAngle = 2.0 * abs(cam.projInverse[1][1]) / float(size.y);
     float highDistance = V4_EMPTY;
     vec4 highCloud = vec4(0.0, 0.0, 0.0, 1.0);
-    if(highCloudEnabled)
+    if(highCloudEnabled && (transmittance > 0.02 || cameraPosition.y > (cam.cloudParams0.x + cam.cloudParams0.y)))
     {
-        highCloud = sampleHighCloud(cameraPosition, worldDirection, lightDirection,
-            highPixelAngle, highDistance);
-        if(highDistance > sceneDistance)
-        {
-            highCloud = vec4(0.0, 0.0, 0.0, 1.0);
-            highDistance = V4_EMPTY;
-        }
+        highCloud = sampleCirrusV5(cameraPosition, worldDirection, lightDirection,
+            sunElevation, skyRayColor, skyZenithColor, directLightColor,
+            highPixelAngle, sunsetWarmthKnob, sceneDistance, highDistance);
     }
     if(highDistance < cloudDistance) scattering = highCloud.rgb + highCloud.a * scattering;
     else scattering += transmittance * highCloud.rgb;
     transmittance *= highCloud.a;
     cloudDistance = min(cloudDistance, highDistance);
 
-    const vec3 fogAmbientLegacy =
-        mix(vec3(0.055, 0.070, 0.125), vec3(0.62, 0.72, 0.92), dayAmount);
-    const vec3 fogAmbientSky = fogSkyAmbient(worldDirection, sunElevation,
-        lightDirection, directLightColor, skyScale, mix(1.0, 0.20, rain));
-    const vec3 fogAmbient = mix(fogAmbientLegacy, fogAmbientSky,
-        clamp(cam.fogExtrasParams.z, 0.0, 1.0));
-
-    // 2026-11-15：雾 march 搬进 froxel（fog_froxel_density / fog_froxel_composite
-    // 两个 pass，在云 pass 之前跑）。这里直接采样合成结果，密度与光照不再有
-    // 逐像素二值跳变（羊毛/头顶柱的同源根因）。enabled=0 时合成输出
-    // transmittance=1、scattering=0 ⇒ 与旧档"雾关"一致。
-    FogResult fog;
-    fog.scattering = vec3(0.0);
-    fog.transmittance = 1.0;
-    fog.firstDistance = 0.0;
-    fog.opticalDepth = 0.0;
-    fog.meanDistance = 0.0;
+    // Premultiplied-alpha horizon aerial perspective matched 1:1 to skyScatteringLut.
     {
-        const vec4 fogColorTex = texelFetch(fogScreenColor, pixel, 0);
-        const vec2 fogDistTex = texelFetch(fogScreenDist, pixel, 0).xy;
-        fog.scattering = fogColorTex.rgb;
-        fog.transmittance = fogColorTex.a;
-        fog.firstDistance = fogDistTex.x;
-        fog.opticalDepth = -log(max(fogColorTex.a, 1.0e-6));
-        fog.meanDistance = fogDistTex.y;
+        float aerialStrength = clamp(cam.cloudAerialParams.x, 0.0, 2.0);
+        if(aerialStrength > 0.001 && cloudDistance > 0.0 && cloudDistance < V4_EMPTY)
+        {
+            float aerialDistance = min(cloudDistance, 55000.0);
+            float avgY = clamp(cameraPosition.y + worldDirection.y * aerialDistance * 0.5, 0.0, 8000.0);
+            float airScaleHeight = exp(-avgY * 0.00014);
+            float horizonFactor = airScaleHeight * (1.0 + 1.8 * rain * rain);
+            float ext = 0.000018 * aerialStrength * horizonFactor;
+            vec3 aerialT = vec3(exp(-ext * aerialDistance));
+            float cloudOpacityForAerial = clamp(1.0 - transmittance, 0.0, 1.0);
+            scattering = scattering * aerialT
+                + skyRayColor * (vec3(1.0) - aerialT) * cloudOpacityForAerial;
+        }
     }
 
-    if(fog.transmittance < 1.0)
-    {
-        if(fog.firstDistance <= cloudDistance) scattering = scattering * fog.transmittance + fog.scattering;
-        else scattering += transmittance * fog.scattering;
-        transmittance *= fog.transmittance;
-    }
-
-    float combinedFirst = min(cloudDistance, fog.firstDistance);
-    // 参考语义：重投影用透射加权平均距离（hpTraceVolumetricRay 的 meanDistance），
-    // 首次命中距离逐帧跳变，破云场景下时域积累会抖。均值未命中（晴空/纯高空云）退回 combinedFirst。
+    // Volumetric fog & light are now composited independently in fog_screen_apply.comp
+    // at full RT resolution with exact per-pixel sceneDepth. Clouds remain pure here so
+    // cloud temporal resolve, cloudShoulder, and far-band split are never polluted by fog.
     float reprojectDistance = (cam.cloudMarchParams.w > 0.5 && hpMeanDistance < V4_EMPTY)
-        ? hpMeanDistance : combinedFirst;
-    if(reprojectDistance <= 0.0 || reprojectDistance >= V4_EMPTY) reprojectDistance = combinedFirst;
-    // 2026-11-15：阈值 0.5 → 0.02。
-    // 原来只有厚雾才用平均距离；薄雾时 reprojectDistance 退化成 combinedFirst，
-    // 而雾的 firstDistance = startDistance = 0 ⇒ resolve 的重投影点塌到相机位置
-    // （全屏取同一个历史采样）⇒ 逐像素噪点（太阳射线的"羊毛"纹理）永远抹不平。
-    // 只要有一点雾就用密度加权平均距离，时域才有空间意义。
-    if(1.0 - fog.transmittance > 0.02) reprojectDistance = fog.meanDistance;
-
-    imageStore(cloudDepthOutput, pixel, vec4(combinedFirst, reprojectDistance, 0.0, 0.0));
+        ? hpMeanDistance : cloudDistance;
+    if(reprojectDistance <= 0.0 || reprojectDistance >= V4_EMPTY) reprojectDistance = cloudDistance;
 
     imageStore(cloudOutput, pixel, vec4(scattering, transmittance));
+    storeTileDepth(tileOrigin, tileSpan, size, vec4(cloudDistance, reprojectDistance, 0.0, 0.0));
 }

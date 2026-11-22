@@ -1,0 +1,11 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+// 2026-11-10 B2：材质 callable 的桩实现。
+// 背景：D1 callable 化已停用（executeCallableEXT 硬崩），该模块在运行期从不被调用，
+// 却在 k2d / k1 的 RTPSO 创建时每次都要编一份 163836 B 的 SPIR-V。
+// k2d 冷编 802 s 后返回 VK_ERROR_INITIALIZATION_FAILED，是四条里编译预算最紧的。
+// 这里换成空实现，stage/group/SBT 布局全部不变（:3021 仍按 6 组取句柄）。
+void main()
+{
+}

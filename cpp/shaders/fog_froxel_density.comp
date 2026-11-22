@@ -1,0 +1,400 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ===========================================================================
+// Volumetric Fog & Volumetric Light — Pass 1/4: Decoupled 3D Froxel Medium
+//
+// Outputs per froxel (rgba16f):
+//   R = hazeSigmaT   : volumetric fog extinction (1/block)
+//   G = shaftSigmaS  : decoupled ground-anchored aerosol scattering for shafts
+//   B = skyOpenness  : [0, 1] openness above local ground (suppresses cave sky leak)
+//   A = 1.0
+// ===========================================================================
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(set = 0, binding = 5) uniform sampler2D sceneDepth;
+layout(set = 0, binding = 7) uniform sampler2D terrainHeightMap;
+layout(rgba16f, set = 0, binding = 18) uniform writeonly image3D fogFroxelDensity;
+
+layout(push_constant) uniform FogFroxelPush
+{
+    vec4 params; // x = layers, y = maxDistance, z = unused, w = unused
+} pc;
+
+#include "fog_froxel_common.glsl"
+#include "sky_model_common.glsl"
+#include "sky_sun_common.glsl"
+
+#define TERRAIN_HEIGHT_CONSUMER 1
+#include "terrain_height.glsl"
+
+// Calibrated so UI density 1.0 = subtle depth haze, 2.5 = rich mist, 5+ = thick fog.
+const float FOG_HAZE_EXTINCTION_UNIT = 0.0028;
+const float FOG_SHAFT_AEROSOL_UNIT   = 0.0080;
+const float FOG_SHAFT_SCALE_HEIGHT   = 22.0;
+const float FOG_SIGMA_CLAMP          = 0.25;
+
+shared float sTileMaxDist[4][4];
+shared float sTileMinDist[4][4];
+
+// Wide 9-tap hemisphere openness & smoothed ground elevation from terrainHeightMap.
+// Eliminates artificial vertical light pillars under small ceiling/canopy gaps and smooths
+// 4x4-block NEAREST ground steps without blurring geometric shadow boundaries (those use RT).
+void fogSampleHemisphereTerrain(
+    vec3 worldPos,
+    out float smoothGroundY,
+    out float rawGroundY,
+    out float groundValidWeight,
+    out float hemiSkyOpenness)
+{
+    float centerOut = 0.0;
+    const float centerH = terrainGroundHeight(worldPos.xz, centerOut);
+    const bool centerValid =
+        centerOut <= TERRAIN_HEIGHT_OUTSIDE_FADE_BLOCKS &&
+        centerH > TERRAIN_HEIGHT_EMPTY * 0.5;
+
+    rawGroundY = centerH;
+    groundValidWeight = centerValid
+        ? (1.0 - smoothstep(0.0, TERRAIN_HEIGHT_OUTSIDE_FADE_BLOCKS, centerOut))
+        : 0.0;
+
+    const vec2 offsets[8] = vec2[8](
+        vec2( 6.0,  6.0), vec2(-6.0,  6.0), vec2( 6.0, -6.0), vec2(-6.0, -6.0),
+        vec2(20.0,  0.0), vec2(-20.0, 0.0), vec2( 0.0, 20.0), vec2( 0.0,-20.0)
+    );
+    const float weights[8] = float[8](
+        0.11, 0.11, 0.11, 0.11,
+        0.10, 0.10, 0.10, 0.10
+    );
+    const float allowances[8] = float[8](
+        3.0, 3.0, 3.0, 3.0,
+        7.0, 7.0, 7.0, 7.0
+    );
+
+    float groundSum = 0.0;
+    float openSum = 0.0;
+    float wSum = 0.0;
+
+    if(centerValid)
+    {
+        groundSum += centerH * 0.16;
+        openSum += smoothstep(-4.0, 2.0, worldPos.y - centerH) * 0.16;
+        wSum += 0.16;
+    }
+
+    for(int i = 0; i < 8; ++i)
+    {
+        float tapOut = 0.0;
+        const float h = terrainGroundHeight(worldPos.xz + offsets[i], tapOut);
+        if(tapOut <= TERRAIN_HEIGHT_OUTSIDE_FADE_BLOCKS && h > TERRAIN_HEIGHT_EMPTY * 0.5)
+        {
+            const float tapFade = 1.0 - smoothstep(0.0, TERRAIN_HEIGHT_OUTSIDE_FADE_BLOCKS, tapOut);
+            const float w = weights[i] * tapFade;
+            groundSum += h * w;
+            openSum += smoothstep(-4.0, 3.5, worldPos.y - (h - allowances[i])) * w;
+            wSum += w;
+        }
+    }
+
+    if(wSum > 1.0e-4)
+    {
+        smoothGroundY = groundSum / wSum;
+        if(!centerValid)
+        {
+            rawGroundY = smoothGroundY;
+            groundValidWeight = clamp(wSum, 0.0, 1.0);
+        }
+        const float rawOpen = openSum / wSum;
+        hemiSkyOpenness = mix(1.0, rawOpen, groundValidWeight);
+    }
+    else
+    {
+        smoothGroundY = TERRAIN_HEIGHT_EMPTY;
+        hemiSkyOpenness = 1.0;
+    }
+}
+
+void main()
+{
+    const ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    const ivec3 size = imageSize(fogFroxelDensity);
+    const int layers = max(int(pc.params.x + 0.5), 2);
+    const int segmentCount = layers - 1;
+    const float maxDistance = max(pc.params.y > 1.0 ? pc.params.y : cam.cloudParams8.w, 16.0);
+
+    // Conservative per-(x,y) column max-depth computation across the workgroup.
+    // barrier() executes unconditionally for all invocations before any early return.
+    if(gl_LocalInvocationID.z == 0u)
+    {
+        float tileMax = maxDistance;
+        float tileMin = maxDistance;
+        const ivec2 depthSize = textureSize(sceneDepth, 0);
+        if(coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
+        {
+            const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+            const vec2 tileStep = 1.0 / vec2(size.xy);
+            float minRawDepth = 1.0;
+            float maxRawDepth = 0.0;
+            vec2 minDepthUv = centerUv;
+            vec2 maxDepthUv = centerUv;
+            bool hasSky = false;
+
+            for(int ty = 0; ty < 4; ++ty)
+            {
+                for(int tx = 0; tx < 4; ++tx)
+                {
+                    const vec2 offset = (vec2(float(tx), float(ty)) * (1.0 / 3.0) - 0.5) * 0.90 * tileStep;
+                    const vec2 sampleUv = clamp(centerUv + offset, vec2(0.0005), vec2(0.9995));
+                    const ivec2 dCoord = clamp(ivec2(sampleUv * vec2(depthSize)), ivec2(0), depthSize - ivec2(1));
+                    const float d = texelFetch(sceneDepth, dCoord, 0).r;
+                    if(d <= 1.0e-5)
+                    {
+                        hasSky = true;
+                    }
+                    else
+                    {
+                        if(d < minRawDepth)
+                        {
+                            minRawDepth = d;
+                            minDepthUv = sampleUv;
+                        }
+                        if(d > maxRawDepth)
+                        {
+                            maxRawDepth = d;
+                            maxDepthUv = sampleUv;
+                        }
+                    }
+                }
+            }
+
+            if(!hasSky)
+            {
+                tileMax = min(maxDistance, fogSceneDistanceForDepth(minDepthUv, minRawDepth, cam.projInverse));
+            }
+            if(maxRawDepth > 1.0e-5)
+            {
+                tileMin = min(tileMax, fogSceneDistanceForDepth(maxDepthUv, maxRawDepth, cam.projInverse));
+            }
+            else
+            {
+                tileMin = tileMax;
+            }
+        }
+        sTileMaxDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = tileMax;
+        sTileMinDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = tileMin;
+    }
+    barrier();
+
+    if(any(greaterThanEqual(coord, size)))
+    {
+        return;
+    }
+
+    // Last Z slice (layers - 1) is not a segment; Pass 3 stores [0..layers-1] boundaries.
+    if(cam.cloudParams7.x < 0.5 || cam.waterSimState.w != 0u || coord.z >= segmentCount)
+    {
+        imageStore(fogFroxelDensity, coord, vec4(0.0));
+        return;
+    }
+
+    const float d0 = fogSliceBoundaryDistance(coord.z, layers, maxDistance);
+    const float d1 = fogSliceBoundaryDistance(coord.z + 1, layers, maxDistance);
+    const float tileMaxDist = sTileMaxDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+    const float tileMinDist = sTileMinDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+    if(d0 >= tileMaxDist)
+    {
+        imageStore(fogFroxelDensity, coord, vec4(0.0));
+        return;
+    }
+    const float visibleFrac = clamp((tileMaxDist - d0) / max(d1 - d0, 1.0e-4), 0.0, 1.0);
+
+    const bool useJitter = cam.fogExtrasParams.w > 0.001;
+    const vec3 jitter = useJitter
+        ? fogTemporalJitter3D(coord, cam.frameCount)
+        : vec3(0.5);
+
+    const vec2 xyOffset = mix(vec2(0.5), jitter.xy, useJitter ? 0.85 : 0.0);
+    const float zOffset = mix(0.5, jitter.z, useJitter ? 0.90 : 0.0);
+
+    const vec2 uv = (vec2(coord.xy) + xyOffset) / vec2(size.xy);
+    const vec3 worldDir = fogWorldRayDirection(uv, cam.projInverse, cam.viewInverse);
+    const vec3 cameraPos = cam.viewInverse[3].xyz;
+    const float boundDist = (d0 < tileMinDist) ? tileMinDist : tileMaxDist;
+    const float segEnd = min(d1, max(d0, boundDist - 0.18));
+    const float dist = mix(d0, segEnd, zOffset);
+    const vec3 fogPos = cameraPos + worldDir * dist;
+
+    const bool isOverworld = abs(cam.weatherParams.z - 1.0) < 0.25;
+    const bool isNether    = abs(cam.weatherParams.z - 2.0) < 0.25;
+    const bool isEnd       = abs(cam.weatherParams.z - 3.0) < 0.25;
+
+    const float rawBaseDensity = max(cam.cloudParams7.y, 0.0);
+    // Soft compression keeps high slider values usable without abrupt cutoff.
+    const float effectiveDensity = rawBaseDensity / (1.0 + rawBaseDensity * 0.04);
+
+    const float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
+    const float rainMul = mix(1.0, max(cam.cloudParams9.z, 0.0), rain);
+
+    const float timeSec = max(uintBitsToFloat(cam.padding), 0.0);
+    const float shapeStrength = clamp(cam.fogMoodParams.x, 0.0, 2.0);
+    const float dawnBoostSetting = clamp(cam.fogMoodParams.y, 1.0, 3.0);
+
+    // Smoothed ground elevation & wide hemisphere sky openness (if inside coverage box).
+    float smoothGroundY = TERRAIN_HEIGHT_EMPTY;
+    float rawGroundY = TERRAIN_HEIGHT_EMPTY;
+    float groundValidWeight = 0.0;
+    float hemiSkyOpenness = 1.0;
+    if(isOverworld)
+    {
+        fogSampleHemisphereTerrain(
+            fogPos, smoothGroundY, rawGroundY, groundValidWeight, hemiSkyOpenness);
+    }
+
+    // 3D animated macro clumps for organic volumetric texture.
+    const vec3 windDrift = vec3(timeSec * 0.65, timeSec * 0.06, timeSec * 0.35);
+    float fbm = 0.5;
+    if(shapeStrength > 0.001)
+    {
+        fbm = fogFbm3D((fogPos + windDrift) * (1.0 / 42.0));
+    }
+    const float shapeMod = clamp(1.0 + (fbm - 0.5) * (1.15 * shapeStrength), 0.20, 2.20);
+
+    float hazeSigmaT = 0.0;
+    float shaftSigmaS = 0.0;
+    float skyOpenness = 1.0;
+
+    if(isOverworld)
+    {
+        const vec3 sunDir = sunDirection();
+        const float sunElev = sunDir.y;
+
+        // Dawn/dusk golden-hour mist enhancement.
+        const float goldenWeight = skySunGoldenHourWeight(sunElev);
+        const float morningWeight = (1.0 - twilightEveningWeight()) *
+            smoothstep(-0.08, 0.06, sunElev) * (1.0 - smoothstep(0.18, 0.42, sunElev));
+        const float dawnFactor = mix(1.0, dawnBoostSetting,
+            clamp(max(goldenWeight, morningWeight), 0.0, 1.0));
+
+        // Height band semantics (UI: heightMax / heightMin). Clamp local thickness so
+        // lowering heightMin toward bedrock (-64) never inflates open overhead sky height.
+        const float bandTop = max(cam.cloudParams7.z, cam.cloudParams7.w);
+        const float bandBottom = min(cam.cloudParams7.z, cam.cloudParams7.w);
+        const float localLayerH = clamp(bandTop - max(bandBottom, 0.0), 14.0, 36.0);
+        const float groundAnchor = clamp(cam.fogExtrasParams.y, 0.0, 1.0);
+
+        const float effectiveGroundY = mix(bandBottom, smoothGroundY, groundValidWeight);
+        const float effectiveTop = mix(
+            bandTop,
+            max(bandTop, effectiveGroundY + localLayerH),
+            groundAnchor * groundValidWeight * 0.65);
+        const float innerBase = mix(
+            bandBottom,
+            max(bandBottom, effectiveGroundY),
+            groundAnchor * groundValidWeight);
+
+        // Above top: smooth exponential decay; inside band: upward thinning
+        // plus valley/lowland ground-pool stratification so open overhead sky stays clean.
+        const float outerFalloffH = mix(30.0, 50.0, rain);
+        const float aboveTop = max(fogPos.y - effectiveTop, 0.0);
+        const float outerDecay = exp(-aboveTop / outerFalloffH);
+
+        const float aboveInner = max(fogPos.y - innerBase, 0.0);
+        const float innerThinning = exp(-min(aboveInner, max(effectiveTop - innerBase, 0.0)) / 32.0);
+        const float valleyPool = groundValidWeight > 0.01
+            ? exp(-max(fogPos.y - smoothGroundY, 0.0) / 18.0) : 0.0;
+        const float heightProfile = outerDecay * mix(1.0, innerThinning, 0.85) *
+            mix(1.0, 1.0 + 0.45 * valleyPool, groundAnchor * groundValidWeight);
+
+        hazeSigmaT = effectiveDensity * FOG_HAZE_EXTINCTION_UNIT *
+            rainMul * dawnFactor * heightProfile * shapeMod;
+
+        // Ground-clinging rolling mist (godRayParams1 + fogOpticsParams.x).
+        if(cam.godRayParams1.x >= 0.5 && groundValidWeight > 0.01)
+        {
+            const float mistLayerH = clamp(cam.godRayParams1.y, 0.25, 8.0) * 4.5;
+            const float mistExtinction = max(cam.godRayParams1.z, 0.0);
+            const float mistMaxDist = clamp(cam.godRayParams1.w, 8.0, 128.0);
+            const float mistSpeed = max(cam.godRayParams2.z, 0.0);
+            const float curlStrength = clamp(cam.fogOpticsParams.x, 0.0, 2.0);
+            const float mistWeather = clamp(rain * 1.15 + morningWeight * 0.40, 0.0, 1.0);
+
+            if(mistExtinction > 0.001 && mistWeather > 0.01 && dist < mistMaxDist)
+            {
+                const float hAboveGround = fogPos.y - rawGroundY;
+                if(hAboveGround > -2.0 && hAboveGround < mistLayerH * 3.0)
+                {
+                    const float hProfile = exp(-max(hAboveGround, 0.0) / max(mistLayerH, 0.5)) *
+                        smoothstep(-2.0, 0.25, hAboveGround);
+                    const float distFade = 1.0 - smoothstep(mistMaxDist * 0.55, mistMaxDist, dist);
+                    const vec3 advectPos = fogPos * 0.085 + vec3(timeSec * mistSpeed * 0.45, 0.0, timeSec * mistSpeed * 0.20);
+                    const float curlOffset = (fogValueNoise3D(advectPos * 1.3 + vec3(4.1, 0.0, -7.3)) - 0.5) * curlStrength;
+                    const float mistNoise = fogFbm3D(advectPos + vec3(curlOffset, 0.0, -curlOffset));
+                    const float mistWisps = smoothstep(0.28, 0.82, mistNoise);
+                    hazeSigmaT += mistExtinction * 0.012 * mistWeather *
+                        hProfile * distFade * mistWisps * groundValidWeight;
+                }
+            }
+        }
+
+        // Decoupled Volumetric Light (Shaft) Aerosol Medium:
+        // Driven independently by fogSunStrength (cloudParams8.y), anchored to
+        // smoothed local ground height with tight scale height -> crisp diagonal sunbeams
+        // even with light haze, and ZERO overhead vertical pillars in open sky!
+        const float sunStrength = max(cam.cloudParams8.y, 0.0);
+        if(sunStrength > 0.001)
+        {
+            const float shaftGroundY = mix(bandTop, smoothGroundY, groundValidWeight);
+            const float aboveShaftGround = max(fogPos.y - shaftGroundY, 0.0);
+            const float shaftHeightProfile = exp(-aboveShaftGround / FOG_SHAFT_SCALE_HEIGHT);
+            // Smoothly soften sharp shafts in heavy rain (overcast rain is diffuse mist).
+            const float rainShaftFade = 1.0 - rain * 0.72;
+            float wisp = fbm;
+            if(shapeStrength > 0.001 && dist < 140.0)
+            {
+                wisp = fogValueNoise3D((fogPos + windDrift * 1.4) * (1.0 / 15.0));
+            }
+            const float shaftTexture = mix(1.0, mix(0.72, 1.32, fbm * 0.65 + wisp * 0.35),
+                clamp(shapeStrength * 0.55, 0.0, 1.0));
+            shaftSigmaS = sunStrength * FOG_SHAFT_AEROSOL_UNIT *
+                shaftHeightProfile * rainShaftFade * shaftTexture;
+        }
+
+        // Hemisphere sky openness: suppresses cave ambient leak without skylight pillar artifacts.
+        skyOpenness = hemiSkyOpenness;
+    }
+    else if(isNether)
+    {
+        hazeSigmaT = effectiveDensity * (FOG_HAZE_EXTINCTION_UNIT * 1.35) * shapeMod;
+        skyOpenness = 1.0;
+    }
+    else if(isEnd)
+    {
+        const float endHeightFade = exp(-abs(fogPos.y - 64.0) / 90.0);
+        hazeSigmaT = effectiveDensity * (FOG_HAZE_EXTINCTION_UNIT * 0.90) *
+            mix(0.35, 1.0, endHeightFade) * shapeMod;
+        skyOpenness = 1.0;
+    }
+
+    hazeSigmaT *= visibleFrac;
+    shaftSigmaS *= visibleFrac;
+
+    if(!(hazeSigmaT == hazeSigmaT) || hazeSigmaT < 0.0)
+    {
+        hazeSigmaT = 0.0;
+    }
+    if(!(shaftSigmaS == shaftSigmaS) || shaftSigmaS < 0.0)
+    {
+        shaftSigmaS = 0.0;
+    }
+    hazeSigmaT = min(hazeSigmaT, FOG_SIGMA_CLAMP);
+    shaftSigmaS = min(shaftSigmaS, FOG_SIGMA_CLAMP);
+
+    const float activeFlag = (hazeSigmaT > 1.0e-6 || shaftSigmaS > 1.0e-6) ? visibleFrac : 0.0;
+    imageStore(fogFroxelDensity, coord, vec4(hazeSigmaT, shaftSigmaS, skyOpenness, activeFlag));
+}

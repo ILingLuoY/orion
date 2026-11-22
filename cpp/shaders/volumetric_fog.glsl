@@ -1,9 +1,78 @@
+#ifndef VFOG_SUN_HEIGHTVIS
+// 高度场太阳遮挡（见下面 fogSunHeightVisibility 的说明）。
+// 默认 0：只有 fog_screen_march.comp 显式打开（它绑定了 binding 7 的高度图）。
+#define VFOG_SUN_HEIGHTVIS 0
+#endif
+
+#ifndef VFOG_FORCE_SUN
+// 对照实验开关：1 = shadow 恒 1（旁路全部可见性），用于区分
+// "太阳项是 0" 与 "可见性恒 0"。默认 0。
+#define VFOG_FORCE_SUN 0
+#endif
+
 #ifndef VOLUMETRIC_FOG_GLSL
 #define VOLUMETRIC_FOG_GLSL
+
+// 2026-11-21 统一风场：本文件的两个宿主（fog_screen_march.comp / volumetric_clouds_v3.comp）
+// 都在 include 本文件之前声明 cam（camera_ubo.glsl@18/@9）。
+#include "wind_common.glsl"
+
+// 2026-11-18 一次性诊断通道（编译期开关，默认 0 = 不编进去）。
+// 把"雾的太阳散射项为什么是 0"直接画成颜色，而不是靠猜：
+//   R = 太阳散射项长度（rayColor × 16）
+//   G = 受光密度占比 litFraction（0 = 全程判阴影，1 = 全程受光）
+//   B = 由 fog_screen_march 填 directLightEnergy × 0.5（0 = 太阳能量本身是 0）
+#ifndef VFOG_DEBUG_OUT
+#define VFOG_DEBUG_OUT 0
+#endif
+#if VFOG_DEBUG_OUT
+vec3 gVfogDebug = vec3(0.0);
+#endif
 
 #include "fog_density_common.glsl"
 
 #include "local_light_grid_common.glsl"
+
+#ifdef SUN_SHADOW_FOG_UNION
+// ===========================================================================
+// 2026-11-15：雾专用的太阳可见性 —— **盒外一律保守判暗**。
+//
+// 原来的 sunShadowFogVisibility() 把近场/远场的"盒外可视度"都传成
+// SUN_SHADOW_FAR_OUTSIDE_VISIBILITY = 1.0（完全受光）。近场盒只有 ±160 格，
+// 而雾视距常见 416 格 ⇒ 160~416 格整段判"没有遮挡 ⇒ 全亮"，看起来就是从
+// 太阳方位凭空漏下的光柱（用户："体积光依然漏"）。
+//
+// 这里传 0.0：没有遮挡数据 = 未知 = 保守判暗。牺牲的是远处雾的太阳散射
+//（160 格外的雾不再被太阳点亮），换来结构上不可能凭空漏光。
+// 放在 volumetric_fog.glsl 里而不是改 sun_shadow.glsl 的常量，是为了不改变
+// rt_test.rgen 的 SPV（否则触发 RTPSO 冷编）。
+// ===========================================================================
+float fogSunShadowVisibility(vec3 position, vec3 sunDirection, int sampleIndex)
+{
+    float nearFade = 0.0;
+    float visibility = sunShadowVisibilityIn(
+        sunShadowMap, position, sunDirection, sampleIndex,
+        SUN_SHADOW_EXTENT_XY, SUN_SHADOW_EXTENT_Z, SUN_SHADOW_TEXEL,
+        SUN_SHADOW_CENTER_QUANTUM,
+        0.0,
+        SUN_SHADOW_BIAS_NEAR, nearFade);
+
+    float noDataFade = nearFade;
+    if(cam.sunShadowFarParams.w > 0.5)
+    {
+        float farFade = 0.0;
+        visibility = min(visibility, sunShadowVisibilityIn(
+            sunShadowMapFar, position, sunDirection, sampleIndex,
+            cam.sunShadowFarParams.x, cam.sunShadowFarParams.y,
+            cam.sunShadowFarParams.z, cam.sunShadowFarParams.z,
+            0.0,
+            SUN_SHADOW_BIAS, farFade));
+        noDataFade = min(nearFade, farFade);
+    }
+
+    return mix(visibility, SUN_SHADOW_OUTSIDE_VISIBILITY, noDataFade);
+}
+#endif
 
 #ifdef VFOG_SUN_RAY
 // ===========================================================================
@@ -18,12 +87,62 @@
 // 现在近场直接按几何判定：与阴影生产者同一个 cull mask（0x04 = 地形层），
 // 命中即遮挡。没有分辨率/PCF/bias/盒子/无数据这些概念，也就没有缝。
 // ===========================================================================
-const float FOG_SUN_RAY_MAX_DISTANCE = 128.0;
+// 2026-11-15：128 → 256。阴影盒只有 ±160 格，射线覆盖到 256 后
+// **绝大部分雾样本都走几何真值**，不再依赖阴影图的"无数据 ⇒ 露天"判据
+//（那是遮挡处仍然发亮的主要来源）。
+const float FOG_SUN_RAY_MAX_DISTANCE = 256.0;
 // 2026-11-15 修正：原来照抄了 SUN_SHADOW_CULL_MASK = 0x04，但 WorldGeometry.cpp
 // 里 0x04 是**第一人称手部**专用位（地形是 0xff，primaryMaskCull 时 0xfe）。
 // 用 0x04 打 ray 时命中集合完全不对 ⇒ 几乎全 miss ⇒ shadow 恒 1 ⇒ "几乎没有遮挡、
 // 全漏光"。这里改用 0xFF（与 rt_sun_volume.comp 一致，能命中全部实例）。
 const uint FOG_SUN_RAY_CULL_MASK = 0xFFu;
+
+// ===========================================================================
+// 2026-11-18（回归修复）：**高度场太阳遮挡** —— 第三条独立可见性来源。
+//
+// 实测（诊断通道）：阴影图路径与 256 格几何射线路径对每个 march 样本都判
+// "被遮挡"（红=0、绿=0）⇒ shadow 恒 0 ⇒ 雾的太阳项恒 0 ⇒ 任何角度都看不到
+// 光柱，与密度/相位/抬头压制全部无关。
+//
+// 所以这里不再依赖那两条链：沿太阳方向在水平面上推进，逐点比较"射线高度"
+// 与"该点地形高度"。被地形挡住即 0，否则 1。用的是已经绑在 binding 7 的
+// 128² / ±256 格地形高度图（terrainGroundHeight），不经过任何加速结构或
+// 阴影纹理，因此不可能被上面两路的问题污染。
+// 产出正是"地形遮挡的柱子"：山脊、谷口、悬崖的剪影。
+// 代价：每次调用最多 8 次 2D 纹理取样。回退：-DVFOG_SUN_HEIGHTVIS=0。
+// ===========================================================================
+const float FOG_SUN_HEIGHT_MAX_DISTANCE = 192.0;
+
+#if VFOG_SUN_HEIGHTVIS
+float fogSunHeightVisibility(vec3 position, vec3 sunDirection, float maxDistance)
+{
+    float advance = 4.0;
+    for(int k = 0; k < 8; ++k)
+    {
+        const vec3 probe = position + sunDirection * advance;
+        if(probe.y > TERRAIN_HEIGHT_WORLD_TOP)
+        {
+            break;   // 已高过地形高度范围，不可能再被地形挡住
+        }
+
+        float outside = 0.0;
+        const float groundHeight = terrainGroundHeight(probe.xz, outside);
+        if(outside <= TERRAIN_HEIGHT_OUTSIDE_FADE_BLOCKS &&
+            groundHeight > TERRAIN_HEIGHT_EMPTY * 0.5 &&
+            probe.y <= groundHeight + 0.35)
+        {
+            return 0.0;
+        }
+
+        advance *= 2.0;
+        if(advance > maxDistance)
+        {
+            break;
+        }
+    }
+    return 1.0;
+}
+#endif
 
 // 在太阳方向周围的锥内抖动一条射线方向（锥心 = 真实太阳方向）。
 vec3 fogSunRayJitter(vec3 base, float h1, float h2, float cone)
@@ -52,11 +171,18 @@ float fogSunRayVisibility(vec3 origin, vec3 sunDirection, float maxDistance, flo
 
         rayQueryEXT query;
         // 起点抬 0.05 格：样本可能正好压在地表/方块面上，贴面起射会退化。
+        // 2026-11-15：flags 改成 Opaque|TerminateOnFirstHit。
+        // 原来带着 SkipClosestHitShaderEXT —— 那是 traceRayEXT 的旗标，inline
+        // ray query 里加上它之后命中可能不被 commit，表现为"射线永远 miss ⇒
+        // 遮挡处照样受光"。Opaque 保证命中直接作为不透明遮挡。
         rayQueryInitializeEXT(query, fogTlas,
-            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+            gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
             FOG_SUN_RAY_CULL_MASK, origin + sunDirection * 0.05, 0.0,
             direction, maxDistance);
-        while(rayQueryProceedEXT(query)) {}
+        // 循环上限：TLAS 未绑定/失效时 rayQueryProceedEXT 可能一直返回 true
+        // ⇒ GPU 侧无限循环 ⇒ TDR ⇒ 驱动 AV（实测 nvoglv64 崩溃）。
+        int proceedGuard = 0;
+        while(rayQueryProceedEXT(query) && ++proceedGuard < 32) {}
 
         blocked += (rayQueryGetIntersectionTypeEXT(query, true) !=
             gl_RayQueryCommittedIntersectionNoneEXT) ? 1.0 : 0.0;
@@ -68,14 +194,102 @@ float fogSunRayVisibility(vec3 origin, vec3 sunDirection, float maxDistance, flo
 // 2026-11-10：6 → 16。
 // 太阳光程改成解析积分后，每样本从 6+8=14 次 exp2 降到约 16+1：仍然更便宜，
 // 而视线步数从 6 提到 16 直接消掉了"6 步跨 320 格"造成的层状带与放射条纹。
+// 2026-11-16：回到 16 步。抬头方向改走解析雾幕（见 evaluateAnalyticFog 里的
+// FOG_SKY_ANALYTIC 分支），不再依赖"加密 march 压噪声"，所以步数回到 16 省回
+// 那 +50% 的开销。
 const float VFOG_QUALITY = 16.0;
 
 // 2026-11-15：0.35 → 0.15。这个地板是"环境光不被太阳直射遮挡完全消灭"的近似，
 // 但 0.35 太高：射线判定为遮挡的洞穴/背光处，雾仍按 35% 发亮，被当成"漏光"。
 // 0.15 留给天空光的底，同时让遮挡区明显暗下去。
-const float FOG_AMBIENT_SHADOW_FLOOR = 0.15;
+// 2026-11-15：0.15 → 0.03。
+// 这个地板是"遮挡处仍按 X% 发光"的量，用户实测"隔着墙也能看到太阳方位的
+// 体积光"—— 墙后的雾不该有 15% 的方向性亮度。压到 0.03 后遮挡区基本只剩
+// 极弱的天光底，不再形成"透视墙"的白光。
+const float FOG_AMBIENT_SHADOW_FLOOR = 0.03;
 
 const int VFOG_SUNLIGHT_STEPS_MAX = 8;
+
+// 2026-11-18：密度标定系数（每格消光 / 单位浓度）。
+// 旧式把密度除以 cameraFar（视距），于是视距越大雾越淡、且同一套参数在不同
+// 视距下完全不可比 —— baseDensity=1 时只有 2.1e-4/格，100 格光程 τ≈0.02，
+// 结构上看不见（用户实测"几乎没有"）。
+// 新口径：0.08*0.15 = 0.012/格 ⇒ baseDensity=1 时 100 格光程 τ≈1.2，
+// 1/e 距离约 83 格，属「中等雾」。UI 的雾浓度旋钮在此基础上线性缩放。
+// 2026-11-18：0.15 → 0.06。用户实测口径："这雾也太浓了"。
+// 0.15 时 baseDensity=1 ⇒ 0.012/格、100 格光程 τ≈1.2、1/e≈83 格，属于浓雾；
+// 0.06 ⇒ 0.0048/格、τ≈0.48、1/e≈208 格，是"远处起薄、近处仍看得见"的中轻雾。
+// UI 的雾浓度滑杆（g_fogBaseDensity）仍在本常量之上线性缩放，要更淡直接拉滑杆。
+const float VFOG_DENSITY_SCALE = 0.06;
+
+// =============================================================================
+// 2026-11-19（重构）：**把"雾"与"体积光"拆成两种独立介质**。
+//
+// 旧模型只有一个密度场，它同时决定两件互不相干的事：
+//   ① 雾有多厚（挡视线、压暗天空、环境内散射）
+//   ② 光柱有多亮（同一密度的单次散射）
+// 结果必然是"要柱子就得浓雾、要淡雾就没柱子"，而且雾带从 170 格盖到 -28 格、
+// 抬头整条视线都在带内 ⇒ 头顶得到一层与几何无关的亮幕（"糊在屏幕上的光柱"）。
+// 用户的判断是对的：这不是参数问题，是模型问题。
+//
+// 新模型：
+//   · 雾（haze）  ：只做消光 + 环境内散射，**不含任何太阳直射项**。
+//                   滑条只控制"看得多远/多灰"，不再牵连光柱亮度。
+//   · 体积光(shaft)：独立介质，**贴地、短标高**（FOG_SHAFT_SCALE_HEIGHT），
+//                   振幅来自独立的强度档，只积分太阳直射。
+// 短标高带来一个结构性保证：相机离地 >~3 个标高之后，视线里的光柱介质已经
+// 衰减到 0 ⇒ **头顶开阔天空不可能出现任何光柱**（不是靠仰角去压，是那里没介质）。
+// =============================================================================
+// 2026-11-19：**体积光强度档（UI「太阳散射强度」滑条，0..4）**。
+// 默认 0 会让柱子完全消失（用户滑到 0 就真看不见，符合滑条语义），
+// 出厂值 1.0（见 Java DEFAULT_VOLUMETRIC_FOG_SETTINGS 的 sunStrength）。
+// 2026-11-20（体积光重构）：22 → 40 格。
+// 22 格在实测里只覆盖贴地一层，视线一抬就穿出介质 ⇒ 屏幕上"没有体积可积分"
+//（用户："画面无变化"）。40 格让柱子在楼宇/树冠高度上仍有余量。
+const float FOG_SHAFT_SCALE_HEIGHT = 40.0;
+// 2026-11-20：0.030 → 0.055。配合标高加高，单根柱子的散射量约 3 倍。
+const float FOG_SHAFT_MEDIUM = 0.055;
+const float FOG_SHAFT_GAIN = 1.0;
+
+// 2026-11-19：太阳项按仰角淡出的区间（视线仰角的 y 分量）。
+// LO 以下 = 1.0（水平/地形方向，柱子完整）；HI 以上 = 0（天空方向一根直射光都不剩）。
+const float FOG_SUN_UP_LO = 0.30;
+const float FOG_SUN_UP_HI = 0.62;
+
+// 2026-11-18：抬头解析雾幕与 march 的混合区间（视线仰角）。
+// 2026-11-19：起点对齐到 FOG_SUN_UP_HI —— 太阳项在 0.62 已经归零，解析路径从
+// 0.62 开始接管，两侧在交界处都"无太阳项"，因此不会出现 y≈0.8 那道圆形台阶。
+const float FOG_UP_BLEND_LO = 0.62;
+const float FOG_UP_BLEND_HI = 0.86;
+
+// =============================================================================
+// 2026-11-18：**把"雾有多厚"与"光柱有多亮"拆开**（用户诉求：浓的体积光 +
+// 淡的雾，且不要把天空压暗）。
+//
+// 问题：消光（density）同时决定"挡不挡视线"和"能散射多少太阳光"，所以调淡雾
+// 就必然把光柱一起调没了 —— 之前所有档位都卡在这个耦合里。
+// 真实介质里这两者由单次散射反照率联系，艺术上可以 >1；这里就用一个增益
+// 直接放大太阳散射项：消光降一半、光柱亮度不变。
+//
+//   FOG_SHAFT_GAIN —— 只乘**太阳散射项**（rayColor），不乘消光、不乘环境项。
+//
+// 2026-11-19（重构）：旧模型里的 8× 增益已删除 —— 见文件顶部常量区
+// FOG_SHAFT_GAIN / FOG_SHAFT_MEDIUM 的说明（介质分离后不需要放大补偿）。
+// 天空早退的仰角阈值（见 evaluateAnalyticFog 里的 skyWeight）：
+// 只有 [LO,HI] 之上（接近天顶）才走"均匀薄霾"，地形/水平方向全部进 march。
+const float FOG_SKY_DIR_LO = 0.62;
+const float FOG_SKY_DIR_HI = 0.86;
+//
+// FOG_SKY_DENSITY_SCALE —— 视线没有命中几何（看天）时的密度折扣。
+// 以及把密度场的等值线（雾带边界/地形锚定的闭合圈）投影成头顶的圆形斑。
+// 打折后天空保持亮、头顶的结构性圆斑几乎不可见；地面与水平方向的光柱不受影响。
+//
+// 2026-11-18（回归修复）：0.30 → 0.75。
+// 0.30 是为了"头顶别那么浓"加的，但它把**天空方向的体积光柱**一起削掉 70%
+// ——而真正防"无源垂直光柱"的是 256 格几何遮挡射线与逐像素云影，不是密度折扣。
+// 保留 25% 的抑制量（天空仍比地面薄），把结构还给太阳项。
+// =============================================================================
+const float FOG_SKY_DENSITY_SCALE = 0.45;
 
 // 尾部淡出：最后这段占比的 march 距离内密度线性压到 0，替代旧档在 fogEnd 的
 // 硬切（VOLUMETRIC_FOG.md 记录过的"浓度平台"取舍）。
@@ -266,9 +480,9 @@ float rollingFogDensity(
         return 0.0;
     }
 
-    // 风推移。云那条链用的是 vec2(0.862, 0.507) * (14.0*0.35*time)，
-    // 地面雾更"重"，取约 1/3 的推进速度。
-    const vec2 wind = vec2(0.862, 0.507) * (max(speed, 0.0) * time);
+    // 风推移。2026-11-21 统一风场：方向改读 cam.windParams.x（windDirXZ），
+    // 无效回落 HP 云原方向；速度仍由调用方 speed 决定（贴地雾更"重"，约云的 1/3）。
+    const vec2 wind = windDirXZ() * (max(speed, 0.0) * time);
 
     // 2026-11-12：竖向坐标随层厚缩放。原来固定除以 26 / 10 格，层厚压到半格后
     // 竖向几乎恒定 ⇒ 雾团会变成"一柱到底"。现在按层厚归一，薄层内部仍有起伏。
@@ -499,6 +713,27 @@ vec3 fogSkyAmbient(
         radianceAntiSun * weightAntiSun) /
         max(weightZenith + weightSunSide + weightAntiSun, 1.0e-4);
 }
+// =============================================================================
+// 2026-11-16 雾的时段倍率（**单一真源**，纯参数版：不引用 cam 的新字段）
+//
+// ⚠ 当前生效的雾是 volumetric_clouds_v5.comp 的内嵌 march
+//   （Clouds.cpp:3809 kEnableFogFroxel = false），它走本文件的 evaluateAnalyticFog
+//   —— 所以时段项必须在这里生效，加在 fog_froxel_density.comp 里是无效的。
+//   fog_froxel_density.comp 调用同一个函数，两者天然同口径。
+//
+// 辐射雾在日出前后最浓、太阳升高后蒸发；入夜后地面辐射仍在，但比清晨薄。
+//   dawnBoostPeak = 晨雾峰值倍率（UI 车道 cam.fogMoodParams.y，默认 1.75）
+//   sunHeight     = 太阳仰角（不是月亮，也不是光源方向）
+// =============================================================================
+float fogTimeOfDayScale(float sunHeight, float dawnBoostPeak)
+{
+    const float dawnDuskMist = smoothstep(-0.10, 0.02, sunHeight) *
+        (1.0 - smoothstep(0.14, 0.55, sunHeight));
+    const float nightMist = smoothstep(0.05, -0.30, sunHeight);
+    return 1.0 + max(dawnBoostPeak - 1.0, 0.0) * dawnDuskMist +
+        0.15 * nightMist;
+}
+
 // 函数名 evaluateAnalyticFog 是旧名，当前内部已是参考的 march，不是解析闭式雾。
 // fogDensityAt() 来自共享头 fog_density_common.glsl。
 FogResult evaluateAnalyticFog(
@@ -548,10 +783,32 @@ FogResult evaluateAnalyticFog(
     const float wetnessRaw = clamp(cam.godRayParams0.z, 0.0, 1.0);
     const float wetnessEnv = wetnessRaw > 0.0 ? wetnessRaw : wetness;
 
+    // 2026-11-16 时段倍率（清晨最浓、正午蒸发）。太阳高度从相位直接算，
+    // 不用 sunDirection()：本文件被多个 TU include，避免引入 include 顺序依赖。
+    const float fogSunHeight = 0.81915204429 *
+        sin(fract(cam.historyParams.w) * 6.28318530718);
+    // 2026-11-18：密度标定改为**物理口径**（每格消光），不再除以视距。
+    //
+    // 旧式：baseDensity * (wetness*0.15+0.08) / max(cam.cameraParams.y, 100)
+    // cam.cameraParams.y 是 cameraFar（视距，见 OrionInternal.h:416-419 的
+    // CameraUBO 字段顺序：cameraNear/Far/Fov/Padding），于是视距 376 时
+    // baseDensity=1 只给出 2.1e-4/格 —— 100 格光程消光 0.02、透射率 0.98，
+    // 结构上不可能看到雾，更不可能看到光柱（用户实测："几乎没有"）。
+    // 而且视距一改密度就变，同一套雾参数在不同视距下完全不同，无法调参。
+    //
+    // 新式：baseDensity=1.0 ⇒ 0.08*0.15 = 0.012/格 ⇒ 100 格光程 τ≈1.2。
+    // 这是「中等雾」的量级（1/e 约 83 格）；UI 的雾浓度旋钮在此基础上线性缩放。
+    // 2026-11-19（密度基准重标定）：(wetness*0.15 + 0.08) → (wetness*0.06 + 0.035)。
+    //
+    // 用户反馈："把密度基准滑条搞正常一点，现在雾随随便便就很浓"。
+    // 旧标定下雾浓度滑条 1.0 就已经是 0.0048/格（100 格 τ≈0.48），滑到 1.5~2
+    // 直接进"糊屏"区间，可用范围全挤在滑条最底部。新标定把整条曲线压到约 0.6 倍，
+    // 让 1.0 落在"能看出来的薄雾"、3.0 才接近浓雾，滑条才有可用的中段。
     const float baseDensity =
         max(baseDensityParam, 0.0) *
-        (wetness * 0.15 + 0.08) /
-        max(cam.cameraParams.y, 100.0);
+        (wetness * 0.06 + 0.035) *
+        VFOG_DENSITY_SCALE *
+        fogTimeOfDayScale(fogSunHeight, cam.fogMoodParams.y);
 
     const float fogTimeFactor =
         mix(1.0, max(rainBoost, 0.0), wetness);
@@ -594,7 +851,9 @@ FogResult evaluateAnalyticFog(
     // 2026-11-12：层厚从 6 格压到 0.5 格后，穿过薄层的光程也少了 12 倍，
     // 必须同比提高消光才看得见。0.05 → 1.50（滑条 0~1 ⇒ 每格 0~1.5 消光，
     // 薄层在掠射视线下的 τ 才够）。
-    const float rollingExtinction = max(mistLane.z, 0.0) * 1.50;
+    // 2026-11-19：1.50 → 0.60（同一次重标定）。1.50 是"0.5 格薄层"时代的补偿值，
+    // 层厚已是 1.5 格后它显得过冲：滑条 0.8 就给到 1.2/格，掠射视线下直接糊屏。
+    const float rollingExtinction = max(mistLane.z, 0.0) * 0.60;
     const float rollingRange = max(mistLane.w, 8.0);
     const float rollingDawnCurve =
         smoothstep(-0.12, -0.02, sunDirection.y) *
@@ -637,6 +896,150 @@ FogResult evaluateAnalyticFog(
         return result;
     }
 
+    // =====================================================================
+    // 2026-11-18：**天空早退 —— 只吃一层与方向无关的均匀薄霾**。
+    //
+    // 症状：相机飞得低（正好在雾带顶 y=98 下方）时，抬头会看到一块"圆形区域"，
+    // 飞高了就没有。原因不是几何，而是雾在天空方向的**径向结构**：视线穿出雾带
+    // 的路径长度 = (带顶 - 相机Y)/仰角正弦，随仰角连续变化；这些等值线在透视
+    // 投影下就是一圈圈以天顶为中心的圆 ⇒ 头顶被看成圆形的明暗台阶。
+    //
+    // 天空方向没有"被雾挡住的东西"，那里的雾只该是一层薄霾。所以直接给常数：
+    // 同一 τ、同一散射，与仰角/路径长度无关 ⇒ 结构上不可能出现同心圆。
+    // 顺带把天空像素的 16 步 march 全部省掉（原来是纯浪费）。
+    // =====================================================================
+    // 2026-11-19（根因修复）：天空判据**改由仰角决定**，不再看 sceneDistance。
+    //
+    // 原判据是 smoothstep(0.85,0.99, sceneDistance/fogFar)。但 sceneDistance 在
+    // 这个雾 pass 里长期是坏的（深度图读出 0），于是**整屏**被判成天空、全部走
+    // 下面这条"均匀薄霾"早退 ⇒ march 一次都不执行 ⇒ 体积光柱结构上不可能出现。
+    //
+    // 2026-11-19（第二次修复）：**删掉硬 return**。
+    // 只把 skyWeight 抬进 upBlend，由下面那条软过渡去混：
+    //   · 硬 return 会在 y=FOG_SKY_DIR_HI 处与 march 结果直接跳变 ⇒ 圆洞复现；
+    //   · 天空方向的解析结果只含环境项（没有太阳项）⇒ 结构上不可能再出现
+    //     "从头顶垂直射下来"的假光柱。
+    // 于是同一个机制同时解决"圆洞"和"头顶无源光柱"，且不再牺牲 march。
+    const float skyWeight =
+        smoothstep(FOG_SKY_DIR_LO, FOG_SKY_DIR_HI, worldDirection.y);
+
+    // =====================================================================
+    // 2026-11-16：抬头方向（worldDirection.y > 0.8）走**解析雾幕**，不 march。
+    //
+    // 三条硬要求：不漏光 / 保性能 / 头顶一点光柱都不能有。
+    // 头顶那片雾的太阳项已按仰角压到 2%（见 sunUpAtten），剩下的只是"均匀的
+    // 环境亮雾"；而 16 步 march 在 198 格厚雾里步长 20+ 格，逐像素抖动落点不同，
+    // 就在这片亮雾上叠出细密竖条（用户："头顶还有残留"）。
+    //
+    // 解析版：只采一次中线密度，按视线到雾顶的光程算透射率，散射全给环境项
+    //（无方向性 ⇒ 结构上不可能有光柱），并且**跳过 march** ⇒ 性能反而更好。
+    // =====================================================================
+    // =====================================================================
+    // 2026-11-18：**硬切换 → 软过渡**（头顶"圆形空洞"的根因）。
+    //
+    // 症状：抬头看天空时，某一块圆形区域里雾的浓淡与亮度明显不同
+    //（用户："头顶有时候有圆形空洞"）。根因不是密度，而是下面这道门槛：
+    // `y > 0.8` 走解析雾幕、其余走 16 步 march，两条路径的亮度与透射率本来就
+    // 不相等；而"仰角 0.8"在透视投影下是天空里的一条**圆锥截线 —— 一个圆**。
+    // 于是分界被看成圆形的明暗台阶（同处 2026-11-16 的注释记的是同一现象）。
+    //
+    // 改法：解析结果先算出来但不立即 return，按仰角在 [LO, HI] 与 march 结果
+    // 混合；只有 y ≥ HI 才走纯解析快路径（保持"头顶不 march"的性能收益）。
+    // =====================================================================
+    const float upBlendRaw =
+        max(smoothstep(FOG_UP_BLEND_LO, FOG_UP_BLEND_HI, worldDirection.y),
+            smoothstep(FOG_SKY_DIR_LO, FOG_SKY_DIR_HI, worldDirection.y));
+    float upBlend = upBlendRaw;
+    FogResult upResult;
+    upResult.scattering = vec3(0.0);
+    upResult.transmittance = 1.0;
+    upResult.opticalDepth = 0.0;
+    upResult.meanDistance = fogNear;
+    upResult.firstDistance = fogNear;
+
+    if(upBlendRaw > 0.0)
+    {
+        const float topY = max(heightMax, heightMin);
+        const float camY = worldOrigin.y;
+        const float dirY = max(worldDirection.y, 1.0e-3);
+        const float a = (2.0 / VFOG_FALLOFF) * (1.0 - wetness * 0.5);
+
+        // 中点采一次地表（innerBase 沿视线变化缓慢，用中点代表整条视线）。
+        const float upPathToTop = (topY - camY) / dirY;
+        const vec3 midPoint =
+            worldOrigin + worldDirection * (fogNear + upPathToTop * 0.5);
+
+        FogGround upGround;
+        upGround.height = FOG_ANCHOR_REFERENCE_Y;
+        upGround.weight = 0.0;
+        if(groundAnchor > 0.0 || rollingStrength > 0.0)
+        {
+            upGround = fogGroundAt(midPoint);
+        }
+        const float upOffset = fogGroundAnchorOffset(upGround, groundAnchor);
+        const float upInnerBase =
+            ((upGround.weight > 0.0) ? upGround.height : FOG_ANCHOR_REFERENCE_Y)
+            - upOffset;
+
+        // 带内剖面（上疏下密）的**闭式积分**：
+        //   density(y) = exp2(-(y-ib)*a)*C + base
+        //   ∫[yLo,topY] = (exp2(-(yLo-ib)*a) - exp2(-(topY-ib)*a)) / (a·ln2)
+        //                 + base·(topY-yLo)
+        // 相机在带底之下时从带底起算；在雾顶之上时 span=0 ⇒ 无雾（正确）。
+        // 之前用"中线单点密度 × 路程"，剖面让高处密度趋近 0 ⇒ 整段雾被算没了，
+        // 表现为"头顶一大块圆形无雾空气"。
+        const float yLo = max(camY, upInnerBase);
+        const float span = max(topY - yLo, 0.0);
+        const float vertical = span > 0.001
+            ? (exp2(-(yLo - upInnerBase) * a) -
+               exp2(-(topY - upInnerBase) * a)) / (a * 1.442695) +
+              baseDensity * span
+            : 0.0;
+
+        // 沿视线 τ = ∫density ds = (∫density dy) / dir.y
+        // 2026-11-18：抬头吃的也是"天空方向折扣"，否则头顶仍是厚霾。
+        const float tau =
+            vertical / dirY * fogTimeFactor * FOG_SKY_DENSITY_SCALE;
+        const float upPath = min(upPathToTop, fogFar - fogNear);
+        const float upTransmittance = exp2(-tau * 1.442695);
+
+        if(upPath > 0.01)
+        {
+            // =================================================================
+            // 2026-11-19（第二次修复）：**天空方向不再有任何太阳项**。
+            //
+            // 症状（用户）："有光柱了，但从头顶垂直射下来的，且看起来没有遮挡
+            // 判断"。根因就是我 11-18 给这条解析快路径补的那份太阳项：
+            //   · 它用的是"射线到地面是否被地形挡住"的判据，而抬头视线的样本
+            //     一路往上走，地形永远在下面 ⇒ 判据恒 1（结构上不可能有遮挡）；
+            //   · 散射又是解析求的(1-T)，与仰角一一对应 ⇒ 于是整片天空按仰角
+            //     分层、在天顶汇聚，看起来就是"从头顶垂直射下来的柱子"。
+            // 天空方向本来就没有"被雾遮挡的光路"，它只该是一层无方向性的薄霾。
+            // 所以这里回到纯环境项：结构上不可能出现头顶光柱。
+            // 真正的地形遮挡柱只留在地面/水平方向的 march 里。
+            // =================================================================
+            upResult.scattering = ambientRadiance * (1.0 - upTransmittance) *
+                (0.3 * max(ambientStrength, 0.0));
+            upResult.transmittance = upTransmittance;
+            upResult.opticalDepth = -log(max(upTransmittance, 1.0e-6));
+            upResult.meanDistance = fogNear + upPath * 0.5;
+
+            // 2026-11-19：上面这份解析太阳项已删除（它产生了"头顶垂直光柱"）。
+            // 天空方向保持无方向性薄霾，见本段开头的说明。
+
+            // 纯抬头（y ≥ HI）：解析口径足够，省掉 march。
+            if(upBlendRaw >= 0.999)
+            {
+                return upResult;
+            }
+        }
+        else
+        {
+            // 相机在雾顶之上：解析口径下就是"无雾"，拿它去混 march 会把雾抹掉。
+            upBlend = 0.0;
+        }
+    }
+
     const vec3 start = worldOrigin + worldDirection * fogNear;
     const vec3 end = worldOrigin + worldDirection * fogFar;
     const vec3 rayVector = end - start;
@@ -648,6 +1051,14 @@ FogResult evaluateAnalyticFog(
 
     const float noise = fogDitherPhase(
         ivec2(gl_GlobalInvocationID.xy), fogTemporalPhase(temporalJitter));
+
+    // 2026-11-18：天空方向折扣（见 FOG_SKY_DENSITY_SCALE 的注释）。
+    // sceneDistance 是这条视线上的最近几何距离；没有命中（>= fogFar）说明看的是天。
+    // 用 smoothstep 过渡，避免物体轮廓处出现硬边。
+    const float skyDensityMul = mix(
+        1.0,
+        FOG_SKY_DENSITY_SCALE,
+        smoothstep(fogFar * 0.85, fogFar * 0.99, sceneDistance));
 
     const float VdotL = dot(worldDirection, sunDirection);
     // 2026-11-09 P4：单叶 → 双叶。55° 侧光下光柱边缘不再"一刀切"，
@@ -670,15 +1081,46 @@ FogResult evaluateAnalyticFog(
     }
     vec3 lightDensityAccum = vec3(0.0);
 
+    // =====================================================================
+    // 2026-11-19（重构）：体积光介质的两个循环不变量。
+    //
+    // ① shaftAmp：光柱强度档。独立于雾密度 —— 这是"浓光柱 + 淡雾"能同时成立的
+    //    前提。雨天直接归零（用户明确要求：雨天的平流雾不该算体积光）。光强
+    //    只影响介质里散射多少太阳光，不影响任何消光。
+    // ② shadowSunDirection：阴影查表必须与生产者 rt_sun_shadow 用同一方向。
+    //    太阳落到地平线以下时生产者把方向翻上来（正交盒永远在场景上方），
+    //    这里必须同式，否则查表落进镜像的纹素、整片误判受光。
+    // =====================================================================
+    const float advectionFogRain = smoothstep(0.35, 0.75, rain);
+    const float shaftAmp = FOG_SHAFT_MEDIUM *
+        clamp(max(sunStrength, 0.0), 0.0, 4.0) *
+        (1.0 - advectionFogRain);
+
+    const float moonPhaseAngle =
+        fract(fract(cam.historyParams.w) + cam.sssParams.z + 0.5) * 6.28318530718;
+    const vec3 moonShadowDirection = normalize(vec3(
+        cos(moonPhaseAngle), 0.81915204429 * sin(moonPhaseAngle),
+        0.57357643635 * sin(moonPhaseAngle)));
+    const vec3 shadowSunDirection =
+        sunDirection.y >= 0.0 ? sunDirection : moonShadowDirection;
+
     // 薄雾激活时也要采地面高度场（薄雾锚在地形上）。
     const bool needGroundSample = groundAnchor > 0.0 || rollingStrength > 0.0;
 
     float transmittance = 1.0;
     float fogDensityAccum = 0.0;
     float rayDensityAccum = 0.0;
+    float shaftScatterAccum = 0.0;
     float fogMeanDistanceAccum = 0.0;
     float fogMeanWeightAccum = 0.0;
     float fogLitAccum = 0.0;
+
+#if VFOG_DEBUG_OUT
+    // 诊断：分开统计"阴影图判的可见度"与"几何射线判的可见度"，
+    // 以便定位是哪一路把 shadow 按成 0。按密度加权归一化。
+    float vfogDbgMapVisAccum = 0.0;
+    float vfogDbgRayVisAccum = 0.0;
+#endif
 
     for(int i = 0; i < int(VFOG_QUALITY); ++i)
     {
@@ -729,7 +1171,7 @@ FogResult evaluateAnalyticFog(
             wetness,
             heightMax,
             heightMin,
-            fogInnerBase) * tailFade;
+            fogInnerBase) * tailFade * skyDensityMul;
 
         // 2026-11-13：雾顶逆温层（雨天）。
         // 真实雨雾/层云有一个相当清晰的上边界（其上空气更干、温度更高），
@@ -753,40 +1195,67 @@ FogResult evaluateAnalyticFog(
                 rollingStrength, rollingRange, rollingTime, rollingSpeed, worldOrigin);
         }
 
+        // =====================================================
+        // 2026-11-16 雾形态：主体积雾的**厚薄不均**。
+        //
+        // 上面两个来源都长不出它：fogDensityAtGround 是纯解析指数（均匀灰膜），
+        // rollingFogDensity 只服务 1.5 格厚的贴地雾且**只在下雨时出现**。
+        // 于是 30~200 格厚的主体积雾在晴天没有任何内部结构。
+        //
+        // 做法：用已绑定的 cloudCurlNoise（低频、平滑、已随风平移）在 120 格
+        // 尺度上乘性调制。乘性 ⇒ 不凭空造雾；clamp 0.45~1.85 ⇒ 不撕出空洞；
+        // 120 格比平流雾的 28/9 格粗得多，不会叠成麻点。
+        //   cam.fogMoodParams.x = 0 ⇒ 逐位回到改动前（均匀灰膜）。
+        // 与 fog_froxel_density.comp 同式（那边有完整注释）。
+        // =====================================================
+        const float fogShapeStrength = clamp(cam.fogMoodParams.x, 0.0, 2.0);
+        if(fogShapeStrength > 0.0 && density > 1.0e-7)
+        {
+            // 2026-11-21 统一风场：滚动方向改读 windDirXZ()，速度（×0.35）不动。
+            const vec2 shapeWind = windDirXZ() *
+                (max(rollingSpeed, 0.0) * rollingTime * 0.35);
+            const vec2 shapeCurl = textureLod(cloudCurlNoise,
+                vec3((fogPos.xz + shapeWind) / 120.0, 0.72), 0.0).xy;
+            density *= clamp(
+                1.0 + shapeCurl.x * 0.85 * fogShapeStrength, 0.45, 1.85);
+        }
+
         const float absorption = exp2(-density * stepDensity);
 
         // =====================================================================
-        // 2026-11-10：太阳方向的光学厚度改为**解析积分**。
-        //
-        // 原实现沿太阳方向走最多 8 步（步长 5 → 7.5 → … → 85 格），每步一次
-        // fogDensityAt（各 1 次 exp2）。两个问题：
-        //   ① 每样本 8 次 exp2 ⇒ 与视线 6 步相乘 = 48 次，是雾段的主要开销；
-        //   ② 步长这么粗，自阴影项被欠采样，残差沿太阳方向成条带 ⇒ 正对太阳时
-        //      呈现"从太阳射出的放射状光柱"（用户实测：关掉体积雾即消失）。
-        //
-        // 高度带雾的密度剖面在带外是纯指数，光程积分有闭式解，直接解析求：
-        // 代价 2~4 次 exp2，且与步数无关。省下的预算给视线步数（6 → 16）。
-        // 薄雾（mist）从自阴影里略去：它只有 1 格厚，对太阳光程的贡献可忽略。
+        // 2026-11-19（重构）：太阳项不再由雾密度驱动，改由**独立的体积光介质**。
+        // 见常量区 FOG_SHAFT_* 的说明。这里只做三件事：
+        //   ① 求本步的介质密度（贴地指数，短标高）
+        //   ② 解析求太阳方向的光学厚度（闭式，2 次 exp2）
+        //   ③ 按本步实际光程累积散射能量
         // =====================================================================
-        // 2026-11-13（A2）：pow(1.5, n) → exp2(n·log2(1.5))。
-        // exp2 在全部目标 GPU 上都是一条指令，pow 是 10~20 周期。
-        // （更彻底的做法是把它提出 march 循环，但那要动循环结构，留待下一批。）
-        const float sunPathLength =
-            10.0 * (exp2(float(sunSteps) * 0.5849625007211562) - 1.0);
-        float lightingDensity = fogSunOpticalDepth(
-            fogPos.y - groundOffset,
-            sunDirection.y,
-            sunPathLength,
-            (2.0 / VFOG_FALLOFF) * (1.0 - wetness * 0.5),
-            baseDensity,
-            heightMax,
-            heightMin) * fogTimeFactor;
+        // stepDensity = dt_blocks × 1.442695，所以 dt = stepDensity / 1.442695。
+        // 2026-11-19（修正）：stepDensity 里的 exponential·rayLength 只是消光积分的
+        // 近似尺度，**不是**本步的实际世界长度。实际步长是相邻两个 stepLength 之差：
+        //   dx = (exponential(i+1) - exponential(i)) · 0.1 · rayLength
+        // 直接用它，光柱能量才和物理光程对得上（旧式大了约 60 倍）。
+        const float nextExponential =
+            pow(11.0, (float(i) + 1.0 + noise) * rSteps);
+        const float stepBlocks =
+            max(nextExponential - exponential, 0.0) * 0.1 * rayLength;
 
-        // 2026-11-09 P4：单次散射 + 多次散射一阶近似。
-        // 薄雾时 boost≈0（逐位等价旧档），厚雾里补最多 40% 能量 ⇒ 光柱深处不死黑。
-        float stepRayDensity =
-            (exp2(-lightingDensity * VFOG_SUNLIGHT_ABSORPTION) +
-             fogMultiScatterBoost(lightingDensity)) * phases;
+        const float localGroundY =
+            (ground.weight > 0.0) ? ground.height : FOG_ANCHOR_REFERENCE_Y;
+        const float shaftHeight = max(fogPos.y - localGroundY, 0.0);
+        const float shaftDensity = shaftAmp *
+            exp2(-shaftHeight / FOG_SHAFT_SCALE_HEIGHT * 1.4426950408889634);
+
+        // 沿太阳方向对贴地指数剖面做闭式积分：
+        //   ∫₀^∞ A·e^{-(h+s·sinθ)/H} ds = A·H/sinθ
+        // 这就是"这个样本上方还有多少介质挡着阳光"。太阳越低，路径越长、越暗。
+        const float shaftSunTau = shaftDensity *
+            FOG_SHAFT_SCALE_HEIGHT / max(shadowSunDirection.y, 0.05);
+        const float shaftSunTransmittance =
+            1.0 - exp2(-shaftSunTau * 1.4426950408889634);
+
+        // 相函数：前向散射（朝太阳看才亮），双瓣近似。
+        const float shaftStep = shaftDensity * stepBlocks * shaftSunTransmittance *
+            phases;
 
         // 2026-11-09：阴影查表必须用**生产者同一个方向**。
         //
@@ -800,8 +1269,10 @@ FogResult evaluateAnalyticFog(
         // depth < 320 ⇒ 判定"受光" ⇒ 雾在洞里整片被太阳点亮（光柱穿墙）。
         //
         // 这里只翻阴影查表这一个用途；上面第 364 行的太阳光步 march 仍用真实方向。
-        const vec3 shadowSunDirection =
-            sunDirection.y >= 0.0 ? sunDirection : -sunDirection;
+        // 2026-11-16：与 sunShadowLightDirection() 同步 —— 月亮按月相沿日轨
+        // 移动，不再是 -sunDirection。本文件不依赖 sky_model_common.glsl 的
+        // include 顺序，故内联同式（改一处必须改另一处）。
+        // 2026-11-19（重构）：提到循环外（原本每个 march 步都重算一遍）。
 
         // 2026-11-10：阴影盒覆盖渐隐。
         // 盒外已经判 0（没有遮挡数据就不给光柱，见 sun_shadow.glsl 的宏分支），
@@ -827,9 +1298,39 @@ FogResult evaluateAnalyticFog(
             (ground.weight > 0.0 && fogPos.y < ground.height + 1.0) ? 0.0 : 1.0;
 #endif
 
-        float shadow = sunShadowFogVisibility(fogPos, shadowSunDirection, i) * cloudGap;
+        // 2026-11-15：走"盒外保守判暗"的雾专用版本（见文件顶部
+        // fogSunShadowVisibility 的说明）。
+        const float shadowMapVis = fogSunShadowVisibility(fogPos, shadowSunDirection, i);
+        float shadow = shadowMapVis * cloudGap;
+        float dbgRayVis = 1.0;   // 诊断用：几何射线自己判的可见度
 
-#ifdef VFOG_SUN_RAY
+#if VFOG_FORCE_SUN
+        // 对照实验：完全旁路可见性。用来区分"太阳项本身是否是 0"与
+        // "可见性链路是否恒为 0"。这一档画面会整片发亮（没有柱子），
+        // 只要能看到雾变亮，就证明太阳项活着。
+        shadow = 1.0;
+#else
+#if VFOG_SUN_HEIGHTVIS
+        // 2026-11-19（回退到可用的判据）：**地形高度场为准**。
+        //
+        // 上一版把太阳阴影图（rt_sun_shadow）当主判据，实测它几乎对每个样本都
+        // 报"被遮挡" ⇒ shadow 恒 0 ⇒ 一根柱子都没有。那张图本身是坏的（另案修），
+        // 不能拿它当"严丝合缝"的前提。
+        // 高度场能给出山脊/谷口/悬崖的真实轮廓，是当前唯一可用且稳定的遮挡源。
+        // 树冠/建筑暂缺 —— 见 FOG_SUN_HEIGHT_MAX_DISTANCE 的说明，后续用可达的
+        // 几何源补（不是靠这张坏图）。
+        // 阴影图路径保留在 VFOG_SHADOWMAP_OCCLUSION 下（默认关），供它修好后启用。
+        {
+            const float heightVis = fogSunHeightVisibility(
+                fogPos, shadowSunDirection, FOG_SUN_HEIGHT_MAX_DISTANCE);
+            shadow = heightVis * cloudGap;
+#if VFOG_SHADOWMAP_OCCLUSION
+            shadow = shadow * shadowMapVis;
+#endif
+        }
+#endif
+
+#if defined(VFOG_SUN_RAY) && !VFOG_SUN_HEIGHTVIS
         // 2026-11-15（L2）：太阳遮挡真值。近场（<= ~128 格）完全按几何判定；
         // 128~192 格平滑过渡回阴影图（更远处雾已经很稀，且那边阴影图的
         // "盒外保守处理"是安全的）。于是洞穴顶 / 树冠 / 山体侧影都不会再漏光，
@@ -839,19 +1340,36 @@ FogResult evaluateAnalyticFog(
                 fogPos, shadowSunDirection, FOG_SUN_RAY_MAX_DISTANCE,
                 float(gl_GlobalInvocationID.x) +
                     float(gl_GlobalInvocationID.y) * 7919.0 + float(i) * 131.0);
+            dbgRayVis = rayVis;
             const float rayWeight =
                 1.0 - smoothstep(FOG_SUN_RAY_MAX_DISTANCE * 0.70,
                     FOG_SUN_RAY_MAX_DISTANCE, sampleDistance);
+            // 2026-11-18 修正：**近场以几何射线为唯一真值源**。
+            //
+            // 原来是 min(阴影图, 射线)。实测（诊断通道）：阴影图路径对每个样本
+            // 都判"被遮挡"（红=0），于是 min 把本来正确的射线（绿）一起否掉，
+            // 雾的太阳项恒为 0 ⇒ 任何角度都看不到体积光。
+            //
+            // 现在按距离过渡：近场（rayWeight→1）纯用射线，远场（超出射线射程）
+            // 才回退阴影图。这也正是"严丝合缝"要求的判据 —— 柱子边界只由真实
+            // 几何决定，不受阴影图的盒边界/清屏值影响。
             shadow = mix(shadow, rayVis, rayWeight);
         }
 #endif
+#endif
 
         const float integral = transmittance - absorption * transmittance;
-        stepRayDensity *= integral;
+
+#if VFOG_DEBUG_OUT
+        vfogDbgMapVisAccum += integral * shadowMapVis;
+        vfogDbgRayVisAccum += integral * dbgRayVis;
+#endif
 
         fogDensityAccum += integral;
         fogLitAccum += integral * shadow;
-        rayDensityAccum += stepRayDensity * shadow;
+        // 2026-11-19（重构）：光柱能量按**光柱介质自己的**光学厚度累积，
+        // 不掺雾的 density。衰减用当前 transmittance（这一段样本到眼睛的遮蔽）。
+        shaftScatterAccum += shaftStep * shadow * transmittance;
 
         fogMeanDistanceAccum += integral * sampleDistance;
         fogMeanWeightAccum += integral;
@@ -905,20 +1423,51 @@ FogResult evaluateAnalyticFog(
         ambientRadiance * fogDensityAccum *
         (0.3 * max(ambientStrength, 0.0)) * ambientVisibility;
 
-    const vec3 rayColor =
-        sunRadiance * rayDensityAccum *
-        (1.2 * max(sunStrength, 0.0));
+    // =====================================================================
+    // 2026-11-19（重构）：合成口径分成三项，互不牵连。
+    //
+    //   fogColor   —— 环境内散射：来自雾介质的密度，不含任何太阳项。
+    //                 "雾有多浓"只体现在这里（画面被压灰多少），与光柱无关。
+    //   shaftColor —— 太阳直射在**光柱介质**里的单次散射：强度、贴地标高、
+    //                 几何遮挡全部独立于雾密度；头顶没有介质 ⇒ 恒为 0。
+    //   lightDensityAccum —— 局部光源在雾里的散射（未改动）。
+    //
+    // 太阳项不再乘任何"抬头压制/仰角淡出"：那类系数是旧模型（一根雾柱盖满
+    // 整个天空）的补丁，介质分离后既不需要，也会误伤低角度的长光柱。
+    // =====================================================================
+    const vec3 shaftColor =
+        sunRadiance * shaftScatterAccum * FOG_SHAFT_GAIN *
+        vec3(cam.fogOpticsParams.y, cam.fogOpticsParams.z,
+            cam.fogOpticsParams.w);
 
-    // 2026-11-13：波长相关透射（fogOpticsParams.yzw）。
-    // 真实介质里蓝光衰减得比红光慢，所以远处/厚雾下的太阳散射偏蓝。
-    // 这里对**太阳散射项**做逐通道加权（环境项不动，否则整片雾会被染色）。
-    // 权重恒为 1 时与原档逐位等价。
-    result.scattering = fogColor +
-        rayColor * vec3(cam.fogOpticsParams.y, cam.fogOpticsParams.z,
-            cam.fogOpticsParams.w) +
-        lightDensityAccum;
+    result.scattering = fogColor + shaftColor + lightDensityAccum;
     result.transmittance = transmittance;
     result.opticalDepth = -log(max(transmittance, 1.0e-6));
+
+    // 2026-11-18：软过渡收口。仰角带内把 march 结果与抬头解析结果按 upBlend 混合，
+    // 消掉原来 y=0.8 那条圆形硬边；带外 upBlend 为 0（或已早退），这里是无操作。
+    if(upBlend > 0.0)
+    {
+        result.scattering = mix(result.scattering, upResult.scattering, upBlend);
+        result.transmittance =
+            mix(result.transmittance, upResult.transmittance, upBlend);
+        result.opticalDepth = -log(max(result.transmittance, 1.0e-6));
+        result.meanDistance =
+            mix(result.meanDistance, upResult.meanDistance, upBlend);
+    }
+
+    // 2026-11-19 诊断（重构后）：三个量都改成新口径，供 fog_screen_march 上色。
+#if VFOG_DEBUG_OUT
+    {
+        //   R = litFraction                 —— 光柱介质的受光比例
+        //   G = shaftScatterAccum×40        —— 光柱介质累积的散射能量
+        //   B = |shaftColor|×3              —— 真正加进画面的那部分
+        gVfogDebug = vec3(
+            clamp(litFraction, 0.0, 1.0),
+            clamp(shaftScatterAccum * 40.0, 0.0, 1.0),
+            clamp(length(shaftColor) * 3.0, 0.0, 1.0));
+    }
+#endif
 
     return result;
 }

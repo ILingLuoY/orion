@@ -345,6 +345,39 @@ bool glassChainAcceptEntry(inout HitPayload payload, float hitT)
 #ifndef GLASS_ALPHA_BLEND_OPAQUENESS_THRESHOLD
 #define GLASS_ALPHA_BLEND_OPAQUENESS_THRESHOLD (254.0 / 255.0)
 #endif
+
+// =====================================================
+// 2026-11-21：清玻璃边框 Alpha-Cutout（顾问方案 A，用户已确认）
+//
+// 问题：原版 16x16 玻璃贴图的边框只有 1 texel（alpha = 1.0），屏幕投影 1~2 px。
+//   它被钉死成 GLASS_FIXED_ALPHA = 0.3 后必须经过 alpha-blend 合成，而合成发生在
+//   NRD / DLSS-RR **之前**，guide 却属于背后几何 ⇒ RR 在 guide 里看不到这条细线，
+//   当成 firefly 抹平；且边框与玻璃中心在同一平面，任何深度型双边权重都挡不住
+//   中心向边框的串扰。
+//
+// 方案：texAlpha >= 阈值（= 边框）且是**清玻璃**（materialId < 2.05 且顶点色为
+//   原版四个灰面明暗之一）时，把该命中直接归为**不透明**：
+//     · rchit  (material_resolve_glass.glsl)：hitClass = RT_HIT_OPAQUE，
+//              不置 GLASS / CLEAR_GLASS 位，glassAlpha 归 1.0；
+//     · rahit  (rt_test.rahit / rt_test_translucent.rahit)：chainAlpha 取贴图
+//              alpha(≈1) ⇒ 越过 OPAQUENESS_THRESHOLD ⇒ 在阈值分支 return，
+//              作为遮挡终止且不记录层。
+//   于是边框拿到与不透明方块完全相同的 depth / normal / MV / albedo guide，
+//   RR 不再把它当噪声；它也不再进入底边那条出射界面走查。
+//
+// 代价（用户明确接受）：边框从"半透明白线"变成实心白框 —— 更清晰，但与
+//   "整块 0.3 半透明"的原版口径不同。
+//
+// 影响范围：只碰普通玻璃。染色玻璃（顶点色 = DyeColor）、遮光玻璃 2.1 /
+//   冰 2.2 / 粘液 2.3 / 蜂蜜 2.4（materialId >= 2.05）全部不受影响。
+// A/B：-DVPT_GLASS_CUTOUT_BORDER=0 逐位回到旧口径。
+// =====================================================
+#ifndef VPT_GLASS_CUTOUT_BORDER
+#define VPT_GLASS_CUTOUT_BORDER 1
+#endif
+#ifndef VPT_GLASS_CUTOUT_THRESHOLD
+#define VPT_GLASS_CUTOUT_THRESHOLD 0.85
+#endif
 #ifndef GLASS_ALPHA_BLEND_STOCHASTIC_MAX_OPACITY
 #define GLASS_ALPHA_BLEND_STOCHASTIC_MAX_OPACITY 0.95
 #endif

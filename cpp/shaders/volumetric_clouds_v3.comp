@@ -73,9 +73,12 @@ float hgPhase(float cosine, float g)
 
 #include "volumetric_fog.glsl"
 
-vec3 v3SunColor(vec3 lightDirection)
+// 2026-11-19：交接带里用的**连续版**阳光色（不判夜、不早退），与 v5 同口径。
+// 旧的非连续版 v3SunColor()（= skyModelSunColor(dir, 0.5)）在 sunElevation < 0 处
+// 会提前返回月蓝，交接带里能量还没归零颜色就先换了，已无读者，删除。
+vec3 v3SunColorContinuous(vec3 lightDirection)
 {
-    return skyModelSunColor(lightDirection, 0.5);
+    return skyModelSunColorContinuous(lightDirection, 0.5);
 }
 
 const float V3_DAYLIGHT_UPPER = 0.25;
@@ -126,9 +129,18 @@ void main()
 
     vec3 lightDirection0 = sunDirection();
     float sunElevation = lightDirection0.y;
-    vec3 lightDirection = sunElevation >= 0.0 ? lightDirection0 : -lightDirection0;
+    // 2026-11-16：夜间光源 = 真实月亮位置（按月相沿日轨移动），不再是 -sunDir。
+    vec3 moonLightDir0 = moonEclipticDirectionAt(
+        moonDecalPhase01(cam.historyParams.w, cam.sssParams.z));
+    // 2026-11-19：直射光交接带与 v5 同口径（sky_model_common.glsl 单一真源）。
+    vec3 lightDirection = skyDirectIsSun(sunElevation)
+        ? lightDirection0 : moonLightDir0;
+    float sunDirectAmount = skyDirectSunAmount(sunElevation);
+    float moonDirectAmount = skyDirectMoonAmount(sunElevation);
     float dayAmount = smoothstep(-0.03, 0.03, sunElevation);
     float elevationMagnitude = abs(sunElevation) / V3_SOLAR_LATITUDE_35_COS;
+    float moonElevationMagnitude =
+        clamp(moonLightDir0.y / V3_SOLAR_LATITUDE_35_COS, 0.0, 1.0);
     float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
 
     float highPixelAngle = 2.0 * abs(cam.projInverse[1][1]) / float(size.y);
@@ -142,16 +154,22 @@ void main()
     }
 
     // 2026-11-13：夜间色改调共享的 skyModelMoonColor（原来硬编码）。
-    vec3 directLightColor = mix(skyModelMoonColor(sunElevation), v3SunColor(lightDirection), dayAmount);
-    float directLightEnergy = mix(V3_MOON_LIGHT_SCALE * elevationMagnitude,
-        6.0, dayAmount) * clamp(cam.cloudParams5.z, 0.0, 3.0);
+    // 2026-11-16：参数/能量改为月亮高度（见 volumetric_clouds_v5.comp 同段）。
+    // 2026-11-19：太阳侧用连续版阳光色（交接带里 skyModelSunColor 会提前变月蓝）。
+    vec3 directLightColor = skyDirectIsSun(sunElevation)
+        ? v3SunColorContinuous(lightDirection0)
+        : skyModelMoonColor(-moonLightDir0.y);
+    float directLightEnergy = (6.0 * sunDirectAmount +
+        V3_MOON_LIGHT_SCALE * moonElevationMagnitude * moonDirectAmount) *
+        clamp(cam.cloudParams5.z, 0.0, 3.0);
     float moonStrength = cam.cloudMoonParams.x >= 0.0 ? cam.cloudMoonParams.x : 1.0;
     float moonPhase = cam.cloudMoonParams.y >= 0.0 ? cam.cloudMoonParams.y : 1.0;
-    float moonAmount = mix(1.0, moonStrength * clamp(moonPhase, 0.0, 1.0), 1.0 - dayAmount);
+    float moonAmount = mix(1.0, moonStrength * clamp(moonPhase, 0.0, 1.0),
+        moonDirectAmount);
     vec3 sunColor = directLightColor * directLightEnergy * moonAmount;
 
     // 2026-11-13：与地形同源的月相调光。
-    sunColor *= mix(1.0, skyModelMoonPhaseDim(cam.sssParams.z, 0.35), 1.0 - dayAmount);
+    sunColor *= mix(1.0, skyModelMoonPhaseDim(cam.sssParams.z, 0.35), moonDirectAmount);
 
     float daylight = mix(V3_NIGHT_AMBIENT, 1.0,
         smoothstep(-0.10, V3_DAYLIGHT_UPPER, sunElevation));

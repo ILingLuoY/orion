@@ -1087,7 +1087,9 @@ void recordSkyAtmosphere(VkCommandBuffer cmd)
     vkCmdPipelineBarrier(cmd,
         g_skyScatteringLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
             g_skyTransmittanceLayout == VK_IMAGE_LAYOUT_UNDEFINED
-            ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            : (VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, barriers);
     g_skyScatteringLayout = VK_IMAGE_LAYOUT_GENERAL;
     g_skyTransmittanceLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1105,7 +1107,9 @@ void recordSkyAtmosphere(VkCommandBuffer cmd)
         barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     }
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0u, 0u, nullptr, 0u, nullptr, 2u, barriers);
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 2u, barriers);
 
     // 记录本次构建的输入快照（下一次据此判断是否可跳过）。
     if(skyLutUbo != nullptr)

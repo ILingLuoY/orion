@@ -1,0 +1,241 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// =============================================================================
+// 2026-11-11/12 太阳可见度**屏幕空间半分辨率滤波**（软影 A 方案，形态 1）
+//
+// 参考实现（本地 C:\Users\马帝\Downloads\caustica_extract\caustica\shaders\world）：
+//   · shadow_closest_hit.slang / shadow_blocker.slang 都把 hitDistance 写进
+//     ShadowPayload —— 与本节"要拿遮挡物距离"一致；
+//   · 它的可见性射线是**随机 seed** 的，靠 NRD（nrd_signals.slang 把 hitDistance
+//     编码进 .a）时空降噪。本工程没有接 NRD 的直射降噪，所以这里用**确定性
+//     空域滤波**代替降噪器：宁可损失一点物理正确性，也不要逐帧噪点。
+//
+// 2026-11-12 修"好多噪点"（用户实测）：上一版三处设计错误
+//   ① 半径几乎恒为 0：MC 的遮挡物大多贴着接收面（0.1~1 格），
+//      半径 = 遮挡距离 × 孔径 × projScale / viewZ 算出来 < 0.5 px
+//      ⇒ 走"原样复制 raw"分支 ⇒ 大部分屏幕**根本没滤波**；
+//   ② raw 按 2×halfPixel **点采样**，2×2 全分辨率像素只取 1 个
+//      ⇒ 半影边缘 2 px 台阶 + 点采样锯齿；
+//   ③ 1 条射线的方差是 16 条平均的 16 倍，且没有时域累积。
+// 现在：最小半径下限（SUNVIS_MIN_RADIUS_PX）+ 2×2 盒降采样（第二趟）
+//      + 核收到 7×7 控成本。**只改这个 comp，不触碰 rgen ⇒ 不需要冷编。**
+//
+// 公式（自创，依据 Imagination 2015 的半影关系 R/L/O 与 PCSS 的 blocker 几何）：
+//   半影宽度(世界) ≈ 遮挡物距离 × 光源角半径
+//   半影宽度(像素) = 半影宽度(世界) × projScale / viewZ，projScale = H/(2 tan(fov/2))
+//
+// 可调量走 CameraUBO.sssParams.y/.z/.w（宿主 ORION_SUNVIS_*）。最小半径是
+// 编译期常量 —— compute 管线冷编只要 0~5 ms，改它成本可忽略。
+// =============================================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 2) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+// x = 可见度（1 = 完全受光，0 = 完全被挡）
+// y = 遮挡物距离（世界单位；未遮挡写 SUNVIS_MISS_DISTANCE）
+// z = 线性 viewZ（>0；天空写 0）
+// w = 保留
+layout(set = 0, binding = 90, rgba16f) uniform readonly image2D sunVisRaw;
+
+// 半分辨率 ping-pong：本 pass 写 [1-historyReadIndex]，下一帧 raygen 读翻转后的
+// 同一个 index。
+layout(set = 0, binding = 91, rgba16f) uniform image2D sunVisHistory[2];
+
+const float SUNVIS_MISS_DISTANCE = 512.0;
+
+// 半分辨率核半径（纹素）。7×7 + step=1 覆盖 ±3 个半分辨率纹素
+// = ±6 个全分辨率像素；配合最小半径下限就是这个 pass 能给出的最宽半影。
+const int SUNVIS_KERNEL_RADIUS = 3;
+
+// 2026-11-12：**最小半影半径**（半分辨率像素）。这是噪点与"接触影变软"的
+// 唯一交换点：
+//   · 0.0  ⇒ 逐位回到上一版（近处不滤波 ⇒ 半分辨率二值图 ⇒ 噪）
+//   · 1.5  ⇒ 任何像素至少与 3 个半分辨率纹素做平均，正好消掉"2×2 块"与
+//             单像素孤立值；接触处影子会比物理略软（约 6 个全分辨率像素）。
+const float SUNVIS_MIN_RADIUS_PX = 1.5;
+
+// 全分辨率 raw 的一个半分辨率纹素 = 2×2 四个像素。点采样会丢 3/4 的信息并
+// 造成 2 px 台阶，这里按盒平均读回（4 次 load，可接受）。
+vec4 sunVisLoadRawBox(
+    ivec2 halfPixel,
+    ivec2 rawSize)
+{
+    const ivec2 base = halfPixel * 2;
+    const ivec2 maxCoord = max(rawSize - ivec2(1), ivec2(0));
+
+    vec4 sum = vec4(0.0);
+    float weightSum = 0.0;
+
+    for(int ty = 0; ty < 2; ++ty)
+    {
+        for(int tx = 0; tx < 2; ++tx)
+        {
+            const ivec2 p = clamp(base + ivec2(tx, ty), ivec2(0), maxCoord);
+            const vec4 s = imageLoad(sunVisRaw, p);
+            const float w = (s.z > 1.0e-4) ? 1.0 : 0.0;
+
+            sum += s * w;
+            weightSum += w;
+        }
+    }
+
+    if(weightSum < 1.0e-5)
+    {
+        // 四个都是天空：返回第一个样本即可（调用方会按 z 判天空）。
+        return imageLoad(sunVisRaw, clamp(base, ivec2(0), maxCoord));
+    }
+
+    return sum / weightSum;
+}
+
+void main()
+{
+    const ivec2 halfPixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 halfSize = imageSize(sunVisHistory[0]);
+
+    if(halfPixel.x >= halfSize.x || halfPixel.y >= halfSize.y)
+    {
+        return;
+    }
+
+    const ivec2 rawSize = imageSize(sunVisRaw);
+    const uint writeIndex = 1u - (cam.historyReadIndex & 1u);
+
+    const vec4 center = sunVisLoadRawBox(halfPixel, rawSize);
+
+    const float centerVis = clamp(center.x, 0.0, 1.0);
+    const float centerZ = center.z;
+
+    // 天空/无表面：直通，避免半影被天空拉成一片。
+    if(centerZ <= 1.0e-4)
+    {
+        imageStore(sunVisHistory[writeIndex], halfPixel,
+                   vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // ---------------------------------------------------------------------
+    // lane：sssParams.y = 光源角半径(rad)，.z = 半径上限(半分辨率像素)，
+    //       .w = 深度拒绝比例。0 = 用默认值（宿主未写时恒 0）。
+    // ---------------------------------------------------------------------
+    const float aperture =
+        (cam.sssParams.y > 1.0e-6) ? cam.sssParams.y : 0.030;
+    const float maxRadiusPx =
+        (cam.sssParams.z > 0.5) ? cam.sssParams.z : 16.0;
+    const float depthTolerance =
+        (cam.sssParams.w > 1.0e-6) ? cam.sssParams.w : 0.05;
+
+    const int r = SUNVIS_KERNEL_RADIUS;
+
+    // ---------------------------------------------------------------------
+    // 第一趟：核内找"最近的被遮挡样本"的遮挡物距离（Imagination 的 cross search，
+    // 受光像素靠它借半径）。只决定半径，不参与最终数值 —— 所以这里用点采样
+    // （盒平均只影响数值，不影响"谁最浅"）。
+    // ---------------------------------------------------------------------
+    const ivec2 centerRaw = min(halfPixel * 2, max(rawSize - ivec2(1), ivec2(0)));
+    float blockerDistance = SUNVIS_MISS_DISTANCE;
+
+    for(int dy = -r; dy <= r; ++dy)
+    {
+        for(int dx = -r; dx <= r; ++dx)
+        {
+            const ivec2 q = halfPixel + ivec2(dx, dy);
+
+            if(q.x < 0 || q.y < 0 || q.x >= halfSize.x || q.y >= halfSize.y)
+            {
+                continue;
+            }
+
+            const vec4 s = imageLoad(
+                sunVisRaw,
+                min(q * 2, max(rawSize - ivec2(1), ivec2(0))));
+
+            if(abs(s.z - centerZ) > depthTolerance * centerZ)
+            {
+                continue;
+            }
+
+            if(s.x < 0.999)
+            {
+                blockerDistance = min(blockerDistance, max(s.y, 0.0));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 半影半径（半分辨率像素）。projScale 用**全分辨率**高度算（halfSize*2），
+    // 再乘 0.5 换算到半分辨率；fov 取 cam.cameraParams.z（rad，
+    // 与 material_resolve.glsl 的 pbrProjScale 同口径）。
+    // ---------------------------------------------------------------------
+    const float fullHeight = float(halfSize.y * 2);
+    const float projScale =
+        fullHeight / (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
+
+    float radiusPx = 0.0;
+
+    if(blockerDistance < SUNVIS_MISS_DISTANCE)
+    {
+        radiusPx =
+            blockerDistance * aperture * projScale * 0.5 / max(centerZ, 1.0e-3);
+    }
+
+    // 2026-11-12：**最小半径下限**是这一版的核心。物理半影在贴脸时确实是 0，
+    // 但"0 半径"在这个架构里等于"不滤波"，而只有 1 条射线时那就是一张
+    // 半分辨率二值图 ⇒ 满屏 2×2 块与孤立噪点。下限把接触影人为软化，
+    // 换来无噪点（与用户"不要噪点"的诉求一致）。
+    radiusPx = max(radiusPx, SUNVIS_MIN_RADIUS_PX);
+
+    // 核覆盖不到就按核上限，避免"半径说 20 px、实际只采 ±3"的假软。
+    radiusPx = clamp(radiusPx, 0.0, min(maxRadiusPx, float(r)));
+
+    // ---------------------------------------------------------------------
+    // 第二趟：按半径加权平均。
+    //   · 空间权重 = 高斯（σ = radius）
+    //   · 深度拒绝：相对 viewZ 差超过 tolerance 的样本整条丢掉（防跨面拉花）
+    //   · **不对可见度本身做 range 权重** —— 可见度就是要被模糊的信号。
+    //   · raw 用 2×2 盒平均读（见 sunVisLoadRawBox），把点采样的锯齿压掉。
+    // ---------------------------------------------------------------------
+    const float invTwoSigmaSq = 1.0 / max(2.0 * radiusPx * radiusPx, 1.0e-4);
+
+    float sum = 0.0;
+    float weightSum = 0.0;
+
+    for(int dy = -r; dy <= r; ++dy)
+    {
+        for(int dx = -r; dx <= r; ++dx)
+        {
+            const ivec2 q = halfPixel + ivec2(dx, dy);
+
+            if(q.x < 0 || q.y < 0 || q.x >= halfSize.x || q.y >= halfSize.y)
+            {
+                continue;
+            }
+
+            const vec4 s = sunVisLoadRawBox(q, rawSize);
+
+            if(s.z <= 1.0e-4 ||
+               abs(s.z - centerZ) > depthTolerance * centerZ)
+            {
+                continue;
+            }
+
+            const float distSq = float(dx * dx + dy * dy);
+            const float w = exp(-distSq * invTwoSigmaSq);
+
+            sum += clamp(s.x, 0.0, 1.0) * w;
+            weightSum += w;
+        }
+    }
+
+    const float filtered =
+        (weightSum > 1.0e-6) ? (sum / weightSum) : centerVis;
+
+    imageStore(sunVisHistory[writeIndex], halfPixel,
+               vec4(clamp(filtered, 0.0, 1.0), centerZ, 0.0, 0.0));
+}

@@ -3180,6 +3180,220 @@ void createMotionImage(uint32_t width,uint32_t height)
     << std::endl;
 }
 
+// 2026-11-21 P0-1：主命中世界位移 per-pixel 旁路槽（binding 98）。
+// 全渲染分辨率 RGBA16F：xyz = rchit 算出的世界位移，a = 有效标记（1=主射线命中写过）。
+// 生命周期/重建/销毁与 g_motionImage 同一套约定；布局常驻 GENERAL，只在 RT dispatch
+// 内由 rgen 清槽、rchit 写槽、rgen 读回，不进 compute 跨 pass 屏障表。
+void createHitOffsetImage(uint32_t width,uint32_t height)
+{
+    if(g_hitOffsetImage &&
+       g_hitOffsetWidth==width &&
+       g_hitOffsetHeight==height)
+        return;
+
+    if(g_hitOffsetView != VK_NULL_HANDLE ||
+       g_hitOffsetImage != VK_NULL_HANDLE ||
+       g_hitOffsetMemory != VK_NULL_HANDLE)
+    {
+        check(
+            FGDeviceWaitIdle(g_device),
+            "wait device before hit-offset recreate failed"
+        );
+    }
+
+    if(g_hitOffsetView)
+    {
+        vkDestroyImageView(
+            g_device,
+            g_hitOffsetView,
+            nullptr
+        );
+
+        g_hitOffsetView =
+            VK_NULL_HANDLE;
+    }
+
+    if(g_hitOffsetImage)
+    {
+        vkDestroyImage(
+            g_device,
+            g_hitOffsetImage,
+            nullptr
+        );
+
+        g_hitOffsetImage =
+            VK_NULL_HANDLE;
+    }
+
+    if(g_hitOffsetMemory)
+    {
+        vkFreeMemory(
+            g_device,
+            g_hitOffsetMemory,
+            nullptr
+        );
+
+        g_hitOffsetMemory =
+            VK_NULL_HANDLE;
+    }
+
+    g_hitOffsetWidth = 0;
+    g_hitOffsetHeight = 0;
+
+    g_hitOffsetLayout =
+        VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkImageCreateInfo ci{
+        VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+    };
+
+    ci.imageType = VK_IMAGE_TYPE_2D;
+
+    ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+
+    ci.extent =
+    {
+        width,
+        height,
+        1
+    };
+
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+
+    ci.usage =
+        VK_IMAGE_USAGE_STORAGE_BIT |
+        VK_IMAGE_USAGE_SAMPLED_BIT;
+
+    ci.initialLayout =
+        VK_IMAGE_LAYOUT_GENERAL;
+
+    check(
+        vkCreateImage(
+            g_device,
+            &ci,
+            nullptr,
+            &g_hitOffsetImage
+        ),
+        "create hit-offset image failed"
+    );
+
+    VkMemoryRequirements mr{};
+
+    vkGetImageMemoryRequirements(
+        g_device,
+        g_hitOffsetImage,
+        &mr
+    );
+
+    VkMemoryAllocateInfo ai{
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+    };
+
+    ai.allocationSize = mr.size;
+
+    ai.memoryTypeIndex =
+        findMemoryType(
+            g_physicalDevice,
+            mr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        );
+
+    check(
+        vkAllocateMemory(
+            g_device,
+            &ai,
+            nullptr,
+            &g_hitOffsetMemory
+        ),
+        "hit-offset memory failed"
+    );
+
+    check(
+        vkBindImageMemory(
+            g_device,
+            g_hitOffsetImage,
+            g_hitOffsetMemory,
+            0
+        ),
+        "bind hit-offset failed"
+    );
+
+    VkImageViewCreateInfo vi{
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+    };
+
+    vi.image=g_hitOffsetImage;
+    vi.viewType=VK_IMAGE_VIEW_TYPE_2D;
+    vi.format=VK_FORMAT_R16G16B16A16_SFLOAT;
+
+    vi.subresourceRange.aspectMask =
+        VK_IMAGE_ASPECT_COLOR_BIT;
+
+    vi.subresourceRange.levelCount=1;
+    vi.subresourceRange.layerCount=1;
+
+    check(
+        vkCreateImageView(
+            g_device,
+            &vi,
+            nullptr,
+            &g_hitOffsetView
+        ),
+        "hit-offset view failed"
+    );
+
+    if(g_rayTracingDescriptorSet != VK_NULL_HANDLE)
+    {
+        VkDescriptorImageInfo hitOffsetDescriptorInfo{};
+
+        hitOffsetDescriptorInfo.imageView =
+            g_hitOffsetView;
+
+        hitOffsetDescriptorInfo.imageLayout =
+            VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet hitOffsetWrite{
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+        };
+
+        hitOffsetWrite.dstSet =
+            g_rayTracingDescriptorSet;
+
+        hitOffsetWrite.dstBinding =
+            98;
+
+        hitOffsetWrite.descriptorCount =
+            1;
+
+        hitOffsetWrite.descriptorType =
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
+        hitOffsetWrite.pImageInfo =
+            &hitOffsetDescriptorInfo;
+
+        vkUpdateDescriptorSets(
+            g_device,
+            1,
+            &hitOffsetWrite,
+            0,
+            nullptr
+        );
+    }
+
+    g_hitOffsetWidth=width;
+    g_hitOffsetHeight=height;
+    g_hitOffsetLayout =
+        VK_IMAGE_LAYOUT_GENERAL;
+
+    std::cerr
+    << "[RT] Hit-offset image created "
+    << width<<"x"<<height
+    << std::endl;
+}
+
 
 void destroyBloomResources()
 {

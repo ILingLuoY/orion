@@ -51,6 +51,33 @@ final class DhFarFieldGeometry {
 
     private static final float[] MATRIX_SCRATCH = new float[16];
 
+    // ------------------------------------------------------------------
+    // 2026-11-19 rasterLod（mode=14）：本引擎相机矩阵来源。
+    // VulkanCameraMixin 每帧在 NativeVulkan.updateCamera 之后把 viewInverse /
+    // projInverse（列主序 float[16]，与 C++ CameraUBO 同约定）写进
+    // com.example.client.EntityRtCapture（公开桥，包外可访问）；push() 在
+    // mode=14 时从那里读当帧矩阵，构造本引擎的 inverse(worldToClip)
+    // = viewInverse × projInverse，替代 DH 自己的矩阵。compat.dh 包内类
+    // 均为包私有，故经 EntityRtCapture 桥（与 setCameraOrigin 同一模式）。
+    // ------------------------------------------------------------------
+    private static boolean engineMvpLogged;
+
+    /**
+     * 列主序 4×4 乘法：out = a × b（arr[4c+r] = m[r][c]，与 JOML
+     * Matrix4f.get(float[]) 及 C++ CameraUBO 同约定）。
+     */
+    private static void multiplyColumnMajor(float[] a, float[] b, float[] out) {
+        for (int c = 0; c < 4; c++) {
+            for (int r = 0; r < 4; r++) {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; k++) {
+                    sum += a[4 * k + r] * b[4 * c + k];
+                }
+                out[4 * c + r] = sum;
+            }
+        }
+    }
+
     
 
     
@@ -255,6 +282,85 @@ final class DhFarFieldGeometry {
         return true;
     }
 
+    // ------------------------------------------------------------------
+    // 2026-11-19 mode 14/15 推送流：引擎相机回调驱动（每帧，不依赖 DH 事件）。
+    // ------------------------------------------------------------------
+    private static boolean engineCallbackRegistered;
+
+    static void registerEngineCameraCallbackOnce() {
+        if (engineCallbackRegistered) return;
+        engineCallbackRegistered = true;
+        com.example.client.EntityRtCapture.setEngineCameraCallback(
+                DhFarFieldGeometry::pushEngineMvp);
+    }
+
+    // 2026-11-19：注册不能依赖 push(param) 首次调用 —— disableRendering=true
+    // 时 DH 渲染管线整体关闭，before-render 事件不再触发（实测 22:10 局零推
+    // 送零注册）。类静态初始化即挂回调，与 DH 事件解耦。
+    static {
+        registerEngineCameraCallbackOnce();
+    }
+
+    /**
+     * 每帧由引擎相机入口回调（EntityRtCapture.setEngineCameraMatrices 尾部）。
+     * 全零矩阵（设备重建窗口的未初始化相机）**不发**：发出去会被 C++ 当
+     * invalidate（换世界/卸载），把远场几何关掉——实测 21:59:52 一次全零
+     * 推送让后续整局回落 stage-1 裸色。
+     */
+    static void pushEngineMvp() {
+        if (!(MODE == 14 || MODE == 15) || !DhFlags.RASTER_LOD) return;
+        try {
+            final float[] viewInverse =
+                    com.example.client.EntityRtCapture.getEngineCameraViewInverse();
+            final float[] projInverse =
+                    com.example.client.EntityRtCapture.getEngineCameraProjInverse();
+            if (viewInverse == null || projInverse == null) {
+                failures++;
+                return;
+            }
+
+            multiplyColumnMajor(viewInverse, projInverse, MATRIX_SCRATCH);
+            boolean mvpFinite = true;
+            boolean anyNonZero = false;
+            for (int i = 0; i < 16; i++) {
+                if (!Float.isFinite(MATRIX_SCRATCH[i])) { mvpFinite = false; break; }
+                if (MATRIX_SCRATCH[i] != 0.0f) anyNonZero = true;
+            }
+            if (!mvpFinite || !anyNonZero) {
+                failures++;
+                return;
+            }
+
+            System.arraycopy(MATRIX_SCRATCH, 0, PAYLOAD, 0, 16);
+            PAYLOAD[16] = MODE;
+            PAYLOAD[17] = STRENGTH;
+            PAYLOAD[18] = GAIN;
+            PAYLOAD[19] = VARIANT;
+            PAYLOAD[20] = 0.0f;
+            PAYLOAD[21] = 0.0f;
+            PAYLOAD[22] = 1.0f;
+            PAYLOAD[23] = 0.0f;
+            Arrays.fill(PAYLOAD, 24, PAYLOAD_LENGTH, 0.0f);
+
+            if (!engineMvpLogged) {
+                engineMvpLogged = true;
+                log("mode=" + MODE + " rasterLod：本引擎 inverse MVP 已下发（viewInv×projInv，"
+                        + "列主序） v0=" + PAYLOAD[0] + " v5=" + PAYLOAD[5]
+                        + " v15=" + PAYLOAD[15]
+                        + "；near/far lane 置零 ⇒ rgen 走矩阵路径");
+            }
+
+            NativeVulkan.updateDhFarField(PAYLOAD);
+            pushes++;
+            if (pushes % 1200L == 0L) {
+                log("引擎 MVP 心跳：第 " + pushes + " 次推送 mode=" + MODE
+                        + "（经引擎相机回调，每帧；DH 事件停发不受影响）");
+            }
+        } catch (Throwable failure) {
+            failures++;
+        }
+    }
+
     /**
      * 渲染线程调用（DH 的 {@code DhApiBeforeRenderEvent} 里）。
      *
@@ -279,6 +385,28 @@ final class DhFarFieldGeometry {
 
         try {
             DhFarFieldSolver.inspect(param);
+
+            // ------------------------------------------------------------------
+            // 2026-11-19 rasterLod（mode=14）：把**本引擎 MVP** 推进 DH 远场载荷
+            //（原规格：Java 侧 mode=14 时把本引擎 MVP 推进 dhFarFieldMvp，
+            // DhFarFieldGeometry/DhApiImpl 已有推送路径 = updateDhFarField）。
+            // 载荷布局不变：[0..15] = 本引擎 inverse(worldToClip)
+            //   = viewInverse × projInverse（rgen dhFarWorldPoint 直接消费），
+            // [16..19] = mode/strength/gain/variant，[20/21] = near/far 置零
+            //   （我们的深度非 reverse-Z ⇒ rgen lanes 判无效 ⇒ 走矩阵路径），
+            // [22] = rasterLod 旗标（C++ updateDhFarField 解析），
+            // [24..39] = 正向矩阵置零（仅 mode 13 消费，mode=14 不用）。
+            // DH 自己的矩阵/近远裁剪全部跳过（不用 DH 的矩阵与深度语义）。
+            // ------------------------------------------------------------------
+            if ((MODE == 14 || MODE == 15) && DhFlags.RASTER_LOD) {
+                // 2026-11-19 推送流改造：mode 14/15 的载荷 = 本引擎相机矩阵，
+                // 与 DH 事件无关。注册引擎相机回调（每帧推）+ 本处兑底同帧推。
+                // 背景：DH before-render 事件在 DH 渲染停摆时停发（实测进世界
+                // 21 秒后整局无推送 ⇒ C++ matrixValid=false ⇒ 远场永远裸色）。
+                registerEngineCameraCallbackOnce();
+                pushEngineMvp();
+                return;
+            }
 
             DhApiMat4f inverse = param.dhInverseMvmProjectionMatrix;
 
@@ -311,7 +439,9 @@ final class DhFarFieldGeometry {
             }
 
             System.arraycopy(MATRIX_SCRATCH, 0, PAYLOAD, 0, 16);
-            PAYLOAD[16] = MODE;
+            // 2026-11-19 钳制：mode 15 只允许在 rasterLod=true 时进 rgen
+            //（描述符仅在 rasterLod 下写入）；否则退回 0（直通），避免未绑定读取。
+            PAYLOAD[16] = (MODE == 15 && !DhFlags.RASTER_LOD) ? 0.0f : MODE;
             PAYLOAD[17] = STRENGTH;
             PAYLOAD[18] = GAIN;
             PAYLOAD[19] = VARIANT;
@@ -319,7 +449,10 @@ final class DhFarFieldGeometry {
             final float farBlocks = resolveFarClipBlocks(param);
             PAYLOAD[20] = nearBlocks;
             PAYLOAD[21] = farBlocks;
-            PAYLOAD[22] = 0.0f;
+            // 2026-11-19 rasterLod：旗标下发（reserved lane [22]）。所有推送都带，
+            // C++ 在矩阵校验之前解析；invalidate 的全零载荷会把旗标瞬时归零，
+            // 下一帧恢复。
+            PAYLOAD[22] = DhFlags.RASTER_LOD ? 1.0f : 0.0f;
             PAYLOAD[23] = 0.0f;
 
             boolean mvpUsable = false;

@@ -284,6 +284,46 @@ float getTimeDrivenSunElevation()
         sin(fract(cam.historyParams.w) * TWO_PI);
 }
 
+// =============================================================================
+// 2026-11-16 月亮方向（与 rgen 的 getTimeDrivenMoonDirection 逐字同式，
+// 也与 sky_model_common.glsl 的 moonEclipticDirectionAt / moonDecalPhase01 同式；
+// 本文件在那个头 include 之前就要用，只能内联 —— **改一处必须改三处**）。
+//
+// 旧实现把太阳方向取反当月亮（月亮永远在太阳正对面、永远满月）。现实里月亮
+// 按**月相**沿同一条日轨移动：
+//   月相 0   ⇒ 偏移 +0.5 圈 ⇒ 与太阳正对（满月）—— 与旧 -sunDirection 等价
+//   月相 0.5 ⇒ 偏移 +0.0 圈 ⇒ 与太阳重合（新月）
+// 于是月亮会出现在白天的天上（上弦/下弦），太阳与月亮不再互斥。
+// =============================================================================
+float getTimeDrivenMoonElevation()
+{
+    const float TWO_PI = 6.28318530718;
+#if END_ORB_ENABLE
+    if(abs(cam.weatherParams.z - 3.0) < 0.25)
+    {
+        return 1.0;
+    }
+#endif
+    float moonAngle = fract(
+        fract(cam.historyParams.w) + cam.sssParams.z + 0.5) * TWO_PI;
+    return SOLAR_LATITUDE_35_COS * sin(moonAngle);
+}
+
+vec3 getTimeDrivenMoonDirection()
+{
+    const float TWO_PI = 6.28318530718;
+#if END_ORB_ENABLE
+    if(abs(cam.weatherParams.z - 3.0) < 0.25)
+    {
+        return vec3(0.0, 1.0, 0.0);
+    }
+#endif
+    float moonAngle = fract(
+        fract(cam.historyParams.w) + cam.sssParams.z + 0.5) * TWO_PI;
+    return vec3(cos(moonAngle), SOLAR_LATITUDE_35_COS * sin(moonAngle),
+        SOLAR_LATITUDE_35_SIN * sin(moonAngle));
+}
+
 
 #include "sky_model_common.glsl"
 // 2026-10-09 末地天空（图集银河 UV + 程序化银河）的单一真源。必须在
@@ -296,6 +336,12 @@ float getTimeDrivenSunElevation()
 vec3 tyndallReflectionSunColor(vec3 lightDirection)
 {
     return skyModelSunColor(lightDirection, 1.0);
+}
+
+// 2026-11-19：交接带用的连续版（不判夜、不早退），与主管线同口径。
+vec3 tyndallReflectionSunColorContinuous(vec3 lightDirection)
+{
+    return skyModelSunColorContinuous(lightDirection, 1.0);
 }
 
 // 火烧云强度，与 volumetric_clouds.comp 逐字一致。
@@ -330,22 +376,29 @@ vec4 sampleVolumetricClouds(vec3 rayOrigin, vec3 rayDir, vec3 sunDir) {
     // 光照参数逐条对齐 volumetric_clouds.comp 主行军（除光线行军外）。
     float trueSunElevation = getTimeDrivenSunElevation();
     float dayAmount = smoothstep(-0.03, 0.03, trueSunElevation);
+    // 2026-11-19：直射光交接带与主管线同口径（sky_model_common.glsl 单一真源）。
+    // 旧式在 trueSunElevation >= 0 处硬翻方向，而 dayAmount 在翻转点只有 0.5
+    // ⇒ 反射里的云还有半档能量时整束换方向 ⇒ 水面/玻璃里的夕阳云突跳。
+    float sunDirectAmount = skyDirectSunAmount(trueSunElevation);
+    float moonDirectAmount = skyDirectMoonAmount(trueSunElevation);
     // 月光相位地板，与主管线 CLOUD_MOON_PHASE_FLOOR(0.55) 同值：夜里直射 =
     // 月光 × phase，而 phase 是前向瓣，背月面塌到 ~0.05 ⇒ 反射里的夜云只剩
     // 正对月亮那一片亮、其余全黑。地板把受光面拉平到「整层都能照到月光」。
-    float moonPhaseFloor = (1.0 - dayAmount) * 0.55;
+    float moonPhaseFloor = moonDirectAmount * 0.55;
     float elevationMagnitude = abs(trueSunElevation) / 0.81915204429;
     // sunDir 由 main() 传入，夜间已换成月亮方向，与主管线一致。
     float viewLightCosine = dot(rayDir, sunDir);
     float phase = mix(henyeyGreenstein(viewLightCosine, CLOUD_PHASE_FORWARD_G),
         henyeyGreenstein(viewLightCosine, CLOUD_PHASE_BACK_G), CLOUD_PHASE_BACK_MIX);
-    vec3 directLightColor = mix(vec3(0.46, 0.56, 1.00),
-        tyndallReflectionSunColor(sunDir), dayAmount);
+    vec3 directLightColor = skyDirectIsSun(trueSunElevation)
+        ? tyndallReflectionSunColorContinuous(sunDir)
+        : vec3(0.46, 0.56, 1.00);
     // 2026-10-01 夜间档与主管线（volumetric_clouds.comp）对齐：月光直射抬到
     // ≈4% 正午（原 2.5%，与 CLOUD_MOON_LIGHT_SCALE 同值），环境地板
     // 0.03 → 0.08（与 CLOUD_NIGHT_AMBIENT 同值）。不同步的话，反射里的夜云
     // 比正片暗一档。
-    float directLightEnergy = mix(6.0 * (0.05 / 1.22077458876), 6.0, dayAmount) *
+    float directLightEnergy = (6.0 * sunDirectAmount +
+        6.0 * (0.05 / 1.22077458876) * moonDirectAmount) *
         clamp(cam.cloudParams5.z, 0.0, 3.0);
     vec3 directLight = directLightColor * directLightEnergy;
     float daylight = mix(0.08, 1.0, smoothstep(-0.10, 0.15, trueSunElevation));
@@ -799,6 +852,24 @@ vec3 analyticSunTint(float elevationSin)
 // descriptor binding is needed in the ray-tracing set.
 const float MOON_DISK_LUMINANCE = 0.85;
 
+// 2026-11-16：白天月亮（上弦/下弦常有）的对比度压缩。真实白天月面亮度相对
+// 天空只高一点点，直接按 MOON_DISK_LUMINANCE 画会硬成一块贴纸。
+// 1.0 = 不压（回到"只有夜里才看得见月亮"的观感）。
+// 这个宏只是**编译期默认值**；实际值由 UI 车道 cam.moonParams.y 下发。
+#ifndef MOON_DAYLIGHT_DIM
+#define MOON_DAYLIGHT_DIM 0.85
+#endif
+
+// 2026-11-16 白天月亮亮度的 UI 车道。z 是有效性标记：旧 DLL 不写这块（全 0）
+// ⇒ 回落到编译期默认值，避免"只换 shader 不换 DLL"时白天月亮整片消失。
+// ⚠ 必须在文件作用域定义（main() 内只能放 #define，不能放函数）。
+float moonDaylightDimUi()
+{
+    return cam.moonParams.z > 0.5
+        ? clamp(cam.moonParams.y, 0.0, 1.0)
+        : MOON_DAYLIGHT_DIM;
+}
+
 vec3 evaluateMoonSurface(vec3 rayDir, vec3 moonDir, float limbCosine)
 {
     vec3 reference = abs(moonDir.y) > 0.95 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
@@ -847,11 +918,18 @@ vec3 evaluateMoonSurface(vec3 rayDir, vec3 moonDir, float limbCosine)
 #define MOON_EARTHSHINE 0.035
 #endif
 
-    float moonPhase = clamp(cam.sssParams.z, 0.0, 1.0);
-    float moonPhaseAngle = 6.28318530718 * moonPhase;
-
-    // 照明方向（月亮局部坐标：x = moonRight, y = moonUp, z = moonDir）
-    vec3 moonSunLocal = vec3(sin(moonPhaseAngle), 0.0, -cos(moonPhaseAngle));
+    // 2026-11-16：照明方向改用**真实太阳方向**投影到月面局部坐标系。
+    // 旧实现按 cam.sssParams.z 人造一个方向（相位 0 = 满月），那套隐含了
+    // "月亮永远在太阳对面"；月亮现在按月相移动，人造方向会与几何打架
+    //（新月时太阳就在月亮背后，却画出满月）。
+    // 用真实投影后月相自动正确，连"白天看到的月牙朝向"也对：
+    //   满月：realSunDir ≈ -moonDir ⇒ z = -1 ⇒ 整面全亮（= 旧的相位 0）
+    //   新月：realSunDir ≈ +moonDir ⇒ z = +1 ⇒ 背面（只剩地照）
+    vec3 pureSunDir = getTimeDrivenSunDirection();
+    vec3 moonSunLocal = normalize(vec3(
+        dot(pureSunDir, moonRight),
+        dot(pureSunDir, moonUp),
+        dot(pureSunDir, moonDir)));
 
     // 界线软一点（真实月面界线在地影里本来就有几度过渡）
     // moonLit 在下面 albedo 之后才求值（齿状界线要用到月面噪声）。
@@ -881,6 +959,120 @@ vec3 evaluateMoonSurface(vec3 rayDir, vec3 moonDir, float limbCosine)
     return vec3(albedo * moonLit * smoothstep(1.0, 0.94, r));
 }
 
+// =============================================================================
+// 2026-11-16 22° 冰晕 / 幻日 / 月晕 / 月华
+//
+// 真实成因：高空卷层云的六角冰晶把阳光折射 22°（月晕同理折射月光），
+// 形成 22° 的色散环；太阳两侧同仰角、方位差 ±22° 处是幻日。
+// 这是雪原/高原最有辨识度的天空现象，也最容易做成"UI 描边"——
+// 关键在于：环必须足够宽（真实 0.7~1.2°，这里 0.75°）、必须有色散
+//（红内蓝外）、必须有强门控（只在特定高度与天气出现）。
+//
+// 门控（用户指定"固定高度触发"）：
+//   玩家 y > ICE_HALO_MIN_ALTITUDE。取 180 格 —— 主世界海平面 63，
+//   这是"雪线/高原"的高度，平原、海边、洞穴永不触发。
+//   再叠太阳高度 0°..32°（更高时冰晶折射角关系变了，环会淡到看不见）
+//   与降雨抑制（云厚时没有卷层云）。
+//
+// ⚠ 只在 miss 里画：天空 LUT（sky_atmosphere.comp）分辨率不够，
+//   水面/玻璃的反射天空里不会有晕 —— 晕本来就是稀有现象，可接受。
+// =============================================================================
+#ifndef ICE_HALO_STRENGTH
+// 2026-11-17 自查：0.85 -> 0.65。真实日晕的环亮度约为天空的 2~3 倍，
+// 不是一圈发光的环；配合环内压暗与部分弧淡出后，这个量级才像自然现象。
+#define ICE_HALO_STRENGTH 0.65
+#endif
+#ifndef ICE_HALO_INSIDE_DIM
+// 环内压暗幅度。日晕同样满足"环内比环外暗"，但白天天空本身很亮，
+// 压过头会显得脏，所以幅度比月晕（0.22）小。
+#define ICE_HALO_INSIDE_DIM 0.16
+#endif
+#ifndef ICE_SUN_DOG_STRENGTH
+#define ICE_SUN_DOG_STRENGTH 0.70
+#endif
+#ifndef MOON_HALO_STRENGTH
+// 2026-11-17：0.30 -> 0.12。真实月晕的环亮度只有天空背景的 1.5~2 倍，
+// 不是"一圈亮带"；配合下面的环内压暗与部分弧淡出，这个量级才像自然现象。
+#define MOON_HALO_STRENGTH 0.12
+#endif
+#ifndef MOON_CORONA_STRENGTH
+#define MOON_CORONA_STRENGTH 0.22
+#endif
+#ifndef MOON_HALO_INSIDE_DIM
+// 环内压暗幅度（香港天文台："环内的亮度比环外的弱"）。0 = 关掉这一半。
+#define MOON_HALO_INSIDE_DIM 0.22
+#endif
+#ifndef ICE_HALO_MIN_ALTITUDE
+#define ICE_HALO_MIN_ALTITUDE 180.0
+#endif
+
+// =============================================================================
+// 2026-11-17 22° 晕的剖面（**日晕 / 月晕共用**，观测口径）
+//
+//   · 光强峰值 22.5°，分布从 20° 延伸到 28°；
+//   · 内缘窄（红边相对锐利）、外缘弥散 —— 不是一条等宽的线；
+//   · 红 21.54° / 绿 21.84° / 蓝 22.37°，色散仅 0.83°；
+//   · **环内的亮度比环外的弱**（冰晶把 22° 以内的光折到环上）。
+//
+// 旧实现是 1.25° 宽的对称高斯 + 沿环亮度均匀 ⇒ 无论怎么调强度都像描边。
+// =============================================================================
+vec3 haloRingProfile(float angle, vec3 radiusOffset)
+{
+    const float peak = 0.39270;         // 22.5°
+    vec3 delta = vec3(angle) - (peak + radiusOffset);
+    // 非对称：内侧 0.95°、外侧 2.2°（step(delta,0) 在 delta<=0 时取 1）
+    vec3 sigma = mix(vec3(0.0384), vec3(0.0166), step(delta, vec3(0.0)));
+    vec3 x = delta / sigma;
+    return exp(-x * x);
+}
+
+// 沿环不均匀：卷层云不匀 ⇒ 常常只有部分弧可见。
+// 三条不同频率的正弦在视线方向叠加（低频、平滑、无需纹理），用与云同一个
+// 时间轴以 0.02 倍速缓慢漂移，避免逐帧闪烁。
+float haloPatchiness(vec3 rayDir, float drift)
+{
+    const float noise =
+        sin(rayDir.x * 5.1 + rayDir.z * 3.7 + 1.3 + drift) * 0.40 +
+        sin(rayDir.y * 4.3 - rayDir.x * 2.9 + 2.1 + drift * 0.7) * 0.35 +
+        sin(rayDir.z * 6.7 + rayDir.y * 3.1 + 0.7 + drift * 1.3) * 0.25;
+    return 0.25 + 0.75 * smoothstep(-0.70, 0.30, noise);
+}
+
+// 环内压暗权重：从 2.6° 起逐步加深、到环的位置（21.5°）归零。
+float haloInsideDim(float angle)
+{
+    return smoothstep(0.045, 0.30, angle) *
+        (1.0 - smoothstep(0.30, 0.375, angle));
+}
+
+float iceSunDog(vec3 rayDir, vec3 lightDir)
+{
+    // 幻日：与太阳**同仰角**、水平方位差 ±22° 的两个亮斑（外侧偏红）。
+    // 用水平投影算方位差；rayDir 接近天顶时退化，用 1e-5 兜底
+    //（太阳 < 32° 时视线也不会真的到天顶）。
+    vec3 lightAz = normalize(vec3(lightDir.x, 1.0e-5, lightDir.z));
+    vec3 rayAz = normalize(vec3(rayDir.x, 1.0e-5, rayDir.z));
+    float azAngle = acos(clamp(dot(rayAz, lightAz), 0.0, 1.0));
+
+    // 2026-11-17 自查（几何）：幻日位于**角距离 22°** 且与太阳同仰角处，
+    // 所以它的**水平方位差**是太阳高度的函数，不是常数：
+    //   cos(22°) = cos²(el) + sin²(el)·cos(Δaz)
+    //   ⇒ Δaz = acos((cos22° - sin²el) / cos²el)
+    // 太阳 0° 时 22.0°、10° 时 22.3°、30° 时 25.4°。原来写死 22° 在太阳
+    // 30° 附近会偏近 3.4°（约两个幻日宽度），位置就飘了。
+    const float sinEl = clamp(lightDir.y, -1.0, 1.0);
+    const float cos2El = max(1.0 - sinEl * sinEl, 1.0e-4);
+    const float dogAzimuth = acos(clamp(
+        (0.92718385 - sinEl * sinEl) / cos2El, -1.0, 1.0));
+
+    // 2026-11-17 自查（尺寸）：方位 σ 1.2°（FWHM 2.8°）比真实幻日（约 1~2° 宽）
+    // 胖了一倍多，观感像两个光球。收到 σ 0.62°（FWHM 1.45°），
+    // 竖向保持拉长（真实幻日在仰角方向就是扁长的柱状亮斑）。
+    float dAz = (azAngle - dogAzimuth) / 0.0108;           // ±0.62° 宽
+    float dEl = (rayDir.y - lightDir.y) / 0.0300;          // ±1.7° 高
+    return exp(-dAz * dAz) * exp(-dEl * dEl);
+}
+
 
 void main() {
     payload.hitDistance = -1.0;
@@ -891,18 +1083,17 @@ void main() {
     // 2026-10-05 末地天空：本文件所有新分支都包在这个门里，主世界/下界逐字节不变。
     const bool isEnd = abs(cam.weatherParams.z - 3.0) < 0.25;
 
-    // At night the visible disk is the moon, opposite the sun and therefore
-    // above the horizon, matching the raygen light direction exactly.
+    // 2026-11-16：太阳与月亮**各自独立**，不再互相取反。
+    // 旧实现把 sunDir 在夜间翻成月亮方向 ⇒ 日月互斥、永远满月、白天看不到月亮。
+    // 现实里月亮按**月相**沿日轨移动：新月与太阳同向、满月在对日点、上下弦差 90°，
+    // 所以"太阳还在、月亮也在"是常态。两者现在各用各的方向，盘面各自按几何判定。
     float sunElevation = getTimeDrivenSunElevation();
     vec3 sunDir = getTimeDrivenSunDirection();
-    // 翻转之前先留一份真实太阳方向：地球的晨昏线与全食遮挡必须用它（夜里那份
-    // 翻转后的方向是"月亮"，拿它算会让地球在夜里整面反着亮）。与原翻转逻辑
-    // 并存，不改它。
+    // realSunDir 保留（末地地球的晨昏线与遮挡要它）；sunDir 不再被改写，
+    // 两者现在是同一个值，留着别名只是为了让下游语义清晰。
     vec3 realSunDir = sunDir;
-    if(sunElevation < 0.0)
-    {
-        sunDir = -sunDir;
-    }
+    vec3 moonDir = getTimeDrivenMoonDirection();
+    float moonElevation = moonDir.y;
 
 #if END_ORB_ENABLE
     // 2026-10-07 地球退役：末地天体只剩光源球，遮挡/相位/地球盘全部下线。
@@ -912,14 +1103,12 @@ void main() {
     vec3 earthDir = endEarthDirection();
 #endif
 
-    vec3 diskColor = sunElevation >= 0.0
-        ? vec3(1.0, 0.98, 0.9)
-        // Moon regolith is a warm grey, not a blue bulb; the cool moonlight
-        // tint belongs to glowColor below.
-        : vec3(0.97, 0.95, 0.92);
-    vec3 glowColor = sunElevation >= 0.0
-        ? vec3(1.0, 0.82, 0.55)
-        : vec3(0.42, 0.54, 0.95);
+    // 2026-11-16：日月盘颜色**解耦**。diskColor / glowColor 从此只属于太阳；
+    // 月盘有自己的一份（月壤暖灰，冷色调只出现在月盘外的辉光里）。
+    // 旧实现靠 `sunElevation >= 0` 三元二选一，前提正是"日月互斥"。
+    vec3 diskColor = vec3(1.0, 0.98, 0.9);
+    vec3 glowColor = vec3(1.0, 0.82, 0.55);
+    vec3 moonDiskColor = vec3(0.97, 0.95, 0.92);
 
     // 2026-11-13：低太阳的**色相偏移**（真实日落变红）。
     // 源数据是 sky_sun_common.glsl 的物理基色（Kasten 气团 × 逐通道光学厚度），
@@ -938,8 +1127,9 @@ void main() {
     // 太阳视觉滑杆：以默认值 (1.20, 0.18, 0.53°) 归一，默认时与旧固定值完全一致。
     // 夜晚改为月亮基准亮度：太阳盘 20.0 会直接过曝成白球，月亮用接近真实
     // 反照率的 0.85（≈ 太阳表面的 4%），使月面细节能留在显示范围内。
-    float diskScale = cam.skyParams0.x *
-        (sunElevation >= 0.0 ? 20.0 / 1.20 : MOON_DISK_LUMINANCE / 1.20);
+    // 2026-11-16：日月各一份亮度基准（原来靠三元二选一）。
+    float diskScale = cam.skyParams0.x * (20.0 / 1.20);
+    float moonDiskScale = cam.skyParams0.x * (MOON_DISK_LUMINANCE / 1.20);
     // 2026-11-13：低太阳**增强光晕**。"日落时太阳看起来更大"的真正来源是眩光
     // 变大，而不是角直径变化（真实变化 < 3%）。地平线附近最多 ×3.2，
     // 正午恒 1.0 ⇒ 默认观感不变。回退：SUN_LOW_GLOW_BOOST = 0.0。
@@ -1207,15 +1397,37 @@ void main() {
             sunDir), 0.0);
     }
 
+    // =====================================================
+    // 2026-11-16 日盘与月盘**互相独立**。
+    //
+    // 旧实现是"白天太阳 / 夜间月亮"的二选一，因为那时月亮被定义成 -sunDir，
+    // 两者几何上不可能同时可见。现在两者各用自己的方向，各自按"是否在地平线
+    // 之上"决定画不画：
+    //   · 太阳落到地平线下 ⇒ 盘被 step(sunDir.y) 关掉（真实的落日残余被地平线
+    //     和地形挡住，不需要在这里画）
+    //   · 月亮升在地平线上 ⇒ **不论昼夜**都画 —— 这正是"太阳在的时候月亮也在"
+    // 白天看到的是淡月牙（真实上弦月下午就在天上），由 MOON_DAYLIGHT_DIM 压一档。
+    // =====================================================
+    float sunAboveHorizon = step(0.0, sunDir.y);
+    float moonAboveHorizon = step(0.0, moonElevation);
+    float moonDaylightDim = mix(1.0, moonDaylightDimUi(),
+        smoothstep(-0.03, 0.10, sunDir.y));
+
     vec3 sunDisk = isEnd
         // 2026-10-07 末地太阳/月亮盘退役：末地的天体只剩光源球（下面）。
         ? vec3(0.0)
-        : sunElevation >= 0.0
-            ? (diskColor * endIlluminanceScale) *
-                smoothstep(diskOuter, diskInner, sunDiskDot) *
-                sunLimbDarkening * diskScale
-            : (diskColor * endIlluminanceScale) * evaluateMoonSurface(rayDir, sunDir, moonDiskInner) * diskScale;
+        : (diskColor * endIlluminanceScale) *
+            smoothstep(diskOuter, diskInner, sunDiskDot) *
+            sunLimbDarkening * diskScale * sunAboveHorizon;
+
+    vec3 moonDisk = isEnd
+        ? vec3(0.0)
+        : (moonDiskColor * endIlluminanceScale) *
+            evaluateMoonSurface(rayDir, moonDir, moonDiskInner) *
+            moonDiskScale * moonAboveHorizon * moonDaylightDim;
+
     sunDisk *= rainCelestial;
+    moonDisk *= rainCelestial;
     // 月食：可见盘整体消失（全食时 sunDot 的 softstep 值再乘 0 —— 抗锯齿边缘
     // 也一起收掉，不会留下"细线太阳"）。
     sunDisk *= endEclipse;
@@ -1223,9 +1435,12 @@ void main() {
     // MIS-A：GI 射线不计日盘（置位者见 rt_test.rgen 的 GI 回路 trace 点）。
     // 2026-10-22：阴影水面的反射射线也置这一位（同一次水面太阳透射）。
     // 放在日盘全部调制之后、合成之前：只影响这一段，日冕瓣由 bit 15 单独处理。
+    // 2026-11-16：月盘一并压制 —— GI 的夜间 NEE 就是对月亮方向的 delta 采样，
+    // 留着月盘会把同一份光重复计一次。
     if((payload.state & RT_STATE_NO_SUN_DISK_BIT) != 0u)
     {
         sunDisk = vec3(0.0);
+        moonDisk = vec3(0.0);
     }
 #endif
     // The glow lobe is the sun's aureole and carries no day/night switch of its
@@ -1259,7 +1474,107 @@ void main() {
     }
 #endif
 
-    vec3 finalColor = skyColor + sunDisk + sunGlow;
+    vec3 finalColor = skyColor + sunDisk + moonDisk + sunGlow;
+
+    // =====================================================
+    // 2026-11-16 冰晕 / 幻日 / 月晕 / 月华（常量与成因见本文件上方）
+    // =====================================================
+    if(!isEnd)
+    {
+        const float haloPlayerAltitude = max(cam.playerPositionAndWater.y, 0.0);
+        const float haloAltitudeGate = smoothstep(ICE_HALO_MIN_ALTITUDE,
+            ICE_HALO_MIN_ALTITUDE + 50.0, haloPlayerAltitude);
+        if(haloAltitudeGate > 0.0)
+        {
+            const float haloRainGate = 1.0 - smoothstep(0.05, 0.30,
+                clamp(cam.weatherParams.x, 0.0, 1.0));
+            const float haloSunGate = smoothstep(0.0, 0.05, sunElevation) *
+                (1.0 - smoothstep(0.32, 0.55, sunElevation));
+            const float iceGate = haloAltitudeGate * haloRainGate * haloSunGate;
+            if(iceGate > 0.0)
+            {
+                const float sunAngle = acos(clamp(dot(rayDir, sunDir), -1.0, 1.0));
+
+                // 22° 环：真实色散（相对峰值 22.5° 的逐通道偏移）。
+                // 太阳强 ⇒ 色比月晕明显得多，这就是日晕留彩色、月晕纯白的原因。
+                const vec3 sunHalo = haloRingProfile(sunAngle,
+                    vec3(-0.0167, -0.0115, -0.0023));
+                const float sunPatch = haloPatchiness(rayDir,
+                    max(uintBitsToFloat(cam.padding), 0.0) * 0.02);
+
+                finalColor += sunHalo * sunPatch * vec3(1.00, 0.955, 0.92) *
+                    (ICE_HALO_STRENGTH * iceGate);
+                // 环内压暗：让环"从天空里长出来"，而不是贴上去的描边。
+                finalColor *= 1.0 - ICE_HALO_INSIDE_DIM *
+                    haloInsideDim(sunAngle) * iceGate;
+
+                // 幻日：太阳越低越亮（高太阳时幻日升高并变淡）。
+                const float dogGate = iceGate *
+                    (1.0 - smoothstep(0.10, 0.34, sunElevation));
+                finalColor += iceSunDog(rayDir, sunDir) *
+                    vec3(1.00, 0.93, 0.85) * (ICE_SUN_DOG_STRENGTH * dogGate);
+            }
+        }
+
+        // 月晕（22° 冰晶环）与月华（corona，几度的衍射环）。
+        //
+        // 2026-11-17 按实际观测口径重写（用户："生硬的环，太抢眼"）。
+        // 权威描述（香港天文台 / 大气物理词条）：
+        //   · 光强峰值 22.5°，分布从 20° 延伸到 28° —— 不是一条 1° 宽的线；
+        //   · 内缘窄、外缘弥散（红 21.54° / 蓝 22.37°，色散只有 0.83°，
+        //     混合后**基本是白色**，只有很强时才看得出内红外蓝）；
+        //   · **环内的亮度比环外的弱** —— 冰晶把 22° 以内的光折到环上，
+        //     内侧被"抽走"了亮度。这是让晕融进天空、而不是贴在天空上的
+        //     关键，只靠加亮环永远画不出这个对比；
+        //   · 卷层云不均匀 ⇒ 常常只有**部分弧**可见。
+        //
+        // 旧实现是 1° 宽的对称亮环 + 沿环亮度均匀 ⇒ 必然像描边。
+        if(sunElevation < 0.0 && moonElevation > 0.10)
+        {
+            const float moonHaloGate =
+                smoothstep(0.10, 0.24, moonElevation) *
+                (1.0 - smoothstep(0.55, 0.80, moonElevation));
+            if(moonHaloGate > 0.0)
+            {
+                const float moonAngle = acos(clamp(dot(rayDir, moonDir), -1.0, 1.0));
+
+                // ① 环剖面（与日晕共用）：峰值 22.5°、内窄外宽。
+                //    月晕传全零偏移 ⇒ 三通道同半径 ⇒ **纯白**（月光太弱，
+                //    肉眼无色觉；色散本身也只有 0.83°）。
+                const vec3 moonHalo = haloRingProfile(moonAngle, vec3(0.0));
+
+                // ② 沿环不均匀 ⇒ 常常只有部分弧可见。
+                const float moonPatch = haloPatchiness(rayDir,
+                    max(uintBitsToFloat(cam.padding), 0.0) * 0.02);
+
+                // ③ 极轻的冷暖（最多 ~5%）：内偏暖、外偏冷。
+                const vec3 moonHue = mix(vec3(1.00, 0.975, 0.955),
+                    vec3(0.955, 0.975, 1.00),
+                    smoothstep(0.378, 0.396, moonAngle));
+
+                finalColor += moonHue * (moonHalo * moonPatch *
+                    MOON_HALO_STRENGTH * moonHaloGate);
+
+                // ④ 环内压暗（真实晕最容易被漏掉的那一半）。
+                finalColor *= 1.0 - MOON_HALO_INSIDE_DIM *
+                    haloInsideDim(moonAngle) * moonHaloGate;
+
+                // 月华（corona）：3.2°~5.7° 的衍射环。离月亮近、相对亮度高，
+                // 是少数**肉眼能看出色彩**的月面现象 —— 但也很淡。饱和度压低，
+                // 以白为主，只留很轻的冷暖倾向。
+                if(moonAngle > 0.050 && moonAngle < 0.105)
+                {
+                    const float coronaInner = smoothstep(0.055, 0.075, moonAngle);
+                    const float coronaOuter = 1.0 - smoothstep(0.075, 0.100, moonAngle);
+                    const vec3 coronaHue = mix(vec3(0.88, 0.92, 1.00),
+                        vec3(1.00, 0.92, 0.84),
+                        smoothstep(0.060, 0.095, moonAngle));
+                    finalColor += coronaHue *
+                        (coronaInner * coronaOuter * MOON_CORONA_STRENGTH * moonHaloGate);
+                }
+            }
+        }
+    }
 
     // 2026-10-07 末地光源球 v3：按 Shadertoy "AI Slop v15" Buffer A 移植 ——
     // 玻璃球(IOR1.46) + 金色等离子体(弦上 march) + 内嵌星壳 + 刻符金箍带 +
@@ -1572,10 +1887,13 @@ void main() {
     // 次级光线保留 Tyndall 云行军；主光线天空像素由计算云管线合成。
     if((payload.state & 0x7u) != RT_PURPOSE_PRIMARY_SKY)
     {
+        // 2026-11-16：夜间云被月亮照亮 ⇒ 传月亮方向（与 rgen 的"夜间光源 =
+        // 月亮"同口径）；白天仍是太阳。2026-11-19：交接点改由 skyDirectIsSun
+        // 判定（-0.05），与云/光柱/雾同一点翻转（那一帧直射能量为 0）。
         vec4 cloudResult = sampleVolumetricClouds(
             gl_WorldRayOriginEXT,
             rayDir,
-            sunDir);
+            skyDirectIsSun(sunElevation) ? sunDir : moonDir);
         finalColor = mix(finalColor, cloudResult.rgb, 1.0 - cloudResult.a);
     }
 
@@ -1592,7 +1910,14 @@ void main() {
     // owns the local HitPayload; the identity payload has no such fields.
     payload.roughness = 1.0;
     payload.f0Metal = 0.0;
+#ifdef ORION_RMISS_SLIM
+    // 2026-11-17 P4（开关 ORION_RMISS_SLIM，默认 0）：miss 分支下游只消费
+    // albedoPacked（天空辐亮度）；emission 的全部读取点都在 hitDistance>=0 的命中
+    // 分支内（逐字段对照见交付文档 11-优化落地-P4P2P1-2026-11-17.md），miss 产物
+    // 不消费它。开关开启时跳过这次约定值写入；关闭档与基线逐位一致。
+#else
     payload.emission = vec3(0.0);
+#endif
     payload.parallaxRayTravel = 0.0;
     payload.pomSelfShadow = 1.0;
 

@@ -1052,142 +1052,6 @@ void prepareGiTemporalHistoryImages(VkCommandBuffer cmd)
 
 
 // ============================================================================
-// 2026-11-14：稀疏反射的时域历史（binding 92）。
-//
-// 为什么需要：GGX 反射是高频镜面项，RR 用**表面** MV 重投影反射内容本身就不准，
-// 所以"非活跃像素写 0 / 活跃像素写 1-rate"的二值方波在时域上抹不平 ⇒ 实机表现为
-// 反射的图形逐帧闪动。改成非活跃像素读上一帧的反射、活跃像素写回：每像素每帧都有
-// 一个真实样本，省掉约 70% 反射射线且不闪（也不需要 1/rate 补偿）。
-//
-// 单张、无 ping-pong：每个 invocation 只读写自己那一个 texel。
-// 重建（分辨率变化）时清黑一次 —— 首帧非活跃像素拿到黑反射，只影响一帧。
-// ============================================================================
-void createGlossyHistoryImage(uint32_t width, uint32_t height)
-{
-    if(width == 0u || height == 0u)
-    {
-        return;
-    }
-
-    if(g_glossyHistoryImage != VK_NULL_HANDLE &&
-       g_glossyHistoryWidth == width &&
-       g_glossyHistoryHeight == height)
-    {
-        return;
-    }
-
-    if(g_glossyHistoryImage != VK_NULL_HANDLE)
-    {
-        check(
-            FGDeviceWaitIdle(g_device),
-            "wait device before glossy history recreate failed"
-        );
-        destroyHistoryImage(
-            g_glossyHistoryImage,
-            g_glossyHistoryMemory,
-            g_glossyHistoryView,
-            g_glossyHistoryLayout
-        );
-    }
-
-    createRRGuideImage(
-        width,
-        height,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
-        g_glossyHistoryImage,
-        g_glossyHistoryMemory,
-        g_glossyHistoryView,
-        g_glossyHistoryLayout
-    );
-    // createRRGuideImage 不重置宿主侧布局影子（见 GI 历史同处注释）。
-    g_glossyHistoryLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    if(g_rayTracingDescriptorSet != VK_NULL_HANDLE &&
-       g_glossyHistoryView != VK_NULL_HANDLE)
-    {
-        VkDescriptorImageInfo info{};
-        info.imageView = g_glossyHistoryView;
-        info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        write.dstSet = g_rayTracingDescriptorSet;
-        write.dstBinding = 92u;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        write.pImageInfo = &info;
-
-        vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
-    }
-
-    g_glossyHistoryWidth = width;
-    g_glossyHistoryHeight = height;
-    g_glossyHistoryNeedsClear = true;
-}
-
-
-void prepareGlossyHistoryImage(VkCommandBuffer cmd)
-{
-    if(cmd == VK_NULL_HANDLE || g_glossyHistoryImage == VK_NULL_HANDLE)
-    {
-        return;
-    }
-
-    VkImageSubresourceRange range{};
-    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    range.levelCount = 1u;
-    range.layerCount = 1u;
-
-    if(g_glossyHistoryNeedsClear)
-    {
-        VkImageMemoryBarrier toGeneral{
-            VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toGeneral.srcAccessMask = 0u;
-        toGeneral.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toGeneral.oldLayout = g_glossyHistoryLayout;
-        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        toGeneral.image = g_glossyHistoryImage;
-        toGeneral.subresourceRange = range;
-
-        vkCmdPipelineBarrier(
-            cmd,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &toGeneral
-        );
-        g_glossyHistoryLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkClearColorValue clearColor{};
-        vkCmdClearColorImage(
-            cmd,
-            g_glossyHistoryImage,
-            VK_IMAGE_LAYOUT_GENERAL,
-            &clearColor,
-            1u,
-            &range
-        );
-        g_glossyHistoryNeedsClear = false;
-    }
-
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrier.image = g_glossyHistoryImage;
-    barrier.subresourceRange = range;
-
-    vkCmdPipelineBarrier(
-        cmd,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier
-    );
-}
-
-
 void destroySharcBuffers()
 {
     if(g_sharcHashEntriesBuffer != VK_NULL_HANDLE)
@@ -2567,9 +2431,234 @@ void ensureK1LandingBuffer(uint32_t width, uint32_t height, uint32_t slots)
               << " x" << slots << "spp (" << bytes << " 字节, binding 88)"
               << std::endl;
 }
-void destroyK1K2Pipeline()
+
+// ============================================================================
+// P2（2026-11-17）：K2 三腿材质结果中转 buffer（binding 94）。
+//
+// 仅 ORION_MAT_REUSE_LEGS=1 时分配；关闭时 g_matReuseBuffer 保持空，着色器走原
+// resolveHitMaterial 路径、不访问本槽位（与 binding 88/89 同一套"共享 layout
+// 声明、未绑定时不被引用"的约定）。记录 64 B（4×uvec4，整条 resolve 后 payload
+// 材质快照，浮点按位序存），下标与 landing 记录同式：pixelLinear * slots + s。
+// 生命周期照 landing 缓冲：分辨率 / spp 变化整张重建；描述符集被环形机制重建后
+// 随动重写。
+// ============================================================================
+namespace
 {
-    if(g_k1k2SbtBuffer != VK_NULL_HANDLE)
+VkDescriptorSet s_matReuseBoundSet = VK_NULL_HANDLE;
+void writeMatReuseDescriptor()
+{
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       g_matReuseBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorBufferInfo info{};
+    info.buffer = g_matReuseBuffer;
+    info.offset = 0u;
+    info.range = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_rayTracingDescriptorSet;
+    write.dstBinding = 94;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &info;
+
+    vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+    s_matReuseBoundSet = g_rayTracingDescriptorSet;
+}
+}
+void destroyMatReuseBuffer()
+{
+    if(g_matReuseBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_matReuseBuffer, nullptr);
+        g_matReuseBuffer = VK_NULL_HANDLE;
+    }
+    if(g_matReuseMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_matReuseMemory, nullptr);
+        g_matReuseMemory = VK_NULL_HANDLE;
+    }
+    g_matReuseWidth = 0u;
+    g_matReuseHeight = 0u;
+    g_matReuseSlots = 0u;
+    s_matReuseBoundSet = VK_NULL_HANDLE;
+}
+void ensureMatReuseBuffer(uint32_t width, uint32_t height, uint32_t slots)
+{
+    // 仅"复用开关打开"且"④ 三腿 / ⑤ 四腿模式"才分配。③ 两腿模式没有 SUN(A)
+    // 生产者腿，中转记录无人写；此模式下不分配、着色器走原路径（与 UBO lane0
+    // 的有效闸门同口径）。⑤ 四腿模式生产者 = SUNA。
+    if(!matReuseLegsEnabled() ||
+       !(k2FourSplitEnabled() || k2ThreeSplitEnabled()))
+    {
+        if(g_matReuseBuffer != VK_NULL_HANDLE)
+        {
+            FGDeviceWaitIdle(g_device);
+            destroyMatReuseBuffer();
+        }
+        return;
+    }
+
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       width == 0u || height == 0u || slots == 0u)
+    {
+        return;
+    }
+    if(g_matReuseBuffer != VK_NULL_HANDLE &&
+       g_matReuseWidth == width && g_matReuseHeight == height &&
+       g_matReuseSlots == slots)
+    {
+        // 描述符集可能被环形机制重建过，binding 94 需要随动。
+        if(s_matReuseBoundSet != g_rayTracingDescriptorSet)
+        {
+            writeMatReuseDescriptor();
+        }
+        return;
+    }
+
+    // 老缓冲可能还有在飞引用
+    FGDeviceWaitIdle(g_device);
+    destroyMatReuseBuffer();
+
+    const VkDeviceSize bytes =
+        (VkDeviceSize)width * height * slots * 64ull;
+    createBuffer(g_device, g_physicalDevice, bytes,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 g_matReuseBuffer, g_matReuseMemory, false);
+    if(g_matReuseBuffer == VK_NULL_HANDLE)
+    {
+        std::cerr << "[P2 复用] 中转缓冲创建失败（" << bytes << " 字节）"
+                  << std::endl;
+        return;
+    }
+    g_matReuseWidth = width;
+    g_matReuseHeight = height;
+    g_matReuseSlots = slots;
+
+    writeMatReuseDescriptor();
+    std::cerr << "[P2 复用] 中转缓冲就绪 " << width << "x" << height
+              << " x" << slots << "spp (" << bytes << " 字节, binding 94)"
+              << std::endl;
+}
+// ============================================================================
+// 本地光 NEE 可见性跨腿缓存（binding 95）
+//
+// 目的：同一帧里 K1 / K2LOC / K2I 三条腿会对**同一个接收点、同一个选中光样本**
+// 各打一条同样的硬件可见性射线（局 F 实测这条链合计 1.57 ms）。这里把射线的返回
+// 透射率按 (pixel, 本 invocation 内第几次 NEE 调用) 存下来，后续腿命中即复用。
+//
+// 安全边界：记录里带 64 位键（receiverOrigin / selectedSample /
+// targetVoxelEntryDistance / cullMask 的位哈希）和本帧标记，**只有两者都逐位相同
+// 才复用**；不同就自己打射线并把结果写回。所以键不匹配只损失收益，不会算错；
+// 键相同时是同一条线段、同一帧静态 TLAS，遍历结果必然相同。
+//
+// 记录 32 B（8×uint32）：[0]keyLo [1]keyHi [2..4]transmittance.xyz 位
+// [5]frameTag [6]callIndex(诊断) [7]保留。下标 = pixelLinear * 4 + callIndex。
+// 仅 ORION_LOCAL_NEE_CACHE=1 时分配；关闭时保持空，着色器闸门关着不访问本槽位。
+// ============================================================================
+namespace
+{
+VkDescriptorSet s_neeVisCacheBoundSet = VK_NULL_HANDLE;
+void writeNeeVisCacheDescriptor()
+{
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       g_neeVisCacheBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorBufferInfo info{};
+    info.buffer = g_neeVisCacheBuffer;
+    info.offset = 0u;
+    info.range = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_rayTracingDescriptorSet;
+    write.dstBinding = 95;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &info;
+
+    vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+    s_neeVisCacheBoundSet = g_rayTracingDescriptorSet;
+}
+} // namespace
+
+void destroyNeeVisCacheBuffer()
+{
+    if(g_neeVisCacheBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_neeVisCacheBuffer, nullptr);
+        g_neeVisCacheBuffer = VK_NULL_HANDLE;
+    }
+    if(g_neeVisCacheMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_neeVisCacheMemory, nullptr);
+        g_neeVisCacheMemory = VK_NULL_HANDLE;
+    }
+    g_neeVisCacheWidth = 0u;
+    g_neeVisCacheHeight = 0u;
+    s_neeVisCacheBoundSet = VK_NULL_HANDLE;
+}
+
+void ensureNeeVisCacheBuffer(uint32_t width, uint32_t height)
+{
+    if(!localNeeVisCacheEnabled())
+    {
+        if(g_neeVisCacheBuffer != VK_NULL_HANDLE)
+        {
+            FGDeviceWaitIdle(g_device);
+            destroyNeeVisCacheBuffer();
+        }
+        return;
+    }
+
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       width == 0u || height == 0u)
+    {
+        return;
+    }
+    if(g_neeVisCacheBuffer != VK_NULL_HANDLE &&
+       g_neeVisCacheWidth == width && g_neeVisCacheHeight == height)
+    {
+        if(s_neeVisCacheBoundSet != g_rayTracingDescriptorSet)
+        {
+            writeNeeVisCacheDescriptor();
+        }
+        return;
+    }
+
+    FGDeviceWaitIdle(g_device);
+    destroyNeeVisCacheBuffer();
+
+    // 每像素 4 个槽位（最多覆盖"主命中 + 2 次弹射"这条链；超出即退回自己打射线）。
+    const VkDeviceSize bytes =
+        (VkDeviceSize)width * height * 4ull * 32ull;
+    createBuffer(g_device, g_physicalDevice, bytes,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 g_neeVisCacheBuffer, g_neeVisCacheMemory, false);
+    if(g_neeVisCacheBuffer == VK_NULL_HANDLE)
+    {
+        RTLog("[本地NEE缓存] 缓冲创建失败（" + std::to_string(bytes) + " 字节）");
+        return;
+    }
+    g_neeVisCacheWidth = width;
+    g_neeVisCacheHeight = height;
+
+    writeNeeVisCacheDescriptor();
+    RTLog(
+        "[本地NEE缓存] 就绪 " + std::to_string(width) + "x" +
+        std::to_string(height) + " x4 槽 (" + std::to_string(bytes) +
+        " 字节, binding 95)");
+}
+
+void destroyK1K2Pipeline()
+{    if(g_k1k2SbtBuffer != VK_NULL_HANDLE)
     {
         vkDestroyBuffer(g_device, g_k1k2SbtBuffer, nullptr);
         g_k1k2SbtBuffer = VK_NULL_HANDLE;
@@ -2603,6 +2692,17 @@ void destroyK1K2Pipeline()
     {
         vkDestroyPipeline(g_device, g_k2sunPipeline, nullptr);
         g_k2sunPipeline = VK_NULL_HANDLE;
+    }
+    // ⑤ 四腿拆分：SUNA/SUNB 与三腿 SUN 互斥存活，销毁时一并兜底。
+    if(g_k2sunAPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_k2sunAPipeline, nullptr);
+        g_k2sunAPipeline = VK_NULL_HANDLE;
+    }
+    if(g_k2sunBPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_k2sunBPipeline, nullptr);
+        g_k2sunBPipeline = VK_NULL_HANDLE;
     }
     if(g_k2locPipeline != VK_NULL_HANDLE)
     {
@@ -2712,14 +2812,21 @@ void ensureK1K2Pipelines()
     const bool k2Split = k2DirectIndirectSplitEnabled();
     // ④ K2-D 再拆分：三腿 SUN/LOC/I（ORION_K2_SPLIT2=0 回退 ③ 两腿 D/I）
     const bool k2Three = k2Split && k2ThreeSplitEnabled();
+    // ⑤ K2-SUN 再拆分：四腿 SUNA/SUNB/LOC/I（ORION_K2_SPLIT3=0 回退 ④ 三腿）
+    const bool k2Four = k2Three && k2FourSplitEnabled();
     const bool k2TransportReady =
-        k2Three
-            ? (g_k2sunPipeline != VK_NULL_HANDLE &&
+        k2Four
+            ? (g_k2sunAPipeline != VK_NULL_HANDLE &&
+               g_k2sunBPipeline != VK_NULL_HANDLE &&
                g_k2locPipeline != VK_NULL_HANDLE &&
                g_k2iPipeline != VK_NULL_HANDLE)
-            : k2Split
-                ? (g_k2dPipeline != VK_NULL_HANDLE && g_k2iPipeline != VK_NULL_HANDLE)
-                : (g_k2Pipeline != VK_NULL_HANDLE);
+            : k2Three
+                ? (g_k2sunPipeline != VK_NULL_HANDLE &&
+                   g_k2locPipeline != VK_NULL_HANDLE &&
+                   g_k2iPipeline != VK_NULL_HANDLE)
+                : k2Split
+                    ? (g_k2dPipeline != VK_NULL_HANDLE && g_k2iPipeline != VK_NULL_HANDLE)
+                    : (g_k2Pipeline != VK_NULL_HANDLE);
     if((g_k1Pipeline != VK_NULL_HANDLE && k2TransportReady) ||
        g_k1K2PipelineFailed)
     {
@@ -2801,9 +2908,20 @@ void ensureK1K2Pipelines()
             : std::vector<uint8_t>{};
         // ④ 三腿：SUN（水+太阳直射/GGX/SSS/RTAO）与 LOC（局部光/水面反射太阳/
         // GGX 镜面）替代 K2-D；K2-I 不变。load-add 复用 binding 89，无新资源。
-        auto k2sunCode = k2Three
+        auto k2sunCode = k2Three && !k2Four
             ? loadRgen("shaders/rt_test_k2sun_ser.rgen.spv",
                        "shaders/rt_test_k2sun.rgen.spv")
+            : std::vector<uint8_t>{};
+        // ⑤ 四腿：SUNA（水+RTAO，写 binding 89）+ SUNB（阴影+GGX+植被SSS，
+        // load-add 复用 binding 89）替代 SUN；LOC/K2-I 不变。切分依据：RTAO 的
+        // rtaoFactor 不进阴影簇 ⇒ 依赖干净；单腿 20GB 冷编四连 OOM 后劈半。
+        auto k2sunACode = k2Four
+            ? loadRgen("shaders/rt_test_k2sunA_ser.rgen.spv",
+                       "shaders/rt_test_k2sunA.rgen.spv")
+            : std::vector<uint8_t>{};
+        auto k2sunBCode = k2Four
+            ? loadRgen("shaders/rt_test_k2sunB_ser.rgen.spv",
+                       "shaders/rt_test_k2sunB.rgen.spv")
             : std::vector<uint8_t>{};
         auto k2locCode = k2Three
             ? loadRgen("shaders/rt_test_k2loc_ser.rgen.spv",
@@ -2845,7 +2963,7 @@ void ensureK1K2Pipelines()
         // D1：材质层 callable（K2 的 landing 解析经它执行；K1 不用）
         auto materialCode = loadSpv("shaders/rt_test_material.spv");
 
-        VkShaderModule mods[12]{};
+        VkShaderModule mods[13]{};
         const char* entry = "main";
         VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         auto makeModule = [&](const std::vector<uint8_t>& code, VkShaderModule& out)
@@ -2856,7 +2974,15 @@ void ensureK1K2Pipelines()
                   "Failed to create K1/K2 shader module");
         };
         makeModule(k1Code, mods[0]);
-        if(k2Three)
+        if(k2Four)
+        {
+            // ⑤ 四腿拆分：SUNA（水+RTAO）/ SUNB（阴影+GGX+SSS，load-add）
+            makeModule(k2sunACode, mods[9]);
+            makeModule(k2sunBCode, mods[10]);
+            makeModule(k2locCode, mods[11]);
+            makeModule(k2iCode, mods[12]);
+        }
+        else if(k2Three)
         {
             makeModule(k2sunCode, mods[9]);
             makeModule(k2locCode, mods[10]);
@@ -2942,6 +3068,10 @@ void ensureK1K2Pipelines()
             pci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         }
 
+        // 2026-11-22 批A：腿级心跳。编译没有进行时心跳（被杀的编译与进行中的
+        // 编译在日志里无法区分，2026-11-21 夜 k2sun 三连败排查耗时大半在这里），
+        // 每条腿创建前打一行——它是该腿的"最后一行"，下次启动时一眼看出死在哪条腿。
+        RTLogFlushed("[K1/K2] leg 1/4 k1-primary compiling...");
         check(OrionCreateRayTracingPipelineTimed(
                   "k1-primary", 1u, &pci, getSharedPipelineCache(),
                   &g_k1Pipeline),
@@ -2968,8 +3098,10 @@ void ensureK1K2Pipelines()
             };
             if(k2Three)
             {
-                // ④ 三腿模式：SUN → LOC → I。三腿共用同一套 stage/group
-                // （只有 rgen 模块不同）；SBT 按腿各自独立取句柄。
+                // ④ 三腿 / ⑤ 四腿模式：共用同一套 stage/group（只有 rgen 模块
+                // 不同）；SBT 按腿各自独立取句柄。
+                // ⑤ 四腿 = SUNA（水+RTAO）/ SUNB（阴影+GGX+SSS，load-add）/
+                //   LOC / I；④ 三腿 = SUN（全直射）/ LOC / I。
                 struct K2LegDef
                 {
                     const char* tag;
@@ -2977,7 +3109,17 @@ void ensureK1K2Pipelines()
                     VkShaderModule* mod;
                     VkPipeline* out;
                 };
-                const K2LegDef k2Legs[] = {
+                const K2LegDef k2LegsFour[] = {
+                    {"k2sunA-direct", "shaders/rt_test_k2sunA.rgen.spv",
+                     &mods[9], &g_k2sunAPipeline},
+                    {"k2sunB-direct", "shaders/rt_test_k2sunB.rgen.spv",
+                     &mods[10], &g_k2sunBPipeline},
+                    {"k2loc-local", "shaders/rt_test_k2loc.rgen.spv",
+                     &mods[11], &g_k2locPipeline},
+                    {"k2i-indirect", "shaders/rt_test_k2i.rgen.spv",
+                     &mods[12], &g_k2iPipeline},
+                };
+                const K2LegDef k2LegsThree[] = {
                     {"k2sun-direct", "shaders/rt_test_k2sun.rgen.spv",
                      &mods[9], &g_k2sunPipeline},
                     {"k2loc-local", "shaders/rt_test_k2loc.rgen.spv",
@@ -2985,8 +3127,19 @@ void ensureK1K2Pipelines()
                     {"k2i-indirect", "shaders/rt_test_k2i.rgen.spv",
                      &mods[11], &g_k2iPipeline},
                 };
-                for(const K2LegDef& leg : k2Legs)
+                const K2LegDef* k2Legs =
+                    k2Four ? k2LegsFour : k2LegsThree;
+                const uint32_t k2LegCountCreate =
+                    k2Four ? 4u : 3u;
+                for(uint32_t legIdx = 0u; legIdx < k2LegCountCreate; ++legIdx)
                 {
+                    const K2LegDef& leg = k2Legs[legIdx];
+                    // 2026-11-22 批A：腿级心跳（k1=1；四腿 2..5，三腿 2..4）。
+                    RTLogFlushed(
+                        std::string("[K1/K2] leg ") +
+                        std::to_string(legIdx + 2u) + "/" +
+                        (k2Four ? "5" : "4") + " " + leg.tag +
+                        " compiling...");
                     stages2[0].module = *leg.mod;
                     VkResult r = tryCreateSplit(
                         leg.tag, getSharedPipelineCache(), leg.out);
@@ -3132,7 +3285,14 @@ void ensureK1K2Pipelines()
                   "Failed to create K2 RT pipeline");
         }
 
-        if(k2Three)
+        if(k2Four)
+        {
+            OrionLogPipelineStats("k2sunA-direct", g_k2sunAPipeline);
+            OrionLogPipelineStats("k2sunB-direct", g_k2sunBPipeline);
+            OrionLogPipelineStats("k2loc-local", g_k2locPipeline);
+            OrionLogPipelineStats("k2i-indirect", g_k2iPipeline);
+        }
+        else if(k2Three)
         {
             OrionLogPipelineStats("k2sun-direct", g_k2sunPipeline);
             OrionLogPipelineStats("k2loc-local", g_k2locPipeline);
@@ -3148,7 +3308,9 @@ void ensureK1K2Pipelines()
             OrionLogPipelineStats("k2-transport", g_k2Pipeline);
         }
 
-        for(uint32_t i = 0u; i < 11u; ++i)
+        // 2026-11-22 ⑤ 拆腿：上限从 11 提到 13（四腿模式用到 mods[12]=k2i）。
+        // 顺带修既有 bug：旧上界 11 漏销 mods[11]（三腿 k2i），一次性模块泄漏。
+        for(uint32_t i = 0u; i < 13u; ++i)
         {
             vkDestroyShaderModule(g_device, mods[i], nullptr);
         }
@@ -3176,15 +3338,39 @@ void ensureK1K2Pipelines()
         const uint32_t ba = rtProps.shaderGroupBaseAlignment;
         const uint32_t handleAligned = ((hs + ha - 1u) / ha) * ha;
         // ④ SBT 按腿泛化：K1 之后每条 K2 腿各占一套 raygen/miss/hit/callable
-        // 记录（句柄按管线区分，不能互借）。腿表：三腿=SUN/LOC/I，
-        // 两腿=D/I（③ 回退档），单发=K2。
-        VkPipeline k2LegPipelines[3]{};
-        VkStridedDeviceAddressRegionKHR* k2LegRaygen[3]{};
-        VkStridedDeviceAddressRegionKHR* k2LegMiss[3]{};
-        VkStridedDeviceAddressRegionKHR* k2LegHit[3]{};
-        VkStridedDeviceAddressRegionKHR* k2LegCallable[3]{};
+        // 记录（句柄按管线区分，不能互借）。腿表：⑤ 四腿=SUNA/SUNB/LOC/I，
+        // 三腿=SUN/LOC/I，两腿=D/I（③ 回退档），单发=K2。
+        VkPipeline k2LegPipelines[4]{};
+        VkStridedDeviceAddressRegionKHR* k2LegRaygen[4]{};
+        VkStridedDeviceAddressRegionKHR* k2LegMiss[4]{};
+        VkStridedDeviceAddressRegionKHR* k2LegHit[4]{};
+        VkStridedDeviceAddressRegionKHR* k2LegCallable[4]{};
         uint32_t k2LegCount = 0u;
-        if(k2Three)
+        if(k2Four)
+        {
+            k2LegPipelines[0] = g_k2sunAPipeline;
+            k2LegPipelines[1] = g_k2sunBPipeline;
+            k2LegPipelines[2] = g_k2locPipeline;
+            k2LegPipelines[3] = g_k2iPipeline;
+            k2LegRaygen[0] = &g_k2sunARaygenRegion;
+            k2LegRaygen[1] = &g_k2sunBRaygenRegion;
+            k2LegRaygen[2] = &g_k2locRaygenRegion;
+            k2LegRaygen[3] = &g_k2iRaygenRegion;
+            k2LegMiss[0] = &g_k2sunAMissRegion;
+            k2LegMiss[1] = &g_k2sunBMissRegion;
+            k2LegMiss[2] = &g_k2locMissRegion;
+            k2LegMiss[3] = &g_k2iMissRegion;
+            k2LegHit[0] = &g_k2sunAHitRegion;
+            k2LegHit[1] = &g_k2sunBHitRegion;
+            k2LegHit[2] = &g_k2locHitRegion;
+            k2LegHit[3] = &g_k2iHitRegion;
+            k2LegCallable[0] = &g_k2sunACallableRegion;
+            k2LegCallable[1] = &g_k2sunBCallableRegion;
+            k2LegCallable[2] = &g_k2locCallableRegion;
+            k2LegCallable[3] = &g_k2iCallableRegion;
+            k2LegCount = 4u;
+        }
+        else if(k2Three)
         {
             k2LegPipelines[0] = g_k2sunPipeline;
             k2LegPipelines[1] = g_k2locPipeline;
@@ -3233,10 +3419,12 @@ void ensureK1K2Pipelines()
         };
         const uint32_t raygen1Offset = 0u;
         uint32_t sbtCursor = alignTo(raygen1Offset + handleAligned);
-        uint32_t legRaygenOffset[3]{};
-        uint32_t legMissOffset[3]{};
-        uint32_t legHitOffset[3]{};
-        uint32_t legCallableOffset[3]{};
+        // 2026-11-22 ⑤ 拆腿：offset 数组 [3]→[4]（与 k2LegCount=4 匹配；
+        // 原 [3] 在四腿模式下 leg=3 越界写栈 —— 16:47:57 崩溃根因）。
+        uint32_t legRaygenOffset[4]{};
+        uint32_t legMissOffset[4]{};
+        uint32_t legHitOffset[4]{};
+        uint32_t legCallableOffset[4]{};
         for(uint32_t leg = 0u; leg < k2LegCount; ++leg)
         {
             legRaygenOffset[leg] = sbtCursor;
@@ -3272,7 +3460,9 @@ void ensureK1K2Pipelines()
 
         const uint32_t groupCount = 6u;
         std::vector<uint8_t> handles1((size_t)groupCount * hs, 0);
-        std::vector<uint8_t> legHandles[3]{
+        // 2026-11-22 ⑤ 拆腿：legHandles [3]→[4]（同 offset 数组，越界即崩）。
+        std::vector<uint8_t> legHandles[4]{
+            std::vector<uint8_t>((size_t)groupCount * hs, 0),
             std::vector<uint8_t>((size_t)groupCount * hs, 0),
             std::vector<uint8_t>((size_t)groupCount * hs, 0),
             std::vector<uint8_t>((size_t)groupCount * hs, 0)};
@@ -3402,8 +3592,14 @@ void ensureK1K2Pipelines()
     }
     catch(const std::exception& error)
     {
-        std::cerr << "[K1/K2] 管线创建失败（本会话不再重试，回退单发主管线）："
+        // 2026-11-22 批A：失败必须同时进 RTLog。原来只写 std::cerr（不进
+        // rt_debug.log），2026-11-21 夜三连败时 rt_debug.log 里"查无死因"
+        // 的根因之一——排查时只看 rt_debug.log 会误判成"编译静默消失"。
+        std::cerr << "[K1/K2] 管线创建失败（本会话不再重试；主管线已退役，整局无 RT）："
                   << error.what() << std::endl;
+        RTLogFlushed(
+            std::string("[K1/K2] 管线创建失败（本会话不再重试；整局无 RT）：") +
+            error.what());
         destroyK1K2Pipeline();
         g_k1K2PipelineFailed = true;
         g_k1Pipeline = VK_NULL_HANDLE;
@@ -3416,7 +3612,11 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
     {
         return false;
     }
-    if(g_rayTracingPipeline == VK_NULL_HANDLE ||
+    // main 不存在有两种情形：懒编跳过（g_rtMainPipelineLazy=true，K1/K2 照常
+    // 跑）与 main 编译失败（worker 抛异常，RT 整局关闭）。前者必须放行，
+    // 否则懒编局会因 main 缺失被挡在这里整局黑屏。
+    if((!g_rtMainPipelineLazy.load(std::memory_order_acquire) &&
+        g_rayTracingPipeline == VK_NULL_HANDLE) ||
        g_rayTracingPipelineLayout == VK_NULL_HANDLE ||
        g_rayTracingDescriptorSet == VK_NULL_HANDLE)
     {
@@ -3424,9 +3624,32 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
     }
 
     ensureK1K2Pipelines();
-    if(g_k1Pipeline == VK_NULL_HANDLE || g_k2Pipeline == VK_NULL_HANDLE)
+    // 三腿（④，默认）建的是 k2sun/k2loc/k2i，两腿（③）建 k2d/k2i，
+    // g_k2Pipeline 只有单发（ORION_K2_SPLIT=0）分支才会建——按实际模式
+    // 核对，否则三腿局永远在这里 return false，画面全靠主管线 fallback
+    //（懒编局 fallback 也没有 ⇒ 天空/雾/云之外全空，2026-11-16 实测踩到）。
     {
-        return false;
+        const bool k2Split = k2DirectIndirectSplitEnabled();
+        const bool k2Three = k2Split && k2ThreeSplitEnabled();
+        const bool k2Four = k2Three && k2FourSplitEnabled();
+        const bool transportReady =
+            k2Four
+                ? (g_k2sunAPipeline != VK_NULL_HANDLE &&
+                   g_k2sunBPipeline != VK_NULL_HANDLE &&
+                   g_k2locPipeline != VK_NULL_HANDLE &&
+                   g_k2iPipeline != VK_NULL_HANDLE)
+                : k2Three
+                    ? (g_k2sunPipeline != VK_NULL_HANDLE &&
+                       g_k2locPipeline != VK_NULL_HANDLE &&
+                       g_k2iPipeline != VK_NULL_HANDLE)
+                    : k2Split
+                        ? (g_k2dPipeline != VK_NULL_HANDLE &&
+                           g_k2iPipeline != VK_NULL_HANDLE)
+                        : (g_k2Pipeline != VK_NULL_HANDLE);
+        if(g_k1Pipeline == VK_NULL_HANDLE || !transportReady)
+        {
+            return false;
+        }
     }
 
     // slotCount 两侧同式：max(1, int(clamp(spp,0.5,4.0)+0.5))
@@ -3441,6 +3664,22 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
     if(s_k1LandingBoundSet != g_rayTracingDescriptorSet)
     {
         writeK1LandingDescriptor();
+    }
+
+    // P2 跨腿材质复用中转 buffer（binding 94）；开关关闭时内部直接返回、不分配。
+    ensureMatReuseBuffer(width, height, slots);
+    if(g_matReuseBuffer != VK_NULL_HANDLE &&
+       s_matReuseBoundSet != g_rayTracingDescriptorSet)
+    {
+        writeMatReuseDescriptor();
+    }
+
+    // 本地光 NEE 可见性跨腿缓存（binding 95）；开关关闭时内部直接返回、不分配。
+    ensureNeeVisCacheBuffer(width, height);
+    if(g_neeVisCacheBuffer != VK_NULL_HANDLE &&
+       s_neeVisCacheBoundSet != g_rayTracingDescriptorSet)
+    {
+        writeNeeVisCacheDescriptor();
     }
 
     auto trace = getCmdTraceRays();
@@ -3471,6 +3710,7 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
     if(logTrace) RTLog("[K1/K2] pre trace-k1");
     trace(cmd, &g_k1RaygenRegion, &g_k1MissRegion,
           &g_k1HitRegion, &g_k1CallableRegion, width, height, 1u);
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K1);
     rtCheckpoint(cmd, "k1k2:post-k1");
     if(logTrace) RTLog("[K1/K2] post trace-k1");
 
@@ -3478,11 +3718,15 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
     {
         if(logTrace) RTLog("[K1/K2] K1_ONLY: 跳过 K2");
         rtCheckpoint(cmd, "k1k2:k1only-skip-k2");
+        // 后续 Frame 代码假设主管线在绑；懒编局 main 不存在，跳过绑回
+        if(g_rayTracingPipeline != VK_NULL_HANDLE)
+        {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                           g_rayTracingPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                                 g_rayTracingPipelineLayout, 0u, 1u,
                                 &g_rayTracingDescriptorSet, 0u, nullptr);
+        }
         return true;
     }
 
@@ -3511,6 +3755,104 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
         // ④ 三腿模式（默认，ORION_K2_SPLIT2=0 回退 ③ 两腿）：K1→K2SUN→barrier→
         // K2LOC→barrier→K2I。K2-LOC 对直射和做 **load-add**（binding 89 复用），
         // 三级交接同过全局 barrier。
+        if(k2FourSplitEnabled())
+        {
+            // ⑤ 四腿模式（默认，ORION_K2_SPLIT3=0 回退 ④ 三腿）：
+            // K1→K2SUNA→barrier→K2SUNB→barrier→K2LOC→barrier→K2I。
+            // K2-SUNA 写 binding 89（水=完整水色 / 不透明 rgb=0 占位、a=rtao），
+            // K2-SUNB **load-add** 叠加阴影+GGX+植被SSS 的直射，K2-LOC 照旧
+            // load-add 局部光，K2-I 照旧整图载入。四级交接同过全局 barrier。
+            if(g_k2sunAPipeline == VK_NULL_HANDLE ||
+               g_k2sunBPipeline == VK_NULL_HANDLE ||
+               g_k2locPipeline == VK_NULL_HANDLE ||
+               g_k2iPipeline == VK_NULL_HANDLE)
+            {
+                return false;
+            }
+            createK2DirectImage(width, height);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                              g_k2sunAPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                    g_rayTracingPipelineLayout, 0u, 1u,
+                                    &g_rayTracingDescriptorSet, 0u, nullptr);
+            rtCheckpoint(cmd, "k1k2:trace-k2suna");
+            trace(cmd, &g_k2sunARaygenRegion, &g_k2sunAMissRegion,
+                  &g_k2sunAHitRegion, &g_k2sunACallableRegion, width, height, 1u);
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2SUNA);
+            rtCheckpoint(cmd, "k1k2:post-k2suna");
+            if(logTrace) RTLog("[K1/K2] post trace-k2suna");
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                              g_k2sunBPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                    g_rayTracingPipelineLayout, 0u, 1u,
+                                    &g_rayTracingDescriptorSet, 0u, nullptr);
+            rtCheckpoint(cmd, "k1k2:trace-k2sunb");
+            trace(cmd, &g_k2sunBRaygenRegion, &g_k2sunBMissRegion,
+                  &g_k2sunBHitRegion, &g_k2sunBCallableRegion, width, height, 1u);
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2SUNB);
+            rtCheckpoint(cmd, "k1k2:post-k2sunb");
+            if(logTrace) RTLog("[K1/K2] post trace-k2sunb");
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                              g_k2locPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                    g_rayTracingPipelineLayout, 0u, 1u,
+                                    &g_rayTracingDescriptorSet, 0u, nullptr);
+            rtCheckpoint(cmd, "k1k2:trace-k2loc");
+            trace(cmd, &g_k2locRaygenRegion, &g_k2locMissRegion,
+                  &g_k2locHitRegion, &g_k2locCallableRegion, width, height, 1u);
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2LOC);
+            rtCheckpoint(cmd, "k1k2:post-k2loc");
+            if(logTrace) RTLog("[K1/K2] post trace-k2loc");
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+
+            // 2026-11-18：GI 跳数为 0 时间接腿整条跳过（四腿模式语义同三腿：
+            // SUNA/B/LOC 已写全屏直射，I 只写间接增量，bounces=0 时白付）。
+            rtCheckpoint(cmd, "k1k2:trace-k2i");
+            if(g_perfGiBounces.load(std::memory_order_relaxed) > 0u)
+            {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                  g_k2iPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                        g_rayTracingPipelineLayout, 0u, 1u,
+                                        &g_rayTracingDescriptorSet, 0u, nullptr);
+                trace(cmd, &g_k2iRaygenRegion, &g_k2iMissRegion,
+                      &g_k2iHitRegion, &g_k2iCallableRegion, width, height, 1u);
+                writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2I);
+            }
+            rtCheckpoint(cmd, "k1k2:post-k2i");
+            if(logTrace) RTLog("[K1/K2] post trace-k2i");
+
+            if(g_rayTracingPipeline != VK_NULL_HANDLE)
+            {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                              g_rayTracingPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                    g_rayTracingPipelineLayout, 0u, 1u,
+                                    &g_rayTracingDescriptorSet, 0u, nullptr);
+            }
+            return true;
+        }
+
         if(k2ThreeSplitEnabled())
         {
             if(g_k2sunPipeline == VK_NULL_HANDLE ||
@@ -3529,6 +3871,7 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
             rtCheckpoint(cmd, "k1k2:trace-k2sun");
             trace(cmd, &g_k2sunRaygenRegion, &g_k2sunMissRegion,
                   &g_k2sunHitRegion, &g_k2sunCallableRegion, width, height, 1u);
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2SUN);
             rtCheckpoint(cmd, "k1k2:post-k2sun");
             if(logTrace) RTLog("[K1/K2] post trace-k2sun");
 
@@ -3546,6 +3889,7 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
             rtCheckpoint(cmd, "k1k2:trace-k2loc");
             trace(cmd, &g_k2locRaygenRegion, &g_k2locMissRegion,
                   &g_k2locHitRegion, &g_k2locCallableRegion, width, height, 1u);
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2LOC);
             rtCheckpoint(cmd, "k1k2:post-k2loc");
             if(logTrace) RTLog("[K1/K2] post trace-k2loc");
 
@@ -3555,22 +3899,34 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
                 VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                 0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
 
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-                              g_k2iPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-                                    g_rayTracingPipelineLayout, 0u, 1u,
-                                    &g_rayTracingDescriptorSet, 0u, nullptr);
+            // 2026-11-18：GI 跳数为 0 时这条间接腿**整条跳过**。
+            // 三腿模式里 K2-I 只负责间接（SUN 写直射、LOC 追加局部光），bounces=0
+            // 时它写的是恒零增量；而 createK2DirectImage 每帧新建，SUN 已经写过
+            // 全屏直射 ⇒ 不跑等价。用户把"GI 跳数"拉到 0 时，这里本来白付
+            // 1.8~2.2 ms（实测占全帧 26%）。
             rtCheckpoint(cmd, "k1k2:trace-k2i");
-            trace(cmd, &g_k2iRaygenRegion, &g_k2iMissRegion,
-                  &g_k2iHitRegion, &g_k2iCallableRegion, width, height, 1u);
+            if(g_perfGiBounces.load(std::memory_order_relaxed) > 0u)
+            {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                  g_k2iPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                        g_rayTracingPipelineLayout, 0u, 1u,
+                                        &g_rayTracingDescriptorSet, 0u, nullptr);
+                trace(cmd, &g_k2iRaygenRegion, &g_k2iMissRegion,
+                      &g_k2iHitRegion, &g_k2iCallableRegion, width, height, 1u);
+                writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2I);
+            }
             rtCheckpoint(cmd, "k1k2:post-k2i");
             if(logTrace) RTLog("[K1/K2] post trace-k2i");
 
+            if(g_rayTracingPipeline != VK_NULL_HANDLE)
+            {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                               g_rayTracingPipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                                     g_rayTracingPipelineLayout, 0u, 1u,
                                     &g_rayTracingDescriptorSet, 0u, nullptr);
+            }
             return true;
         }
 
@@ -3610,11 +3966,15 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
         rtCheckpoint(cmd, "k1k2:post-k2i-2leg");
         if(logTrace) RTLog("[K1/K2] post trace-k2i");
 
+        // 后续 Frame 代码假设主管线在绑；懒编局 main 不存在，跳过绑回
+        if(g_rayTracingPipeline != VK_NULL_HANDLE)
+        {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                           g_rayTracingPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                                 g_rayTracingPipelineLayout, 0u, 1u,
                                 &g_rayTracingDescriptorSet, 0u, nullptr);
+        }
         return true;
     }
 
@@ -3634,11 +3994,14 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
     if(logTrace) RTLog("[K1/K2] post trace-k2");
 
     // K1/K2 两发录完，把主管线绑回去——后续 Frame 代码假设主管线在绑
+    if(g_rayTracingPipeline != VK_NULL_HANDLE)
+    {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                       g_rayTracingPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                             g_rayTracingPipelineLayout, 0u, 1u,
                             &g_rayTracingDescriptorSet, 0u, nullptr);
+    }
     return true;
 }
 void sharcStatsRecordReadBack(VkCommandBuffer commandBuffer)

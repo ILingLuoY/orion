@@ -55,5 +55,47 @@ vec3 skySunGoldenTint(vec3 baseColor, float elevation)
     return saturated * mix(vec3(1.0), vec3(1.32, 0.62, 0.30), w);
 }
 
+// =============================================================================
+// 2026-11-16 午后暖光（"下午 5 点"时段）
+//
+// 现有 skySunGoldenTint 只覆盖 -2°..+12.6°（黄金时刻）。而一天里**占时最长**
+// 的暖光其实是太阳 15°~32° 的午后：色温从正午 ~5500K 降到 ~4500K，阴影开始
+// 偏蓝，天空地平线有一层薄暖。这一段此前完全是纯物理（正午白），
+// 是"一天里大部分时间没有氛围"的主因。
+//
+// 窗口：12.6° 淡入、19.5° 满值、31.5°..43° 淡出。
+// 本工程的"正午"是 55°（0.819），完全落在窗口外 ⇒ 中午逐位不变。
+//
+// 只改色温、不改亮度：暖色乘子按 Rec.709 亮度归一到 1.0，所以地面照度、
+// 阴影强度、曝光全都不受影响，只是“光变暖了”。
+// 回退：SKY_AFTERNOON_WARMTH = 0。
+// =============================================================================
+#ifndef SKY_AFTERNOON_WARMTH
+#define SKY_AFTERNOON_WARMTH 1
+#endif
+#if SKY_AFTERNOON_WARMTH
+
+float skySunAfternoonWarmthWeight(float elevation)
+{
+    return smoothstep(0.22, 0.34, elevation) *
+        (1.0 - smoothstep(0.55, 0.75, elevation));
+}
+
+vec3 skySunAfternoonWarmth(vec3 color, float elevation)
+{
+    float w = skySunAfternoonWarmthWeight(elevation);
+    if(w <= 0.0)
+    {
+        return color;
+    }
+    const vec3 warmTint = vec3(1.10, 0.99, 0.86);
+    const float warmLuma =
+        0.2126 * warmTint.r + 0.7152 * warmTint.g + 0.0722 * warmTint.b;
+    const vec3 normalizedTint = warmTint / max(warmLuma, 1.0e-4);
+    return color * mix(vec3(1.0), normalizedTint, w);
+}
+
+#endif
+
 #endif
 #endif

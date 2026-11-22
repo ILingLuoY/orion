@@ -14,32 +14,38 @@ layout(set = 0, binding = 3) uniform sampler2D cloudCurrentDepth;
 layout(set = 0, binding = 4) uniform sampler2D cloudHistoryDepth;
 layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D cloudResolved;
 
-const float CLOUD_DEPTH_EMPTY = 1000000.0;
+// 2026-11-21 统一风场：cam 已在上方 CameraProperties 块声明完毕。
+#include "wind_common.glsl"
 
-#ifndef CLOUD_HISTORY_WEIGHT_MAX
-#define CLOUD_HISTORY_WEIGHT_MAX 0.95
-#endif
+const float CLOUD_DEPTH_EMPTY = 1000000.0;
 
 #ifndef CLOUD_VELOCITY_DAMP
 #define CLOUD_VELOCITY_DAMP 0.02
 #endif
 
+#ifndef CLOUD_EDGE_NOISE_GATE
+#define CLOUD_EDGE_NOISE_GATE 1
+#endif
+
+const ivec2 BAYER_2X2[4] = ivec2[4](
+    ivec2(0, 0), ivec2(1, 1), ivec2(1, 0), ivec2(0, 1)
+);
+
 bool reprojectCloudHistory(vec3 worldPosition, out vec2 historyUV)
 {
-    if(cam.historyValid == 0u || cam.playerVelocityAndSpeed.w > 32.0)
+    if(cam.historyValid == 0u || cam.playerVelocityAndSpeed.w > 48.0)
     {
         return false;
     }
-    vec3 previousCamera = cam.prevViewInverse[3].xyz;
-    mat3 previousViewRotation = transpose(mat3(cam.prevViewInverse));
-    vec3 previousViewPosition = previousViewRotation * (worldPosition - previousCamera);
-    float depth = max(abs(previousViewPosition.z), 1.0e-4);
-    vec2 projectionScale = max(abs(vec2(cam.prevProjInverse[0][0],
-        cam.prevProjInverse[1][1])), vec2(1.0e-4));
-    vec2 previousNdc = previousViewPosition.xy / (depth * projectionScale);
-    historyUV = vec2(previousNdc.x, -previousNdc.y) * 0.5 + 0.5;
-    return all(greaterThan(historyUV, vec2(0.002))) &&
-        all(lessThan(historyUV, vec2(0.998)));
+    vec4 prevClip = cam.prevViewProj * vec4(worldPosition, 1.0);
+    if(prevClip.w <= 1.0e-4)
+    {
+        return false;
+    }
+    vec2 prevNdc = prevClip.xy / prevClip.w;
+    historyUV = vec2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
+    return all(greaterThan(historyUV, vec2(0.001))) &&
+        all(lessThan(historyUV, vec2(0.999)));
 }
 
 vec3 worldDirectionForPixel(ivec2 pixel, ivec2 size)
@@ -53,80 +59,43 @@ vec3 worldDirectionForPixel(ivec2 pixel, ivec2 size)
     return normalize((cam.viewInverse * vec4(viewDirection, 0.0)).xyz);
 }
 
-#ifndef CLOUD_SPATIAL_RADIUS
-#define CLOUD_SPATIAL_RADIUS 0
-#endif
-
-#ifndef CLOUD_EDGE_NOISE_GATE
-#define CLOUD_EDGE_NOISE_GATE 1
-#endif
-#ifndef CLOUD_EDGE_REJECT_FLOOR
-#define CLOUD_EDGE_REJECT_FLOOR 0.45
-#endif
-
-vec4 spatialDenoise(ivec2 pixel, ivec2 size, vec4 center, float centerDistance)
+bool isTracedMode1(ivec2 p, ivec2 size, uint frameCount)
 {
-#if CLOUD_SPATIAL_RADIUS > 0
-    ivec2 limit = size - ivec2(1, 1);
-    vec3 colorSum = center.rgb;
-    float alphaSum = center.a;
-    float weightSum = 1.0;
-    const float depthTolerance = max(32.0, centerDistance * 0.06);
-    for(int y = -CLOUD_SPATIAL_RADIUS; y <= CLOUD_SPATIAL_RADIUS; ++y)
-    for(int x = -CLOUD_SPATIAL_RADIUS; x <= CLOUD_SPATIAL_RADIUS; ++x)
+    if(((size.x & 1) == 1) && (p.x == size.x - 1))
     {
-        if(x == 0 && y == 0)
-        {
-            continue;
-        }
-        ivec2 samplePixel = clamp(pixel + ivec2(x, y), ivec2(0), limit);
-        vec4 sampleCloud = texelFetch(cloudCurrent, samplePixel, 0);
-        float sampleDistance = texelFetch(cloudCurrentDepth, samplePixel, 0).r;
-        float depthWeight = exp(-abs(sampleDistance - centerDistance) / depthTolerance);
-        float alphaWeight = exp(-abs(sampleCloud.a - center.a) * 6.0);
-        float weight = depthWeight * alphaWeight;
-        colorSum += sampleCloud.rgb * weight;
-        alphaSum += sampleCloud.a * weight;
-        weightSum += weight;
+        return true;
     }
-    center = vec4(colorSum / weightSum, alphaSum / weightSum);
-#endif
-    return center;
+    return ((uint(p.x) ^ uint(p.y) ^ frameCount) & 1u) == 0u;
 }
 
-// sigmaAlpha = 当前帧 3×3 邻域透射率的标准差。它区分两类边缘（见文件头）：
-// 大 = 云/天空在本帧邻域里混杂 ⇒ 噪声型边缘（该放历史进来）；
-// 小 = 本帧轮廓干净 ⇒ 真移动的边缘（该继续拒历史）。
-vec4 clampHistoryToNeighborhood(
-    vec4 history, ivec2 pixel, ivec2 size, out float sigmaAlpha)
+ivec2 snapTracedMode1(ivec2 p, ivec2 size, uint frameCount)
 {
-    vec3 minimumColor = vec3(1.0e20);
-    vec3 maximumColor = vec3(-1.0e20);
-    float minimumTransmittance = 1.0e20;
-    float maximumTransmittance = -1.0e20;
-    float transmittanceSum = 0.0;
-    float transmittanceSquareSum = 0.0;
-    for(int y = -1; y <= 1; ++y)
-    for(int x = -1; x <= 1; ++x)
+    p = clamp(p, ivec2(0), size - ivec2(1));
+    if(!isTracedMode1(p, size, frameCount))
     {
-        ivec2 samplePixel = clamp(pixel + ivec2(x, y), ivec2(0), size - 1);
-        vec4 sampleCloud = texelFetch(cloudCurrent, samplePixel, 0);
-        minimumColor = min(minimumColor, sampleCloud.rgb);
-        maximumColor = max(maximumColor, sampleCloud.rgb);
-        minimumTransmittance = min(minimumTransmittance, sampleCloud.a);
-        maximumTransmittance = max(maximumTransmittance, sampleCloud.a);
-        transmittanceSum += sampleCloud.a;
-        transmittanceSquareSum += sampleCloud.a * sampleCloud.a;
+        p.x = (p.x + 1 < size.x) ? (p.x + 1) : max(p.x - 1, 0);
     }
-    float meanTransmittance = transmittanceSum / 9.0;
-    sigmaAlpha = sqrt(max(
-        transmittanceSquareSum / 9.0 - meanTransmittance * meanTransmittance, 0.0));
-    vec3 colorRange = max(maximumColor - minimumColor, vec3(0.025));
-    float transmittanceRange = max(maximumTransmittance - minimumTransmittance, 0.025);
-    history.rgb = clamp(history.rgb, minimumColor - colorRange * 0.25,
-        maximumColor + colorRange * 0.25);
-    history.a = clamp(history.a, minimumTransmittance - transmittanceRange * 0.25,
-        maximumTransmittance + transmittanceRange * 0.25);
+    return p;
+}
+
+vec4 clampToVarianceBox(
+    vec4 history,
+    vec3 minColor, vec3 maxColor, vec3 m1Color, vec3 m2Color,
+    float minA, float maxA, float sumA, float sumSqA,
+    float sampleCount, float gamma, out float sigmaAlpha)
+{
+    float invCount = 1.0 / max(sampleCount, 1.0);
+    vec3 meanColor = m1Color * invCount;
+    vec3 sigmaColor = sqrt(max(m2Color * invCount - meanColor * meanColor, vec3(0.0)));
+    float meanA = sumA * invCount;
+    sigmaAlpha = sqrt(max(sumSqA * invCount - meanA * meanA, 0.0));
+
+    vec3 minBound = max(minColor, meanColor - sigmaColor * gamma);
+    vec3 maxBound = min(maxColor, meanColor + sigmaColor * gamma);
+    float minABound = max(minA, meanA - sigmaAlpha * gamma);
+    float maxABound = min(maxA, meanA + sigmaAlpha * gamma);
+    history.rgb = clamp(history.rgb, minBound, maxBound);
+    history.a = clamp(history.a, minABound, maxABound);
     return history;
 }
 
@@ -139,7 +108,21 @@ void main()
         return;
     }
 
-    vec4 currentCloud = texelFetch(cloudCurrent, pixel, 0);
+    int temporalMode = clamp(int(cam.cloudTemporalParams.x + 0.5), 0, 2);
+    ivec2 bayerOff = BAYER_2X2[cam.frameCount & 3u];
+    ivec2 qMax = (size - ivec2(1)) >> 1;
+
+    bool tracedThisFrame = true;
+    if(temporalMode == 1)
+    {
+        tracedThisFrame = isTracedMode1(pixel, size, cam.frameCount);
+    }
+    else if(temporalMode == 2)
+    {
+        ivec2 ownTraced = min((pixel >> 1) * 2 + bayerOff, size - ivec2(1));
+        tracedThisFrame = (pixel == ownTraced);
+    }
+
     vec4 currentDepthTexel = texelFetch(cloudCurrentDepth, pixel, 0);
     float currentDistance = currentDepthTexel.r;
     float reprojectDistance = currentDepthTexel.g;
@@ -147,16 +130,175 @@ void main()
     {
         reprojectDistance = currentDistance;
     }
-    if(currentDistance >= CLOUD_DEPTH_EMPTY)
+
+    vec3 minColor = vec3(1.0e20);
+    vec3 maxColor = vec3(-1.0e20);
+    vec3 m1Color = vec3(0.0);
+    vec3 m2Color = vec3(0.0);
+    float minA = 1.0e20;
+    float maxA = -1.0e20;
+    float sumA = 0.0;
+    float sumSqA = 0.0;
+    float statsCount = 0.0;
+    float minNeighborDist = CLOUD_DEPTH_EMPTY;
+
+    vec4 currentCloud = vec4(0.0, 0.0, 0.0, 1.0);
+    vec4 spatialFallback = vec4(0.0, 0.0, 0.0, 1.0);
+
+    if(tracedThisFrame)
     {
-        imageStore(cloudResolved, pixel, currentCloud);
+        currentCloud = texelFetch(cloudCurrent, pixel, 0);
+        if(temporalMode == 0)
+        {
+            for(int oy = -1; oy <= 1; ++oy)
+            for(int ox = -1; ox <= 1; ++ox)
+            {
+                ivec2 sp = clamp(pixel + ivec2(ox, oy), ivec2(0), size - 1);
+                vec4 sc = texelFetch(cloudCurrent, sp, 0);
+                float sd = texelFetch(cloudCurrentDepth, sp, 0).g;
+                if((ox != 0 || oy != 0) && sd > 0.0 && sd < CLOUD_DEPTH_EMPTY)
+                {
+                    minNeighborDist = min(minNeighborDist, sd);
+                }
+                minColor = min(minColor, sc.rgb);
+                maxColor = max(maxColor, sc.rgb);
+                m1Color += sc.rgb;
+                m2Color += sc.rgb * sc.rgb;
+                minA = min(minA, sc.a);
+                maxA = max(maxA, sc.a);
+                sumA += sc.a;
+                sumSqA += sc.a * sc.a;
+                statsCount += 1.0;
+            }
+        }
+        else
+        {
+            // Mode 1: center + 4 diagonal traced texels; Mode 2: center + 4 cardinal quad-stepped traced texels.
+            const ivec2 diagOffsets[4] = ivec2[4](
+                ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1)
+            );
+            const ivec2 cardOffsets[4] = ivec2[4](
+                ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1)
+            );
+            minColor = currentCloud.rgb;
+            maxColor = currentCloud.rgb;
+            m1Color = currentCloud.rgb;
+            m2Color = currentCloud.rgb * currentCloud.rgb;
+            minA = currentCloud.a;
+            maxA = currentCloud.a;
+            sumA = currentCloud.a;
+            sumSqA = currentCloud.a * currentCloud.a;
+            statsCount = 1.0;
+
+            ivec2 qBase = pixel >> 1;
+            for(int k = 0; k < 4; ++k)
+            {
+                ivec2 sp = (temporalMode == 1)
+                    ? snapTracedMode1(pixel + diagOffsets[k], size, cam.frameCount)
+                    : min(clamp(qBase + cardOffsets[k], ivec2(0), qMax) * 2 + bayerOff, size - ivec2(1));
+                vec4 sc = texelFetch(cloudCurrent, sp, 0);
+                float sd = texelFetch(cloudCurrentDepth, sp, 0).g;
+                if(sd > 0.0 && sd < CLOUD_DEPTH_EMPTY)
+                {
+                    minNeighborDist = min(minNeighborDist, sd);
+                }
+                minColor = min(minColor, sc.rgb);
+                maxColor = max(maxColor, sc.rgb);
+                m1Color += sc.rgb;
+                m2Color += sc.rgb * sc.rgb;
+                minA = min(minA, sc.a);
+                maxA = max(maxA, sc.a);
+                sumA += sc.a;
+                sumSqA += sc.a * sc.a;
+                statsCount += 1.0;
+            }
+        }
+    }
+    else
+    {
+        // Untraced pixel: sample strictly from 4 surrounding guaranteed-traced texels.
+        spatialFallback = vec4(0.0);
+        if(temporalMode == 1)
+        {
+            const ivec2 cardOffsets[4] = ivec2[4](
+                ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1)
+            );
+            for(int k = 0; k < 4; ++k)
+            {
+                ivec2 sp = snapTracedMode1(pixel + cardOffsets[k], size, cam.frameCount);
+                vec4 sc = texelFetch(cloudCurrent, sp, 0);
+                float sd = texelFetch(cloudCurrentDepth, sp, 0).g;
+                if(sd > 0.0 && sd < CLOUD_DEPTH_EMPTY)
+                {
+                    minNeighborDist = min(minNeighborDist, sd);
+                }
+                spatialFallback += sc * 0.25;
+                minColor = min(minColor, sc.rgb);
+                maxColor = max(maxColor, sc.rgb);
+                m1Color += sc.rgb;
+                m2Color += sc.rgb * sc.rgb;
+                minA = min(minA, sc.a);
+                maxA = max(maxA, sc.a);
+                sumA += sc.a;
+                sumSqA += sc.a * sc.a;
+                statsCount += 1.0;
+            }
+        }
+        else
+        {
+            vec2 rel = vec2(pixel - bayerOff) * 0.5;
+            ivec2 q0 = ivec2(floor(rel));
+            vec2 fw = clamp(rel - vec2(q0), 0.0, 1.0);
+            for(int dy = 0; dy <= 1; ++dy)
+            for(int dx = 0; dx <= 1; ++dx)
+            {
+                float w = (dx == 0 ? 1.0 - fw.x : fw.x) * (dy == 0 ? 1.0 - fw.y : fw.y);
+                ivec2 qN = clamp(q0 + ivec2(dx, dy), ivec2(0), qMax);
+                ivec2 sp = min(qN * 2 + bayerOff, size - ivec2(1));
+                vec4 sc = texelFetch(cloudCurrent, sp, 0);
+                float sd = texelFetch(cloudCurrentDepth, sp, 0).g;
+                if(sd > 0.0 && sd < CLOUD_DEPTH_EMPTY)
+                {
+                    minNeighborDist = min(minNeighborDist, sd);
+                }
+                spatialFallback += sc * w;
+                minColor = min(minColor, sc.rgb);
+                maxColor = max(maxColor, sc.rgb);
+                m1Color += sc.rgb;
+                m2Color += sc.rgb * sc.rgb;
+                minA = min(minA, sc.a);
+                maxA = max(maxA, sc.a);
+                sumA += sc.a;
+                sumSqA += sc.a * sc.a;
+                statsCount += 1.0;
+            }
+        }
+        currentCloud = spatialFallback;
+    }
+
+    // Fast skip for clear sky & opaque terrain below the cloud deck.
+    if(currentDistance >= CLOUD_DEPTH_EMPTY && minNeighborDist >= CLOUD_DEPTH_EMPTY)
+    {
+        imageStore(cloudResolved, pixel, vec4(0.0, 0.0, 0.0, 1.0));
         return;
     }
 
-    currentCloud = spatialDenoise(pixel, size, currentCloud, currentDistance);
+    bool edgeBorrow = false;
+    if(currentDistance >= CLOUD_DEPTH_EMPTY)
+    {
+        reprojectDistance = minNeighborDist;
+        edgeBorrow = true;
+    }
 
-    vec3 cameraPosition = (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
-    vec3 historyPoint = cameraPosition + worldDirectionForPixel(pixel, size) * reprojectDistance;
+    vec3 cameraPosition = cam.viewInverse[3].xyz;
+    vec3 hitPoint = cameraPosition + worldDirectionForPixel(pixel, size) * reprojectDistance;
+    // Compensate for wind drift matched to cloud_v5_core (14.0 * 0.35 = 4.9 m/s) so clouds stay crisp.
+    // 2026-11-21 统一风场：方向必须与 cloud_v5_core 的 windUV（cfg.windDir →
+    // windDirXZ()）逐位同源，否则云会拖影。
+    float cloudTimeDelta = (abs(cam.weatherParams.z - 1.0) < 0.25) ? 0.0167 : 0.0;
+    vec2 windShiftDir = windDirXZ();
+    vec3 windShiftXZ = vec3(windShiftDir.x, 0.0, windShiftDir.y) * (4.9 * cloudTimeDelta);
+    vec3 historyPoint = hitPoint - windShiftXZ;
     vec2 historyUV;
     if(reprojectCloudHistory(historyPoint, historyUV))
     {
@@ -169,36 +311,53 @@ void main()
             previousReproject = previousDistance;
         }
         float expectedDistance = length(historyPoint - cam.prevViewInverse[3].xyz);
-        float depthTolerance = max(64.0, expectedDistance * 0.08);
-        if(previousDistance < CLOUD_DEPTH_EMPTY &&
+        float depthTolerance = tracedThisFrame
+            ? max(80.0, expectedDistance * 0.10)
+            : max(120.0, expectedDistance * 0.14);
+        if((previousDistance < CLOUD_DEPTH_EMPTY &&
             previousReproject > 0.0 && previousReproject < CLOUD_DEPTH_EMPTY &&
-            abs(previousReproject - expectedDistance) <= depthTolerance)
+            abs(previousReproject - expectedDistance) <= depthTolerance) || edgeBorrow)
         {
+            float speedT = clamp(cam.playerVelocityAndSpeed.w / 10.0, 0.0, 1.0);
+            float gamma = tracedThisFrame ? mix(1.65, 1.10, speedT) : mix(1.90, 1.25, speedT);
             float sigmaAlpha = 0.0;
-            vec4 historyCloud = clampHistoryToNeighborhood(
-                textureLod(cloudHistory, historyUV, 0.0), pixel, size, sigmaAlpha);
-            float historyWeight = min(cam.cloudParams2.w,
-                cam.playerVelocityAndSpeed.w > 8.0 ? 0.58 : CLOUD_HISTORY_WEIGHT_MAX);
+            vec4 historyCloud = clampToVarianceBox(
+                textureLod(cloudHistory, historyUV, 0.0),
+                minColor, maxColor, m1Color, m2Color,
+                minA, maxA, sumA, sumSqA, statsCount, gamma, sigmaAlpha);
+
             float temporalDampStrength = clamp(cam.cloudTemporalParams.z, 0.0, 1.0);
-            if(temporalDampStrength > 0.001)
+            if(tracedThisFrame)
             {
-                float speedDamped = exp(
-                    -CLOUD_VELOCITY_DAMP * cam.playerVelocityAndSpeed.w);
-                historyWeight = min(cam.cloudParams2.w,
-                    mix(historyWeight, speedDamped, temporalDampStrength));
-            }
-            float opacityDifference = abs(currentCloud.a - historyCloud.a);
-            float silhouetteReject = 1.0 - smoothstep(0.06, 0.30, opacityDifference);
+                float historyWeight = mix(0.90, 0.64, clamp(cam.playerVelocityAndSpeed.w / 12.0, 0.0, 1.0));
+                if(edgeBorrow)
+                {
+                    historyWeight = min(historyWeight, 0.72);
+                }
+                if(temporalDampStrength > 0.001)
+                {
+                    float speedDamped = exp(-CLOUD_VELOCITY_DAMP * cam.playerVelocityAndSpeed.w);
+                    historyWeight = mix(historyWeight, min(historyWeight, speedDamped), temporalDampStrength);
+                }
+                float opacityDifference = abs(currentCloud.a - historyCloud.a);
+                float silhouetteReject = 1.0 - smoothstep(0.08, 0.36, opacityDifference);
 #if CLOUD_EDGE_NOISE_GATE
-            float noiseGate = smoothstep(0.02, 0.10, sigmaAlpha);
-            float longHistoryGate = smoothstep(0.84, 0.90, cam.cloudParams2.w);
-            silhouetteReject = mix(
-                silhouetteReject,
-                max(silhouetteReject, CLOUD_EDGE_REJECT_FLOOR),
-                noiseGate * longHistoryGate);
+                float noiseGate = smoothstep(0.015, 0.08, sigmaAlpha);
+                silhouetteReject = mix(silhouetteReject, max(silhouetteReject, 0.55), noiseGate);
 #endif
-            historyWeight *= silhouetteReject;
-            currentCloud = mix(currentCloud, historyCloud, historyWeight);
+                historyWeight *= silhouetteReject;
+                currentCloud = mix(currentCloud, historyCloud, historyWeight);
+            }
+            else
+            {
+                float untracedWeight = edgeBorrow ? 0.72 : 0.94;
+                if(temporalDampStrength > 0.001)
+                {
+                    float speedDamped = exp(-0.015 * cam.playerVelocityAndSpeed.w);
+                    untracedWeight = mix(untracedWeight, min(untracedWeight, speedDamped), temporalDampStrength);
+                }
+                currentCloud = mix(spatialFallback, historyCloud, untracedWeight);
+            }
         }
     }
     imageStore(cloudResolved, pixel, currentCloud);

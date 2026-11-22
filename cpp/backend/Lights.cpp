@@ -7,6 +7,129 @@
 
 
 
+// =============================================================================
+// 2026-11-18：本地光表 / 光网格缓冲的**延迟回收**。
+//
+// 病征：进世界后偶发整机黑屏 / 驱动 TDR（nvlddmkm 153），Vulkan 侧报
+// "5s timeout reached when waiting for VK semaphore"。看门狗两次都把冻结点
+// 钉在同一个 dispatch —— k1k2:trace-k2i，且崩前帧时长完全正常（5.2~6.2 ms、
+// k2i 1.0~1.9 ms），下一拍直接冻死。
+//
+// 根因链：着色器 localLightGridLookupCell()（local_light_grid_common.glsl:90）
+// 的探测循环上界直接读 GPU 缓冲里的 fogLightGrid.words[2]，**没有上限钳制**。
+// 而这张网格缓冲在灯表扩容时会被销毁重建，重建前只等了我们自己的 RT 队列
+// （vkQueueWaitIdle(g_queue)）—— 光追命令是录进**引擎**的 command buffer、由
+// 引擎队列提交的，我们这条等待证明不了引擎在飞的帧已经读完旧缓冲。引擎那一帧
+// 读到已释放缓冲的垃圾 words[2] 时，每个像素的探测次数会被推到数百万级
+// ⇒ dispatch 永不返回 ⇒ 驱动 TDR。
+//
+// 旁证：三次崩溃都发生在灯表/实例数暴涨的那几帧（instances 2 → 503 → 1467），
+// 同一时间窗还出现过 k2loc 从 2.4 ms 暴涨到 34 ms（同一个 cell 计数异常在
+// 便宜的那条腿上先露头）。
+// 反证：ORION_NO_SECTION_FREE=1 关掉区块显存释放后**照样崩**，所以这条不是
+// section buffer 的 use-after-free。
+//
+// 口径：旧缓冲挂进回收队列，至少 3 帧龄后才真销毁（与 OrionInternal.h:1187
+// 的 SectionRetirementSlot 同一套判据）。
+// 回退：ORION_LOCAL_LIGHT_RETIRE=0 ⇒ 恢复立即销毁（旧行为）。
+// =============================================================================
+namespace {
+
+struct RetiredLocalBuffer
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint64_t retireFrameSerial = 0u;
+};
+
+std::vector<RetiredLocalBuffer> g_retiredLocalBuffers;
+
+inline constexpr uint64_t kLocalBufferRetireFrameAge = 3u;
+
+bool localLightRetireEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* raw = std::getenv("ORION_LOCAL_LIGHT_RETIRE");
+
+        return !(raw != nullptr && raw[0] == '0');
+    }();
+
+    return enabled;
+}
+
+// 帧龄到期的旧缓冲在这里真销毁。只在灯表重建时调用 —— 那时 CPU 已经在重建
+// 路径上，不在热路径。
+void pumpRetiredLocalBuffers()
+{
+    if(g_retiredLocalBuffers.empty())
+    {
+        return;
+    }
+
+    const uint64_t nowSerial = g_perfL10FrameSerial;
+
+    for(size_t i = 0u; i < g_retiredLocalBuffers.size();)
+    {
+        const RetiredLocalBuffer& entry = g_retiredLocalBuffers[i];
+
+        if(nowSerial - entry.retireFrameSerial >= kLocalBufferRetireFrameAge)
+        {
+            if(entry.buffer != VK_NULL_HANDLE)
+            {
+                vkDestroyBuffer(g_device, entry.buffer, nullptr);
+            }
+
+            if(entry.memory != VK_NULL_HANDLE)
+            {
+                vkFreeMemory(g_device, entry.memory, nullptr);
+            }
+
+            g_retiredLocalBuffers[i] = g_retiredLocalBuffers.back();
+            g_retiredLocalBuffers.pop_back();
+            continue;
+        }
+
+        ++i;
+    }
+}
+
+// 把一对 (buffer, memory) 从全局句柄上摘下来，按开关决定延迟回收还是立即销毁。
+void retireOrDestroyLocalBuffer(VkBuffer& buffer, VkDeviceMemory& memory)
+{
+    if(buffer == VK_NULL_HANDLE && memory == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    if(localLightRetireEnabled())
+    {
+        RetiredLocalBuffer entry;
+        entry.buffer = buffer;
+        entry.memory = memory;
+        entry.retireFrameSerial = g_perfL10FrameSerial;
+        g_retiredLocalBuffers.push_back(entry);
+    }
+    else
+    {
+        if(buffer != VK_NULL_HANDLE)
+        {
+            vkDestroyBuffer(g_device, buffer, nullptr);
+        }
+
+        if(memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(g_device, memory, nullptr);
+        }
+    }
+
+    buffer = VK_NULL_HANDLE;
+    memory = VK_NULL_HANDLE;
+}
+
+} // namespace
+
+
 uint32_t localLightGridHash32(
     int32_t x,
     int32_t y,
@@ -34,37 +157,11 @@ uint32_t localLightGridHash32(
 
 void destroyLocalLightGpuBuffer()
 {
-    if(
-        g_localLightGpuBuffer !=
-        VK_NULL_HANDLE
-    )
-    {
-        vkDestroyBuffer(
-            g_device,
-            g_localLightGpuBuffer,
-            nullptr
-        );
-
-        g_localLightGpuBuffer =
-            VK_NULL_HANDLE;
-    }
-
-
-    if(
-        g_localLightGpuMemory !=
-        VK_NULL_HANDLE
-    )
-    {
-        vkFreeMemory(
-            g_device,
-            g_localLightGpuMemory,
-            nullptr
-        );
-
-        g_localLightGpuMemory =
-            VK_NULL_HANDLE;
-    }
-
+    // 2026-11-18：走帧龄延迟回收（见文件顶部那段注释）。
+    retireOrDestroyLocalBuffer(
+        g_localLightGpuBuffer,
+        g_localLightGpuMemory
+    );
 
     g_localLightGpuCount =
         0;
@@ -73,37 +170,11 @@ void destroyLocalLightGpuBuffer()
 
 void destroyLocalLightGridGpuBuffer()
 {
-    if(
-        g_localLightGridGpuBuffer !=
-        VK_NULL_HANDLE
-    )
-    {
-        vkDestroyBuffer(
-            g_device,
-            g_localLightGridGpuBuffer,
-            nullptr
-        );
-
-        g_localLightGridGpuBuffer =
-            VK_NULL_HANDLE;
-    }
-
-
-    if(
-        g_localLightGridGpuMemory !=
-        VK_NULL_HANDLE
-    )
-    {
-        vkFreeMemory(
-            g_device,
-            g_localLightGridGpuMemory,
-            nullptr
-        );
-
-        g_localLightGridGpuMemory =
-            VK_NULL_HANDLE;
-    }
-
+    // 2026-11-18：走帧龄延迟回收（见文件顶部那段注释）。
+    retireOrDestroyLocalBuffer(
+        g_localLightGridGpuBuffer,
+        g_localLightGridGpuMemory
+    );
 
     g_localLightGridCellCount =
         0;
@@ -458,6 +529,10 @@ void rebuildLocalLightGpuBuffer()
     {
         return;
     }
+
+
+    // 2026-11-18：先把帧龄到期的旧缓冲真正销毁掉再重建（见文件顶部注释）。
+    pumpRetiredLocalBuffers();
 
 
     const auto perfL10RebuildStart =

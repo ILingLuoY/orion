@@ -141,3 +141,43 @@ if (sampleNext1D < prob) terminate;  // 否则 thpRuRuCorrection = 1/(1-prob)
    只有把 GI 弹射数调回 2+ 时才有意义。暂不动。
 4. **SpecularBased 模式**：本工程 GI 回路是余弦漫反射 + 薄壁玻璃，没有"镜面 lobe 继续
    追踪"的分支，暂不移植；将来若把 glossy 并进 GI 路径再评估。
+
+---
+
+## 2026-11-16：glossy 反射链的 RR（第二个实现）
+
+GI 之外还有一条独立的镜面链 `rgen_glossy.glsl`（trace 段 40% 的成本）。它此前有 RR，
+但写成了"固定阈值筛选"：
+
+```glsl
+q = max(throughput)                 // 每跳只乘一个 Fresnel
+if (q < 0.02) return;               // 萤火虫闸
+if (q < 0.30) { survive with p = q; throughput /= q; }
+```
+
+**问题**：金属链的 Fresnel 是 0.9+，`q` 永远 >0.3 ⇒ 这段代码一次也不执行。镜面深度
+实际由整数 `mirrorBounceLimit`(1..8) 决定，于是"镜子里映镜子少一层"是硬切档，
+且空房间与堆满镜面的房间付一样的射线钱。
+
+改成与 GI 同形的深度坡道（`GLOSSY_RR_DEPTH_RAMP=0.5`、`GLOSSY_RR_SURVIVAL_FLOOR=0.35`）：
+
+```
+term      = (1 - q) + 0.5 * max(0, pathStep / cap - 0.4)
+survival  = clamp(1 - term, 0.35, 1)
+存活 ⇒ throughput /= survival
+```
+
+契约不变（掷骰 p 与除法 p 是同一个数 ⇒ 无偏），地板只把最大权重抬到 1/0.35 ≈ 2.86×。
+前 40% 的 cap 深度不参与抽签 ⇒ 近处镜面保持满质量；`mirrorBounceLimit` 仍是硬上限。
+语义上这是"按内容付费"而非"按档位付费"：亮的镜面链自然多弹，暗的自动早停。
+
+**默认值对齐**：`Settings.cpp` 的 `glossyRrEnabled()` 之前要求 `ORION_GLOSSY_RR=1`，
+而 shader 头注释写的是"默认开" ⇒ 这份实现从未生效。现改为默认开、`=0` 关闭。
+
+回退阶梯（都不需要改 shader 代码）：
+`ORION_GLOSSY_RR=0` → 整块不执行（回到确定性跑满）；`-DGLOSSY_RR_DEPTH_RAMP=0` →
+只留亮度项；`-DGLOSSY_RR_SURVIVAL_FLOOR=1.0` → 只剩抽签、不减预算。
+
+**已验证**：14 个 rgen 变体重编并四处同步，`tools/audit_spv_freshness.py` 80 个产物
+0 漂移 / 0 未部署。**帧时间与画面（镜面链噪声、映镜子层数观感）仍属跑批验证项**——
+出数前不要把 `GLOSSY_RR_DEPTH_RAMP` 再往上抬。

@@ -604,7 +604,9 @@ void createRtDescriptorRing()
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 * RT_DESCRIPTOR_RING_SIZE },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * RT_DESCRIPTOR_RING_SIZE },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 * RT_DESCRIPTOR_RING_SIZE },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 * RT_DESCRIPTOR_RING_SIZE }
+        // 2026-11-17 P2：binding 94 跨腿材质复用中转 buffer（仅复用开关打开时写）；
+        // 池容量 20 -> 24 留头，避免复用臂下 STORAGE_BUFFER 描述符超池。
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 24 * RT_DESCRIPTOR_RING_SIZE }
     };
     VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pi.maxSets = RT_DESCRIPTOR_RING_SIZE;
@@ -747,7 +749,11 @@ void createRayTracingDescriptorPoolAndSet()
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
         // 2026-11-04 A1：+2 = GI 时域历史 binding 86/87（20 → 22，原配额恰好用满）。
         // 2026-11-05 ③：+1 = K2-D/K2-I 直射级交接图 binding 89（22 → 23）。
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 23 },
+        // 2026-11-19 rasterLod：+2 = DH LOD 光栅 color/depth binding 96/97
+        //（23 → 25；描述符按需写，但池配额按布局的静态绑定数扣减，不补
+        // 会在 g_rayTracingDescriptorSet 分配时直接失败）。
+        // 2026-11-21 P0-1：+1 = 主命中世界位移旁路槽 binding 98（25 → 26）。
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 26 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 },
         // 2026-11-05 B：+1 = K1/K2 landing SSBO（binding 88，21 → 22）。

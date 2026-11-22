@@ -65,6 +65,13 @@ bool lodColumnNearReady(ivec2 column)
 
 // 远场命中是否只是近场几何的冗余表示 ⇒ 应当 ignoreIntersectionEXT。
 // 只对 DH 远场成立；Voxy LOD 与近场地形一律返回 false（Voxy 行为不变）。
+//
+// 2026-11-19 rasterLod（挂载点⑥，原规格行号 :81）：rasterLod=true 时 DH 键
+// 已从 BLAS/TLAS/角色表结构性摘除（C++ 挂载点②③④），role 永远不会是
+// LOD_ROLE_DH_FAR ⇒ 本函数天然短路，无需额外旗标位（本 TU 未声明相机
+// UBO，旗标无法低风险到达；结构性摘除即等价语义）。近场让位逻辑由 K1
+// mode=14 的 dhFarFieldOurs 门（主射线命中即不合成远场）承担。关闭旗标时
+// 行为与改前逐位一致。
 bool lodHitIsRedundant(uint role, vec3 hitWorldPosition)
 {
     if(role != LOD_ROLE_DH_FAR)

@@ -26,6 +26,7 @@
 | [`cloud-lightstep-perf.md`](cloud-lightstep-perf.md) | 体积云光步降档：光步占云 pass 6~8 成采样量、参考的 mip 机制在本仓空转、两个开关的实测加速（1.33×）与外观代价；地球遮挡为何被否决 |
 | [`cloud-coverage-size-split.md`](cloud-coverage-size-split.md) | 云量与云大小解耦（presence 遮罩 + 常数阈值、按 R 分布标定 presCut、大小滑条方向修正）、天气图 1024²→512² 与少一档倍频、3D 噪声 mip 链（本机收益为 0 的实测）；§8：常数阈值 2026-11-01 反转为逐柱 coverage 耦合（0.48=99.7% 全遮盖是"灰毯怪"根因）+ weather.a 云顶逐柱变化 |
 | [`vulkancore-split.md`](vulkancore-split.md) | 2026-11-01 把 7.1 万行单文件 VulkanCore.cpp 机械拆成 cpp/backend/ 32 模块的定案：初始化次序/记账宏/死代码三条语义支柱、拆分器踩过的 7 个坑、一致性验证（197 导出逐一相同）、明确不做的三件事 |
+| [`direct-light-handover.md`](direct-light-handover.md) | 2026-11-19 直射光「太阳 → 月亮」交接连续化（"云在夕阳到夜晚光照突然跳变"）：方向在 `sunElevation >= 0` 硬翻而混色权重只有 0.5 的根因、-0.05 交接带 + 两侧同时归零的定案、六个消费者清单、为何不改地形与阴影方向、四个被排除的方案 |
 
 其它文档：
 

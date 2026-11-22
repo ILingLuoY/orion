@@ -11,7 +11,12 @@ float waterSimUpdateSeconds()
     {
         const char* raw = std::getenv("ORION_WATER_SIM_HZ");
 
-        int hz = 15;
+        // 2026-11-21 顾问轮1（修复①）：默认 15 → 30 Hz。旧 15 Hz 下交互法线
+        // 以 66.7ms 步进，用户实测"一卡一卡、拖拽感"；且双子步改版后每次
+        // 调度的状态跳变量还放大了 ~30%。30 Hz 单子步：物理子步率不变
+        //（等效 Courant 与稳定域一致），步进间隔减半到 33ms，每步跳变量减半。
+        // 512² RG16F compute 实测 <0.2ms/次，翻倍无感知成本。
+        int hz = 30;
 
         if(raw != nullptr)
         {
@@ -189,6 +194,25 @@ float matFarLodDistance()
     return cached;
 }
 
+// 2026-11-15：GI 弹射分档边界的**环境变量覆盖**（单位：区块；未设 / 负数 = 用
+// g_perfBounceBandChunks 的 UI 值，出厂 4 区块）。
+// 用途：同场景 A/B「>4 区块只 1 弹」这条改动。设 32 = 覆盖到常见视距之外 ⇒
+// 等效关闭分档，且**不重编 SPV、不触发冷编**（只改 UBO 的 perfBandParams.y）。
+float giBounceBandChunksOverride()
+{
+    static const float cached = []()
+    {
+        const char* raw = std::getenv("ORION_GI_BOUNCE_BAND");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return -1.0f;
+        }
+        return static_cast<float>(std::atof(raw));
+    }();
+
+    return cached;
+}
+
 // 2026-11-15 远场贴图降档起点（单位**格**；0 = 关）。
 // shader 侧 material_resolve.glsl：起点起每 32 格抬 1 级 mip，封顶 +3，
 // albedo/normal/specular 通道全部保留采样（不复现旧 ORION_MAT_FAR_LOD 硬跳档
@@ -222,13 +246,17 @@ bool giVisibilityGateEnabled()
 
 // 2026-11-10：glossy 反射链的俄罗斯轮盘（无偏，只换方差）。
 // 依据：trace 段 16.12ms 中反射链占 6.5ms（noGlossy 消融），而该路径此前
-// 确定性跑满、没有 RR。回退：ORION_GLOSSY_RR=0。
+// 确定性跑满、没有 RR。
+// 2026-11-16：默认值对齐。shader 头注释一直写"默认开"，这里却要求 =1，
+// 于是这份半成品从未生效（镜面链仍然确定性跑满 cap）。改为默认开、
+// =0 关闭，与 ORION_WATER_ADAPTIVE 等同一口径（env 缺省 = 开）。
+// 回退：ORION_GLOSSY_RR=0。
 bool glossyRrEnabled()
 {
     static const bool cached = []()
     {
         const char* raw = std::getenv("ORION_GLOSSY_RR");
-        return raw != nullptr && raw[0] != '\0' && raw[0] == '1';
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
     }();
 
     return cached;
@@ -410,8 +438,14 @@ bool giHalfEnabled()
 // 2026-11-05 B：K1(主视线)/K2(传输) 两发拆分。
 // 2026-11-06 落盘为默认开（实测 trace 7.74→6.12ms，视觉验证通过）；
 // ORION_K1_K2=0 仅作紧急回退口，正常启动无需任何 env。
+// 2026-11-16 主管线退役定案：K1/K2 拆分管线是唯一 RT 路径。6-stage 主单体的
+// 全部创建点已 #if 0 屏蔽（boot worker / recreateMainRtPipeline / Device.cpp
+// 同步版）——29GB commit 冷编墙随之一并退役。这里强制 true：ORION_K1_K2=0
+// 不再通往主管线，只会得到"整局无 RT"。旧逃生口逻辑屏蔽保留
+//（回滚 = 还原本函数 + 去掉三处创建点的 #if 0/#endif）。
 bool k1k2SplitEnabled()
 {
+#if 0
     static const bool cached = []()
     {
         const char* raw = std::getenv("ORION_K1_K2");
@@ -419,6 +453,8 @@ bool k1k2SplitEnabled()
     }();
 
     return cached;
+#endif
+    return true;
 }
 
 // 2026-11-07 SER 门控口径（对齐规范与官方示例）：
@@ -477,6 +513,94 @@ bool k2ThreeSplitEnabled()
     {
         const char* raw = std::getenv("ORION_K2_SPLIT2");
         return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// ⑤ K2-SUN 再拆分（2026-11-22）：K2-SUN → K2-SUNA（水+RTAO）+ K2-SUNB
+//（阴影+GGX+植被SSS，load-add 复用 binding 89）。动机：k2sun 单腿优化冷编
+// 20GB 级 commit、9.5~50 分钟，2026-11-21/22 四连 OOM（result=-3）；rgen 臂
+// 占编译 ~85%（k2i 91.8s = 共享 6 stage 下限），劈半把单腿峰值拉到墙下。
+// GPU 总工作量不变（同样光线同样着色，多一道腿间 barrier ≈ 0.1ms 级）。
+// 默认开；ORION_K2_SPLIT3=0 回退 ④ 三腿（sun/loc/i）。
+bool k2FourSplitEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_K2_SPLIT3");
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// P2 跨腿材质复用（2026-11-17）：运行期开关，不是编译期宏。同一份二进制内
+// 复用 / 非复用两条路径共存。
+// 2026-11-17 晚（用户决定）：**默认开**。探针局 J3 已把差异面钉死在一个字段上：
+// 165/165 窗口的位图都是 0x00010080 ⇒ 只有 pomSelfShadow（位 7）不同，且只出现在
+// I 腿（位 16）；hitDistance/roughness/state/albedo/normal.xyz/emission 逐位相同，
+// 量级约 3.5 像素/帧（1.4e-5）。该字段只乘太阳直射项，是一片刻度 0..1 的平滑遮蔽，
+// 画面不可见。收益：trace −0.74 ms / −7.9%（对照 A 局），ev_primary 3→1。
+// 显式 ORION_MAT_REUSE_LEGS=0/f/F 可回到逐位旧行为做反向对照。
+bool matReuseLegsEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_MAT_REUSE_LEGS");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return true;
+        }
+
+        return raw[0] != '0' && raw[0] != 'f' && raw[0] != 'F';
+    }();
+
+    return cached;
+}
+
+// 一次性校验臂：消费者腿既读复用记录又原地重跑一次解析，逐位比对，不一致计数进
+// 计数器缓冲 reservedLane6。默认关；需配合 ORION_RT_STAGE_COUNTERS=1 的采集档
+// 部署才有落盘缓冲可读。
+bool matReuseAssertEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_MAT_REUSE_ASSERT");
+        return raw != nullptr && raw[0] != '\0' &&
+               raw[0] != '0' && raw[0] != 'f' && raw[0] != 'F';
+    }();
+
+    return cached;
+}
+
+// 本地光 NEE 硬件可见性射线的跨腿结果缓存。默认关。
+// 设计上的安全边界：只有 (receiverOrigin, selectedSample, targetVoxelEntryDistance,
+// cullMask) 的 64 位键与记录逐位相同才复用，否则自己打射线 —— 所以"键不同"只会
+// 白跑，不会算错；键相同则同一段线段、同一静态 TLAS，遍历结果必然逐位相同。
+bool localNeeVisCacheEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_LOCAL_NEE_CACHE");
+        return raw != nullptr && raw[0] != '\0' &&
+               raw[0] != '0' && raw[0] != 'f' && raw[0] != 'F';
+    }();
+
+    return cached;
+}
+
+// 计数器 lane 6（reservedLane6，材质复用不一致计数）的额外打印开关。默认关：
+// 现有 L10 [RT STAGE CNT] 日志只打 lane 0-5，格式不动；ORION_RT_STAGE_CNT_LANE6=1
+// 才在每个窗口闭合时多打一行 matReuseMismatch=<lane6>。需配合计数器采集档部署。
+bool rtStageCntLane6PrintEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_RT_STAGE_CNT_LANE6");
+        return raw != nullptr && raw[0] != '\0' &&
+               raw[0] != '0' && raw[0] != 'f' && raw[0] != 'F';
     }();
 
     return cached;
@@ -564,15 +688,62 @@ float sparseSamplingRateEffective()
 }
 bool cloudFarBandSplitActive()
 {
-    constexpr bool kEnableFarBandSplit = false;
-    // 2026-11-13：原第二项 !g_cloudPostRrComposite.load() 随开关退役删除。
-    return kEnableFarBandSplit &&
-        g_rrFarCloudDistance.load() > 0.0f &&
-        g_cloudResFloorPercent.load() > 0u;
+    // 2026-11-16：远云脱离 RR。默认开；ORION_CLOUD_FARBAND=0 回到旧档
+    // （云全部混进 RR 输入，逐位等价于改动前）。
+    //
+    // 只在"确实在做上采样"时才有意义：
+    //   · 没有 RR/SR 输出图（g_dlssOutputImage 为空）⇒ 没有后合成目标；
+    //   · 输出分辨率不大于渲染分辨率 ⇒ 分层不会带来任何细节收益。
+    static const bool s_enabled = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_CLOUD_FARBAND");
+
+        if(raw != nullptr &&
+           (raw[0] == '0' || raw[0] == 'n' || raw[0] == 'N'))
+        {
+            return false;
+        }
+
+        return true;
+    }();
+
+    if(!s_enabled)
+    {
+        return false;
+    }
+
+    if(g_dlssOutputImage == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    if(g_dlssOutputWidth <= g_rtOutputWidth ||
+       g_dlssOutputHeight <= g_rtOutputHeight)
+    {
+        return false;
+    }
+
+    return cloudFarBandSplitDistance() > 0.0f;
 }
+
 float cloudFarBandSplitDistance()
 {
-    return std::max(g_rrFarCloudDistance.load(), 0.0f);
+    // 分带距离（世界单位，沿射线）。ORION_CLOUD_FARBAND_SPLIT 可调，<=0 关闭分层。
+    static const float s_distance = []() -> float
+    {
+        const char* raw = std::getenv("ORION_CLOUD_FARBAND_SPLIT");
+
+        if(raw == nullptr)
+        {
+            return 320.0f;
+        }
+
+        const float value = static_cast<float>(std::atof(raw));
+
+        return value > 0.0f ? value : 0.0f;
+    }();
+
+    return s_distance;
 }
 float effectiveCloudFarFadeDistance()
 {
@@ -786,6 +957,38 @@ void populateSkyModelParams(float* params)
     // z / w：2026-11-01 起不再保留（夜间天空底光 / 雨天压暗倍率）
     params[2] = g_skyNightAmbient.load();
     params[3] = g_skyRainDim.load();
+}
+
+// 2026-11-16 月光两旋钮（车道见 CameraUBO.moonParams）。
+// 每帧读原子量 ⇒ UI 改完下一帧生效（天空 LUT 与 miss 共享同一份 UBO）。
+void populateMoonParams(float* params)
+{
+    params[0] = g_moonLightFloor.load();
+    params[1] = g_moonDaylightDim.load();
+    // z = 有效性标记：shader 靠它区分"宿主已写入"与"旧 DLL 未写本块"。
+    params[2] = 1.0f;
+    params[3] = 0.0f;
+}
+
+// 2026-11-16 雾外观（车道见 CameraUBO.fogMoodParams）。
+// 每帧读原子量 ⇒ UI 改完下一帧生效。
+void populateFogMoodParams(float* params)
+{
+    params[0] = g_fogShapeStrength.load();
+    params[1] = g_fogDawnBoost.load();
+    params[2] = 0.0f;
+    params[3] = 0.0f;
+}
+
+// 2026-11-21 统一风场（车道见 CameraUBO.windParams，消费方 wind_common.glsl）。
+// 每帧读原子量 ⇒ UI 改完下一帧生效。
+//   [0] = 风向角（度）  [1] = 风强倍率  [2] = 阵风强度  [3] = 有效标记
+void populateWindParams(float* params)
+{
+    params[0] = std::min(std::max(g_windAngle.load(), 0.0f), 360.0f);
+    params[1] = std::min(std::max(g_windStrength.load(), 0.0f), 2.0f);
+    params[2] = std::min(std::max(g_windGust.load(), 0.0f), 1.0f);
+    params[3] = 1.0f;
 }
 
 // 末地银河四个旋钮（2026-10-08，最后一个当天由"替换式"改成叠加时启用）。
@@ -1007,10 +1210,10 @@ void populateCloudMsParams2(float* params)
 // 那条路是 v5 的真实消费者，所以该 atomic 保留。这里四 lane 全写 0。
 void populateCloudLightParams2(float* params)
 {
-    params[0] = 0.0f;
-    params[1] = 0.0f;
-    params[2] = 0.0f;
-    params[3] = 0.0f;
+    params[0] = g_cloudPowderEffect.load();
+    params[1] = g_cloudSilverSpread.load();
+    params[2] = g_cloudSharpness.load();
+    params[3] = g_cloudBaseErosion.load();
 }
 void populateCloudProfileParams(float* params)
 {
@@ -1058,7 +1261,7 @@ void populateFogExtrasParams(float* params)
 // 移除 ⇒ 三个 atomic 已删，这里写 0 保持 std140 偏移。
 void populateCloudTemporalParams(float* params)
 {
-    params[0] = 0.0f;
+    params[0] = static_cast<float>(g_cloudTemporalMode.load());
     params[1] = 0.0f;
     params[2] = g_cloudTemporalDamp.load();
     params[3] = 0.0f;
@@ -1074,24 +1277,18 @@ void populateCloudTemporalParams(float* params)
 // .y/.z 是活的（rt_test.rgen 的地面大气透视 + 遮挡衰减）。
 void populateCloudAerialParams(float* params)
 {
-    params[0] = 0.0f;
+    params[0] = g_cloudAerialStrength.load();
     params[1] = g_groundAerialStrength.load();
     params[2] = g_groundAerialOcclusion.load();
     params[3] = 0.0f;
 }
 
-// 2026-10-14 日落天光修正（CameraUBO.cloudSkyHueParams，偏移 1472）。
-// x 天光冷化强度 / y 天光能量衰减强度。
-// 2026-10-17：z 方向性天光强度 / w 顶底性质统一强度（原为保留，写 0）。
-//
-// 2026-11-07 死设置清理：整块在 cpp/shaders 里只剩 camera_ubo.glsl:107 的
-// 声明、零读取（v5 云模型没有接这四项）。四个 atomic 已删，整块写 0。
 void populateCloudSkyHueParams(float* params)
 {
-    params[0] = 0.0f;
-    params[1] = 0.0f;
-    params[2] = 0.0f;
-    params[3] = 0.0f;
+    params[0] = g_cloudStormDarkness.load();
+    params[1] = g_cloudLightningStrength.load();
+    params[2] = g_cloudSunsetWarmth.load();
+    params[3] = g_cloudWeatherCoupling.load();
 }
 
 // 2026-10-15 云地面反射与视觉回退参数（CameraUBO.cloudPhysicsParams，偏移 1488）。
@@ -1184,7 +1381,11 @@ void populateWaterStyleParams(float* params)
     params[1] = g_waterStyleTintMix.load();
     params[2] = g_waterStyleDensityScale.load();
     params[3] = g_waterStyleCausticStrength.load();
-    params[4] = g_waterStyleWaveSpeed.load();
+    // 2026-11-20：waterStyleParams1.x 改吃「风速」（g_waterFftWindSpeed/7），与 FFT
+    // 主表同源。这条车道唯一的活消费者是 rt_test_translucent.rchit 的解析波相位
+    // （group3 半透明命中组），原来由已下线的「波速」滑杆写死 1.0，跟 FFT 主表
+    // 的快慢不一致。现在两套波面共用同一个时间标量。
+    params[4] = std::min(std::max(g_waterFftWindSpeed.load() / 7.0f, 0.05f), 2.0f);
     params[5] = g_waterStyleSwellScale.load();
     params[6] = g_waterStyleMidScale.load();
     params[7] = g_waterStyleFineScale.load();

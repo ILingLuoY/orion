@@ -19,6 +19,9 @@
 // cam.waterSim*.
 // ===========================================================================
 
+// 2026-11-21 统一风场：风向 helper（本文件的全部宿主 TU 都已满足上面的 cam 契约）。
+#include "wind_common.glsl"
+
 #ifndef WATER_WAVE_FIELD_NO_DESCRIPTORS
 layout(binding = 33, set = 0) uniform sampler2DArray waterSimulationState;
 
@@ -258,25 +261,102 @@ float waterFftSlopeLodFromProj(vec3 surfacePos, float rayDistance, float projSca
     return clamp(log2(max(worldPerPixel / texelWorld, 1.0e-4)), -8.0, 9.0);
 }
 
+// ── 2026-11-20 波面重构 v2：多级 cascade，去掉扭曲与旋转 ────────────────
+//
+// v1 那版做了两件"网上主流实现都不做"的事，观感也确实是它们造成的：
+//
+//   · **域扭曲**（拿噪声梯度推采样坐标）：FFT 涌浪是严格周期的，扭曲只是把
+//     周期场再揉一遍 —— 揉出来的波峰形状不像水，还按周期地把缝/褶皱送到
+//     瓦片边界上。
+//   · **同谱异尺度 + 旋转的第二层**：同一份 Phillips 谱按 0.4351 倍周期、
+//     31.7° 旋转再采一次。同谱 ⇒ 同一组波峰以两个尺寸同时出现（非物理，会
+//     打出节拍感）；异向 ⇒ 交叉浪网。两者叠加就是"更怪"的来源。
+//
+// 主流 FFT 水体是怎么做的（本次直接照这个结构，不再自由发挥）：
+//
+//   · Crest（wave-harmonic/crest，`FFTSpectrum.compute`）：**多级 cascade**，
+//     每级一张 256² 图覆盖不同面积，且注释写明"不是最大级就只保留自己的波段，
+//     **按波段切分、互不重叠**"；远处的细节靠 LOD 收缩。
+//   · Mozobo/Ocean-Simulation（Unity URP 的 JONSWAP+TMA FFT）：README 直接
+//     写"单体 cascade 必然看得见 tiling（尤其从高处俯视）"，解法就是**多级
+//     cascade 各跑一段波长再混合**，并建议上限 4 级。
+//   · Unity HDRP Water System：Swell 两级 + Ripple 一级，同样按波段分。
+//
+// 我们这张图本来就已经是两级 cascade（宿主一次 finalize 出两个通道）：
+//   `.rg` = 长波级（平铺 128 格，谱覆盖 ~1.3~40 格）
+//   `.ba` = 短波级（平铺 32 格，谱覆盖 ~0.3~8 格，宿主的 detail band）
+// 所以正确做法不是再造一层，而是：
+//   ① 两级都按**同一风向**采样（谱里的 wind 方向本来就是同一个，
+//      不旋转 —— 真实海面所有尺度都朝同一个风向排列）；
+//   ② 权重按"短波级主导、长波级压住"重新配平：重复感来自长波级，
+//      把它压到辅助位就基本看不住，同时短波级把水面撑住；
+//   ③ 两级各自只保留自己的漂移相位，不再做任何坐标变形。
+//
+// 平静化：总增益 0.62，长波级 0.45 / 短波级 0.90。
+// 成本：水面像素仍是 2 次 textureLod（和改动前一样，比 v1 少一次）。
+//
+// 回退：WATER_FFT_CASCADE_BALANCE = 0 逐位回旧档（等权重、满增益）。
+#ifndef WATER_FFT_CASCADE_BALANCE
+#define WATER_FFT_CASCADE_BALANCE 1
+#endif
+// 长波级权重：重复感的唯一来源，压到 0.45 就是"看得见浪、看不住格"。
+const float WATER_FFT_SWELL_WEIGHT = 0.45;
+// 短波级权重：撑住水面的主结构。
+const float WATER_FFT_DETAIL_WEIGHT = 0.90;
+// 总增益：海况默认从"中浪"降到"微风"。
+const float WATER_FFT_TOTAL_GAIN = 0.62;
+
 // horizonFade = HORIZON_WAVE_FADE = 1 − exp(−4·|NoV|)，由调用方按
 // 相机→水面的视线与竖直方向的夹角算好传入（NoV = 该夹角的余弦 = |viewDir.y|）。
 // waveLod = 上面算好的 mip 级（0 = 最清，8 = 最糊）。
 vec2 waterFftSwellSlope(vec2 worldXZ, float horizonFade, float waveLod)
 {
     const float tilePeriod = max(cam.waterFftParams.x, 1.0e-3);
-    const vec2 uv = fract(worldXZ / tilePeriod);
-    const vec2 slope = textureLod(waterFftSlope, uv, clamp(waveLod, 0.0, 9.0)).rg;
+    // 两级 cascade 共用同一个时间与同一个漂移相位基准，方向不拆开：
+    // 2026-11-21 统一风场：FFT 谱风向已改由 push 下发（windDirXZ 同源角度），
+    // 这个采样漂移也转到同一风向（uv += drift ⇒ 图形朝 −drift 移动，取 −dir
+    // 让附加平流顺风走）；模长保持 0.0629（原 |(-0.055,0.031)|），仅旋转。
+    // 与 rgen_water_caustics.glsl 的 causticDrift 必须逐位同源。
+    float waveTime = uintBitsToFloat(cam.padding) *
+        clamp(cam.waterFftParams.w, 0.0, 4.0);
+    vec2 drift = -windDirXZ() * 0.0629 * waveTime;
 
+    // 长波级（128 格）：谱的低频段。
+    vec2 uvSwell = fract(worldXZ / tilePeriod + drift);
+    vec2 swellSlope =
+        textureLod(waterFftSlope, uvSwell, clamp(waveLod, 0.0, 9.0)).rg;
+
+    // 短波级（32 格）：同一张图的 .ba 通道，宿主按 detail band 单独算过。
     const float detailLod = clamp(
         waveLod + log2(max(tilePeriod / WATER_FFT_DETAIL_TILE, 1.0e-4)),
         0.0,
-        9.0
-    );
-    const vec2 detailUv = fract(worldXZ / WATER_FFT_DETAIL_TILE);
-    const vec2 detailSlope =
+        9.0);
+    vec2 detailUv = fract(worldXZ / WATER_FFT_DETAIL_TILE + drift * 1.7);
+    vec2 detailSlope =
         textureLod(waterFftSlope, detailUv, detailLod).ba;
 
-    return (slope + detailSlope) * horizonFade;
+#if WATER_FFT_CASCADE_BALANCE
+    // 2026-11-20：权重改由 GUI 驱动（设置页「涌浪权重 / 短波权重」）：
+    //   cam.waterFftParams2.z = 长波级（原 swellGain 车道）
+    //   cam.waterFftParams2.x = 短波级（原 windDirection 车道）
+    // 0 = 宿主没写这条车道（旧 DLL）⇒ 回落成本文件的出厂常量。
+    float swellWeight = cam.waterFftParams2.z;
+    if(swellWeight <= 0.0)
+    {
+        swellWeight = WATER_FFT_SWELL_WEIGHT;
+    }
+    float detailWeight = cam.waterFftParams2.x;
+    if(detailWeight <= 0.0)
+    {
+        detailWeight = WATER_FFT_DETAIL_WEIGHT;
+    }
+    return (
+        swellSlope * swellWeight +
+        detailSlope * detailWeight
+    ) * (WATER_FFT_TOTAL_GAIN * horizonFade);
+#else
+    return (swellSlope + detailSlope) * horizonFade;
+#endif
 }
 
 // ── 2026-11-15 程序化微波细法线层（用户要求新增；见文件头契约更新）──

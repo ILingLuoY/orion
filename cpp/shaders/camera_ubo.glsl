@@ -25,7 +25,10 @@
 
     vec4 waterSimSurfaceAndOrigin;
     uvec4 waterSimState;
-    vec4 waterSimImpulse;
+    // 2026-11-21 顾问轮1（F6）：原 waterSimImpulse 死车道（装玩家入水脉冲，
+    // 着色端零读者）改载群系水色 (R, G, B, valid)。C++ 字段同步改名
+    // waterBiomeTintR/G/B/Valid，字节布局零变化。
+    vec4 waterBiomeTint;
 
     vec4 weatherParams;
 
@@ -221,3 +224,29 @@
     // 宿主：环境变量 ORION_VIS_QUERY（4 位掩码），每帧写入。
     // 消费方：上述三个 rgen 点位各自的 query 臂（#if RTAO_VISIBILITY_EARLYOUT 包着）。
     uvec4 visQueryAb;
+
+    // ── matReuseAb ──（2026-11-17 追加在末尾，与 OrionInternal.h 顺序一致）
+    // P2 跨腿材质复用运行期闸门（不是编译期宏；同一份二进制内复用/非复用两条路径
+    // 共存，默认全 0 = 逐位旧行为）。宿主每帧从 getenv 写入：
+    //   [0] = ORION_MAT_REUSE_LEGS  1 = K2SUN 解析后把材质结果落中转 buffer，
+    //        K2LOC/K2I 读回灌进 payload、跳过 resolveHitMaterial；0 = 三条腿各自解析。
+    //   [1] = ORION_MAT_REUSE_ASSERT 1 = 一次性校验臂：消费者腿既读复用记录又原地
+    //        重跑一次解析，逐位比对，不一致计数进计数器缓冲 reservedLane6。
+    //   [2]/[3] = 保留（写 0）。
+    uvec4 matReuseAb;
+
+    // ── windParams ──（2026-11-21 追加在末尾，与 OrionInternal.h 顺序一致；
+    // 只许追加不许插入：中间插入会让后面所有字段整体平移）
+    //   x = 风向角（世界 XZ 平面，度；dir = (cos a, sin a)，出厂 30.5 ≈ HP 云原方向）
+    //   y = 风强倍率（0..2，1 = 出厂；植物摇摆/阵风幅度乘数）
+    //   z = 阵风强度（0..1，0 = 恒定风）
+    //   w = 有效性标记（1 = 宿主已写入本块）。消费方必须走 w > 0.5 判定：
+    //       旧 DLL 不写 ⇒ 全 0 ⇒ 回落各自原硬编码方向，逐位旧档
+    //       （回落常量统一在 wind_common.glsl 的 WIND_DEFAULT_DIR / windStrength /
+    //       windGust，见该文件头注释）。
+    // 消费方：wind_common.glsl（cloud_v5_core 经 HPCloudConfig.windDir 间接）、
+    //         tyndall_cloud_field / cloud_cirrus_v5 / volumetric_fog /
+    //         volumetric_cloud_resolve / water_wave_field / rgen_water_caustics /
+    //         material_resolve + rt_test.rahit（植物）。水 FFT compute 无 cam UBO，
+    //         风向走 push constant（Water.cpp waterFftDispatch）。
+    vec4 windParams;

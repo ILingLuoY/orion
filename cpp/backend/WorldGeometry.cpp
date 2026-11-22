@@ -661,6 +661,153 @@ bool rebuildWorldGeometry(
 
         RTLog(countersLog.str());
 
+        // 2026-11-15：**自愈扫描**（默认开，ORION_SECTION_SELFHEAL=0 关）。
+        // 动机：用户报告"每局一个固定一区块大小、永不恢复的洞，位置每局不同"。
+        // 根因类别是竞态（槽位/退休环/arena），确定性的对症修法需要多轮定位；
+        // 但"重建一次该段"对所有这些坏状态都有效（重建会重发槽位 + 重写 BLAS）。
+        // 做法：每 60 帧（≈1 s）把游标推进 4 段，把它们重新标脏 ⇒ 以 g_sectionBLAS
+        // 的规模（~5000 段）计约 20 分钟内全表轮一遍；对单个 ~5 ms 的重建成本而言
+        // 4 段/秒 ≈ 2% 单核占用，可忽略。
+        static const uint32_t sSelfHealPerSecond = []
+        {
+            const char* raw = std::getenv("ORION_SECTION_SELFHEAL_RATE");
+            if(raw == nullptr || raw[0] == '\0')
+            {
+                return 4u;
+            }
+            const int v = std::atoi(raw);
+            return v < 0 ? 0u : static_cast<uint32_t>(v);
+        }();
+
+        static bool sSelfHealEnabled = []
+        {
+            const char* raw = std::getenv("ORION_SECTION_SELFHEAL");
+            return raw == nullptr || raw[0] != '0';
+        }();
+
+        if(sSelfHealEnabled && sSelfHealPerSecond > 0u && !g_sectionBLAS.empty())
+        {
+            static size_t sSelfHealPhase = 0u;
+
+            std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+
+            const size_t total = g_sectionBLAS.size();
+            const size_t stride = std::max<size_t>(
+                1u,
+                total / std::max<size_t>(1u, sSelfHealPerSecond));
+
+            size_t index = 0u;
+            size_t healed = 0u;
+
+            for(auto it = g_sectionBLAS.begin();
+                it != g_sectionBLAS.end();
+                ++it, ++index)
+            {
+                if((index % stride) != sSelfHealPhase)
+                {
+                    continue;
+                }
+
+                // 只重建地形类（opaque/OMM）：实体/粒子每帧都在变，不归这里管。
+                const uint64_t classBits =
+                    it->second.sectionKey & ~SPATIAL_SECTION_KEY_MASK;
+
+                if(classBits != SECTION_AS_CLASS_OPAQUE &&
+                   classBits != SECTION_AS_CLASS_OMM)
+                {
+                    continue;
+                }
+
+                const uint64_t spatialKey =
+                    it->second.sectionKey & SPATIAL_SECTION_KEY_MASK;
+
+                if(g_dirtySectionKeys.insert(spatialKey).second)
+                {
+                    ++healed;
+                }
+            }
+
+            sSelfHealPhase = (sSelfHealPhase + 1u) % stride;
+
+            if(healed > 0u)
+            {
+                markWorldGeometryDirty();
+            }
+        }
+
+        // 2026-11-15：段级转储（ORION_SECTION_DUMP=1）。
+        // 目的：定位"固定一区块大小的永久洞"。
+        //   若洞里那段出现在本行的 zeroTri 列表（triangleCount==0）⇒ 几何到过
+        //     C++，死在下游（捕获/BLAS 构建）；
+        //   若整段不在 g_sectionBLAS 里 ⇒ 几何根本没到（Java 侧没发/被去重拦住）。
+        // 同时打印 asN（BLAS 表规模）与 dirtyN（待重建脏段数）。
+        static const bool sSectionDumpEnabled = []
+        {
+            const char* raw = std::getenv("ORION_SECTION_DUMP");
+            return raw != nullptr && raw[0] == '1';
+        }();
+
+        if(sSectionDumpEnabled)
+        {
+            size_t zeroTriCount = 0u;
+            size_t listed = 0u;
+            std::string zeroTriList;
+
+            for(const auto& entry : g_sectionBLAS)
+            {
+                const RTSectionAS& asEntry = entry.second;
+
+                // 只关心地形主类（opaque/OMM），实体/粒子类没有三角数是常态。
+                const uint64_t classBits =
+                    asEntry.sectionKey & ~SPATIAL_SECTION_KEY_MASK;
+
+                if(classBits != SECTION_AS_CLASS_OPAQUE &&
+                   classBits != SECTION_AS_CLASS_OMM)
+                {
+                    continue;
+                }
+
+                if(asEntry.triangleCount != 0u)
+                {
+                    continue;
+                }
+
+                ++zeroTriCount;
+
+                if(listed < 24u)
+                {
+                    ++listed;
+
+                    const uint64_t spatialKey =
+                        asEntry.sectionKey & SPATIAL_SECTION_KEY_MASK;
+
+                    const int32_t sx = sectionKeyColumnX(spatialKey);
+                    const int32_t sz = sectionKeyColumnZ(spatialKey);
+                    const int32_t sy =
+                        static_cast<int16_t>(
+                            (spatialKey >> 44) & 0xFFFFull);
+
+                    zeroTriList += " (" + std::to_string(sx) + "," +
+                        std::to_string(sy) + "," +
+                        std::to_string(sz) + ")";
+                }
+            }
+
+            size_t dirtyCount = 0u;
+
+            {
+                std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+                dirtyCount = g_dirtySectionKeys.size();
+            }
+
+            RTLogFlushed(
+                "[SECTION DUMP] asN=" + std::to_string(g_sectionBLAS.size()) +
+                " zeroTri=" + std::to_string(zeroTriCount) +
+                " dirtyN=" + std::to_string(dirtyCount) +
+                " zeroTriList(first " + std::to_string(listed) + "):" +
+                (zeroTriList.empty() ? std::string(" <none>") : zeroTriList));
+        }
+
         logNativeMemoryReport();
 
         logVramGovernor();
@@ -3059,6 +3206,19 @@ bool rebuildWorldGeometry(
             const uint64_t instanceSpatialKey =
                 section.sectionKey &
                 SPATIAL_SECTION_KEY_MASK;
+
+            // ===================================================================
+            // 2026-11-19 rasterLod（挂载点③，原规格行号 WorldGeometry.cpp:3210）：
+            // DH 键不进 TLAS —— 远场由 dh_lod_raster.comp 光栅投影接管，主射线
+            // miss 的像素由 K1 mode=14 从光栅 color/depth 图合成。与上面视锥
+            // 剔除的 continue 同款；旗标关闭时不进本分支，与改前逐位一致。
+            // ===================================================================
+            if(g_dhRasterLodEnabled &&
+               isDhLodSpatialKey(instanceSpatialKey))
+            {
+                ++g_dhLodRasterTlasSkips;
+                continue;
+            }
 
             if(g_dhFarFieldMode > 0.5f &&
                isDhLodSpatialKey(instanceSpatialKey))

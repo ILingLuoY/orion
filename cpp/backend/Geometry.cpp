@@ -1104,6 +1104,21 @@ void geometryCaptureSectionLocked(
     SectionGeometrySplit& split
 )
 {
+    // =======================================================================
+    // 2026-11-19 rasterLod（挂载点②，原规格行号 Geometry.cpp:1999/1102）：
+    // DH 键不再进 BLAS 捕获 —— 远场改由 dh_lod_raster.comp 光栅投影接管。
+    // 本函数是分类路由的唯一实现，三个消费者（捕获线程 / 增量批次 /
+    // forceReset）共用 ⇒ 单点门控即全覆盖。空 split 走下游
+    // rebuildGeometryClass 的 vertices.empty() 分支 = retire 旧 BLAS、不建新。
+    // 旗标关闭时本分支不执行，与改前逐位一致。
+    // =======================================================================
+    if(g_dhRasterLodEnabled && isDhLodSpatialKey(spatialSectionKey))
+    {
+        SectionGeometrySplit emptySplit;
+        split = std::move(emptySplit);
+        return;
+    }
+
     for(uint64_t layerIndex = 0ull; layerIndex < 16ull; ++layerIndex)
     {
         auto layerIt = g_chunkMeshes.find(
@@ -2558,6 +2573,28 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
     g_chunkUploadCalls.fetch_add(1u, std::memory_order_relaxed);
 
     if (vertexCount == 0 || vertexPointer == 0 || vertexStride != 28) {
+        // 2026-11-15：这条路径会**擦掉**该段的缓存几何。Java 侧上传成功后会把
+        // 哈希记进 SectionUploadDedup，之后同内容不再重发 ⇒ 若这里误判（例如
+        // 某条上传路径的 stride 不是 28），表现就是"固定一区块大小的永久洞"。
+        // 以前完全静默，现在带坐标留痕（限频）。
+        {
+            static uint32_t sUploadEraseLogCount = 0u;
+
+            if((++sUploadEraseLogCount % 50u) == 1u)
+            {
+                RTLog(
+                    "[CHUNK UPLOAD ERASE] section=(" +
+                    std::to_string(sectionX) + "," +
+                    std::to_string(sectionY) + "," +
+                    std::to_string(sectionZ) + ") layer=" +
+                    std::to_string(layerId) + " count=" +
+                    std::to_string(vertexCount) + " ptr=" +
+                    std::to_string(vertexPointer) + " stride=" +
+                    std::to_string(vertexStride) + " total=" +
+                    std::to_string(sUploadEraseLogCount));
+            }
+        }
+
         std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
         const ChunkMutexHoldProbe chunkHoldProbe("uploadErase");
 
@@ -2582,7 +2619,39 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
         return;
     }
 
-    if (vertexCount % 4 != 0) return;
+    if (vertexCount % 4 != 0)
+    {
+        // 2026-11-15：以前这里是**静默 return** —— 不存几何、不标脏、不打日志。
+        // 而 Java 侧（SectionCompilerMixin）在上传返回后会把这个内容记进
+        // SectionUploadDedup，之后同内容被 shouldSkip 拦住不再重发 ⇒ 该段
+        // 永远拿不到几何，表现就是"固定一区块大小的永久洞"（用户 2026-11-15
+        // 报告）。这里改为：留痕 + 重新标脏（至少让它有机会用旧数据补上），
+        // 便于一局内定位到底是哪条上传路径送来了非 4 倍数顶点数。
+        {
+            static uint32_t sMod4RejectLogCount = 0u;
+
+            if((++sMod4RejectLogCount % 20u) == 1u)
+            {
+                RTLog(
+                    "[CHUNK UPLOAD REJECT] reason=mod4 section=(" +
+                    std::to_string(sectionX) + "," +
+                    std::to_string(sectionY) + "," +
+                    std::to_string(sectionZ) + ") layer=" +
+                    std::to_string(layerId) + " count=" +
+                    std::to_string(vertexCount) + " stride=" +
+                    std::to_string(vertexStride) + " total=" +
+                    std::to_string(sMod4RejectLogCount));
+            }
+        }
+
+        {
+            std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+            g_dirtySectionKeys.insert(spatialSectionKey);
+            markWorldGeometryDirty();
+        }
+
+        return;
+    }
 
     const uint8_t* const rawMemory =
         reinterpret_cast<const uint8_t*>(vertexPointer);
@@ -2999,6 +3068,11 @@ int32_t sectionKeyColumnZ(uint64_t spatialKey)
 // therefore owns many keys at once.
 uint32_t sectionRoleOf(const RTSectionAS& section)
 {
+    // 2026-11-19 rasterLod（挂载点④，原规格行号 Sections.cpp:3962 /
+    // Geometry.cpp:3054）：DH 角色不再入 binding 19 角色表 —— 由挂载点②
+    // （geometryCaptureSectionLocked 跳 DH 键）结构性保证：DH 键的 BLAS
+    // 根本不会被创建，writeSectionRoleSlot 因此不会被 DH 节调用，本函数
+    // 不会遇到 DH 键。旗标关闭时行为与改前逐位一致（本注释不改变行为）。
     const bool lodSpatialKey =
         (section.sectionKey & VOXY_LOD_RESERVED_Y) == VOXY_LOD_RESERVED_Y;
 

@@ -509,10 +509,11 @@ void createCameraUBO() {
     ubo->waterSimEnabled = 0u;
     ubo->waterSimImpulsePending = 0u;
     ubo->cameraInWater = 0u;
-    ubo->waterSimImpulseX = 0.0f;
-    ubo->waterSimImpulseZ = 0.0f;
-    ubo->waterSimImpulseStrength = 0.0f;
-    ubo->waterSimImpulseSurfaceY = 0.0f;
+    // 2026-11-21（F6）：群系水色槽——初始 0 = valid 关闭，着色端回落海洋参照。
+    ubo->waterBiomeTintR = 0.0f;
+    ubo->waterBiomeTintG = 0.0f;
+    ubo->waterBiomeTintB = 0.0f;
+    ubo->waterBiomeTintValid = 0.0f;
 
     ubo->weatherParams[0] = 0.0f;
     ubo->weatherParams[1] = 0.0f;
@@ -529,6 +530,8 @@ void createCameraUBO() {
     populateCloudParams(ubo->cloudParams);
     populateSkyParams(ubo->skyParams);
     populateSkyModelParams(ubo->skyModelParams);
+    populateMoonParams(ubo->moonParams);
+    populateFogMoodParams(ubo->fogMoodParams);
     populateGalaxyParams(ubo->galaxyParams);
     populateGodRayParams(ubo->godRayParams);
     populateGroundMistParams(ubo->godRayParams + 4);

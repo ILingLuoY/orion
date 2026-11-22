@@ -19,7 +19,9 @@ const float TERRAIN_HEIGHT_MARGIN = 32.0;
 
 const float TERRAIN_HEIGHT_EMPTY = -1.0e30;
 
-const uint TERRAIN_HEIGHT_CULL_MASK = 0x04u;
+// 0x08u hits opaque terrain & OMM foliage while excluding hand (0x04),
+// local player (0x02), and particles (0xF7).
+const uint TERRAIN_HEIGHT_CULL_MASK = 0x08u;
 
 const float TERRAIN_HEIGHT_ORIGIN_BIAS = 0.02;
 
@@ -67,17 +69,29 @@ float terrainGroundHeight(vec2 worldXZ, out float outsideDistance)
 float terrainHeightTrace(vec3 origin, vec3 direction, float maxDistance)
 {
     rayQueryEXT query;
+    // Closest-hit traversal (NO TerminateOnFirstHit) so downward probe finds
+    // the true top ground surface rather than an arbitrary cave floor.
     rayQueryInitializeEXT(
         query,
         sceneTlas,
-        gl_RayFlagsTerminateOnFirstHitEXT |
-            gl_RayFlagsSkipClosestHitShaderEXT,
+        0u,
         TERRAIN_HEIGHT_CULL_MASK,
         origin,
         TERRAIN_HEIGHT_ORIGIN_BIAS,
         direction,
         maxDistance);
-    while(rayQueryProceedEXT(query)) {}
+    int guard = 0;
+    while(rayQueryProceedEXT(query) && ++guard < 64)
+    {
+        if(rayQueryGetIntersectionTypeEXT(query, false) ==
+           gl_RayQueryCandidateIntersectionTriangleEXT)
+        {
+            if(rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(query, false) <= 1u)
+            {
+                rayQueryConfirmIntersectionEXT(query);
+            }
+        }
+    }
     if(rayQueryGetIntersectionTypeEXT(query, true) ==
         gl_RayQueryCommittedIntersectionNoneEXT)
     {

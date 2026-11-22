@@ -1,0 +1,313 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// ===========================================================================
+// 2026-11-16：体积雾的独立屏幕 march pass（与云彻底解耦）。
+//
+// 雾的 16 步 march 原来内嵌在云 pass（volumetric_clouds_v5）里 ⇒
+// cloudEnabled=false 时整条链被跳过，雾跟着消失。现在把 evaluateAnalyticFog
+// 搬到这里，无条件录制：云开着由 v5 采样两张输出图；云关着由
+// fog_screen_apply 直接合成到场景图。密度/光照口径与 v5 内嵌版逐项一致。
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(set = 0, binding = 1) uniform sampler3D cloudShapeNoise;
+layout(set = 0, binding = 2) uniform sampler3D cloudCurlNoise;
+layout(set = 0, binding = 5) uniform sampler2D sceneDepth;
+layout(set = 0, binding = 6) uniform sampler2D sunShadowMap;
+layout(set = 0, binding = 7) uniform sampler2D terrainHeightMap;
+layout(set = 0, binding = 8) uniform sampler2D sunShadowMapFar;
+layout(set = 0, binding = 14) uniform sampler2D cloudShadowMap;
+
+// 2026-11-18：云影图的覆盖半径，必须与 rt_cloud_shadow.comp 里的
+// CLOUD_SHADOW_EXTENT（512）以及 rt_cloud_shadow.comp 的 UV 映射一致：
+//   uv = (worldXZ - cameraXZ) / (2 * EXTENT) + 0.5
+const float FOG_CLOUD_SHADOW_EXTENT = 512.0;
+layout(set = 0, binding = 16) uniform accelerationStructureEXT fogTlas;
+
+layout(rgba16f, set = 0, binding = 19) uniform writeonly image2D fogScreenColorOut;
+layout(rg16f, set = 0, binding = 20) uniform writeonly image2D fogScreenDistOut;
+
+const float V4_EMPTY = 1000000.0;
+const float V4_PI = 3.14159265;
+
+// volumetric_fog.glsl 需要这个符号（v5 同款，在 include 之前定义）。
+float hgPhase(float cosine, float g)
+{
+    float g2 = g * g;
+    float d = max(1.0e-4, 1.0 + g2 - 2.0 * g * cosine);
+    return (1.0 - g2) / (4.0 * V4_PI * d * sqrt(d));
+}
+
+#include "sky_model_common.glsl"
+#include "sky_sun_common.glsl"
+#include "clear_sky_aerial.glsl"
+
+// 2026-11-18 一次性诊断：把雾的太阳项画成颜色（见 volumetric_fog.glsl 顶部）。
+// 诊断已完成（结论：阴影图路径全判遮挡），这一版关闭诊断看真实画面。
+#define VFOG_DEBUG_OUT 0
+
+#define TERRAIN_HEIGHT_CONSUMER 1
+#include "terrain_height.glsl"
+
+#define SUN_SHADOW_FAR_MAP 1
+#define SUN_SHADOW_CONSUMER 1
+#define SUN_SHADOW_PCF_TAPS_4 1
+#define SUN_SHADOW_FOG_UNION 1
+#define SUN_SHADOW_FRAME_SEED 0
+#define SUN_SHADOW_TREAT_NO_HIT_AS_NO_DATA 1
+#define VFOG_CLOUD_SHADOW_MAP 1
+// 2026-11-18（回归修复）：近场太阳遮挡改走**地形高度场**（binding 7）。
+// 阴影图与 TLAS 射线两路实测恒判遮挡，导致太阳项恒 0、任何角度都没光柱。
+#define VFOG_SUN_HEIGHTVIS 1
+// 2026-11-19：太阳阴影图当前对雾样本几乎恒判遮挡（另案修），默认不参与光柱。
+#define VFOG_SHADOWMAP_OCCLUSION 0
+// 对照实验：旁路全部太阳可见性，验证"太阳项本身是否为 0"。
+#define VFOG_FORCE_SUN 0
+#define VFOG_SUN_RAY 1
+#include "sun_shadow.glsl"
+
+#include "fog_density_common.glsl"
+#include "local_light_grid_common.glsl"
+#include "volumetric_fog.glsl"
+
+float sceneDistanceForDepth(vec2 ndc, float depthValue)
+{
+    if(depthValue <= 1.0e-5) return 1.0e30;
+    vec4 p = cam.projInverse * vec4(ndc, depthValue, 1.0);
+    if(abs(p.w) <= 1.0e-6) return 1.0e30;
+    return length(p.xyz / p.w);
+}
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(fogScreenColorOut);
+    if(pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 outColor = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 outDist = vec2(0.0, 0.0);
+
+    // 2026-11-16 链路诊断（默认关闭）：输出固定的半透明白。
+    // 画面出现半透明白雾 ⇒ march→apply 链通，问题在 evaluateAnalyticFog 的数值；
+    // 画面无任何变化 ⇒ march 的写入丢失（描述符/图绑定问题）。
+    //
+    // 注意：这里必须用 `#if` 而不是 `#ifdef`。宏**总是**被定义（值为 0），
+    // `#ifdef` 只判"有没有定义"，会把调试白幕无条件编进生产 SPV，
+    // 表现就是整屏一整个白幕（2026-11-16 事故）。
+    // A/B：-DFOG_MARCH_DEBUG_SOLID=1 重编 fog_screen_march.comp 才打开。
+#ifndef FOG_MARCH_DEBUG_SOLID
+#define FOG_MARCH_DEBUG_SOLID 0
+#endif
+#if FOG_MARCH_DEBUG_SOLID
+    imageStore(fogScreenColorOut, pixel, vec4(1.0, 1.0, 1.0, 0.5));
+    imageStore(fogScreenDistOut, pixel, vec4(0.0, 100.0, 0.0, 0.0));
+    return;
+#endif
+
+    const float enabled = cam.cloudParams7.x;
+    const float maxDistance = cam.cloudParams8.w;
+    const float startDistance = cam.cloudParams9.x;
+
+    if(enabled >= 0.5)
+    {
+        const vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+        vec2 ndc = uv * 2.0 - 1.0;
+        ndc.y = -ndc.y;
+        const vec4 viewPosition = cam.projInverse * vec4(ndc, 1.0, 1.0);
+        const vec3 viewTarget = abs(viewPosition.w) > 1.0e-6
+            ? viewPosition.xyz / viewPosition.w : viewPosition.xyz;
+        const vec3 worldDirection =
+            normalize((cam.viewInverse * vec4(normalize(viewTarget), 0.0)).xyz);
+        const vec3 cameraPosition = cam.viewInverse[3].xyz;
+
+        // =================================================================
+        // 2026-11-19（根因修复）：**场景距离改由地形高度场求首个交点**。
+        //
+        // 病征链：诊断图整屏白 ⇒ sceneDistance 恒 1e30 ⇒ volumetric_fog.glsl 的
+        // "天空早退"对每个像素生效 ⇒ 16 步 march 一次都不执行 ⇒ 遮挡/增益/密度
+        // 全部落空（这才是"怎么改都没有光柱"的真正原因）。
+        //
+        // 试过的两条外部来源都不可靠：
+        //   · binding 5（云描述符集里的 g_dlssDepthView）：读出恒 0；
+        //   · fogTlas 主射线：对大多数地形像素 miss（AS/坐标系与 RT 用的不一致），
+        //     结果整片退回天空薄霾、地形被雾盖成"透明"。
+        //
+        // 现在只用**已经绑在 binding 7 的地形高度图**沿视线求交：指数推进 8 个
+        // 采样点，第一个"射线高度 ≤ 地形高度"的点就是地面距离。完全自足，不依赖
+        // 深度图、不依赖加速结构。
+        // 未命中（视线朝上 / 出了高度场范围）⇒ 用 maxDistance 封顶，
+        // 而"天空"的判定改由仰角负责（见 volumetric_fog.glsl 的 skyWeight）。
+        // =================================================================
+        float sceneDistance = maxDistance;
+        {
+            float advance = 2.0;
+            for(int k = 0; k < 9; ++k)
+            {
+                const vec3 probe = cameraPosition + worldDirection * advance;
+                if(probe.y > TERRAIN_HEIGHT_WORLD_TOP)
+                {
+                    break;   // 已高过地形范围：这段不可能再被地形挡住
+                }
+
+                float outside = 0.0;
+                const float groundHeight = terrainGroundHeight(probe.xz, outside);
+                if(outside <= TERRAIN_HEIGHT_OUTSIDE_FADE_BLOCKS &&
+                    groundHeight > TERRAIN_HEIGHT_EMPTY * 0.5 &&
+                    probe.y <= groundHeight)
+                {
+                    sceneDistance = advance;
+                    break;
+                }
+
+                advance *= 2.0;
+                if(advance > maxDistance)
+                {
+                    break;
+                }
+            }
+        }
+
+        const vec3 lightDir0 = sunDirection();
+        const float sunElevation = lightDir0.y;
+        // 2026-11-19：夜间光源改用**真实月亮位置**（与 rgen / rmiss / 云 /
+        // 光柱同一向量）。旧式用 -lightDir0（"永远满月、永远与太阳正对"），
+        // 与其它三处不一致 ⇒ 入夜后雾的受光方向与云/光柱对不上。
+        const vec3 moonLightDir0 = moonEclipticDirectionAt(
+            moonDecalPhase01(cam.historyParams.w, cam.sssParams.z));
+        // 直射光交接带与云同口径（sky_model_common.glsl 单一真源）：旧式在
+        // sunElevation >= 0 处硬翻方向，而 dayAmount 在翻转点只有 0.5 ⇒ 雾的
+        // 太阳散射项还有 0.75 能量时整束换方向 ⇒ 夕阳时地平线上那团暖光
+        // 突然跳到天的另一边。新式交接点下移到 -0.05 且两侧在该点同时归零。
+        const float sunDirectAmount = skyDirectSunAmount(sunElevation);
+        const float moonDirectAmount = skyDirectMoonAmount(sunElevation);
+        const bool sunIsDirectLight = skyDirectIsSun(sunElevation);
+        const vec3 lightDirection =
+            sunIsDirectLight ? lightDir0 : moonLightDir0;
+        const float dayAmount = smoothstep(-0.03, 0.03, sunElevation);
+        const float elevationMagnitude = abs(sunElevation) / 0.81915204429;
+        // 月光能量必须用月亮自己的高度：月亮按月相移动后它与太阳下沉深度
+        // 不再互为相反数（旧式 elevationMagnitude 是"太阳下沉深度"）。
+        const float moonElevationMagnitude =
+            clamp(moonLightDir0.y / 0.81915204429, 0.0, 1.0);
+        const float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
+
+        // 太阳侧用连续版：skyModelSunColor() 在 sun<0 处会提前变月蓝，交接带
+        // 里能量还没归零颜色就先换了（跳变根源）。
+        const vec3 directLightColor = sunIsDirectLight
+            ? skyModelSunColorContinuous(lightDir0, 0.5)
+            : skyModelMoonColor(-moonLightDir0.y);
+        // 2026-11-18：太阳辐照度**不再乘云的「阳光强度」**（cloudParams5.z）。
+        //
+        // 病征（用户）：关掉体积云之后，体积雾与体积光一起消失；把云的日照强度
+        // 调高，雾和光柱又回来。根因就是这一行：cloudParams5.z 是
+        // g_cloudSunlightStrength（Settings.cpp:795 params[22]），属于**云的旋钮**。
+        // 云关掉/调低时它被清零，雾的太阳散射项随之归零 —— 雾只剩环境项，
+        // 光柱直接没有源。
+        // 现在改用雾自己的「太阳强度」车道 cloudParams8.z（g_fogSunStrength，
+        // 默认 1.0，UI 里本来就有这个旋钮），与云完全无关。
+        float directLightEnergy =
+            (1.5 * sunDirectAmount +
+             1.5 * (0.05 / 1.22077458876) * moonElevationMagnitude * moonDirectAmount) *
+            clamp(cam.cloudParams8.z, 0.0, 3.0);
+
+        // =================================================================
+        // 2026-11-18：**云隙光** —— 按像素采云影图（binding 14）。
+        //
+        // 老问题："头顶天空没有光源，却有垂直光柱"。根因之一：雾的太阳项一路
+        // cloudGapTransmittance() 被写死 1.0，完全不知道云的存在。
+        // 上一版先用"全屏一致"的 exp(-τ_cloud) 压住了这个病，但那只能整体变暗，
+        // 画不出"亮柱从云缝下来"。
+        //
+        // 现在改采云影图：rt_cloud_shadow.comp 每帧以相机为中心 ±512 格、
+        // 沿太阳方向积云的密度，输出 256² 透射率。逐像素采样 ⇒ 缝隙亮、云盖暗，
+        // 柱子的形状就是真实云缝的形状。
+        //
+        // 采样点在视线前方（最多 128 格），对应"这束光穿过云层时走的那一列"。
+        // 出界后淡回 1.0（否则夹取会把边缘遮挡铺到远处，远处整片变暗）。
+        // =================================================================
+        const float cloudDeckOn = cam.cloudParams1.w >= 0.5 ? 1.0 : 0.0;
+        if(cloudDeckOn > 0.5)
+        {
+            const vec3 cloudProbe =
+                cameraPosition + worldDirection * min(sceneDistance * 0.6, 128.0);
+            const vec2 cloudUv = vec2(
+                (cloudProbe.x - cam.viewInverse[3].x) /
+                    (2.0 * FOG_CLOUD_SHADOW_EXTENT) + 0.5,
+                (cloudProbe.z - cam.viewInverse[3].z) /
+                    (2.0 * FOG_CLOUD_SHADOW_EXTENT) + 0.5);
+            const vec2 cloudOut =
+                max(max(-cloudUv, cloudUv - 1.0), vec2(0.0));
+            const float cloudFade =
+                1.0 - smoothstep(0.0, 0.08, max(cloudOut.x, cloudOut.y));
+            const float cloudMapT = textureLod(
+                cloudShadowMap, clamp(cloudUv, 0.0, 1.0), 0.0).r;
+            const float cloudTransmittance = mix(1.0, cloudMapT, cloudFade);
+
+            directLightEnergy *= cloudTransmittance;
+        }
+
+        const float daylight =
+            mix(0.08, 1.0, smoothstep(-0.10, 0.25, sunElevation));
+        const float skyScale = daylight * clamp(elevationMagnitude, 0.0, 1.0);
+
+        // 与 v5 同口径：legacy 常数色与天空环境项按 fogExtrasParams.z 混合，
+        // 天空权重上限 0.35（Mie 前向瓣的方向性被压住，避免"隔墙看到太阳方位
+        // 的白光"，见 v5 同处注释）。
+        const vec3 fogAmbientLegacy = mix(vec3(0.055, 0.070, 0.125),
+            vec3(0.62, 0.72, 0.92), dayAmount);
+        const vec3 fogAmbientSky = fogSkyAmbient(worldDirection, sunElevation,
+            lightDirection, directLightColor, skyScale, mix(1.0, 0.20, rain));
+        const vec3 fogAmbient = mix(fogAmbientLegacy, fogAmbientSky,
+            clamp(cam.fogExtrasParams.z, 0.0, 0.35));
+
+        FogResult fog = evaluateAnalyticFog(cameraPosition, worldDirection,
+            sceneDistance,
+            directLightColor * directLightEnergy, lightDirection,
+            fogAmbient, rain,
+            cam.cloudParams7.x, cam.cloudParams7.y, cam.cloudParams7.z,
+            cam.cloudParams7.w,
+            cam.cloudParams8.x, cam.cloudParams8.y, cam.cloudParams8.z,
+            cam.cloudParams8.w,
+            cam.cloudParams9.x, cam.cloudParams9.y, cam.cloudParams9.z,
+            cam.fogExtrasParams.y, cam.fogExtrasParams.w,
+            cam.fogExtrasParams.x,
+            vec4(0.0),
+            vec2(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5)));
+
+        outColor = vec4(fog.scattering, fog.transmittance);
+        outDist = vec2(fog.firstDistance, fog.meanDistance);
+
+        // 2026-11-18 三通道数值探针（当前开启）：
+        //   R = 受光比例 litFraction（shadow 加权平均）
+        //   G = 太阳方向累积散射密度 rayDensityAccum×40
+        //   B = **最终**太阳项长度×3（已含 tint / 抬头压制 / 雨天归零 / SHAFT_GAIN）
+        // 三者一起看就能唯一确定断点在哪一项。
+#if VFOG_DEBUG_OUT
+        // 2026-11-18 三通道（在 comp 里算，不受函数内部早退影响）：
+        //   R = sceneDistance / maxDist   —— 深度是否正常（地形应在 0.1~0.5）
+        //   G = skyWeight（是否被判成天空，>0.999 就会走"均匀薄霾"早退）
+        //   B = 最终雾散射亮度 ×4
+        outColor = vec4(
+            clamp(sceneDistance / max(cam.cloudParams8.w, 1.0), 0.0, 1.0),
+            clamp(smoothstep(0.85, 0.99,
+                sceneDistance / max(cam.cloudParams8.w, 1.0)), 0.0, 1.0),
+            clamp(length(fog.scattering) * 4.0, 0.0, 1.0),
+            0.0);
+        outDist = vec2(0.0, 1000.0);
+#endif
+    }
+
+    imageStore(fogScreenColorOut, pixel, outColor);
+    imageStore(fogScreenDistOut, pixel, vec4(outDist, 0.0, 0.0));
+}

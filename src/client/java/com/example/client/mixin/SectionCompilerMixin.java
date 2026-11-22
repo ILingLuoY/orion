@@ -1,6 +1,7 @@
 package com.example.client.mixin;
 
 import com.example.vulkan.NativeVulkan;
+import com.example.vulkan.RustBridge;
 import com.example.client.access.PBRAtlasStorage;
 import com.example.client.access.OmmCutoutClassifier;
 import com.example.client.access.SectionUploadDedup;
@@ -38,6 +39,20 @@ public class SectionCompilerMixin {
     private static final int SECTION_EDGE = 16;
     private static final int SECTION_VOXEL_COUNT =
             SECTION_EDGE * SECTION_EDGE * SECTION_EDGE;
+
+    // ===== Rust VPT 反照率（orion_farfield，-Dorion.rustVpt=true 启用；见 HANDOFF-2026-11-17 §9）=====
+    private static final boolean RUST_VPT = Boolean.getBoolean("orion.rustVpt");
+    private static int VPT_DIAG;
+    private static final int VPT_PLAN_QUAD_CAP = 32768;
+    // VPT 中间缓冲必须 ThreadLocal：section 编译跑在多个 worker 线程上，static 共享
+    // 会跨线程互覆（plan 被别的线程覆盖 → 探针读到垃圾坐标 → getBlockState 拖死 worker
+    // → 渲染线程 VK 信号量 5s 超时崩溃）。与 SectionScratch 同一模式。
+    private static final ThreadLocal<ByteBuffer> VPT_PARAMS_BUF = ThreadLocal.withInitial(
+            () -> ByteBuffer.allocateDirect(48).order(ByteOrder.nativeOrder()));
+    private static final ThreadLocal<ByteBuffer> VPT_PLAN_BUF = ThreadLocal.withInitial(
+            () -> ByteBuffer.allocateDirect(VPT_PLAN_QUAD_CAP * 48).order(ByteOrder.nativeOrder()));
+    private static final ThreadLocal<ByteBuffer> VPT_BITS_BUF = ThreadLocal.withInitial(
+            () -> ByteBuffer.allocateDirect(VPT_PLAN_QUAD_CAP * 6).order(ByteOrder.nativeOrder()));
     private static final int SECTION_VOXEL_BYTES =
             SECTION_VOXEL_COUNT * Integer.BYTES;
 
@@ -417,19 +432,47 @@ public class SectionCompilerMixin {
                         scTagNanos += System.nanoTime() - scTTag;
                     } else {
                         final long scTFused = System.nanoTime();
-                        accumulateVptAlbedoAndTagRainPuddles(
-                                sectionPos,
-                                region,
-                                vertexBuffer,
-                                vertexCount,
-                                stride,
-                                vptRed,
-                                vptGreen,
-                                vptBlue,
-                                vptCount,
-                                entry.getKey().ordinal() == 1,
-                                scratch
-                        );
+                        boolean vptRustHandled = false;
+                        if (RUST_VPT) {
+                            try {
+                                vptRustHandled = accumulateVptAlbedoRust(
+                                        sectionPos,
+                                        region,
+                                        vertexBuffer,
+                                        vertexCount,
+                                        stride,
+                                        vptRed,
+                                        vptGreen,
+                                        vptBlue,
+                                        vptCount,
+                                        entry.getKey().ordinal() == 1,
+                                        scratch);
+                            } catch (Throwable failure) {
+                                if (VPT_DIAG < 3) {
+                                    VPT_DIAG++;
+                                    System.out.println("[RUST-VPT] failed, fallback to Java: " + failure
+                                            + " | vc=" + vertexCount + " cap=" + vertexBuffer.capacity()
+                                            + " lim=" + vertexBuffer.limit() + " pos=" + vertexBuffer.position()
+                                            + " stride=" + stride + " ord=" + entry.getKey().ordinal());
+                                }
+                                vptRustHandled = false;
+                            }
+                        }
+                        if (!vptRustHandled) {
+                            accumulateVptAlbedoAndTagRainPuddles(
+                                    sectionPos,
+                                    region,
+                                    vertexBuffer,
+                                    vertexCount,
+                                    stride,
+                                    vptRed,
+                                    vptGreen,
+                                    vptBlue,
+                                    vptCount,
+                                    entry.getKey().ordinal() == 1,
+                                    scratch
+                            );
+                        }
                         scFusedNanos += System.nanoTime() - scTFused;
                     }
 
@@ -1670,6 +1713,159 @@ public class SectionCompilerMixin {
         }
 
         return 0;
+    }
+
+    /**
+     * Rust VPT 路径（-Dorion.rustVpt=true）：plan（纯几何探针槽）→ Java 逐槽探针
+     * （控制流/调用次数与生产一致；槽位谓词位 0x80|bits，未探=0xFF）→
+     * build（albedo 累加 + 就地植被/雨洼打标全在 Rust）。返回 false = 回落 Java 路径。
+     * 对拍与 A/B：rust/orion-farfield/bench/OrionFarFieldBench.java VPT 段。
+     */
+    private static boolean accumulateVptAlbedoRust(
+            SectionPos sectionPos,
+            net.minecraft.client.renderer.chunk.RenderSectionRegion region,
+            ByteBuffer vertexBuffer, int vertexCount, int stride,
+            int[] red, int[] green, int[] blue, int[] count,
+            boolean cutoutLayer, SectionScratch scratch) {
+        if (region == null || vertexBuffer == null || !vertexBuffer.isDirect()
+                || stride != 28 || vertexCount <= 0 || (vertexCount % 4) != 0) {
+            return false;
+        }
+        final com.mojang.blaze3d.platform.NativeImage albedoAtlas =
+                PBRAtlasStorage.globalVptAlbedoAtlas;
+        final boolean doAlbedo = albedoAtlas != null;
+        if (!RustBridge.available()) {
+            return false;
+        }
+        if (vertexCount / 4 > VPT_PLAN_QUAD_CAP) {
+            return false;
+        }
+
+        ByteBuffer pbuf = VPT_PARAMS_BUF.get();
+        ByteBuffer vptPlanBuf = VPT_PLAN_BUF.get();
+        ByteBuffer vptBitsBuf = VPT_BITS_BUF.get();
+        pbuf.clear();
+        pbuf.putInt(sectionPos.minBlockX()).putInt(sectionPos.minBlockY()).putInt(sectionPos.minBlockZ());
+        pbuf.putInt(vertexCount).putInt(stride);
+        pbuf.putInt(doAlbedo ? albedoAtlas.getWidth() : 0);
+        pbuf.putInt(doAlbedo ? albedoAtlas.getHeight() : 0);
+        pbuf.putInt(cutoutLayer ? 1 : 0);
+        pbuf.putInt(doAlbedo ? 1 : 0);
+        pbuf.putInt(vertexCount / 4);
+        pbuf.putLong(doAlbedo ? albedoAtlas.getPointer() : 0L);
+        pbuf.flip();
+
+        vptPlanBuf.clear();
+        int slots;
+        try {
+            slots = RustBridge.vptPlan(pbuf, vertexBuffer, vptPlanBuf);
+        } catch (Throwable planFailure) {
+            if (VPT_DIAG < 3) {
+                VPT_DIAG++;
+                System.out.println("[RUST-VPT] PLAN threw: " + planFailure
+                        + " | vc=" + vertexCount + " cap=" + vertexBuffer.capacity()
+                        + " lim=" + vertexBuffer.limit() + " pos=" + vertexBuffer.position()
+                        + " stride=" + stride + " cutout=" + cutoutLayer);
+                for (StackTraceElement frame : planFailure.getStackTrace()) {
+                    if (frame.getClassName().startsWith("com.example.")) {
+                        System.out.println("    at " + frame);
+                    }
+                }
+            }
+            return false;
+        }
+        if (slots < 0 || slots % 6 != 0) {
+            if (VPT_DIAG < 3) {
+                VPT_DIAG++;
+                System.out.println("[RUST-VPT] plan failed (fallback to Java): slots=" + slots
+                        + " | vc=" + vertexCount + " cap=" + vertexBuffer.capacity()
+                        + " lim=" + vertexBuffer.limit() + " pos=" + vertexBuffer.position()
+                        + " stride=" + stride + " cutout=" + cutoutLayer);
+            }
+            return false;
+        }
+        final int quads = slots / 6; // 钳制后 quad 数（MC 26.x vertexBuffer 容量按 28B/quad 记，vertexCount 是 4× 展开数）
+        if (VPT_DIAG < 3) {
+            VPT_DIAG++;
+            System.out.println("[RUST-VPT] ok: vc=" + vertexCount + " cap=" + vertexBuffer.capacity()
+                    + " lim=" + vertexBuffer.limit() + " pos=" + vertexBuffer.position()
+                    + " stride=" + stride + " cutout=" + cutoutLayer
+                    + " quadsClaimed=" + (vertexCount / 4) + " quadsRust=" + quads);
+        }
+
+        // 探针循环（控制流与生产一致：getBlockState 次数同量同序）
+        final BlockPos.MutableBlockPos probe = new BlockPos.MutableBlockPos();
+        vptBitsBuf.clear();
+        for (int quad = 0; quad < quads; ++quad) {
+            for (int s = 0; s < 6; ++s) {
+                final int kind = vptPlanBuf.get() & 0xFF;
+                vptPlanBuf.get(); // pad
+                final int lx = vptPlanBuf.getShort();
+                final int ly = vptPlanBuf.getShort();
+                final int lz = vptPlanBuf.getShort();
+                byte out;
+                switch (kind) {
+                    case 1 -> out = (byte) (0x80 | (region.getBlockState(
+                            probe.set(sectionPos.minBlockX() + lx, sectionPos.minBlockY() + ly,
+                                    sectionPos.minBlockZ() + lz)).isAir() ? 1 : 0));
+                    case 2 -> {
+                        final int b0 = vptBitsBuf.get(quad * 6) & 0xFF;
+                        out = (b0 != 0xFF && (b0 & 1) != 0)
+                                ? (byte) (0x80 | (region.getBlockState(
+                                        probe.set(sectionPos.minBlockX() + lx, sectionPos.minBlockY() + ly,
+                                                sectionPos.minBlockZ() + lz)).isAir() ? 1 : 0))
+                                : (byte) 0xFF;
+                    }
+                    case 3 -> out = (byte) (0x80 | (vptFoliageAt(region, probe,
+                            sectionPos.minBlockX(), sectionPos.minBlockY(), sectionPos.minBlockZ(),
+                            lx, ly, lz) ? 2 : 0));
+                    case 4 -> {
+                        final int b2 = vptBitsBuf.get(quad * 6 + 2) & 0xFF;
+                        out = (b2 != 0xFF && (b2 & 2) != 0)
+                                ? (byte) 0xFF
+                                : (byte) (0x80 | (vptFoliageAt(region, probe,
+                                        sectionPos.minBlockX(), sectionPos.minBlockY(), sectionPos.minBlockZ(),
+                                        lx, ly, lz) ? 2 : 0));
+                    }
+                    case 5 -> out = (byte) (0x80 | (region.getBlockState(
+                            probe.set(sectionPos.minBlockX() + lx, sectionPos.minBlockY() + ly,
+                                    sectionPos.minBlockZ() + lz)).canOcclude() ? 4 : 0));
+                    case 6 -> {
+                        final int b4 = vptBitsBuf.get(quad * 6 + 4) & 0xFF;
+                        out = (b4 != 0xFF && (b4 & 4) != 0)
+                                ? (byte) (0x80 | (region.getBlockState(
+                                        probe.set(sectionPos.minBlockX() + lx, sectionPos.minBlockY() + ly,
+                                                sectionPos.minBlockZ() + lz)).canOcclude() ? 4 : 0))
+                                : (byte) 0xFF;
+                    }
+                    default -> out = 0;
+                }
+                vptBitsBuf.put(out);
+            }
+        }
+        vptPlanBuf.position(0);
+        vptBitsBuf.position(0);
+
+        final int ret = RustBridge.vptBuild(pbuf, vertexBuffer, vptPlanBuf, vptBitsBuf,
+                red, green, blue, count);
+        if (ret < 0) {
+            return false;
+        }
+        if (ret != 0) {
+            scratch.vptAny = true;
+        }
+        return true;
+    }
+
+    /** 生产语义：一次 getBlockState，同时判 LEAVES/FLOWERS 两个 tag。 */
+    private static boolean vptFoliageAt(
+            net.minecraft.client.renderer.chunk.RenderSectionRegion region,
+            BlockPos.MutableBlockPos pos, int minX, int minY, int minZ,
+            int lx, int ly, int lz) {
+        pos.set(minX + lx, minY + ly, minZ + lz);
+        final BlockState state = region.getBlockState(pos);
+        return state.is(net.minecraft.tags.BlockTags.LEAVES)
+                || state.is(net.minecraft.tags.BlockTags.FLOWERS);
     }
 
     private static void accumulateVptAlbedoAndTagRainPuddles(

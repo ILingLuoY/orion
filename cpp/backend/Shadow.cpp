@@ -247,6 +247,31 @@ bool sunShadowSignatureChanged(
     float builtCenter[3]
 )
 {
+    // 2026-11-18 一次性诊断：把"太阳高度/远影开关"打到日志，用于判定
+    // 雾的太阳项恒为 0 是"太阳在地平线下"还是"阴影数据坏"。
+    // 必须放在上面 early-return 之前，否则 sunShadowForceAlways() 时会跳过。
+    {
+        static bool s_sunElevLogged = false;
+        if(!s_sunElevLogged && g_cameraUboMapped != nullptr)
+        {
+            s_sunElevLogged = true;
+            const CameraUBO* probe = static_cast<const CameraUBO*>(g_cameraUboMapped);
+            const float probePhase = probe->historyParamsPadding1;
+            const float probeWrapped = probePhase - std::floor(probePhase);
+            const float probeSunHeight =
+                0.81915204429f * std::sin(probeWrapped * 6.28318530718f);
+            char sunElev[256];
+            _snprintf_s(sunElev, sizeof(sunElev), _TRUNCATE,
+                "[SUN ELEV] phase=%.5f sunHeight=%.4f farFlag=%.1f "
+                "farExtent=%.1f forceAlways=%d",
+                probePhase, probeSunHeight,
+                static_cast<double>(probe->sunShadowFarParams[3]),
+                static_cast<double>(probe->sunShadowFarParams[0]),
+                sunShadowForceAlways() ? 1 : 0);
+            RTLogFlushed(sunElev);
+        }
+    }
+
     if(sunShadowForceAlways() || g_cameraUboMapped == nullptr)
     {
         return true;
@@ -669,6 +694,10 @@ void destroySunShadowResources()
 // （距离剔除 120 格 + 视距 128 格），1024² = 1,048,576 根射线全部 miss ——
 // 纯开销。判据用 g_dhFarFieldMode > 0.5，与实例 mask 特判（:68722）同一口径。
 //
+// 2026-11-19 rasterLod（挂载点⑦）：DH 键已从 TLAS 摘除（挂载点③），这张图的
+// 射线同样全部 miss —— 自适应档在 rasterLod 开启时同步关断；显式
+// ORION_SUNSHADOW_FAR=1 仍可强制开（用户显式意图优先）。
+//
 // 注意：不能退回"static 只读一次"，因为 DH 合成块可以在运行时开关；按帧求值
 // 只是两次读 + 一次比较，且派发/UBO 两条路径本来就每帧问一次。
 bool sunShadowFarEnabled()
@@ -691,7 +720,9 @@ bool sunShadowFarEnabled()
     }
 
     const bool enabled =
-        (s_override >= 0) ? (s_override != 0) : (g_dhFarFieldMode > 0.5f);
+        (s_override >= 0)
+            ? (s_override != 0)
+            : (g_dhFarFieldMode > 0.5f && !g_dhRasterLodEnabled);
 
     static std::atomic<int> s_lastLoggedState{-1};
 
@@ -702,6 +733,7 @@ bool sunShadowFarEnabled()
         RTLog(
             std::string("[SUNSHADOW-FAR] dispatch=") + (enabled ? "on" : "off") +
             " dhFarFieldMode=" + std::to_string(g_dhFarFieldMode) +
+            " rasterLod=" + (g_dhRasterLodEnabled ? "1" : "0") +
             (s_override >= 0 ? " (env override)" : " (auto: needs DH composite)")
         );
     }

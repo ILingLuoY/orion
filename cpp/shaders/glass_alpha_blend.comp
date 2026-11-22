@@ -301,7 +301,19 @@ void main()
     const vec3 cameraPosition = cam.viewInverse[3].xyz;
 
 #ifndef VPT_GLASS_ALPHA_BLEND_ALBEDO_SMOOTH
-#define VPT_GLASS_ALPHA_BLEND_ALBEDO_SMOOTH 1
+// 2026-11-21：**默认关闭**（原为 1）。
+//
+// 用户报"原版材质下清玻璃边框模糊、带噪点"。顾问诊断见
+// docs/consult/20261121-1605-clear-glass-edge-blur.md：
+//   1) 贴图 albedo/alpha 本身不含随机采样噪声，屏幕空间滤波只应作用于带噪的
+//      surfaceLight，**绝不能滤 alphaBlendGbuffer**；
+//   2) 原版 glass 贴图 16x16、边框仅 1 texel，屏幕投影 1~2 px；5x5 核总权重
+//      6.91，1 px 细线沿线仅得 2.4 ⇒ 自身信号只剩约 35%，其余被透明中心稀释
+//      —— 这就是"糊边"的头号元凶；
+//   3) 边框与玻璃中心在**同一平面**（相对深度差≈0），任何深度型双边权重都
+//      挡不住两者的串扰（2026-11-21 曾实现一版双边，据此否决）。
+// A/B 回旧档：-DVPT_GLASS_ALPHA_BLEND_ALBEDO_SMOOTH=1
+#define VPT_GLASS_ALPHA_BLEND_ALBEDO_SMOOTH 0
 #endif
 #if VPT_GLASS_ALPHA_BLEND_ALBEDO_SMOOTH
     {

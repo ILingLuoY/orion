@@ -33,6 +33,9 @@ const float SOLAR_LATITUDE_35_COS = 0.81915204429;
 
 const float VL_MEDIUM_SIGMA = 0.0011;
 const float VL_LAYER_SIGMA = 0.0022;
+// 2026-11-20：UI 驱动密度的换算单位与地面夹底（见 else 分支里的注释）。
+const float VL_DENSITY_UNIT = 0.020;
+const float VL_GROUND_FLOOR = 0.25;
 const float VL_LAYER_HEIGHT = 143.0;
 const float VL_LAYER_SCALE_HEIGHT = 124.0;
 const float VL_LAYER_MIN_EXPONENT = -4.0;
@@ -75,8 +78,70 @@ const float WATER_GODRAY_SHIMMER = 8.0;
 const float WATER_GODRAY_WAVE_AMPLITUDE = 0.25;
 const float WATER_SURFACE_F0 = 0.020;
 
+#ifndef WATER_VOLUMETRIC_BIOME_SYNC
+#define WATER_VOLUMETRIC_BIOME_SYNC 1
+#endif
+
 // 水色三件套 —— 与 rt_test.rgen 的同名函数逐字同步（真源在 rgen，本 pass
 // 不能 include 它）。「水色浓度」「水色倾向」滑杆因此同时管水柱与光柱。
+#if WATER_VOLUMETRIC_BIOME_SYNC
+const vec3 WATER_BIOME_TINT_OCEAN = vec3(0.2471, 0.4627, 0.8941);
+const vec3 WATER_BIOME_TINT_OCEAN_LIN = vec3(0.0462, 0.1835, 0.7816);
+
+#ifndef WATER_BIOME_TINT_STRENGTH
+#define WATER_BIOME_TINT_STRENGTH 1.0
+#endif
+
+vec3 waterBiomeTint()
+{
+    if(cam.waterBiomeTint.w < 0.5)
+    {
+        return WATER_BIOME_TINT_OCEAN;
+    }
+    return clamp(cam.waterBiomeTint.xyz, vec3(0.0), vec3(1.0));
+}
+
+vec3 waterAbsorptionColor()
+{
+    vec3 tint = mix(
+        WATER_BIOME_TINT_OCEAN,
+        waterBiomeTint(),
+        clamp(WATER_BIOME_TINT_STRENGTH, 0.0, 1.0)
+    );
+    vec3 tintLin = pow(max(tint, vec3(0.02)), vec3(2.2));
+    vec3 rawAbsMod = (-log(clamp(tintLin, vec3(0.02), vec3(0.98)))) /
+                     (-log(WATER_BIOME_TINT_OCEAN_LIN));
+    vec3 biomeModulate = clamp(
+        pow(rawAbsMod, vec3(0.75)), vec3(0.25), vec3(6.0)
+    );
+    return mix(
+        vec3(0.18, 0.055, 0.018),
+        vec3(0.24, 0.045, 0.055),
+        clamp(cam.waterStyleParams0.y, 0.0, 1.0)
+    ) * clamp(cam.waterStyleParams0.z, 0.25, 4.0) * biomeModulate;
+}
+
+vec3 waterScatterColor()
+{
+    vec3 tint = mix(
+        WATER_BIOME_TINT_OCEAN,
+        waterBiomeTint(),
+        clamp(WATER_BIOME_TINT_STRENGTH, 0.0, 1.0)
+    );
+    vec3 tintLin = pow(max(tint, vec3(0.02)), vec3(2.2));
+    vec3 rawScatMod = pow(tintLin / WATER_BIOME_TINT_OCEAN_LIN, vec3(0.60));
+    float lumaRatio = dot(rawScatMod, vec3(0.2126, 0.7152, 0.0722));
+    vec3 biomeModulate = clamp(
+        rawScatMod / mix(1.0, max(lumaRatio, 0.15), 0.65),
+        vec3(0.25), vec3(2.0)
+    );
+    return mix(
+        vec3(0.05, 0.22, 0.28),
+        vec3(0.05, 0.34, 0.30),
+        clamp(cam.waterStyleParams0.y, 0.0, 1.0)
+    ) * biomeModulate;
+}
+#else
 vec3 waterAbsorptionColor()
 {
     return mix(
@@ -94,6 +159,7 @@ vec3 waterScatterColor()
         clamp(cam.waterStyleParams0.y, 0.0, 1.0)
     );
 }
+#endif
 
 float waterScatteringAmount()
 {
@@ -321,17 +387,20 @@ const int VL_SHADOW_RAY_STEP_STRIDE = 4;
 float sunVisibilityRayQuery(vec3 position, vec3 sunDirection)
 {
     rayQueryEXT query;
+    // Any-hit visibility without gl_RayFlagsOpaqueEXT: opaque blocks & OMM foliage
+    // block light; water & glass (FORCE_NO_OPAQUE) let sunlight enter; 0x08u excludes
+    // first-person hand (0x04), local player (0x02), and particles (0xF7).
     rayQueryInitializeEXT(
         query,
         sceneTlas,
-        gl_RayFlagsTerminateOnFirstHitEXT |
-            gl_RayFlagsSkipClosestHitShaderEXT,
+        gl_RayFlagsTerminateOnFirstHitEXT,
         SUN_SHADOW_CULL_MASK,
         position,
         SUN_SHADOW_ORIGIN_BIAS,
         sunDirection,
         VL_SHADOW_RAY_DISTANCE);
-    while(rayQueryProceedEXT(query)) {}
+    int guard = 0;
+    while(rayQueryProceedEXT(query) && ++guard < 64) {}
     return rayQueryGetIntersectionTypeEXT(query, true) ==
         gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
 }
@@ -388,6 +457,13 @@ vec3 marchUnderwaterGodRays(
     float distance = jitter * stepLength;
     float terrainVisibility = 1.0;
 
+#if WATER_VOLUMETRIC_BIOME_SYNC
+    vec3 refractedLightIn = refract(-lightDirection, vec3(0.0, 1.0, 0.0), 1.0 / 1.33);
+    vec3 underwaterLightDir = dot(refractedLightIn, refractedLightIn) > 1.0e-6
+        ? normalize(-refractedLightIn)
+        : lightDirection;
+#endif
+
     for(int step = 0; step < MAX_LIGHT_RAY_STEPS; ++step)
     {
         if(step >= steps ||
@@ -397,8 +473,13 @@ vec3 marchUnderwaterGodRays(
         float depthBelowSurface = surfaceY - position.y;
         if(depthBelowSurface > 0.0)
         {
+#if WATER_VOLUMETRIC_BIOME_SYNC
+            float slantDepth = depthBelowSurface / max(underwaterLightDir.y, 0.15);
+            vec3 surfaceCrossing = position + underwaterLightDir * slantDepth;
+#else
             float slantDepth = depthBelowSurface / max(lightDirection.y, 0.05);
             vec3 surfaceCrossing = position + lightDirection * slantDepth;
+#endif
             vec3 lightPathTransmittance = exp(-sigmaAbsorption * slantDepth);
             if(step % VL_SHADOW_RAY_STEP_STRIDE == 0)
             {
@@ -435,21 +516,47 @@ void main()
 
     vec3 sunDirection0 = sunDirection();
     float sunElevation = sunDirection0.y;
-    vec3 lightDirection = sunElevation >= 0.0 ? sunDirection0 : -sunDirection0;
+    // 2026-11-16：夜间光源 = 真实月亮位置（按月相沿日轨移动），不再是 -sunDir。
+    // 与 rgen / rmiss / 阴影生产者同一向量。
+    vec3 moonlightDirection = moonEclipticDirectionAt(
+        moonDecalPhase01(cam.historyParams.w, cam.sssParams.z));
+    // =====================================================================
+    // 2026-11-19：光柱的直射光交接与云同口径（sky_model_common.glsl 单一真源）
+    //
+    // 旧式在 sunElevation >= 0 处硬翻方向，而 dayAmount 在翻转点只有 0.5
+    // ⇒ 光柱还有半档能量时整束换了方向（满月差 176°）⇒ 夕阳时"光束突然
+    // 换到天的另一边"。新式交接点下移到 -0.05 且两侧能量在该点同时归零。
+    // 回退：把 sunDirectAmount/moonDirectAmount 换回 dayAmount / (1-dayAmount)。
+    // =====================================================================
+    float sunDirectAmount = skyDirectSunAmount(sunElevation);
+    float moonDirectAmount = skyDirectMoonAmount(sunElevation);
+    vec3 lightDirection = skyDirectIsSun(sunElevation)
+        ? sunDirection0 : moonlightDirection;
+
     if(abs(lightDirection.y) <= 1.0e-4)
     {
         storeGodRayNeutral(pixel);
         return;
     }
     float dayAmount = smoothstep(-0.03, 0.03, sunElevation);
-    float elevationMagnitude = abs(sunElevation) / SOLAR_LATITUDE_35_COS;
+    // 月光的"高度归一"必须用月亮自己的高度：月亮按月相移动后它与太阳下沉
+    // 深度不再互为相反数。旧式 abs(sunElevation) 会让月亮已经落山的光柱仍按
+    // "月亮在天顶"给能量。白天这一项被 mix 成 1.0，逐位不变。
+    // 2026-11-16 自查：原来的 elevationMagnitude 在这里已无读者，已删除。
+    float moonElevation01 = clamp(
+        moonlightDirection.y / SOLAR_LATITUDE_35_COS, 0.0, 1.0);
     // 2026-11-13：夜间色改调共享的 skyModelMoonColor（原来硬编码）。
-    vec3 lightColor = mix(skyModelMoonColor(sunElevation), sunColor(lightDirection), dayAmount);
-    float lightEnergy = GODRAY_SUN_ENERGY * mix(
-        GODRAY_MOON_FRACTION * elevationMagnitude, 1.0, dayAmount);
+    // 2026-11-16：参数改为月亮高度（该函数收"负仰角"）。
+    // 2026-11-19：太阳侧用连续版（sunColor() 在 sun<0 处会提前变月蓝）。
+    vec3 lightColor = skyDirectIsSun(sunElevation)
+        ? skyModelSunColorContinuous(sunDirection0, 1.0)
+        : skyModelMoonColor(-moonlightDirection.y);
+    float lightEnergy = GODRAY_SUN_ENERGY * (
+        sunDirectAmount +
+        GODRAY_MOON_FRACTION * moonElevation01 * moonDirectAmount);
 
     // 2026-11-13：与地形同源的月相调光。
-    lightEnergy *= mix(1.0, skyModelMoonPhaseDim(cam.sssParams.z, 0.35), 1.0 - dayAmount);
+    lightEnergy *= mix(1.0, skyModelMoonPhaseDim(cam.sssParams.z, 0.35), moonDirectAmount);
 
     vec2 ndc = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
     ndc.y = -ndc.y;
@@ -526,10 +633,13 @@ void main()
 
     float rain = saturate(cam.weatherParams.x);
 
+    // 2026-11-18：与 volumetric_fog.glsl 同口径 —— 密度按**每格消光**标定，
+    // 不再除以视距（cameraParams.y = cameraFar）。旧式 base=1 只有 2.1e-4/格，
+    // 100 格光程 τ≈0.02 ⇒ 结构上看不见光柱。
     const float vlBaseDensity =
         max(cam.cloudParams7.y, 0.0) *
-        (rain * 0.15 + 0.08) /
-        max(cam.cameraParams.y, 100.0);
+        (rain * 0.15 + 0.08) *
+        VFOG_DENSITY_SCALE;
     const float vlFogTimeFactor =
         mix(1.0, max(cam.cloudParams9.z, 0.0), rain);
     const float vlHeightMax =
@@ -621,8 +731,23 @@ void main()
             -(position.y - VL_LAYER_HEIGHT) / VL_LAYER_SCALE_HEIGHT,
             VL_LAYER_MIN_EXPONENT));
         float hazeRainWeight = mix(1.0, VL_MEDIUM_RAIN_BOOST, rain);
-        float sigmaScatter =
-            (VL_MEDIUM_SIGMA + VL_LAYER_SIGMA * vlLayerDensity) * hazeRainWeight;
+        // -----------------------------------------------------------------
+        // 2026-11-20：介质密度不再用写死的常数（旧值 0.0011/格，100 格只有
+        // 10% 消光，肉眼等于没有雾）。改由 UI 的雾参数驱动：
+        //   cloudParams7.y = 雾密度基准（UI「雾密度基准」）
+        //   cloudParams7.z = 雾底锚点 Y（UI 滑块，标签即将修正）
+        //   cloudParams7.w = 标高
+        //   cloudParams9.z = 雨天倍率
+        // 1.0 基准 ⇒ 地面附近 σ≈0.02/格（50 格 T≈0.37），属"明显但不糊"。
+        // -----------------------------------------------------------------
+        const float vlBaseDensity = max(cam.cloudParams7.y, 0.0);
+        const float vlAnchorY = cam.cloudParams7.z;
+        const float vlScaleHeight = max(cam.cloudParams7.w, 1.0);
+        const float vlHeightProfile =
+            exp(-max(position.y - vlAnchorY, 0.0) / vlScaleHeight);
+        const float sigmaScatter =
+            vlBaseDensity * VL_DENSITY_UNIT *
+            mix(VL_GROUND_FLOOR, 1.0, vlHeightProfile) * hazeRainWeight;
         float sigmaExtinction = sigmaScatter;
         {
             if(step % VL_SHADOW_RAY_STEP_STRIDE == 0)

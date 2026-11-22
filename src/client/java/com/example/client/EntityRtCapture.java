@@ -4,6 +4,7 @@ import com.example.client.mixin.RenderSetupAccessor;
 import com.example.client.mixin.RenderTypeAccessor;
 import com.example.client.mixin.TextureBindingAccessor;
 import com.example.vulkan.NativeVulkan;
+import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import com.mojang.renderpearl.api.textures.GpuSampler;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
 import com.mojang.blaze3d.vertex.PoseStack;
@@ -27,6 +28,7 @@ import net.minecraft.client.renderer.blockentity.state.BeaconRenderState;
 import net.minecraft.client.renderer.entity.state.AvatarRenderState;
 import net.minecraft.client.renderer.feature.ItemFeatureRenderer;
 import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
+import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.client.renderer.rendertype.RenderSetup;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.texture.AbstractTexture;
@@ -70,10 +72,20 @@ public final class EntityRtCapture {
     // 2026-11-15：同一次 submit 内，同一面旗帜的所有图案层共用同一个 Pose；按"同 Pose 第几次
     // banner_pattern 提交"还原原版 order（底色层 1、其后每层 +1）。每帧 beginFrame 清零。
     private static final java.util.HashMap<Long, Integer> bannerPatternLayerRanks = new java.util.HashMap<>();
+    // 2026-11-16：[RTX-BANNER] 只打一次的开关，用来在运行时确认旗帜层序路径确实命中
+    // （isBannerPattern 的判据不能再靠推断，见该方法里的注释）。
+    private static boolean bannerPipelineLogged;
     // 2026-11-15：短格式顶点（地图）的拼接状态。逐顶点热路径要求零分配，
     // 且区块网格构建线程也会调 BufferBuilder 的短格式 setter，所以必须按线程隔离。
     private static final int POSITION_ONLY_MAX_VERTICES = 8192;
     private static boolean positionOnlyOverflowLogged;
+    // 地图批次诊断（[RTX-MAP]）的每帧条数限制。
+    private static int mapDiagFrame = -1;
+    private static int mapDiagCount;
+    // 地图批次探针的上次打印帧。刻意**不**接 isDiagnosticFrame()：
+    // 那个条件是 frame%64==1，若再叠加 %90 就等于每 2880 帧才打一次（≈48 秒），
+    // 实测等于永远看不到。
+    private static int mapProbeFrame = -1;
     private static final ThreadLocal<ShortVertex> shortVertex =
             ThreadLocal.withInitial(ShortVertex::new);
     // 短格式顶点"半截状态"是否存在的保守前置过滤：全格式 addVertex 是全场最热的路径，
@@ -290,6 +302,8 @@ public final class EntityRtCapture {
         textBatchSlot = 0;
         captureFrameActive = true;
         bannerPatternLayerRanks.clear();
+        frameOwnerRecords.clear();
+        frameHistoryOrdinals.clear();
         // 上一帧若在某条短格式顶点中途结束（异常/取消），残留的 pending 会串到本帧的批次里。
         cancelShortVertex();
 
@@ -608,6 +622,20 @@ public final class EntityRtCapture {
             net.minecraft.world.entity.EntityType<?>, java.util.ArrayList<double[]>>
             entityMotionTrackers = new java.util.HashMap<>();
 
+    /**
+     * 本帧「EntityRenderState 实例 → 运动记录」。
+     *
+     * <p>为什么需要它：同一个实体在一帧里会被提交多次（实体本体 / 装备层 / 手持物，
+     * 各自不同的 RenderType），这些批次必须共用同一条记录；而<b>不同</b>实体即使
+     * 类型相同、位置挨得很近（鸡群、僵尸群、同一格里的掉落物），也绝不能互相借记录。
+     * 旧实现用「本帧已更新的最近记录 + 8 格半径」做这个判断，两种情形分不开 ⇒
+     * 相邻同类实体会拿到别人的位姿增量和**别人的顶点历史**，表现为鬼影 + 交替抖动。</p>
+     *
+     * <p>用 {@link java.util.IdentityHashMap} 以 state 对象身份为键，一帧一清。</p>
+     */
+    private static final java.util.IdentityHashMap<Object, double[]> frameOwnerRecords =
+            new java.util.IdentityHashMap<>();
+
     
 
     private static final boolean LIMB_MV_ENABLED = resolveLimbMvEnabled();
@@ -628,8 +656,25 @@ public final class EntityRtCapture {
 
     private static final int ENTITY_VERTEX_HISTORY_MAX_KEYS = 32;
 
-    /** 一批模型几何的稳定身份：同一实体的同一提交逐帧对应。 */
-    private record ModelBatchKey(Model<?> model, RenderType renderType) {}
+    /**
+     * 一批模型几何的稳定身份：同一实体的同一提交逐帧对应。
+     *
+     * <p>{@code ordinal} = 本实体本帧第几次提交同一个 (model, renderType)。
+     * 少了它，同一模型 + 同一 RenderType 被提交多次时会共用一条历史 ——
+     * 最典型的是旗帜：底色层和每个图案层都是 {@code BannerFlagModel} +
+     * {@code bannerPattern}，后一层会把前一层的 p_prev 覆盖掉，于是每层都在
+     * 拿"另一层"的上一帧顶点位置算 MV，得到一个恒定的假运动 ⇒ 旗帜闪烁/拖影。</p>
+     */
+    private record ModelBatchKey(Model<?> model, RenderType renderType, int ordinal) {
+        ModelBatchKey(Model<?> model, RenderType renderType) {
+            this(model, renderType, 0);
+        }
+    }
+
+    /** 本帧「实体记录 → (model, renderType) → 已提交次数」，与 frameOwnerRecords 同生命周期。 */
+    private static final java.util.IdentityHashMap<
+            double[], java.util.HashMap<ModelBatchKey, int[]>>
+            frameHistoryOrdinals = new java.util.IdentityHashMap<>();
 
     /** 一条 (模型, RenderType) 批次的上一帧顶点位置（相机相对，与顶点缓冲同序）。 */
     private static final class VertexHistory {
@@ -811,34 +856,25 @@ public final class EntityRtCapture {
         final com.mojang.blaze3d.vertex.PoseStack.Pose rootPose = submit.pose();
         final Matrix4f currentPose = rootPose != null ? rootPose.pose() : null;
 
+        final Object ownerKey = stateObject;
+        final double[] owner = frameOwnerRecords.get(ownerKey);
+        if (owner != null) {
+            // 同一实体本帧的后续批次（装备层 / 手持物 / 其它 RenderType）：
+            // 共用第一次算出的增量与顶点历史。身份判定，不做位置猜测。
+            applyRecordedMotion(batch, owner);
+            attachVertexHistory(batch, submit, owner);
+            return;
+        }
+
         final java.util.ArrayList<double[]> trackers =
                 entityMotionTrackers.computeIfAbsent(
                         renderState.entityType, key -> new java.util.ArrayList<>());
 
-        double[] best = null;
-        double bestDistance = Double.MAX_VALUE;
-
-        for (int index = 0; index < trackers.size(); ++index) {
-            final double[] record = trackers.get(index);
-            if ((int)record[T_FRAME] != entityMotionFrame) {
-                continue;
-            }
-            final double distance = entityMotionDistanceSq(record, x, y, z);
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                best = record;
-            }
-        }
-
-        if (best != null && bestDistance <= ENTITY_MOTION_MATCH_RADIUS_SQ) {
-            applyRecordedMotion(batch, best);
-            attachVertexHistory(batch, submit, best);
-            return;
-        }
-
         double[] candidate = null;
         double candidateDistance = Double.MAX_VALUE;
 
+        // 只和「上一帧及更早」的记录配对。本帧已被更新的记录属于别的实体，
+        // 把位置最近的那个当自己用会串 MV 与顶点历史（见 frameOwnerRecords 注释）。
         for (int index = 0; index < trackers.size(); ++index) {
             final double[] record = trackers.get(index);
             if ((int)record[T_FRAME] == entityMotionFrame) {
@@ -856,6 +892,7 @@ public final class EntityRtCapture {
             final double[] record = entityMotionTracker(x, y, z);
             writePose(record, currentPose);
             trackers.add(record);
+            frameOwnerRecords.put(ownerKey, record);
             // 仍然挂上历史：本帧 uploadBatch 会把顶点位置记进去，下一帧就有 p_prev 了。
             attachVertexHistory(batch, submit, record);
             return;
@@ -887,6 +924,7 @@ public final class EntityRtCapture {
 
         applyRecordedMotion(batch, candidate);
         attachVertexHistory(batch, submit, candidate);
+        frameOwnerRecords.put(ownerKey, candidate);
 
         if (trackers.size() > ENTITY_MOTION_MAX_TRACKERS_PER_TYPE) {
             pruneEntityMotionTrackers();
@@ -908,7 +946,13 @@ public final class EntityRtCapture {
             return;
         }
         batch.vertexHistory = history;
-        batch.vertexHistoryKey = new ModelBatchKey(submit.model(), submit.renderType());
+        final java.util.HashMap<ModelBatchKey, int[]> ordinals =
+                frameHistoryOrdinals.computeIfAbsent(record, key -> new java.util.HashMap<>());
+        final int[] counter = ordinals.computeIfAbsent(
+                new ModelBatchKey(submit.model(), submit.renderType()), key -> new int[1]);
+        // 同一实体本帧的第 N 次同 key 提交 → 历史条目 N，逐帧稳定对应。
+        batch.vertexHistoryKey =
+                new ModelBatchKey(submit.model(), submit.renderType(), counter[0]++);
     }
 
     /** 清掉太久没被匹配到的记录（以及随之变空的类型）。 */
@@ -993,6 +1037,13 @@ public final class EntityRtCapture {
             if (bannerPattern) {
                 customDiagLog("banner_rank" + batch.coplanarLayerBoost,
                         renderTypeName(submit.renderType()), texture);
+                if (!bannerPipelineLogged) {
+                    bannerPipelineLogged = true;
+                    final RenderPipeline pipeline = bannerPipeline(submit.renderType());
+                    System.out.println("[RTX-BANNER] pattern layer hit, pipeline="
+                            + (pipeline == null ? "?" : pipeline.getLocation())
+                            + ", rank=" + batch.coplanarLayerBoost);
+                }
             }
             activeBatch.set(batch);
             resolveBatchMotion(batch, submit);
@@ -1208,9 +1259,113 @@ public final class EntityRtCapture {
         cameraWorldZ = z;
     }
 
+    // ------------------------------------------------------------------
+    // 2026-11-19 rasterLod：本引擎相机逆矩阵缓存（与 setCameraOrigin 同源：
+    // VulkanCameraMixin 在 NativeVulkan.updateCamera 之后写入）。供
+    // compat.dh.DhFarFieldGeometry 在 mode=14 时构造本引擎 inverse MVP。
+    // 列主序 float[16]，与 CameraUBO 同约定。仅渲染线程读写。
+    // ------------------------------------------------------------------
+    private static volatile float[] engineCameraViewInverse;
+    private static volatile float[] engineCameraProjInverse;
+
+    public static void setEngineCameraMatrices(float[] viewInverse, float[] projInverse) {
+        if (viewInverse == null || projInverse == null
+                || viewInverse.length < 16 || projInverse.length < 16) {
+            return;
+        }
+        // 2026-11-19 NaN 守卫：首帧相机矩阵未就绪时 VulkanCameraMixin 可能写入 NaN
+        // （实测 v0/v5=NaN 被首帧锁进载荷）。非 finite 一律拒收，保留旧值（或 null）。
+        for (int i = 0; i < 16; i++) {
+            if (!Float.isFinite(viewInverse[i]) || !Float.isFinite(projInverse[i])) {
+                return;
+            }
+        }
+        float[] viewCopy = new float[16];
+        float[] projCopy = new float[16];
+        System.arraycopy(viewInverse, 0, viewCopy, 0, 16);
+        System.arraycopy(projInverse, 0, projCopy, 0, 16);
+        engineCameraViewInverse = viewCopy;
+        engineCameraProjInverse = projCopy;
+        // 2026-11-19 mode 14/15 推送挂点：引擎相机是每帧权威入口；DH 的
+        // before-render 事件会在 DH 渲染停摆时停发（实测进世界 21 秒后整局
+        // 无推送 ⇒ C++ matrixValid=false ⇒ 远场永远 stage-1 裸色）。回调由
+        // DhFarFieldGeometry 注册（compat.dh 包私有，经本类公共桥接）。
+        Runnable cameraCallback = engineCameraCallback;
+        if (cameraCallback != null) {
+            try {
+                cameraCallback.run();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    public static float[] getEngineCameraViewInverse() {
+        return engineCameraViewInverse;
+    }
+
+    public static float[] getEngineCameraProjInverse() {
+        return engineCameraProjInverse;
+    }
+
+    // 2026-11-19 mode 14/15 推送回调（DhFarFieldGeometry 注册，见上）。
+    private static volatile Runnable engineCameraCallback;
+
+    public static void setEngineCameraCallback(Runnable callback) {
+        engineCameraCallback = callback;
+    }
+
+    /**
+     * 把一整批模型几何沿「质心 → 相机」方向外移 rank 个层间距。
+     *
+     * <p>参数与短格式路径 {@code applyCoplanarLayerOffset()} 完全一致：
+     * {@link #ENTITY_COPLANAR_LAYER_STEP}、{@link #ENTITY_COPLANAR_LAYER_MAX}。
+     * 顶点是相机相对坐标（native 侧才加 cameraWorld），所以相机在原点，
+     * 方向就是 {@code -normalize(centroid)}。整批用同一个方向，避免把 quad 推歪。</p>
+     */
+    private static void applyBannerLayerOffset(ActiveBatch batch) {
+        final int vertexCount = batch.vertexCount;
+        float centerX = 0.0f;
+        float centerY = 0.0f;
+        float centerZ = 0.0f;
+        for (int vertex = 0; vertex < vertexCount; ++vertex) {
+            final int base = vertex * BYTES_PER_VERTEX;
+            centerX += batch.buffer.getFloat(base);
+            centerY += batch.buffer.getFloat(base + 4);
+            centerZ += batch.buffer.getFloat(base + 8);
+        }
+        final float inverse = 1.0f / vertexCount;
+        centerX *= inverse;
+        centerY *= inverse;
+        centerZ *= inverse;
+        final float toCamera = (float) Math.sqrt(
+                centerX * centerX + centerY * centerY + centerZ * centerZ);
+        if (toCamera <= 1.0e-4f) {
+            return;
+        }
+        final float offset = Math.min(
+                batch.coplanarLayerBoost * ENTITY_COPLANAR_LAYER_STEP,
+                ENTITY_COPLANAR_LAYER_MAX);
+        final float dx = -centerX / toCamera * offset;
+        final float dy = -centerY / toCamera * offset;
+        final float dz = -centerZ / toCamera * offset;
+        for (int vertex = 0; vertex < vertexCount; ++vertex) {
+            final int base = vertex * BYTES_PER_VERTEX;
+            batch.buffer.putFloat(base, batch.buffer.getFloat(base) + dx);
+            batch.buffer.putFloat(base + 4, batch.buffer.getFloat(base + 4) + dy);
+            batch.buffer.putFloat(base + 8, batch.buffer.getFloat(base + 8) + dz);
+        }
+    }
+
     private static void uploadBatch(ActiveBatch batch) {
         batch.pendingQuadVertexCount = 0;
         batch.buffer.flip();
+        // 2026-11-19：旗帜图案层的 order 必须落到几何上。
+        // 在此之前 coplanarLayerBoost 只被短格式 quad 路径读取，模型批次从不经过
+        // 那条路 ⇒ 底布 / 底色层 / 图案层在 RT 里仍然严格共面，谁被 BLAS 命中
+        // 完全随机，表现就是"旗帜图案时有时无"。这里整批沿指向相机的方向外移。
+        if (batch.coplanarLayerBoost > 0 && batch.vertexCount > 0) {
+            applyBannerLayerOffset(batch);
+        }
         if (!endPortalBatchLogged && batch.textureSlot >= 1
                 && batch.textureSlot <= MAX_TEXTURE_SLOTS) {
             final String endPortalLabel = frameTextureLabels[batch.textureSlot - 1];
@@ -1372,7 +1527,9 @@ public final class EntityRtCapture {
         // 2026-11-03 诊断：第一人称手部批次的 UV 范围。用来判定这批几何到底是
         // "皮肤 UV 空间"（手臂，0..1 且贴合皮肤布局）还是"item/方块图集空间"
         // （手持物，UV 会带图集偏移），从而确认手持物是否被并进了皮肤纹理批次。
-        if (batch.diagHand && isDiagnosticFrame() && batch.vertexCount > 0) {
+        final boolean mapProbeDue = batch.positionOnlyCapture && batch.vertexCount > 0
+                && (mapProbeFrame < 0 || captureFrameSerial - mapProbeFrame >= 120);
+        if (((batch.diagHand && isDiagnosticFrame()) || mapProbeDue) && batch.vertexCount > 0) {
             final ByteBuffer source = batch.buffer;
             float uMin = Float.MAX_VALUE;
             float uMax = -Float.MAX_VALUE;
@@ -1392,13 +1549,49 @@ public final class EntityRtCapture {
             // 一局下来日志能到 30 MB。GC 日志显示年轻代一次就 845M->380M，
             // 随后触发 14 次 Concurrent Mark Cycle（中位 124ms）抢渲染线程 CPU —— 
             // 这是"走/站都卡"最可疑的分配源。需要时：ORION_LOG_HANDUV=1。
-            if (LOG_HANDUV) {
-                System.err.println("[RTX-HANDUV] slot=" + batch.textureSlot
-                        + " vertices=" + batch.vertexCount
-                        + " u=[" + uMin + "," + uMax + "]"
-                        + " v=[" + vMin + "," + vMax + "]"
-                        + " texture=" + frameTextureLabels[
+            // 地图探针限频：isDiagnosticFrame() 在诊断模式下可能每帧都成立，
+            // 而地图批次每帧都有（手持 + 展示框），不限频会把日志刷爆。
+            final boolean mapProbe = mapProbeDue;
+            if (mapProbe) {
+                mapProbeFrame = captureFrameSerial;
+            }
+            if (LOG_HANDUV || mapProbe) {
+                final StringBuilder line = new StringBuilder(160);
+                line.append("[RTX-MAP] slot=").append(batch.textureSlot)
+                        .append(" vertices=").append(batch.vertexCount)
+                        // rem = 收尾时还剩几个凑不满 quad 的顶点。地图本体应该是 4 的倍数、
+                        // rem=0；rem≠0 说明短格式顶点的 addVertex/setUv 配对漏了。
+                        .append(" rem=").append(batch.pendingQuadVertexCount)
+                        .append(" u=[").append(uMin).append(',').append(uMax).append(']')
+                        .append(" v=[").append(vMin).append(',').append(vMax).append(']')
+                        .append(" texture=").append(frameTextureLabels[
                             Math.min(Math.max(batch.textureSlot - 1, 0), MAX_TEXTURE_SLOTS - 1)]);
+                // 地图：把前 4 个顶点的 (x,y,z|u,v) 一起打出来。贴图错而几何对时，
+                // 先确认这 4 个顶点是不是 (0,128)(128,128)(128,0)(0,0) 且 UV 一一对应
+                // (0,1)(1,1)(1,0)(0,0) —— 对不上就是批次里混进了别的顶点（UV 错位）。
+                if (batch.positionOnlyCapture) {
+                    if (mapDiagFrame != captureFrameSerial) {
+                        mapDiagFrame = captureFrameSerial;
+                        mapDiagCount = 0;
+                    }
+                    final int probes = Math.min(batch.vertexCount, 8);
+                    for (int vertex = 0; vertex < probes; ++vertex) {
+                        final int base = vertex * BYTES_PER_VERTEX;
+                        line.append(" v").append(vertex).append('=')
+                                .append(source.getFloat(base)).append('/')
+                                .append(source.getFloat(base + Float.BYTES)).append('/')
+                                .append(source.getFloat(base + 2 * Float.BYTES)).append('|')
+                                .append(source.getFloat(base + 3 * Float.BYTES)).append('/')
+                                .append(source.getFloat(base + 4 * Float.BYTES));
+                    }
+                    ++mapDiagCount;
+                    if (mapDiagCount > 4) {
+                        line.setLength(0);
+                    }
+                }
+                if (line.length() > 0) {
+                    System.err.println(line);
+                }
             }
         }
 
@@ -2772,13 +2965,27 @@ public final class EntityRtCapture {
             return;
         }
         ++genericSubmitCount;
-        if (activeBatch.get() != null) {
+        // ⚠ 2026-11-16 修：一次 prepareGroup 里会**连续出现多个不同 RenderType** 的 custom 提交。
+        // 26.3 的 CustomFeatureRenderer#buildGroup 是 for 循环逐个 getVertexBuilder(renderType)，
+        // 而同一个 Group 内部用 draws 列表承载多个 RenderType（见 RenderTypeFeatureRenderer.Group），
+        // 我们的 endCustomGroup() 只在 prepareGroup 收尾时调一次。
+        //
+        // 原实现在 activeBatch 非空时直接 return，后果是：整组只有**第一个** RenderType 真正
+        // 开出了批次，后面所有提交（含它们的贴图槽和 positionOnlyCapture 判定）都被塞进这
+        // 一个批次。地图墙就是最典型的受害者 —— 几十张 map/<id> 全部采样第一张地图的贴图，
+        // 于是"所有展示框地图永远长一个样子"；而"哪张是第一张"取决于该帧提交排序，于是"会闪"。
+        //
+        // 正确语义：RenderType 变了就必须收掉上一批（贴图槽是批次的属性，不是组的属性）；
+        // 只有 RenderType 相同才复用同一批次。
+        if (customBatchOpen) {
+            if (customRenderType == renderType) {
+                return;
+            }
+            flushCustomBatch();
+        } else if (activeBatch.get() != null) {
+            // 别的子系统（ModelFeatureRenderer 的模型批次）正开着槽，不归我们管。
             return;
         }
-        if (customBatchOpen && customRenderType == renderType) {
-            return;
-        }
-        flushCustomBatch();
         if (renderType == null) {
             return;
         }
@@ -2870,6 +3077,9 @@ public final class EntityRtCapture {
         }
         customBatchOpen = false;
         customRenderType = null;
+        // 批次收尾时丢掉没走完 setUv 的半截短格式顶点，避免它被下一个批次的
+        // 第一个 addVertex 顺手 flush 进去（那会让后面所有顶点的 UV 整体错位）。
+        cancelShortVertex();
         endModel();
     }
 
@@ -2935,18 +3145,26 @@ public final class EntityRtCapture {
      * （见 {@link ActiveBatch#coplanarLayerBoost}）。</p>
      */
     private static boolean isBannerPattern(RenderType renderType) {
-        if (renderType == null) {
-            return false;
-        }
-        final RenderSetup setup = ((RenderTypeAccessor) (Object) renderType).rtx$getState();
-        if (setup == null) {
-            return false;
-        }
-        final var pipeline = ((RenderSetupAccessor) (Object) setup).rtx$getPipeline();
+        final RenderPipeline pipeline = bannerPipeline(renderType);
         if (pipeline == null) {
             return false;
         }
-        return "minecraft:pipeline/banner_pattern".equals(pipeline.getLocation().toString());
+        // 2026-11-16：优先用对象同一性判定。RenderPipelines.BANNER_PATTERN 是 register()
+        // 进 PIPELINES_BY_LOCATION 的单例，所有旗帜图案层的 RenderSetup 都引用它；
+        // 字符串比较只作兜底 —— withLocation("pipeline/banner_pattern") 的命名空间补全
+        // 规则是推断来的，若格式有任何变化，只靠字符串会让整条旗帜层序静默失效
+        // （表现：图案与底色共面、互相闪）。
+        return pipeline == RenderPipelines.BANNER_PATTERN
+                || "minecraft:pipeline/banner_pattern".equals(pipeline.getLocation().toString());
+    }
+
+    /** 取 RenderSetup 上的 pipeline；字段是包私有的，只能靠 accessor 读。 */
+    private static RenderPipeline bannerPipeline(RenderType renderType) {
+        if (renderType == null) {
+            return null;
+        }
+        final RenderSetup setup = ((RenderTypeAccessor) (Object) renderType).rtx$getState();
+        return setup == null ? null : ((RenderSetupAccessor) (Object) setup).rtx$getPipeline();
     }
 
     /**

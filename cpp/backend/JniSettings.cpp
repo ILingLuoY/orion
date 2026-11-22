@@ -718,6 +718,73 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setSkyModelSetti
     return JNI_TRUE;
 }
 
+// 2026-11-16 月光两旋钮（设置界面「新月月光」「白天月亮亮度」）。
+// floor:    0..1，新月夜 = 满月的这一比例（0 = 纯物理，新月夜只剩环境光）
+// daylight: 0..1，白天月亮亮度占夜间基准的比例（1 = 不压暗）
+// 生效时机：下一帧起（UBO 每帧重写），不需要重建任何管线。
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setMoonSettings(
+    JNIEnv*,
+    jclass,
+    jfloat lightFloor,
+    jfloat daylightDim)
+{
+    const float requestedFloor = static_cast<float>(lightFloor);
+    const float requestedDaylight = static_cast<float>(daylightDim);
+
+    if(!std::isfinite(requestedFloor) ||
+       requestedFloor < 0.0f || requestedFloor > 1.0f ||
+       !std::isfinite(requestedDaylight) ||
+       requestedDaylight < 0.0f || requestedDaylight > 1.0f)
+    {
+        return JNI_FALSE;
+    }
+
+    g_moonLightFloor.store(requestedFloor);
+    g_moonDaylightDim.store(requestedDaylight);
+
+    fprintf(
+        stderr,
+        "[MOON] java lightFloor=%.2f daylight=%.2f\n",
+        requestedFloor,
+        requestedDaylight);
+    fflush(stderr);
+    return JNI_TRUE;
+}
+
+// 2026-11-16 雾外观两旋钮（设置界面「雾形态」「晨雾增强」）。
+// shape:     0..2（0 = 均匀灰膜旧档，1 = 出厂团块）
+// dawnBoost: 1..3（晨雾峰值倍率，1 = 不增强）
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setFogMoodSettings(
+    JNIEnv*,
+    jclass,
+    jfloat shape,
+    jfloat dawnBoost)
+{
+    const float requestedShape = static_cast<float>(shape);
+    const float requestedDawn = static_cast<float>(dawnBoost);
+
+    if(!std::isfinite(requestedShape) ||
+       requestedShape < 0.0f || requestedShape > 2.0f ||
+       !std::isfinite(requestedDawn) ||
+       requestedDawn < 1.0f || requestedDawn > 3.0f)
+    {
+        return JNI_FALSE;
+    }
+
+    g_fogShapeStrength.store(requestedShape);
+    g_fogDawnBoost.store(requestedDawn);
+
+    fprintf(
+        stderr,
+        "[FOG MOOD] java shape=%.2f dawnBoost=%.2f\n",
+        requestedShape,
+        requestedDawn);
+    fflush(stderr);
+    return JNI_TRUE;
+}
+
 extern "C"
 JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setAuroraStrength(
     JNIEnv*,
@@ -953,6 +1020,29 @@ JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_getCloudResFloorPerc
     jclass)
 {
     return static_cast<jint>(g_cloudResFloorPercent.load());
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudTemporalMode(
+    JNIEnv*,
+    jclass,
+    jint mode)
+{
+    const int requested = static_cast<int>(mode);
+    if(requested < 0 || requested > 2)
+    {
+        return JNI_FALSE;
+    }
+    g_cloudTemporalMode.store(static_cast<uint32_t>(requested));
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_getCloudTemporalMode(
+    JNIEnv*,
+    jclass)
+{
+    return static_cast<jint>(g_cloudTemporalMode.load());
 }
 
 extern "C"
@@ -1504,8 +1594,14 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudSkyHuePa
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    // 2026-11-07 死设置清理：cloudSkyHueParams 整块零读取（v5 云模型没有接这
-    // 四项），四个 atomic 已删，populateCloudSkyHueParams 写常量 0。
+    g_cloudStormDarkness.store(
+        std::min(std::max(static_cast<float>(values[0]), 0.0f), 2.0f));
+    g_cloudLightningStrength.store(
+        std::min(std::max(static_cast<float>(values[1]), 0.0f), 3.0f));
+    g_cloudSunsetWarmth.store(
+        std::min(std::max(static_cast<float>(values[2]), 0.0f), 2.0f));
+    g_cloudWeatherCoupling.store(
+        std::min(std::max(static_cast<float>(values[3]), 0.0f), 2.0f));
 
     g_volumetricCloudHistoryNeedsClear.store(true);
     return JNI_TRUE;
@@ -1568,9 +1664,14 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudLight2Pa
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    // 2026-11-07 死设置清理：cloudLightParams2 的 x/y/z 零读取，三个 atomic 已删。
-    // 注意"光粉强度"（g_cloudPowderStrength）是活的，但它走 cloudParams[23]，
-    // 不经这个块，见 populateCloudParams / setCloudPowderStrength。
+    g_cloudPowderEffect.store(
+        std::min(std::max(static_cast<float>(values[0]), 0.0f), 2.0f));
+    g_cloudSilverSpread.store(
+        std::min(std::max(static_cast<float>(values[1]), 0.0f), 2.0f));
+    g_cloudSharpness.store(
+        std::min(std::max(static_cast<float>(values[2]), 0.0f), 2.0f));
+    g_cloudBaseErosion.store(
+        std::min(std::max(static_cast<float>(values[3]), 0.0f), 1.5f));
 
     g_volumetricCloudHistoryNeedsClear.store(true);
     return JNI_TRUE;
@@ -1781,8 +1882,8 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudAerialPa
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }
-    // 2026-11-07 死设置清理：.x（云后大气透视）只在退役的 v3 云模型里有读取点
-    // （volumetric_clouds_v3.comp:294，需 cloud_v3.flag），atomic 已删，写常量 0。
+    g_cloudAerialStrength.store(
+        std::min(std::max(static_cast<float>(values[0]), 0.0f), 2.0f));
     g_groundAerialStrength.store(
         std::min(std::max(static_cast<float>(values[1]), 0.0f), 2.0f));
     g_groundAerialOcclusion.store(
@@ -1924,6 +2025,7 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setVolumetricFog
     g_fogRainBoost.store(requestedRainBoost);
 
     g_volumetricCloudHistoryNeedsClear.store(true);
+    g_fogFroxelHistoryNeedsClear.store(true);
     return JNI_TRUE;
 }
 
@@ -2076,9 +2178,14 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setWaterSimWaveP
     JNIEnv* env, jclass, jfloatArray params)
 {
     if(params == nullptr || env->GetArrayLength(params) < 4) return JNI_FALSE;
-    jfloat values[4];
-    env->GetFloatArrayRegion(params, 0, 4, values);
-    for(int i = 0; i < 4; ++i)
+    // 2026-11-21：[4] 曾是独立「雨滴涟漪」倍率；顾问轮1 并入降雨页
+    //「雨波纹明显度」（g_rainRippleStrength），此处仅校验、不消费。
+    // Java record 仍发 5 元素（存档字段保留，JSON 兼容）。
+    const jsize length = env->GetArrayLength(params);
+    jfloat values[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    env->GetFloatArrayRegion(
+        params, 0, std::min<jsize>(length, 5), values);
+    for(int i = 0; i < std::min<jsize>(length, 5); ++i)
     {
         if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
     }

@@ -368,6 +368,83 @@ bool isDhLodSpatialKey(uint64_t spatialKey)
         spatialKey);
 }
 
+// ---------------------------------------------------------------------------
+// 2026-11-19 rasterLod：记录流大 SSBO 的区间分配器（bump + free-list）。
+// 所有区间 256B 对齐；所有调用方必须已持有 g_chunkMutex（与 uploadDhLodSection
+// /removeDhLodSection/recordDhLodRasterPass 同一把锁）。
+// 扩容在渲染线程 recordDhLodRasterPass 入口做（FGDeviceWaitIdle + 重建 + 全部
+// 节 recordOffset 置 INVALID），上传线程只保留 CPU 记录，绝不碰 Vulkan。
+// ---------------------------------------------------------------------------
+constexpr VkDeviceSize DH_LOD_RASTER_ALIGN = 256;
+constexpr VkDeviceSize DH_LOD_RASTER_MIN_CAPACITY = 64ull * 1024ull * 1024ull;
+
+// 文件内分配器状态（语义上属于 g_dhLodRaster* 全局组；不出头文件）。
+static std::vector<std::pair<VkDeviceSize, VkDeviceSize>> g_dhLodRasterFreeRanges;
+static VkDeviceSize g_dhLodRasterBumpHighWater = 0;
+
+static VkDeviceSize dhLodRasterPaddedBytes(uint32_t quadCount)
+{
+    const VkDeviceSize bytes =
+        static_cast<VkDeviceSize>(quadCount) * 64ll;
+    return (bytes + DH_LOD_RASTER_ALIGN - 1) & ~(DH_LOD_RASTER_ALIGN - 1);
+}
+
+static VkDeviceSize dhLodRasterAllocRangeLocked(VkDeviceSize bytes)
+{
+    if(bytes == 0)
+    {
+        return DhLodSection::DH_LOD_RASTER_OFFSET_INVALID;
+    }
+
+    // 先找 free-list（first-fit）；找不到从 bump 水位分配。
+    for(size_t index = 0; index < g_dhLodRasterFreeRanges.size(); ++index)
+    {
+        if(g_dhLodRasterFreeRanges[index].second >= bytes)
+        {
+            const VkDeviceSize offset =
+                g_dhLodRasterFreeRanges[index].first;
+            const VkDeviceSize slack =
+                g_dhLodRasterFreeRanges[index].second - bytes;
+            if(slack > 0)
+            {
+                g_dhLodRasterFreeRanges[index] =
+                    { offset + bytes, slack };
+            }
+            else
+            {
+                g_dhLodRasterFreeRanges.erase(
+                    g_dhLodRasterFreeRanges.begin() +
+                    static_cast<ptrdiff_t>(index));
+            }
+            return offset;
+        }
+    }
+
+    if(g_dhLodRasterRecordCapacity == 0 ||
+       g_dhLodRasterBumpHighWater + bytes > g_dhLodRasterRecordCapacity)
+    {
+        g_dhLodRasterGrowRequested = true;
+        return DhLodSection::DH_LOD_RASTER_OFFSET_INVALID;
+    }
+
+    const VkDeviceSize offset = g_dhLodRasterBumpHighWater;
+    g_dhLodRasterBumpHighWater += bytes;
+    return offset;
+}
+
+static void dhLodRasterFreeRangeLocked(VkDeviceSize offset, uint32_t quadCount)
+{
+    if(offset == DhLodSection::DH_LOD_RASTER_OFFSET_INVALID ||
+       g_dhLodRasterRecordCapacity == 0 ||
+       offset >= g_dhLodRasterRecordCapacity)
+    {
+        return;
+    }
+
+    g_dhLodRasterFreeRanges.push_back(
+        { offset, dhLodRasterPaddedBytes(quadCount) });
+}
+
 /** Rebuilds g_dhLodSpatialSnapshot.  Caller must hold g_chunkMutex. */
 void refreshDhLodSpatialSnapshotLocked()
 {
@@ -503,7 +580,41 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadDhLodSection(
     if(alpha.empty()) g_chunkMeshes.erase(alphaKey);
     else g_chunkMeshes[alphaKey] = std::move(alpha);
     g_chunkMeshes.erase(LOD_AS_CLASS_WATER | spatialKey);
-    g_dhLodSections[section] = { static_cast<uint64_t>(version), spatialKey };
+
+    // ------------------------------------------------------------------
+    // 2026-11-19 rasterLod：保留原始 64B/quad 记录流（G-buffer 光栅投影
+    // pass 的 SSBO 数据源）+ push constants 所需的原点/宽度。旗标关闭时只
+    // 清零 raster 字段，行为与未接入前逐位一致。区间分配/上 GPU 都推迟到
+    // 渲染线程 recordDhLodRasterPass（上传线程不做任何 Vulkan 调用）。
+    // ------------------------------------------------------------------
+    {
+        DhLodSection& stored = g_dhLodSections[section];
+        // 归还旧记录区间（同节重传：旧区间作废，下一帧重分配；旗标关闭时
+        // offset 本就是 INVALID，空操作）。
+        dhLodRasterFreeRangeLocked(
+            stored.recordOffset,
+            stored.quadCount);
+        stored.version = static_cast<uint64_t>(version);
+        stored.spatialKey = spatialKey;
+        stored.quadCount = g_dhRasterLodEnabled
+            ? static_cast<uint32_t>(input.size() / 64u)
+            : 0u;
+        stored.originX = originX;
+        stored.originY = originY;
+        stored.originZ = originZ;
+        stored.width = width;
+        stored.recordVersion = 0u;
+        stored.recordOffset = DhLodSection::DH_LOD_RASTER_OFFSET_INVALID;
+        if(g_dhRasterLodEnabled)
+        {
+            stored.records = std::move(input);
+        }
+        else
+        {
+            stored.records.clear();
+        }
+    }
+
     g_dhLodSpatialOwners[spatialKey] = section;
     g_dirtySectionKeys.insert(spatialKey);
     markWorldGeometryDirty();
@@ -524,6 +635,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeDhLodSection(
     g_chunkMeshes.erase(spatialKey);
     g_chunkMeshes.erase(LOD_AS_CLASS_ALPHA | spatialKey);
     g_chunkMeshes.erase(LOD_AS_CLASS_WATER | spatialKey);
+    // 2026-11-19 rasterLod：归还记录流区间（旗标关闭时 offset 本就是 INVALID，空操作）。
+    dhLodRasterFreeRangeLocked(
+        entry->second.recordOffset,
+        entry->second.quadCount);
     g_dhLodSpatialOwners.erase(spatialKey);
     g_dhLodSections.erase(entry);
     g_dirtySectionKeys.insert(spatialKey);
@@ -540,6 +655,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeDhLodSection(
 // =====================================================
 void clearDhLodSpatialTablesLocked()
 {
+    // 2026-11-19 rasterLod：世界卸载时归还全部记录区间。
+    for(const auto& entry : g_dhLodSections)
+    {
+        dhLodRasterFreeRangeLocked(
+            entry.second.recordOffset,
+            entry.second.quadCount);
+    }
     g_dhLodSections.clear();
     g_dhLodSpatialOwners.clear();
     g_dhLodSpatialSnapshot.clear();
@@ -560,6 +682,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_clearDhLodSections(
         g_chunkMeshes.erase(spatialKey);
         g_chunkMeshes.erase(LOD_AS_CLASS_ALPHA | spatialKey);
         g_chunkMeshes.erase(LOD_AS_CLASS_WATER | spatialKey);
+        // 2026-11-19 rasterLod：归还记录流区间。
+        dhLodRasterFreeRangeLocked(
+            entry.second.recordOffset,
+            entry.second.quadCount);
         g_dirtySectionKeys.insert(spatialKey);
     }
     g_dhLodSections.clear();
@@ -1050,4 +1176,744 @@ void rebuildLodCoverage(
         words[index / 4u] |=
             LOD_COVERAGE_FLAG_NEAR_READY << ((index % 4u) * 8u);
     }
+}
+
+// ===========================================================================
+// 2026-11-19 DH LOD「G-buffer 光栅光影」引擎接线（阶段二余下）
+// ===========================================================================
+// 组成：
+//   ① 输出图：与 DH 图同尺寸（g_dhTextureWidth/Height；DH 未发布时回落渲染
+//      分辨率）的 RGBA8 color + R32F depth storage image（createRRGuideImage）。
+//      rgen 侧读点 = binding 96/97（mode=14，见 rgen_dh_far.glsl）。
+//   ② compute 管线：dh_lod_raster.comp.spv（push constants ivec4×2 = 32B），
+//      描述符集 set0 = {0: cam UBO, 1: 记录流大 SSBO, 2/3: 两张输出图}，
+//      创建模式仿 Shadow.cpp 的 createSunShadowFarResources。
+//   ③ 每帧派发：recordDhLodRasterPass —— 在 RT 主派发（traceK1K2）之前由
+//      Frame.cpp 调用，对 g_dhLodSections 里每个节派发一次（g_dhLodSections
+//      与 g_chunkMeshes 的 DH 键一一对应，且只有它持有 push constants 所需的
+//      原点/宽度/记录数据，故以其为枚举源）。
+//   ④ 记录流 SSBO：单一大 device-local 缓冲（256B 对齐区间 + free-list）+
+//      常驻 host-visible staging。上传线程（uploadDhLodSection）只保留 CPU
+//      记录；渲染线程在本函数里把版本变化节的记录 memcpy 进 staging 并
+//      vkCmdCopyBuffer 到 device 缓冲，再逐节 push+dispatch。
+//   同步链：clear(TRANSFER) -> compute 写图 -> RT shader 读图，全在同一条
+//      command buffer 内用 pipeline barrier 串行；跨帧依赖用旧 layout +
+//      srcStage(COMPUTE|RT_SHADER) 的 image barrier 覆盖（同
+//      recordSunShadowFarMap 的既有模式）。
+//
+// 旗标 g_dhRasterLodEnabled=false 时：create/record 首行短路，零资源、零
+//   命令、零行为差异。
+// ===========================================================================
+
+// push constants 内存布局（必须与 dh_lod_raster.comp 的 SectionPush 一致）
+struct DhLodRasterPush
+{
+    int32_t originAndWidth[4];   // x,y,z = section 最小角（世界格），w = blockWidth
+    int32_t countsAndDims[4];    // x = quadCount, y = 图宽, z = 图高, w = 记录字节偏移
+};
+static_assert(sizeof(DhLodRasterPush) == 32,
+    "DhLodRasterPush must match dh_lod_raster.comp SectionPush (ivec4 x2)");
+
+// RT set 的 binding 96/97 是否已写上（set 重建/资源重建后重写）
+static VkDescriptorSet g_dhLodRasterBoundSet = VK_NULL_HANDLE;
+
+static void dhLodRasterDestroyImages()
+{
+    if(g_dhLodRasterColorView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(g_device, g_dhLodRasterColorView, nullptr);
+        g_dhLodRasterColorView = VK_NULL_HANDLE;
+    }
+    if(g_dhLodRasterColorImage != VK_NULL_HANDLE)
+    {
+        vkDestroyImage(g_device, g_dhLodRasterColorImage, nullptr);
+        vkFreeMemory(g_device, g_dhLodRasterColorMemory, nullptr);
+        g_dhLodRasterColorImage = VK_NULL_HANDLE;
+        g_dhLodRasterColorMemory = VK_NULL_HANDLE;
+    }
+    if(g_dhLodRasterDepthView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(g_device, g_dhLodRasterDepthView, nullptr);
+        g_dhLodRasterDepthView = VK_NULL_HANDLE;
+    }
+    if(g_dhLodRasterDepthImage != VK_NULL_HANDLE)
+    {
+        vkDestroyImage(g_device, g_dhLodRasterDepthImage, nullptr);
+        vkFreeMemory(g_device, g_dhLodRasterDepthMemory, nullptr);
+        g_dhLodRasterDepthImage = VK_NULL_HANDLE;
+        g_dhLodRasterDepthMemory = VK_NULL_HANDLE;
+    }
+    g_dhLodRasterColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_dhLodRasterDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+// 扩容记录流缓冲：必须已持锁 + 设备空闲后调用。扩后全部节重分配。
+static bool dhLodRasterGrowRecordBuffersLocked()
+{
+    if(g_device == VK_NULL_HANDLE || g_physicalDevice == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    const VkDeviceSize newCapacity =
+        g_dhLodRasterRecordCapacity == 0
+            ? DH_LOD_RASTER_MIN_CAPACITY
+            : std::max(
+                  g_dhLodRasterRecordCapacity * 2,
+                  g_dhLodRasterRecordCapacity + DH_LOD_RASTER_MIN_CAPACITY);
+
+    FGDeviceWaitIdle(g_device);
+
+    if(g_dhLodRasterRecordStagingMapped != nullptr)
+    {
+        vkUnmapMemory(g_device, g_dhLodRasterRecordStagingMemory);
+        g_dhLodRasterRecordStagingMapped = nullptr;
+    }
+    if(g_dhLodRasterRecordStaging != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_dhLodRasterRecordStaging, nullptr);
+        vkFreeMemory(g_device, g_dhLodRasterRecordStagingMemory, nullptr);
+        g_dhLodRasterRecordStaging = VK_NULL_HANDLE;
+        g_dhLodRasterRecordStagingMemory = VK_NULL_HANDLE;
+    }
+    if(g_dhLodRasterRecordDevice != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_dhLodRasterRecordDevice, nullptr);
+        vkFreeMemory(g_device, g_dhLodRasterRecordDeviceMemory, nullptr);
+        g_dhLodRasterRecordDevice = VK_NULL_HANDLE;
+        g_dhLodRasterRecordDeviceMemory = VK_NULL_HANDLE;
+    }
+
+    try
+    {
+        createBuffer(g_device, g_physicalDevice, newCapacity,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            g_dhLodRasterRecordDevice, g_dhLodRasterRecordDeviceMemory);
+        createBuffer(g_device, g_physicalDevice, newCapacity,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            g_dhLodRasterRecordStaging, g_dhLodRasterRecordStagingMemory);
+        check(vkMapMemory(g_device, g_dhLodRasterRecordStagingMemory, 0u,
+                newCapacity, 0u, &g_dhLodRasterRecordStagingMapped),
+            "dh lod raster staging map failed");
+    }
+    catch(...)
+    {
+        RTLog("[DH-RASTER] 记录流缓冲扩容失败，本帧跳过投影");
+        g_dhLodRasterRecordCapacity = 0u;
+        g_dhLodRasterBumpHighWater = 0u;
+        g_dhLodRasterFreeRanges.clear();
+        for(auto& entry : g_dhLodSections)
+        {
+            entry.second.recordOffset =
+                DhLodSection::DH_LOD_RASTER_OFFSET_INVALID;
+            entry.second.recordVersion = 0u;
+        }
+        g_dhLodRasterGrowRequested = false;
+        return false;
+    }
+
+    const VkDeviceSize oldCapacity = g_dhLodRasterRecordCapacity;
+    g_dhLodRasterRecordCapacity = newCapacity;
+    g_dhLodRasterBumpHighWater = 0u;
+    g_dhLodRasterFreeRanges.clear();
+    g_dhLodRasterGrowRequested = false;
+
+    // 旧区间全部失效：渲染线程在后续帧重新分配 + 重拷（CPU 记录仍在）。
+    for(auto& entry : g_dhLodSections)
+    {
+        entry.second.recordOffset =
+            DhLodSection::DH_LOD_RASTER_OFFSET_INVALID;
+        entry.second.recordVersion = 0u;
+    }
+
+    // 记录流 SSBO 描述符重新指向新缓冲。
+    if(g_dhLodRasterSet != VK_NULL_HANDLE)
+    {
+        VkDescriptorBufferInfo recordInfo{};
+        recordInfo.buffer = g_dhLodRasterRecordDevice;
+        recordInfo.offset = 0u;
+        recordInfo.range = newCapacity;
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = g_dhLodRasterSet;
+        write.dstBinding = 1u;
+        write.descriptorCount = 1u;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &recordInfo;
+        vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+    }
+
+    RTLog("[DH-RASTER] 记录流缓冲扩容 " +
+        std::to_string(static_cast<uint64_t>(oldCapacity / (1024ull * 1024ull))) +
+        "MB -> " +
+        std::to_string(static_cast<uint64_t>(newCapacity / (1024ull * 1024ull))) +
+        "MB，全部节待重分配");
+    return true;
+}
+
+void createDhLodRasterResources(uint32_t renderWidth, uint32_t renderHeight)
+{
+    if(!g_dhRasterLodEnabled || g_device == VK_NULL_HANDLE ||
+       g_physicalDevice == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 尺寸：跟随 DH 图（publishDhTextures 下发的 W×H）；DH 未发布时回落渲染分辨率。
+    const uint32_t width =
+        (g_dhTexturesValid && g_dhTextureWidth > 0) ?
+            static_cast<uint32_t>(g_dhTextureWidth) :
+            std::max(renderWidth, 1u);
+    const uint32_t height =
+        (g_dhTexturesValid && g_dhTextureHeight > 0) ?
+            static_cast<uint32_t>(g_dhTextureHeight) :
+            std::max(renderHeight, 1u);
+
+    const bool resourcesCurrent =
+        g_dhLodRasterColorImage != VK_NULL_HANDLE &&
+        g_dhLodRasterDepthImage != VK_NULL_HANDLE &&
+        g_dhLodRasterWidth == width &&
+        g_dhLodRasterHeight == height &&
+        g_dhLodRasterBoundSet == g_rayTracingDescriptorSet;
+
+    if(resourcesCurrent && g_dhLodRasterPipeline != VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 尺寸/set 变化 ⇒ 重建图（销毁前等空闲，尺寸变化是低频事件）。
+    if(!resourcesCurrent)
+    {
+        if(g_dhLodRasterColorImage != VK_NULL_HANDLE ||
+           g_dhLodRasterDepthImage != VK_NULL_HANDLE)
+        {
+            FGDeviceWaitIdle(g_device);
+            dhLodRasterDestroyImages();
+        }
+
+        RTLogFlushed(std::string("[DH-RASTER] 创建资源 img=") +
+            std::to_string(width) + "x" + std::to_string(height) +
+            "（DH 发布=" + (g_dhTexturesValid ? "1" : "0") + "）");
+
+        createRRGuideImage(
+            width,
+            height,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            g_dhLodRasterColorImage,
+            g_dhLodRasterColorMemory,
+            g_dhLodRasterColorView,
+            g_dhLodRasterColorLayout);
+
+        createRRGuideImage(
+            width,
+            height,
+            VK_FORMAT_R32_SFLOAT,
+            g_dhLodRasterDepthImage,
+            g_dhLodRasterDepthMemory,
+            g_dhLodRasterDepthView,
+            g_dhLodRasterDepthLayout);
+
+        g_dhLodRasterColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        g_dhLodRasterDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        g_dhLodRasterWidth = width;
+        g_dhLodRasterHeight = height;
+    }
+
+    // 记录流缓冲（首次建 64MB；后续按需扩容）。仅在锁内碰记录簿记，
+    // 描述符/管线创建不持 g_chunkMutex（避免阻塞 Java 上传线程）。
+    {
+        std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+        if(g_dhLodRasterRecordDevice == VK_NULL_HANDLE)
+        {
+            g_dhLodRasterGrowRequested = true;
+            dhLodRasterGrowRecordBuffersLocked();
+        }
+    }
+
+    // RT set binding 96/97（rgen mode=14 读本项目光栅图；rasterLod 关闭时
+    // 本函数不执行，着色器也不动态访问这两个槽 —— 与 binding 94 的
+    // ensureMatReuseBuffer 同一约定：共享 layout 先声明，描述符按需写）。
+    if(g_rayTracingDescriptorSet != VK_NULL_HANDLE)
+    {
+        VkDescriptorImageInfo infos[2]{};
+        infos[0].imageView = g_dhLodRasterColorView;
+        infos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        infos[1].imageView = g_dhLodRasterDepthView;
+        infos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = g_rayTracingDescriptorSet;
+        writes[0].dstBinding = 96u;
+        writes[0].descriptorCount = 1u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].pImageInfo = &infos[0];
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = g_rayTracingDescriptorSet;
+        writes[1].dstBinding = 97u;
+        writes[1].descriptorCount = 1u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].pImageInfo = &infos[1];
+        vkUpdateDescriptorSets(g_device, 2u, writes, 0u, nullptr);
+        g_dhLodRasterBoundSet = g_rayTracingDescriptorSet;
+    }
+
+    if(g_dhLodRasterPipeline != VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // compute set layout：0=cam UBO / 1=记录流 SSBO / 2=color / 3=depth
+    VkDescriptorSetLayoutBinding bindings[4]{};
+    bindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    bindings[1] = { 1u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    bindings[2] = { 2u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    bindings[3] = { 3u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    VkDescriptorSetLayoutCreateInfo layoutInfo{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    };
+    layoutInfo.bindingCount = 4u;
+    layoutInfo.pBindings = bindings;
+    check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
+        &g_dhLodRasterSetLayout), "dh lod raster set layout failed");
+
+    VkDescriptorPoolSize poolSizes[3] = {
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2u }
+    };
+    VkDescriptorPoolCreateInfo poolInfo{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    };
+    poolInfo.maxSets = 1u;
+    poolInfo.poolSizeCount = 3u;
+    poolInfo.pPoolSizes = poolSizes;
+    check(vkCreateDescriptorPool(g_device, &poolInfo, nullptr,
+        &g_dhLodRasterDescriptorPool), "dh lod raster descriptor pool failed");
+
+    VkDescriptorSetAllocateInfo setAllocation{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    };
+    setAllocation.descriptorPool = g_dhLodRasterDescriptorPool;
+    setAllocation.descriptorSetCount = 1u;
+    setAllocation.pSetLayouts = &g_dhLodRasterSetLayout;
+    check(vkAllocateDescriptorSets(g_device, &setAllocation,
+        &g_dhLodRasterSet), "dh lod raster descriptor set failed");
+
+    VkDescriptorBufferInfo cameraInfo{};
+    cameraInfo.buffer = g_cameraUboBuffer;
+    cameraInfo.range = sizeof(CameraUBO);
+    VkDescriptorBufferInfo recordInfo{};
+    recordInfo.buffer = g_dhLodRasterRecordDevice;
+    recordInfo.offset = 0u;
+    recordInfo.range = g_dhLodRasterRecordCapacity;
+    VkDescriptorImageInfo colorInfo{};
+    colorInfo.imageView = g_dhLodRasterColorView;
+    colorInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo depthInfo{};
+    depthInfo.imageView = g_dhLodRasterDepthView;
+    depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[4]{};
+    writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+        g_dhLodRasterSet, 0u, 0u, 1u,
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &cameraInfo, nullptr };
+    writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+        g_dhLodRasterSet, 1u, 0u, 1u,
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &recordInfo, nullptr };
+    writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+        g_dhLodRasterSet, 2u, 0u, 1u,
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &colorInfo, nullptr, nullptr };
+    writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+        g_dhLodRasterSet, 3u, 0u, 1u,
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &depthInfo, nullptr, nullptr };
+    vkUpdateDescriptorSets(g_device, 4u, writes, 0u, nullptr);
+
+    const std::vector<uint8_t> code =
+        loadSpv("shaders/dh_lod_raster.comp.spv");
+    VkShaderModule shader = createShaderModule(g_device, code);
+    try
+    {
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushRange.offset = 0u;
+        pushRange.size = sizeof(DhLodRasterPush);
+
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+        };
+        pipelineLayoutInfo.setLayoutCount = 1u;
+        pipelineLayoutInfo.pSetLayouts = &g_dhLodRasterSetLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1u;
+        pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+        check(vkCreatePipelineLayout(g_device, &pipelineLayoutInfo, nullptr,
+            &g_dhLodRasterPipelineLayout), "dh lod raster pipeline layout failed");
+
+        VkPipelineShaderStageCreateInfo stage{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+        };
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = shader;
+        stage.pName = "main";
+        VkComputePipelineCreateInfo pipelineInfo{
+            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+        };
+        pipelineInfo.stage = stage;
+        pipelineInfo.layout = g_dhLodRasterPipelineLayout;
+        check(vkCreateComputePipelines(g_device, getSharedPipelineCache(), 1u,
+            &pipelineInfo, nullptr, &g_dhLodRasterPipeline),
+            "dh lod raster pipeline failed");
+    }
+    catch(...)
+    {
+        vkDestroyShaderModule(g_device, shader, nullptr);
+        destroyDhLodRasterResources();
+        throw;
+    }
+    vkDestroyShaderModule(g_device, shader, nullptr);
+
+    RTLog("[DH-RASTER] 资源就绪 " + std::to_string(width) + "x" +
+        std::to_string(height) + "（RGBA8 color + R32F depth，每节一次 dispatch，"+
+        "binding 96/97 -> rgen mode=14）");
+}
+
+void recordDhLodRasterPass(VkCommandBuffer cmd)
+{
+    if(cmd == VK_NULL_HANDLE || !g_dhRasterLodEnabled ||
+       g_dhLodRasterPipeline == VK_NULL_HANDLE ||
+       g_dhLodRasterPipelineLayout == VK_NULL_HANDLE ||
+       g_dhLodRasterSet == VK_NULL_HANDLE ||
+       g_dhLodRasterColorImage == VK_NULL_HANDLE ||
+       g_dhLodRasterDepthImage == VK_NULL_HANDLE ||
+       g_dhLodRasterRecordDevice == VK_NULL_HANDLE ||
+       g_dhLodRasterRecordStagingMapped == nullptr ||
+       g_dhLodRasterWidth == 0u || g_dhLodRasterHeight == 0u)
+    {
+        // 2026-11-19 入口门诊断：首 3 次拦截逐成员打印，定位哪一项把投影 pass 拦住。
+        static std::atomic<uint32_t> s_gateLogCount{0u};
+        if(s_gateLogCount.fetch_add(1u, std::memory_order_relaxed) < 3u)
+        {
+            RTLogFlushed(std::string("[DH-RASTER] 入口门拦截：cmd=") +
+                (cmd == VK_NULL_HANDLE ? "null" : "ok") +
+                " 旗标=" + (g_dhRasterLodEnabled ? "1" : "0") +
+                " pipe=" + (g_dhLodRasterPipeline == VK_NULL_HANDLE ? "null" : "ok") +
+                " layout=" + (g_dhLodRasterPipelineLayout == VK_NULL_HANDLE ? "null" : "ok") +
+                " set=" + (g_dhLodRasterSet == VK_NULL_HANDLE ? "null" : "ok") +
+                " color=" + (g_dhLodRasterColorImage == VK_NULL_HANDLE ? "null" : "ok") +
+                " depth=" + (g_dhLodRasterDepthImage == VK_NULL_HANDLE ? "null" : "ok") +
+                " rec=" + (g_dhLodRasterRecordDevice == VK_NULL_HANDLE ? "null" : "ok") +
+                " stage=" + (g_dhLodRasterRecordStagingMapped == nullptr ? "null" : "ok") +
+                " img=" + std::to_string(g_dhLodRasterWidth) + "x" +
+                std::to_string(g_dhLodRasterHeight));
+        }
+        return;
+    }
+
+    std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+
+    if(g_dhLodRasterGrowRequested)
+    {
+        dhLodRasterGrowRecordBuffersLocked();
+    }
+
+    bool anyDispatch = false;
+    bool anyMissingRecords = false;
+
+    // ---- ① 版本变化的节：分配区间 + 写 staging + 当帧 copyBuffer ------------
+    for(auto& entry : g_dhLodSections)
+    {
+        DhLodSection& section = entry.second;
+        if(section.quadCount == 0u || section.records.empty())
+        {
+            if(section.quadCount != 0u)
+            {
+                anyMissingRecords = true;
+            }
+            continue;
+        }
+
+        const VkDeviceSize bytes =
+            dhLodRasterPaddedBytes(section.quadCount);
+
+        if(section.recordOffset ==
+           DhLodSection::DH_LOD_RASTER_OFFSET_INVALID)
+        {
+            const VkDeviceSize offset =
+                dhLodRasterAllocRangeLocked(bytes);
+            if(offset == DhLodSection::DH_LOD_RASTER_OFFSET_INVALID)
+            {
+                continue;   // 扩容已请求，下一帧重分配
+            }
+            section.recordOffset = offset;
+        }
+
+        if(section.recordVersion == section.version)
+        {
+            continue;       // GPU 上已是当前版本
+        }
+
+        const size_t rawBytes =
+            static_cast<size_t>(section.quadCount) * 64u;
+        std::memcpy(
+            reinterpret_cast<uint8_t*>(g_dhLodRasterRecordStagingMapped) +
+                static_cast<size_t>(section.recordOffset),
+            section.records.data(),
+            rawBytes);
+
+        VkBufferCopy region{};
+        region.srcOffset = section.recordOffset;
+        region.dstOffset = section.recordOffset;
+        region.size = bytes;
+        vkCmdCopyBuffer(
+            cmd,
+            g_dhLodRasterRecordStaging,
+            g_dhLodRasterRecordDevice,
+            1u,
+            &region);
+        section.recordVersion = section.version;
+    }
+
+    // ---- ② 跨帧 image barrier（上一帧 RT 读 + 上帧 compute 写 -> 本帧 clear）-
+    VkImageMemoryBarrier clearBarrier{};
+    clearBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    clearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    clearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    clearBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    clearBarrier.subresourceRange.levelCount = 1u;
+    clearBarrier.subresourceRange.layerCount = 1u;
+
+    auto recordClearBarrier = [&](VkImage image, VkImageLayout& tracked)
+    {
+        clearBarrier.oldLayout = tracked;
+        clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        clearBarrier.srcAccessMask = tracked == VK_IMAGE_LAYOUT_UNDEFINED
+            ? 0u
+            : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        clearBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        clearBarrier.image = image;
+        vkCmdPipelineBarrier(
+            cmd,
+            tracked == VK_IMAGE_LAYOUT_UNDEFINED
+                ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                : (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                   VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR),
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 0u, nullptr, 1u, &clearBarrier);
+        tracked = VK_IMAGE_LAYOUT_GENERAL;
+    };
+    recordClearBarrier(g_dhLodRasterColorImage, g_dhLodRasterColorLayout);
+    recordClearBarrier(g_dhLodRasterDepthImage, g_dhLodRasterDepthLayout);
+
+    // ---- ③ 当帧清零（未覆盖像素 = 0.0 = 无几何；避免陈旧像素残留）-----------
+    const VkClearColorValue zeroColor{};
+    const VkImageSubresourceRange fullRange{
+        VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u };
+    vkCmdClearColorImage(cmd, g_dhLodRasterColorImage,
+        VK_IMAGE_LAYOUT_GENERAL, &zeroColor, 1u, &fullRange);
+    vkCmdClearColorImage(cmd, g_dhLodRasterDepthImage,
+        VK_IMAGE_LAYOUT_GENERAL, &zeroColor, 1u, &fullRange);
+
+    // clear -> compute 写图
+    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    clearBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    clearBarrier.image = g_dhLodRasterColorImage;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+        1u, &clearBarrier);
+    clearBarrier.image = g_dhLodRasterDepthImage;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+        1u, &clearBarrier);
+
+    // ---- ④ 记录拷贝 -> compute 读（SSBO 可见） -------------------------------
+    VkMemoryBarrier recordBarrier{};
+    recordBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    recordBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    recordBarrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 1u, &recordBarrier,
+        0u, nullptr, 0u, nullptr);
+
+    // ---- ⑤ 逐节派发 -------------------------------------------------------
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_dhLodRasterPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_dhLodRasterPipelineLayout, 0u, 1u, &g_dhLodRasterSet, 0u, nullptr);
+
+    for(const auto& entry : g_dhLodSections)
+    {
+        const DhLodSection& section = entry.second;
+        if(section.quadCount == 0u || section.records.empty() ||
+           section.recordOffset ==
+               DhLodSection::DH_LOD_RASTER_OFFSET_INVALID)
+        {
+            continue;
+        }
+
+        DhLodRasterPush push{};
+        push.originAndWidth[0] = section.originX;
+        push.originAndWidth[1] = section.originY;
+        push.originAndWidth[2] = section.originZ;
+        push.originAndWidth[3] = section.width;
+        push.countsAndDims[0] = static_cast<int32_t>(section.quadCount);
+        push.countsAndDims[1] = static_cast<int32_t>(g_dhLodRasterWidth);
+        push.countsAndDims[2] = static_cast<int32_t>(g_dhLodRasterHeight);
+        push.countsAndDims[3] = static_cast<int32_t>(section.recordOffset);
+
+        vkCmdPushConstants(
+            cmd,
+            g_dhLodRasterPipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0u,
+            sizeof(DhLodRasterPush),
+            &push);
+        const uint32_t groups =
+            (section.quadCount + 63u) / 64u;
+        vkCmdDispatch(cmd, groups, 1u, 1u);
+        anyDispatch = true;
+    }
+
+    // 2026-11-19 派发计数诊断：首 3 次 + 每 600 帧一次，量化「图为什么没内容」。
+    {
+        static std::atomic<uint32_t> s_dispatchLogFrame{0u};
+        const uint32_t frameIdx =
+            s_dispatchLogFrame.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if(frameIdx <= 3u || frameIdx % 600u == 0u)
+        {
+            uint32_t readySections = 0u;
+            uint64_t readyQuads = 0u;
+            for(const auto& entry : g_dhLodSections)
+            {
+                const DhLodSection& s = entry.second;
+                if(s.quadCount != 0u && !s.records.empty() &&
+                   s.recordOffset !=
+                       DhLodSection::DH_LOD_RASTER_OFFSET_INVALID)
+                {
+                    ++readySections;
+                    readyQuads += s.quadCount;
+                }
+            }
+            RTLogFlushed(std::string("[DH-RASTER] 帧计数=") +
+                std::to_string(frameIdx) +
+                " 本帧派发=" + (anyDispatch ? "有" : "无") +
+                " 就绪节=" + std::to_string(readySections) +
+                " quad=" + std::to_string(readyQuads) +
+                " img=" + std::to_string(g_dhLodRasterWidth) + "x" +
+                std::to_string(g_dhLodRasterHeight) +
+                " 旗标=" + (g_dhRasterLodEnabled ? "1" : "0"));
+        }
+    }
+
+    if(anyMissingRecords)
+    {
+        static std::atomic<uint32_t> s_missingLogCount{0u};
+        if(s_missingLogCount.fetch_add(1u, std::memory_order_relaxed) < 3u)
+        {
+            RTLog("[DH-RASTER] 有节在旗标开启前上传、无保留记录，跳过投影" +
+                std::string("（重新上传后恢复）"));
+        }
+    }
+
+    if(!anyDispatch)
+    {
+        return;
+    }
+
+    // ---- ⑥ compute 写图 -> RT shader 读 -----------------------------------
+    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    clearBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    clearBarrier.image = g_dhLodRasterColorImage;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &clearBarrier);
+    clearBarrier.image = g_dhLodRasterDepthImage;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &clearBarrier);
+}
+
+void destroyDhLodRasterResources()
+{
+    if(g_device == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    FGDeviceWaitIdle(g_device);
+
+    if(g_dhLodRasterPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_dhLodRasterPipeline, nullptr);
+        g_dhLodRasterPipeline = VK_NULL_HANDLE;
+    }
+    if(g_dhLodRasterPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_dhLodRasterPipelineLayout, nullptr);
+        g_dhLodRasterPipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_dhLodRasterDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(g_device, g_dhLodRasterDescriptorPool, nullptr);
+        g_dhLodRasterDescriptorPool = VK_NULL_HANDLE;
+        g_dhLodRasterSet = VK_NULL_HANDLE;
+    }
+    if(g_dhLodRasterSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(
+            g_device, g_dhLodRasterSetLayout, nullptr);
+        g_dhLodRasterSetLayout = VK_NULL_HANDLE;
+    }
+
+    dhLodRasterDestroyImages();
+
+    if(g_dhLodRasterRecordStagingMapped != nullptr)
+    {
+        vkUnmapMemory(g_device, g_dhLodRasterRecordStagingMemory);
+        g_dhLodRasterRecordStagingMapped = nullptr;
+    }
+    if(g_dhLodRasterRecordStaging != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_dhLodRasterRecordStaging, nullptr);
+        vkFreeMemory(g_device, g_dhLodRasterRecordStagingMemory, nullptr);
+        g_dhLodRasterRecordStaging = VK_NULL_HANDLE;
+        g_dhLodRasterRecordStagingMemory = VK_NULL_HANDLE;
+    }
+    if(g_dhLodRasterRecordDevice != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_dhLodRasterRecordDevice, nullptr);
+        vkFreeMemory(g_device, g_dhLodRasterRecordDeviceMemory, nullptr);
+        g_dhLodRasterRecordDevice = VK_NULL_HANDLE;
+        g_dhLodRasterRecordDeviceMemory = VK_NULL_HANDLE;
+    }
+
+    {
+        std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+        g_dhLodRasterRecordCapacity = 0u;
+        g_dhLodRasterBumpHighWater = 0u;
+        g_dhLodRasterFreeRanges.clear();
+        g_dhLodRasterGrowRequested = false;
+        for(auto& entry : g_dhLodSections)
+        {
+            entry.second.recordOffset =
+                DhLodSection::DH_LOD_RASTER_OFFSET_INVALID;
+            entry.second.recordVersion = 0u;
+        }
+    }
+
+    g_dhLodRasterWidth = 0u;
+    g_dhLodRasterHeight = 0u;
+    g_dhLodRasterBoundSet = VK_NULL_HANDLE;
 }

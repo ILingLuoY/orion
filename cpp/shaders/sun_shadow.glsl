@@ -39,7 +39,9 @@ const float SUN_SHADOW_BIAS_NEAR = 0.06;
 
 const float SUN_SHADOW_ORIGIN_BIAS = 0.02;
 
-const uint SUN_SHADOW_CULL_MASK = 0x04u;
+// 0x08u hits opaque blocks, OMM foliage, and DH far LODs while excluding
+// first-person hand (0x04), local player (0x02), and particles (0xF7).
+const uint SUN_SHADOW_CULL_MASK = 0x08u;
 
 // 光的方向：与两个体积 pass 的 sunDirection() 同一个公式（同一个
 // cam.historyParams.w），并且同样在太阳落到地平线以下后翻到月亮方向。
@@ -52,7 +54,18 @@ vec3 sunShadowLightDirection()
     float angle = fract(cam.historyParams.w) * TWO_PI;
     vec3 direction = normalize(vec3(cos(angle), 0.81915204429 * sin(angle),
         0.57357643635 * sin(angle)));
-    return direction.y >= 0.0 ? direction : -direction;
+    if(direction.y >= 0.0)
+    {
+        return direction;
+    }
+    // 2026-11-16：夜间不再用 -direction（"月亮永远在太阳对面"），改为月亮
+    // 沿同一条日轨推移 (月相 + 0.5) 圈。月相 0（满月）时本式与 -direction
+    // 逐位等价；其余月相下阴影方向会跟着月亮走，与 rgen/rmiss 的可见月亮
+    // 同一向量。⚠ 与 sky_model_common.glsl 的 moonEclipticDirectionAt 同式。
+    float moonAngle = fract(
+        fract(cam.historyParams.w) + cam.sssParams.z + 0.5) * TWO_PI;
+    return normalize(vec3(cos(moonAngle), 0.81915204429 * sin(moonAngle),
+        0.57357643635 * sin(moonAngle)));
 }
 
 // 正交盒中心：跟着相机，但量化到纹素尺寸以抑制移动时的"游泳"。
@@ -132,17 +145,19 @@ vec3 sunShadowRayOriginFar(vec2 uv, vec3 sunDirection, vec3 center,
 float sunShadowTraceDepth(vec3 origin, vec3 sunDirection, float maxDistance)
 {
     rayQueryEXT query;
+    // Closest-hit traversal (NO TerminateOnFirstHit) so we record the highest
+    // occluder along -sunDirection rather than an arbitrary BVH triangle.
     rayQueryInitializeEXT(
         query,
         sceneTlas,
-        gl_RayFlagsTerminateOnFirstHitEXT |
-            gl_RayFlagsSkipClosestHitShaderEXT,
+        0u,
         SUN_SHADOW_CULL_MASK,
         origin,
         SUN_SHADOW_ORIGIN_BIAS,
         sunDirection,
         maxDistance);
-    while(rayQueryProceedEXT(query)) {}
+    int guard = 0;
+    while(rayQueryProceedEXT(query) && ++guard < 64) {}
     if(rayQueryGetIntersectionTypeEXT(query, true) ==
         gl_RayQueryCommittedIntersectionNoneEXT)
     {

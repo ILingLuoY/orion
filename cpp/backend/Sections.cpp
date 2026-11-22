@@ -6,6 +6,72 @@
 #include "TrackingHooks.h"
 
 
+// 2026-11-15：顶点地址槽的**存活位图 + 空闲表去重**。
+// 动机（用户 2026-11-15 报告）：每局出现"固定一区块大小、永不恢复"的洞，位置
+// 每局不同；段级转储显示 zeroTri=0（几何都在）⇒ 不是"几何没到"，而是命中着色
+// 读错了顶点表。段退役时会把 vertexAddressSlot 推回空闲表，若同一次退役被推两次
+// （退休代际重叠/重复回收），两个活着的段会拿到同一个槽 ⇒ 该段着色读到别人的顶点
+// 缓冲 ⇒ 位置/法线错乱，视觉上就是一块洞。
+// 这里把"同一槽同时被两个活段持有"（[SLOT COLLISION]）与"同一槽被回收两次"
+// （[SLOT DUP]）都变成可观测事件，并顺手把重复入表挡掉。
+namespace
+{
+std::vector<uint64_t> g_sectionSlotLiveBits;
+
+bool slotLiveSet(uint32_t slot)
+{
+    const size_t word = slot >> 6u;
+    const uint64_t bit = 1ull << (slot & 63u);
+
+    if(g_sectionSlotLiveBits.size() <= word)
+    {
+        g_sectionSlotLiveBits.resize(word + 1u, 0ull);
+    }
+
+    if((g_sectionSlotLiveBits[word] & bit) != 0ull)
+    {
+        return true;   // 已经活着 = 冲突
+    }
+
+    g_sectionSlotLiveBits[word] |= bit;
+    return false;
+}
+
+bool slotLiveClear(uint32_t slot)
+{
+    const size_t word = slot >> 6u;
+
+    if(g_sectionSlotLiveBits.size() <= word)
+    {
+        return false;
+    }
+
+    const uint64_t bit = 1ull << (slot & 63u);
+
+    if((g_sectionSlotLiveBits[word] & bit) == 0ull)
+    {
+        return false;   // 本来就不活着 = 重复回收
+    }
+
+    g_sectionSlotLiveBits[word] &= ~bit;
+    return true;
+}
+
+bool slotFreeListContains(uint32_t slot)
+{
+    for(const uint32_t existing : g_sectionVertexAddressFreeSlots)
+    {
+        if(existing == slot)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+} // namespace
+
+
 // 2026-10-14：新建池槽时的容量取整（见下方 adopt 的说明）。
 //
 // 目的：把"连续变化"的批次尺寸钉到少数几档，让池命中从"看运气"变成"几乎恒命中"。
@@ -2117,9 +2183,39 @@ void releaseRetirementSlot(
     {
         if(section.hasVertexAddressSlot && section.vertexAddressSlot != 0u)
         {
-            g_sectionVertexAddressFreeSlots.push_back(
-                section.vertexAddressSlot
-            );
+            // 2026-11-15：见文件头的槽位竞态说明。回收两次 / 重复入表都留痕。
+            const uint32_t freedSlot = section.vertexAddressSlot;
+
+            if(!slotLiveClear(freedSlot))
+            {
+                static uint32_t sSlotDupLogCount = 0u;
+
+                if((++sSlotDupLogCount % 20u) == 1u)
+                {
+                    RTLog(
+                        "[SLOT DUP] slot=" + std::to_string(freedSlot) +
+                        " sectionKey=" + std::to_string(section.sectionKey) +
+                        " total=" + std::to_string(sSlotDupLogCount));
+                }
+            }
+
+            if(!slotFreeListContains(freedSlot))
+            {
+                g_sectionVertexAddressFreeSlots.push_back(freedSlot);
+            }
+            else
+            {
+                static uint32_t sSlotDupFreeLogCount = 0u;
+
+                if((++sSlotDupFreeLogCount % 20u) == 1u)
+                {
+                    RTLog(
+                        "[SLOT DUP] freeList already holds slot=" +
+                        std::to_string(freedSlot) +
+                        " sectionKey=" + std::to_string(section.sectionKey) +
+                        " total=" + std::to_string(sSlotDupFreeLogCount));
+                }
+            }
         }
 
         section.hasVertexAddressSlot = false;
@@ -3302,6 +3398,8 @@ void destroySectionVertexAddressBuffer()
 
     g_sectionVertexAddressNextSlot = 1u;
     g_sectionVertexAddressFreeSlots.clear();
+    // 2026-11-15：槽位表重建 ⇒ 存活位图必须一起清空（见文件头槽位竞态说明）。
+    g_sectionSlotLiveBits.clear();
 
     if(g_sectionRoleMapped != nullptr && g_sectionRoleMemory != VK_NULL_HANDLE)
     {
@@ -3755,6 +3853,33 @@ bool ensureSectionVertexAddressSlot(
             g_sectionVertexAddressNextSlot++;
     }
 
+
+    // 2026-11-15：分配后立刻校验"该槽当前没有活着的持有者"。
+    // 命中说明空闲表被污染（同一槽被回收两次），两个活段共用一张顶点表项 ⇒
+    // 其中一个段着色会读到别人的顶点数据（视觉上就是一块洞）。留痕并换新槽。
+    if(slotLiveSet(section.vertexAddressSlot))
+    {
+        static uint32_t sCollisionLogCount = 0u;
+
+        if((++sCollisionLogCount % 20u) == 1u)
+        {
+            RTLog(
+                "[SLOT COLLISION] slot=" +
+                std::to_string(section.vertexAddressSlot) +
+                " sectionKey=" + std::to_string(section.sectionKey) +
+                " total=" + std::to_string(sCollisionLogCount) +
+                " action=freshSlot");
+        }
+
+        if(g_sectionVertexAddressNextSlot <
+           SECTION_VERTEX_ADDRESS_SLOT_LIMIT)
+        {
+            section.vertexAddressSlot =
+                g_sectionVertexAddressNextSlot++;
+
+            slotLiveSet(section.vertexAddressSlot);
+        }
+    }
 
     section.hasVertexAddressSlot =
         true;

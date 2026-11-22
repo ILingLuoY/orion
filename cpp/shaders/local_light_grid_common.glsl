@@ -84,10 +84,29 @@ bool localLightGridLookupCell(
         return false;
     }
 
+    // 2026-11-18：容量合法性检查 + 探测次数硬上限。
+    //
+    // hashCapacity 来自 GPU 缓冲（fogLightGrid.words[2]），而这张缓冲在灯表扩容时
+    // 会被销毁重建。重建前只等了我们自己的 RT 队列，管不住**引擎**在飞的帧：
+    // 那一帧可能读到已释放/未初始化的缓冲，words[2] 变成垃圾大数。原实现的探测
+    // 循环直接用它作上界 ⇒ 每个像素探测数百万次 ⇒ dispatch 永不返回 ⇒ 驱动 TDR
+    //（实机三次崩溃全部冻在 k1k2:trace-k2i；同一时段 k2loc 从 2.4 ms 涨到 34 ms）。
+    // 这里两道保险：容量必须是 2 的幂且不超过 2^24（哈希要求），探测最多 4096 次。
+    // C++ 侧同时改成帧龄延迟回收（Lights.cpp 顶部注释）。
+    const bool capacityPowerOfTwo =
+        (hashCapacity & (hashCapacity - 1u)) == 0u;
+    if(!capacityPowerOfTwo || hashCapacity > (1u << 24u))
+    {
+        firstLightIndex = 0u;
+        lightCount = 0u;
+        return false;
+    }
+
     uint hashMask = hashCapacity - 1u;
     uint slotIndex = localLightGridHash32(cellCoord) & hashMask;
+    const uint probeLimit = min(hashCapacity, 4096u);
 
-    for(uint probe = 0u; probe < hashCapacity; ++probe)
+    for(uint probe = 0u; probe < probeLimit; ++probe)
     {
         uint slotBase = 4u + slotIndex * 8u;
         if(fogLightGrid.words[slotBase + 3u] == 0u)

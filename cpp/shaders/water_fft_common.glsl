@@ -32,6 +32,11 @@ layout(push_constant) uniform WaterFftPush
     float detailTexelWorldSize;
     float detailVisualScale;
     float minWaveRadius;
+    // 2026-11-21 统一风场：Phillips 谱的风向单位向量（世界 XZ）。
+    // 与 camera_ubo.glsl 的 windParams.x 同源（宿主同一角度 cos/sin 出来）；
+    // 长度 <0.5（旧 DLL 没填）⇒ waterFftPhillips 回落出厂 (0.7071,0.7071)。
+    float windDirX;
+    float windDirY;
 } fftPush;
 // 8 位位反转（LOG2_N 固定为 8；N 改动时这里要同步）
 uint waterFftBitReverse(uint value)
@@ -106,7 +111,15 @@ vec2 waterFftPhillips(vec2 gridIndex, vec2 gauss)
         return vec2(0.0);
     }
 
-    const vec2 wind = vec2(0.70710678, 0.70710678);
+    // 2026-11-21 统一风场：风向改由宿主 push 下发（与云/雾同一 windParams.x 角度）。
+    // 出厂 = Tessendorf 原档 normalize(vec2(1,1))；|push| < 0.5（旧 DLL）逐位回落。
+    // 两级 cascade 本就共用这一个谱函数 ⇒ 同向约束天然满足（见 water_wave_field.glsl
+    // 顶部"两级必须同向才是同一片海"的注释）。谱形/权重不动（铁律 4）。
+    vec2 wind = vec2(fftPush.windDirX, fftPush.windDirY);
+    if(dot(wind, wind) < 0.25)
+    {
+        wind = vec2(0.70710678, 0.70710678);
+    }
     const float gravity = 9.80665;
     float spectrumA = 5500.0e-9 * (1.0 + 3.0 * fftPush.rainStrength);
     float windVelocity = 4.0 + fftPush.rainStrength;

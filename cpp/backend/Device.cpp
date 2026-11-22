@@ -254,7 +254,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
                     ? VK_NULL_HANDLE
                     : getSharedPipelineCache();
 
-            if(rtPipelineDisableOptimization())
+            if(rtPipelineDisableOptimization() || orionMainPipelineNoOpt())
             {
                 pci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
             }
@@ -337,9 +337,6 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
         createCloudBaseNoiseResources();
         createCloudV3Resources();
         createCloudV4Resources();
-
-        std::cout << "[WATER NORMAL] create mipmapped detail normal" << std::endl;
-        createWaterDetailNormalResources();
 
         std::cout << "[ENTITY PBR] create neutral fallback image" << std::endl;
         createEntityPbrFallbackResources();

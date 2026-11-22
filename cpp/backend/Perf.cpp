@@ -412,8 +412,21 @@ void updatePerfL10SerPathToggles()
     }
     else
     {
-        g_perfL10SerMode = 6u;
-        g_perfL10SerRadToggle = 6u;
+        // 2026-11-17 定案：默认档由 6 改为 5。
+        //   局 L-ser-ladder（同视野、5 档轮换、每档 25 窗、中位=均值）：
+        //     mode0(关)=20.14  mode1=13.78  mode4=13.70  mode5=13.40  mode6=13.69
+        //   档 6 是探针臂：rgen 侧 hitObject 查询会**跳过命中着色器派发**，
+        //   且 rgen_main_body.glsl:1583 传裸 gl_RayFlagsNoneEXT（缺
+        //   CullBackFacingTriangles），并绕过 any-hit ⇒ alpha-cutout 植被与玻璃
+        //   不再过滤该探针，水面反射 guide 距离随之改变（代码 :1558-1565 自述
+        //   "PIXEL-UNEQUAL by construction"）。
+        //   它还比档 1 一点不快（13.69 vs 13.78，噪声内），却比档 5 慢 0.29 ms。
+        //   档 5 = 全融合 hitObjectTraceReorderExecuteEXT；着色器侧只看
+        //   perfSerAb.* != 0u（:59/:418/:3485/:3823…），只有 :1519 的 ==6u
+        //   才是探针分支 ⇒ 5 与 1 逐位同语义，故换成 5 是"更快 + 无偏差"。
+        //   A/B 回旧行为：ORION_SER_MODE=6。
+        g_perfL10SerMode = 5u;
+        g_perfL10SerRadToggle = 5u;
 
         g_perfL10SerPathsPhase = g_perfL10RtaoSkipToggle;
     }
@@ -1596,7 +1609,9 @@ void logPerfL10RayStatsWindow()
                 g_perfL10RayStatsSums[PERF_L10_RAY_STAT_AO_RAYS]
             ) / instrumentedPixels
         )
-        << std::setprecision(1)
+        // 2026-11-17：这一段的 1 位小数会把"每像素 0.06 条局部光射线"打成 0.0，
+        // 而分母是四腿合计像素（4×），小量级射线会被直接抹平。改 2 位。
+        << std::setprecision(2)
         << " farPixPct="
         << (
             100.0 * static_cast<double>(
@@ -1811,7 +1826,11 @@ void endPerfL10RayStats(
 //                                    inline rayQuery 次数（主射线与次级弹射合并）。
 //   [1] RT_STAGE_CNT_HITS_ACCEPTED  rchit / rahit 命中组被硬件派发执行的次数。
 //                                    硬件不暴露遍历步数，本计数不是 traversal steps。
-//   [2] RT_STAGE_CNT_MATERIAL_EVALS K2 callable 材质解析在调用方被调用的次数。
+//   [2] RT_STAGE_CNT_MATERIAL_EVALS 完整材质解析执行次数（rgen 漏斗 + 命中侧漏斗）。
+//   [3] RT_STAGE_CNT_EV_PRIMARY     主射线类解析（K2 内联 / callable 落地重建）。
+//   [4] RT_STAGE_CNT_EV_SECONDARY   次级射线不透明命中解析。
+//   [5] RT_STAGE_CNT_EV_GLASS       半透明/玻璃命中组解析。
+//   [6] [7] 预留。
 //
 // 同步纪律（硬约束）：
 //   · 清零 / 回读 / 映射 / barrier 全部录在 begin/end 钩子，与 RayStats 同侧，
@@ -2000,14 +2019,24 @@ void beginRtStageCounters(
     VkCommandBuffer commandBuffer
 )
 {
-    if(!perfRtStageCountersEnabled())
+    // 2026-11-18 修正（设备丢失根因）：缓冲创建 / 描述符写入必须与"读回开关"解耦。
+    //   反汇编已证 run\shaders 落盘的 spv 带 OpAtomicIAdd @ Binding 93
+    //   （k1.rchit 5 个、k1.rgen 4 个、translucent 5 个）。若总闸关掉时这里直接
+    //   return，则 ensureRtStageCounters() 永不调用 ⇒ binding 93 的缓冲不存在、
+    //   描述符从未写入 ⇒ 着色器对未绑定 SSBO 做原子加 = 未定义行为。
+    //   实测后果：进世界第 1–2 帧在 k1k2:pre-k1 处 GPU 悬挂（nvlddmkm 事件 153），
+    //   Java 侧报 VK_ERROR_DEVICE_LOST(-4) "Failed to wait for semaphore"。
+    //   这不是档位问题：old default(mode6) 与 mode5 同样崩，只有显式开总闸的局能跑。
+    //   现在:缓冲恒建、描述符恒写（8 lane × 4 B = 32 B，成本可忽略），
+    //   只有"清零 / 回读 / 打印"仍受总闸控制。
+    if(!ensureRtStageCounters())
     {
-        (void)commandBuffer;
         return;
     }
 
-    if(!ensureRtStageCounters())
+    if(!perfRtStageCountersEnabled())
     {
+        (void)commandBuffer;
         return;
     }
 
@@ -2030,7 +2059,16 @@ void beginRtStageCounters(
 
         for(uint32_t i = 0u; i < PERF_RT_STAGE_CNT_COUNT; ++i)
         {
-            g_rtStageCntSums[i] += sample[i];
+            // lane 7 是 shader 侧 atomicOr 累积的**位图**，跨帧必须按位或折叠；
+            // 用加法折叠会进位，伪造出并不存在的位数（2026-11-17 晚踩过）。
+            if(i == RT_STAGE_CNT_RESERVED_7)
+            {
+                g_rtStageCntSums[i] |= sample[i];
+            }
+            else
+            {
+                g_rtStageCntSums[i] += sample[i];
+            }
         }
 
         ++g_rtStageCntWindowFrames;
@@ -2049,8 +2087,36 @@ void beginRtStageCounters(
                     g_rtStageCntSums[RT_STAGE_CNT_HITS_ACCEPTED]) +
                 " mateval=" + std::to_string(
                     g_rtStageCntSums[RT_STAGE_CNT_MATERIAL_EVALS]) +
+                " ev_primary=" + std::to_string(
+                    g_rtStageCntSums[RT_STAGE_CNT_EV_PRIMARY]) +
+                " ev_secondary=" + std::to_string(
+                    g_rtStageCntSums[RT_STAGE_CNT_EV_SECONDARY]) +
+                " ev_glass=" + std::to_string(
+                    g_rtStageCntSums[RT_STAGE_CNT_EV_GLASS]) +
                 " frames=" + std::to_string(PERF_L10_GPU_WINDOW_FRAMES)
             );
+
+            // lane 6（reservedLane6 = 材质复用不一致计数）默认不进 L10 行；仅
+            // ORION_RT_STAGE_CNT_LANE6=1 时多打一行，默认关不改动现有日志格式。
+            // 注意：本行在 sums 清零之前读取，窗口口径与上方 lane 0-5 一致。
+            if(rtStageCntLane6PrintEnabled())
+            {
+                // lane 7 = 字段位图（shader 侧 atomicOr 累积）。位序：
+                // 0-3 a 组（hitDistance/roughness/f0Metal/glassAlpha）、
+                // 4-7 b 组（state/albedoPacked/parallaxRayTravel/pomSelfShadow）、
+                // 8-11 c 组（normal.xyz/pomMicroOcclusion）、12-14 d 组（emission.xyz）、
+                // 15 不一致出现在 LOC 腿、16 出现在 I 腿。
+                std::ostringstream maskHex;
+                maskHex
+                    << std::hex << std::setw(8) << std::setfill('0')
+                    << g_rtStageCntSums[RT_STAGE_CNT_RESERVED_7];
+
+                RTLog(
+                    "[RT STAGE CNT] matReuseMismatch=" + std::to_string(
+                        g_rtStageCntSums[RT_STAGE_CNT_RESERVED_6]) +
+                    " matReuseFieldMask=0x" + maskHex.str()
+                );
+            }
 
             for(uint32_t i = 0u; i < PERF_RT_STAGE_CNT_COUNT; ++i)
             {

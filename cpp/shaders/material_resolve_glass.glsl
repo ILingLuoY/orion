@@ -1714,7 +1714,32 @@ if(t12IsGlass)
     bool glassBottomFace =
         geoNormal.y < -0.5;
 
+    // 2026-11-21：清玻璃边框 Alpha-Cutout（宏说明见 glass_chain_common.glsl）。
+    // 判定与两个 rahit 同源：清玻璃（materialId + 顶点色）且贴图 texel alpha
+    // 达到阈值。达标者直接按不透明几何处理。
+    const bool clearGlassPane =
+        materialId < 2.05 &&
+        glassVertexFactorIsFaceShade(interpColor.rgb);
+#if VPT_GLASS_CUTOUT_BORDER
+    const bool glassCutoutBorder =
+        clearGlassPane &&
+        atlasSpriteSample.a >= VPT_GLASS_CUTOUT_THRESHOLD;
+#else
+    const bool glassCutoutBorder = false;
+#endif
 
+if(glassCutoutBorder)
+{
+    // 边框 = 不透明命中：不置玻璃位，rgen 走标准 PBR 主路径，写出与不透明方块
+    // 一致的 depth / normal / MV / albedo guide。RR 因此能把这条 1~2 px 亮线
+    // 当作真实几何边缘保留，而不是当 firefly 抹平。
+    payload.state = makeHitState(
+        getRayPurpose(payload.state), RT_HIT_OPAQUE,
+        RT_WATER_NONE, false, false, 0u);
+    payload.glassAlpha = 1.0;
+}
+else
+{
     payload.state = makeHitState(
         getRayPurpose(payload.state), RT_HIT_TRANSLUCENT,
         RT_WATER_NONE, true, glassBottomFace,
@@ -1740,10 +1765,11 @@ if(t12IsGlass)
     //       没注入染料；已由 BlockModelLighterMixin 修为 3+dyeId）
     //     · 遮光玻璃 2.1 / 冰 2.2 / 粘液 2.3 / 蜂蜜 2.4
     //   ⇒ 加 `materialId < 2.05` 把后一档挡在外面，"当空气"只留给普通玻璃块/板。
-    if(materialId < 2.05 && glassVertexFactorIsFaceShade(interpColor.rgb))
+    if(clearGlassPane)
     {
         payload.state |= RT_STATE_CLEAR_GLASS_BIT;
     }
+}
 }
 else if(t12IsWater)
 {

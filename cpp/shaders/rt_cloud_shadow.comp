@@ -1,0 +1,134 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ===========================================================================
+// 2026-11-12：云影图（cloud shadow map）。
+//
+// 目的：给体积雾的"云隙光"提供一张**与渲染出来的云同源**的太阳透射率图。
+//
+// 之前的做法是在雾里用 620/210 格的自造 3D 噪声当"云隙"，光柱位置与真正的
+// 云隙无关（用户实测："云隙光也不和云隙对齐"）。原因很硬：真实云的覆盖率来自
+// HP_WEATHER_TILE = 96000 的宏观天气图，在 300 格视野内几乎是常数，产不出隙；
+// 而云的可见细节来自 HP 的 3D 形状/侵蚀噪声。
+//
+// 这里直接调用主云 pass 用的同一个密度函数 hpEvaluateCloudProperties()，
+// 沿太阳方向穿过云层积分光学厚度 τ，输出 exp(-τ)。雾只需按世界 XZ 查表，
+// 于是光柱**必然**落在真正的云隙下面。
+//
+// 布局：256² rgba8（只写 r 通道 = 透射率），覆盖以相机为中心的 ±512 格。
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(set = 0, binding = 1) uniform sampler2D cloudWeather;
+layout(set = 0, binding = 2) uniform sampler3D cloudBase;
+layout(set = 0, binding = 3) uniform sampler3D cloudErosion;
+layout(rgba8, set = 0, binding = 4) uniform writeonly image2D cloudShadowOut;
+
+#include "sky_model_common.glsl"
+#include "sky_sun_common.glsl"
+#include "cloud_v5_core.glsl"
+
+// 覆盖半径（格）。雾的 march 到 fogFar(~320)，512 足够覆盖所有可见光柱。
+const float CLOUD_SHADOW_EXTENT = 512.0;
+
+// 沿太阳方向穿过云层的采样步数。云层通常 300~600 格厚，4 步足以刻画
+// "这柱子是密的还是空的"；再细的差异对光柱形状没有贡献。
+const int CLOUD_SHADOW_STEPS = 4;
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(cloudShadowOut);
+
+    if(any(greaterThanEqual(pixel, size)))
+    {
+        return;
+    }
+
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    const vec2 ndc = uv * 2.0 - 1.0;
+
+    const vec3 cameraPos = cam.viewInverse[3].xyz;
+    const vec3 sunDir = sunDirection();
+
+    // 太阳贴地/落下时不做云影（透射率 1 = 不遮挡），与雾侧的提前返回一致。
+    if(sunDir.y <= 0.02)
+    {
+        imageStore(cloudShadowOut, pixel, vec4(1.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // Match V5 cloud configuration & anchorXZ coordinate space exactly.
+    const float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
+    const float thunder = clamp(cam.weatherParams.y, 0.0, 1.0);
+    const float weatherCoupling = clamp(cam.cloudSkyHueParams.w, 0.0, 2.0);
+    const float stormBuild = clamp((rain * 0.85 + thunder * 0.70) * weatherCoupling, 0.0, 1.4);
+
+    HPCloudConfig hp = hpDefaultConfig();
+    hp.bottomHeight = max(cam.cloudParams0.x, 1.0);
+    hp.topHeight = hp.bottomHeight + max(cam.cloudParams0.y, 1.0);
+    hp.coverage = clamp(mix(cam.cloudParams0.z, 0.96, clamp(stormBuild * 0.9, 0.0, 1.0)), 0.0, 1.0);
+    hp.densityMult = 0.004 * clamp(cam.cloudParams0.w, 0.05, 10.0) * (1.0 + stormBuild * 0.40);
+    hp.noiseScale = max(cam.cloudParams3.z, 0.05);
+    hp.detailScale = clamp(cam.cloudParams6.w, 0.1, 12.0) / 10.0;
+    hp.detailStrength = clamp(cam.cloudParams5.y, 0.0, 2.0);
+    hp.typeBias = clamp(cam.cloudParams5.x + stormBuild * 0.25, 0.0, 1.0);
+    hp.baseErosion = clamp(cam.cloudLightParams2.w, 0.0, 1.5);
+    hp.weatherCoupling = weatherCoupling;
+    hp.covMapScale = cam.hpShapeD.x >= 0.0 ? cam.hpShapeD.x : hp.covMapScale;
+    hp.sunDir = sunDir;
+    hp.time = max(uintBitsToFloat(cam.padding), 0.0);
+
+    const float slabHeight = max(hp.topHeight - hp.bottomHeight, 1.0);
+    const vec2 anchorXZ = cam.cloudParams3.xy;
+
+    // Project camera onto cloud bottom along +sunDir so ±512 covers the visible froxel field.
+    const float camToCloud = max(hp.bottomHeight - cameraPos.y, 0.0);
+    const float camSlant = min(camToCloud / max(sunDir.y, 0.12), 4096.0);
+    const vec2 shadowOriginXZ = cameraPos.xz + sunDir.xz * camSlant;
+    const float relX = (shadowOriginXZ.x - anchorXZ.x) + ndc.x * CLOUD_SHADOW_EXTENT;
+    const float relZ = (shadowOriginXZ.y - anchorXZ.y) + ndc.y * CLOUD_SHADOW_EXTENT;
+
+    // March UPWARD from cloud bottom TOWARD the sun (+sunDir).
+    const float verticalStep = slabHeight / float(CLOUD_SHADOW_STEPS);
+    const float pathStep = verticalStep / max(sunDir.y, 0.15);
+
+    float opticalDepth = 0.0;
+
+    for(int i = 0; i < CLOUD_SHADOW_STEPS; ++i)
+    {
+        const float stepDist = pathStep * (float(i) + 0.5);
+        const float h = hp.bottomHeight + verticalStep * (float(i) + 0.5);
+        const vec3 samplePos = vec3(
+            relX + sunDir.x * stepDist,
+            h + hp.planetRadius,
+            relZ + sunDir.z * stepDist);
+
+        float density = 0.0;
+        float localHeight = 0.0;
+
+        hpEvaluateCloudProperties(
+            samplePos,
+            slabHeight,
+            0.0,
+            true,                 // simpleMode：云影只需要密度，跳过细节修饰
+            hp,
+            cloudWeather,
+            cloudBase,
+            cloudErosion,
+            density,
+            localHeight);
+
+        opticalDepth += density * pathStep;
+    }
+
+    const float transmittance = exp(-opticalDepth);
+
+    imageStore(cloudShadowOut, pixel, vec4(transmittance, 0.0, 0.0, 1.0));
+}

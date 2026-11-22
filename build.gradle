@@ -41,9 +41,10 @@ loom {
 			//   rtxSectionFastFill → 全空气段跳过逐体素分类，直接发全 0
 			vmArg "-Drtx.diag.sectionPalette=${project.findProperty('rtxDiagPalette') ?: 'false'}"
 			vmArg "-Drtx.sectionFastFill=${project.findProperty('rtxSectionFastFill') ?: 'false'}"
-			// 2026-11-14：手部渲染路径切换（崩溃 A/B，不触发 RTPSO 冷编）。
-			//   gradlew runClient -PhandRt=0  → 光栅手（不走 "Item in hand" 的 RT 注入）
-			vmArg "-Dorion.handRt=${project.findProperty('handRt') ?: '1'}"
+			// 2026-11-18：手部默认**退出光追、走原版光栅**（RT 手保留为对照路径）。
+			//   gradlew runClient              → 光栅手（默认）
+			//   gradlew runClient -PhandRt=1   → RT 手（旧路径，会取消光栅手）
+			vmArg "-Dorion.handRt=${project.findProperty('handRt') ?: '0'}"
 			// 2026-11-04：确定性抓帧（ci/capture_regression.py）靠固定相机路径复现输入，
 			// 而 CameraPathDriver 读的是 JVM 系统属性 —— gradlew 的 -D 只到 daemon，
 			// 到不了 fork 出去的游戏进程。这里把 Gradle 项目属性（-P）桥接进去：

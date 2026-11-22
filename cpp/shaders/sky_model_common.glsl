@@ -11,6 +11,42 @@ vec3 sunDirection()
         0.57357643635 * sin(angle)));
 }
 
+// =============================================================================
+// 2026-11-16 月亮方向（**单一真源**，纯函数：不引用 cam，任何 TU 都能 include）
+//
+// 旧实现把"太阳方向取反"当月亮 ⇒ 断言了"月亮永远在太阳正对面"：永远满月、
+// 太阳一落它才升起、白天天上永远没有月亮。现实完全不是这样 ——
+//   朔（新月）  黄经差   0°  ⇒ 与太阳同升同落，白天就在天上（被阳光淹没）
+//   上弦/下弦   黄经差  90°  ⇒ 傍晚在正头顶 / 后半夜才升起
+//   望（满月）  黄经差 180°  ⇒ 太阳落下时升起
+// 也就是说**太阳在的时候月亮经常也在**，只是相位、方位、亮度不同。
+//
+// 本工程沿用同一条 35°N 春分日轨（忽略 5.1° 黄白交角），只沿日轨推移相位：
+//   月相 0   ⇒ 偏移 +0.5 圈 ⇒ 与太阳正对，与旧 `-sunDirection()` **逐位等价**
+//                              （cos(a+π) = -cos(a)、sin(a+π) = -sin(a)）
+//   月相 0.5 ⇒ 偏移 +0.0 圈 ⇒ 与太阳重合（新月）
+// 月相来源 = CameraUBO.sssParams.z，语义必须与 skyModelMoonPhaseDim() 一致：
+// z = 0 满月、z = 0.5 新月（两者同源于同一个 z，不会出现"能量按满月给、
+// 月盘却画成月牙"）。
+//
+// ⚠ 这里**只能**放纯函数。引用 cam.sssParams 的包装函数必须写在调用方 TU 里：
+//   cloud_bevy_preview.comp 用的是裁剪版 camera 块（没有 sssParams 字段），
+//   在这里引用会让它编译失败（实测 'sssParams' : no such field in structure）。
+// =============================================================================
+vec3 moonEclipticDirectionAt(float phase01)
+{
+    const float TWO_PI = 6.28318530718;
+    float angle = fract(phase01) * TWO_PI;
+    return normalize(vec3(cos(angle), 0.81915204429 * sin(angle),
+        0.57357643635 * sin(angle)));
+}
+
+// 月亮在日轨上的相位 = 太阳相位 + 月相 + 0.5
+float moonDecalPhase01(float sunPhase01, float moonPhase01)
+{
+    return fract(sunPhase01 + moonPhase01 + 0.5);
+}
+
 
 const vec3 END_SKY_POLE = vec3(0.0, 0.57357643635, -0.81915204429);
 const float END_SKY_SPIN_RATE = 2.0;
@@ -183,9 +219,90 @@ float skyModelMoonPhaseDim(float moonPhase01, float floorValue)
     return mix(floorValue, 1.0, illuminated);
 }
 
-// 阳光色核心。goldenStrength：日照金山混入强度（1.0 全档 / 0.5 云半档）。
+// =============================================================================
+// 2026-11-19 直射光「太阳 → 月亮」交接带（**单一真源**）
+//
+// 病灶（用户报告："云在夕阳到夜晚的某一段时间光照会突然跳变"）：
+//   旧口径把方向在 sunElevation >= 0 处硬翻（太阳 ↔ 真实月亮），而混色权重
+//   dayAmount = smoothstep(-0.03, 0.03, s) 在翻转点只有 0.5 ⇒ 直射能量还剩
+//   一半时就整束换了方向 + 换了颜色。满月时方向差 176°、上弦 86°；按 MC
+//   20 分钟一天，这一段只有约 12 秒 ⇒ 云的亮度/前向散射/银边/云影方向同时跳。
+//
+// 修法：交接点下移到太阳沉到地平线下 0.05（≈2.9°），并让两侧能量在该点
+//   **同时归零**：
+//       太阳项 = smoothstep(-0.05, 0.06, s)      在 s = -0.05 时 = 0
+//       月亮项 = 1 - smoothstep(-0.11, -0.05, s)  在 s = -0.05 时 = 0
+//   方向/颜色的硬切换发生在"两侧能量都为 0"的那一点 ⇒ 画面上不可见；交接带
+//   之外两侧各自连续。白天（s > 0.06）太阳项仍严格 = 1.0、深夜月亮项仍严格
+//   = 1.0，所以两端观感与改动前逐位一致。
+//
+// ⚠ 消费者必须共用本组函数（各写一份必然漂移）：volumetric_clouds_v3/v5、
+//   volumetric_light（光柱）、fog_screen_march（体积雾）。
+//   地形 rt_test.rgen 不在此列 —— 那里地平线处的直射能量本来就随 |e| 归零，
+//   硬翻发生在零能量点，且"太阳落山后云仍被照亮、地面已不受光"是物理正确的。
+// =============================================================================
+const float SKY_DIRECT_HANDOVER_ELEVATION = -0.05;
+
+// 太阳那一份直射能量的权重。
+float skyDirectSunAmount(float sunElevation)
+{
+    return smoothstep(SKY_DIRECT_HANDOVER_ELEVATION, 0.06, sunElevation);
+}
+
+// 月亮那一份直射能量的权重（含月出/月落的淡入淡出）。
+float skyDirectMoonAmount(float sunElevation)
+{
+    return 1.0 - smoothstep(-0.11, SKY_DIRECT_HANDOVER_ELEVATION, sunElevation);
+}
+
+// 当前该用太阳还是月亮作直射方向。**只**在两侧权重都为 0 的那一点翻转。
+bool skyDirectIsSun(float sunElevation)
+{
+    return sunElevation >= SKY_DIRECT_HANDOVER_ELEVATION;
+}
+
+// 阳光色核心（**白天路径本体**：不含天气缩放、不含夜蓝早退）。
+// goldenStrength：日照金山混入强度（1.0 全档 / 0.5 云半档）。
 // goldenStrength=1.0 时 mix(x,y,1.0) 逐位等于 y（0·x+y，IEEE 精确），与
 // 旧直写 skySunGoldenTint(...) 语义一致。
+vec3 skyModelSunColorDaylight(vec3 lightDirection, float goldenStrength)
+{
+#if SKY_SUN_TRANSMITTANCE_COLOR
+    vec3 color = skySunPhysicalBaseColor(lightDirection.y);
+#else
+    float highSun = smoothstep(0.08, 0.68, max(lightDirection.y, 0.0));
+    vec3 color = mix(vec3(1.0, 0.45, 0.18), vec3(1.0, 0.96, 0.90), highSun);
+#endif
+    float sunset = 1.0 - smoothstep(0.04, 0.22, lightDirection.y);
+    vec3 twilightTint = twilightPalette(lightDirection.y);
+    color = mix(color, twilightTint, sunset * 0.78);
+#if SKY_DAY_PHASE
+    // 2026-11-16 午后暖光：12.6°..43° 之间的色温偏移（正午 55° 不受影响）。
+    // 必须在 goldenTint 之前 —— goldenTint 是贴地那一刻的强调，午后是它的
+    // 前奏，顺序反了会让黄金时刻的饱和度被暖光乘子削弱。
+    color = skySunAfternoonWarmth(color, lightDirection.y);
+    color = mix(color, skySunGoldenTint(color, lightDirection.y), goldenStrength);
+#endif
+    return color;
+}
+
+// 2026-11-19：**连续版**阳光色（不判夜、不早退）。
+//
+// skyModelSunColor() 在 sunElevation < 0 处硬返回月蓝（2026-11-13 的修正）。
+// 对"直射能量在地平线已经归零"的地形没问题；但云 / 体积光 / 雾的直射项在
+// 地平线附近还有一段收尾斜坡（太阳仍在地平线下照亮云顶）。那一刻若颜色硬切，
+// 画面上就是整片云/光晕突然换色 —— 用户报告的"夕阳到夜晚光照突然跳变"。
+//
+// 所以交接带里用本函数取"太阳侧"的连续色，交接点由调用方把能量压到 0。
+vec3 skyModelSunColorContinuous(vec3 lightDirection, float goldenStrength)
+{
+    float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
+    float thunder = clamp(cam.weatherParams.y, 0.0, 1.0);
+    vec3 weatherScale = mix(1.0, 0.35, rain) *
+        mix(vec3(1.0), vec3(0.72, 0.78, 0.86), thunder);
+    return skyModelSunColorDaylight(lightDirection, goldenStrength) * weatherScale;
+}
+
 vec3 skyModelSunColor(vec3 lightDirection, float goldenStrength)
 {
     float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
@@ -240,19 +357,7 @@ vec3 skyModelSunColor(vec3 lightDirection, float goldenStrength)
         return moonColor * weatherScale;
     }
 
-#if SKY_SUN_TRANSMITTANCE_COLOR
-    vec3 color = skySunPhysicalBaseColor(lightDirection.y);
-#else
-    float highSun = smoothstep(0.08, 0.68, max(lightDirection.y, 0.0));
-    vec3 color = mix(vec3(1.0, 0.45, 0.18), vec3(1.0, 0.96, 0.90), highSun);
-#endif
-    float sunset = 1.0 - smoothstep(0.04, 0.22, lightDirection.y);
-    vec3 twilightTint = twilightPalette(lightDirection.y);
-    color = mix(color, twilightTint, sunset * 0.78);
-#if SKY_DAY_PHASE
-    color = mix(color, skySunGoldenTint(color, lightDirection.y), goldenStrength);
-#endif
-    return color * weatherScale;
+    return skyModelSunColorDaylight(lightDirection, goldenStrength) * weatherScale;
 }
 
 // ---------------------------------------------------------------------------

@@ -113,7 +113,7 @@ public final class RTXSettingsConfig {
             8;
 
     private static float[] ueCloud = {
-            1.0f,
+            3.0f,
             0.5f,
             0.5f,
             1.0f,
@@ -177,7 +177,7 @@ public final class RTXSettingsConfig {
             DEFAULT_ATMOSPHERE_SETTINGS;
 
     private static float powderStrength =
-            3.0f;
+            1.0f;
 
     private static float cloudSunForwardScattering =
             1.0f;
@@ -190,6 +190,16 @@ public final class RTXSettingsConfig {
     // 2026-11-01：夜间天空底光 / 雨天压暗倍率（CameraUBO.skyModelParams.z / .w）
     private static float nightSkyAmbientScale = 1.0f;
     private static float rainSkyDimScale = 1.0f;
+    // 2026-11-16 月光两旋钮（CameraUBO.moonParams.x / .y）：
+    //   moonLightFloor  = 月光能量地板（新月夜 = 满月的这一比例；0 = 纯物理）
+    //   moonDaylightDim = 白天月亮亮度（占夜间基准的比例；1 = 不压暗）
+    private static float moonLightFloor = 0.35f;
+    private static float moonDaylightDim = 0.85f;
+    // 2026-11-16 雾外观（CameraUBO.fogMoodParams.x / .y）：
+    //   fogShapeStrength = 主体积雾的形态强度（0 = 均匀灰膜旧档，1 = 出厂团块）
+    //   fogDawnBoost     = 晨雾峰值倍率（1 = 不增强，1.75 = 出厂）
+    private static float fogShapeStrength = 1.0f;
+    private static float fogDawnBoost = 1.75f;
 
     private static float auroraBrightness =
             1.0f;
@@ -617,7 +627,7 @@ public final class RTXSettingsConfig {
         }
     }
     private static PlaneCloudSettings planeCloudSettings = new PlaneCloudSettings(
-            true, 6000.0f, 1.0f, 1.0f, 4.0f, 0.45f, 5, 100000.0f, 1.0f);
+            true, 6500.0f, 1.4f, 1.0f, 3.2f, 0.42f, 5, 110000.0f, 1.15f);
     public static synchronized PlaneCloudSettings getPlaneCloudSettings() { return planeCloudSettings; }
     public static synchronized void setPlaneCloudSettings(PlaneCloudSettings settings) {
         planeCloudSettings = java.util.Objects.requireNonNull(settings);
@@ -1143,10 +1153,66 @@ public final class RTXSettingsConfig {
         }
     }
     private static CloudAerialSettings cloudAerialSettings = new CloudAerialSettings(
-            0.0f, 0.0f, 0.0f);
+            0.85f, 0.0f, 0.0f);
     public static synchronized CloudAerialSettings getCloudAerialSettings() { return cloudAerialSettings; }
     public static synchronized void setCloudAerialSettings(CloudAerialSettings settings) {
         cloudAerialSettings = java.util.Objects.requireNonNull(settings);
+        markDirty();
+    }
+
+    public static final int CLOUD_OVERHAUL_VERSION = 1;
+
+    public record CloudWeatherStyleSettings(
+            float stormDarkness,
+            float lightningStrength,
+            float sunsetWarmth,
+            float weatherCoupling) {
+        public CloudWeatherStyleSettings {
+            if(!Float.isFinite(stormDarkness) || stormDarkness < 0 || stormDarkness > 2 ||
+               !Float.isFinite(lightningStrength) || lightningStrength < 0 || lightningStrength > 3 ||
+               !Float.isFinite(sunsetWarmth) || sunsetWarmth < 0 || sunsetWarmth > 2 ||
+               !Float.isFinite(weatherCoupling) || weatherCoupling < 0 || weatherCoupling > 2)
+                throw new IllegalArgumentException("Invalid cloud weather style settings");
+        }
+
+        public float[] toParamArray() {
+            return new float[] { stormDarkness, lightningStrength, sunsetWarmth, weatherCoupling };
+        }
+    }
+    private static CloudWeatherStyleSettings cloudWeatherStyleSettings =
+            new CloudWeatherStyleSettings(0.85f, 1.20f, 1.00f, 1.00f);
+    public static synchronized CloudWeatherStyleSettings getCloudWeatherStyleSettings() {
+        return cloudWeatherStyleSettings;
+    }
+    public static synchronized void setCloudWeatherStyleSettings(CloudWeatherStyleSettings settings) {
+        cloudWeatherStyleSettings = java.util.Objects.requireNonNull(settings);
+        markDirty();
+    }
+
+    public record CloudLight2Settings(
+            float powderEffect,
+            float silverSpread,
+            float sharpness,
+            float baseErosion) {
+        public CloudLight2Settings {
+            if(!Float.isFinite(powderEffect) || powderEffect < 0 || powderEffect > 2 ||
+               !Float.isFinite(silverSpread) || silverSpread < 0 || silverSpread > 2 ||
+               !Float.isFinite(sharpness) || sharpness < 0 || sharpness > 2 ||
+               !Float.isFinite(baseErosion) || baseErosion < 0 || baseErosion > 1.5f)
+                throw new IllegalArgumentException("Invalid cloud light2 settings");
+        }
+
+        public float[] toParamArray() {
+            return new float[] { powderEffect, silverSpread, sharpness, baseErosion };
+        }
+    }
+    private static CloudLight2Settings cloudLight2Settings =
+            new CloudLight2Settings(0.65f, 0.85f, 0.75f, 0.55f);
+    public static synchronized CloudLight2Settings getCloudLight2Settings() {
+        return cloudLight2Settings;
+    }
+    public static synchronized void setCloudLight2Settings(CloudLight2Settings settings) {
+        cloudLight2Settings = java.util.Objects.requireNonNull(settings);
         markDirty();
     }
 
@@ -1279,18 +1345,21 @@ public final class RTXSettingsConfig {
             float spongeWidth,
             float gaussianSource,
             float dampingScale,
-            float propagationSpeed) {
+            float propagationSpeed,
+            float rainRippleScale) {
         public WaterSimWaveSettings {
             if(!Float.isFinite(spongeWidth) || spongeWidth < 0 || spongeWidth > 0.45f ||
                !Float.isFinite(gaussianSource) || gaussianSource < 0 || gaussianSource > 1 ||
                !Float.isFinite(dampingScale) || dampingScale < 0 || dampingScale > 3 ||
-               !Float.isFinite(propagationSpeed) || propagationSpeed < 0 || propagationSpeed > 2)
+               !Float.isFinite(propagationSpeed) || propagationSpeed < 0 || propagationSpeed > 2 ||
+               !Float.isFinite(rainRippleScale) || rainRippleScale < 0 || rainRippleScale > 4)
                 throw new IllegalArgumentException("Invalid water sim wave settings");
         }
 
         public float[] toParamArray() {
             return new float[] {
-                spongeWidth, gaussianSource, dampingScale, propagationSpeed };
+                spongeWidth, gaussianSource, dampingScale, propagationSpeed,
+                rainRippleScale };
         }
     }
     // 2026-10-03 薄层 SSS 四件套（CameraUBO.waterSssParams，偏移 1264，rt_test.rgen 读）：
@@ -1324,7 +1393,9 @@ public final class RTXSettingsConfig {
     }
 
     private static WaterSimWaveSettings waterSimWaveSettings = new WaterSimWaveSettings(
-            0.0f, 0.0f, 1.0f, 1.0f);
+            0.0f, 0.0f, 1.0f, 1.0f,
+            // 2026-11-21 雨滴涟漪倍率：出厂 1.5（用户反馈"太不明显"后的加强档）
+            1.5f);
     public static synchronized WaterSimWaveSettings getWaterSimWaveSettings() { return waterSimWaveSettings; }
     public static synchronized void setWaterSimWaveSettings(WaterSimWaveSettings settings) {
         waterSimWaveSettings = java.util.Objects.requireNonNull(settings);
@@ -1346,27 +1417,44 @@ public final class RTXSettingsConfig {
     //   Tessendorf FFT 海洋，风固定 normalize(1,1)、谱峰只随雨强，故以下三项已无
     //   消费者而删除：windSpeed「浪速」/ windDirectionDeg「海浪风向」/ swellGain
     //   「涌浪强度」（旧 JSON 键读出后静默丢弃）。tilePeriod 恢复为可调滑杆。
+    // 2026-11-20 复活：windSpeed「风速」以新语义回来 —— 它不再是谱峰参数，
+    //   而是浪的推进速度（见 record 里的 windSpeed 注释）。
     public record WaterFftSettings(
             boolean enabled,
             float amplitude,
             float choppiness,
             float tilePeriod,
-            float detail) {
+            float detail,
+            // 2026-11-20 波面 cascade 配平（见 water_wave_field.glsl 的 v2 注释）：
+            //   swellWeight  长波级（.rg，平铺 tilePeriod 格）权重 —— 重复感的唯一来源
+            //   detailWeight 短波级（.ba，平铺 32 格）权重 —— 撑住主结构
+            // 两者都经 CameraUBO.waterFftParams2 的两条空闲车道送到着色器。
+            float swellWeight,
+            float detailWeight,
+            // 2026-11-20「风速」：浪的推进快慢。这一项是**时间标量**，不是外观参数。
+            // 它同时喂三处：CameraUBO.waterFftParams.w（着色端 speedMul = windSpeed/7）、
+            // 宿主 FFT 时钟的推进速率、以及旧解析波路径的 waterStyleParams1.x，
+            // 三处共用同一个数才不会出现"纹理在动、波峰不动"的错位。
+            float windSpeed) {
         public WaterFftSettings {
             if(!Float.isFinite(amplitude) || amplitude < 0 || amplitude > 3 ||
                !Float.isFinite(choppiness) || choppiness < 0 || choppiness > 3 ||
                !Float.isFinite(tilePeriod) || tilePeriod < 2 || tilePeriod > 128 ||
-               !Float.isFinite(detail) || detail < 0 || detail > 3)
+               !Float.isFinite(detail) || detail < 0 || detail > 3 ||
+               !Float.isFinite(swellWeight) || swellWeight < 0.02f || swellWeight > 2 ||
+               !Float.isFinite(detailWeight) || detailWeight < 0.02f || detailWeight > 3 ||
+               !Float.isFinite(windSpeed) || windSpeed < 0.5f || windSpeed > 14)
                 throw new IllegalArgumentException("Invalid water FFT settings");
         }
 
         public float[] toParamArray() {
             return new float[] {
-                enabled ? 1.0f : 0.0f, amplitude, choppiness, tilePeriod, detail };
+                enabled ? 1.0f : 0.0f, amplitude, choppiness, tilePeriod, detail,
+                swellWeight, detailWeight, windSpeed };
         }
     }
     private static WaterFftSettings waterFftSettings = new WaterFftSettings(
-            true, 1.0f, 1.0f, 10.0f, 1.0f);
+            true, 1.0f, 1.0f, 10.0f, 1.0f, 0.45f, 0.90f, 3.5f);
     public static synchronized WaterFftSettings getWaterFftSettings() { return waterFftSettings; }
     public static synchronized void setWaterFftSettings(WaterFftSettings settings) {
         waterFftSettings = java.util.Objects.requireNonNull(settings);
@@ -1655,7 +1743,10 @@ public final class RTXSettingsConfig {
     // 云固定走 RR 之前的旧合成档。旧存档里的同名 key 会被 Gson 直接忽略。
 
     private static int cloudResFloorPercent =
-            100;
+            0;
+
+    private static int cloudTemporalMode =
+            2;
 
     private static float cloudFarStepDensity =
             0.45f;
@@ -1882,6 +1973,18 @@ public final class RTXSettingsConfig {
         final int clamped = Math.max(0, Math.min(100, percent));
         if (cloudResFloorPercent != clamped) {
             cloudResFloorPercent = clamped;
+            markDirty();
+        }
+    }
+
+    public static synchronized int getCloudTemporalMode() {
+        return cloudTemporalMode;
+    }
+
+    public static synchronized void setCloudTemporalMode(int mode) {
+        final int clamped = Math.max(0, Math.min(2, mode));
+        if (cloudTemporalMode != clamped) {
+            cloudTemporalMode = clamped;
             markDirty();
         }
     }
@@ -2509,6 +2612,66 @@ public final class RTXSettingsConfig {
         return rainSkyDimScale;
     }
 
+    public static synchronized float getFogShapeStrength() {
+        return fogShapeStrength;
+    }
+
+    public static synchronized void setFogShapeStrength(float value) {
+        if(!Float.isFinite(value) || value < 0.0f || value > 2.0f) {
+            throw new IllegalArgumentException("Invalid fog shape strength: " + value);
+        }
+        float rounded = Math.round(value * 20.0f) / 20.0f;
+        if(Float.compare(fogShapeStrength, rounded) != 0) {
+            fogShapeStrength = rounded;
+            markDirty();
+        }
+    }
+
+    public static synchronized float getFogDawnBoost() {
+        return fogDawnBoost;
+    }
+
+    public static synchronized void setFogDawnBoost(float value) {
+        if(!Float.isFinite(value) || value < 1.0f || value > 3.0f) {
+            throw new IllegalArgumentException("Invalid fog dawn boost: " + value);
+        }
+        float rounded = Math.round(value * 20.0f) / 20.0f;
+        if(Float.compare(fogDawnBoost, rounded) != 0) {
+            fogDawnBoost = rounded;
+            markDirty();
+        }
+    }
+
+    public static synchronized float getMoonLightFloor() {
+        return moonLightFloor;
+    }
+
+    public static synchronized void setMoonLightFloor(float value) {
+        if(!Float.isFinite(value) || value < 0.0f || value > 1.0f) {
+            throw new IllegalArgumentException("Invalid moon light floor: " + value);
+        }
+        float rounded = Math.round(value * 20.0f) / 20.0f;
+        if(Float.compare(moonLightFloor, rounded) != 0) {
+            moonLightFloor = rounded;
+            markDirty();
+        }
+    }
+
+    public static synchronized float getMoonDaylightDim() {
+        return moonDaylightDim;
+    }
+
+    public static synchronized void setMoonDaylightDim(float value) {
+        if(!Float.isFinite(value) || value < 0.0f || value > 1.0f) {
+            throw new IllegalArgumentException("Invalid moon daylight dim: " + value);
+        }
+        float rounded = Math.round(value * 20.0f) / 20.0f;
+        if(Float.compare(moonDaylightDim, rounded) != 0) {
+            moonDaylightDim = rounded;
+            markDirty();
+        }
+    }
+
     public static synchronized void setRainSkyDimScale(float value) {
         if(!Float.isFinite(value) || value < 0.0f || value > 2.0f) {
             throw new IllegalArgumentException("Invalid rain sky dim scale: " + value);
@@ -2590,6 +2753,21 @@ public final class RTXSettingsConfig {
         return performanceMode;
     }
 
+    // =====================================================
+    // 2026-11-16 UI 审计：性能模式改成**非破坏**。
+    //
+    // 旧实现进入时直接改写 SSPT / SSR / RT 光泽三项，退出时又写死
+    // 0 / 0 / true —— 用户的原始值永久丢失（而且那三项在「材质与画面」页
+    // 各有自己的滑条，等于两个入口互相踩）。
+    //
+    // 现在：进入时快照，退出时还原。快照存在静态字段里（不写存档，避免动
+    // 保存格式）；进程重启后仍处于性能模式时快照为空，此时才退回旧的
+    // 0 / 0 / true 行为。
+    // =====================================================
+    private static float perfModeSavedSspt = Float.NaN;
+    private static float perfModeSavedSsr = Float.NaN;
+    private static boolean perfModeSavedRtGlossy = true;
+
     /**
      * 切换「性能模式」。这里只改自己这一项 + 联动那三项的值（走各自的
      * setter，保证落盘与原生侧同步）；原生调用的失败处理在调用方（设置界面）。
@@ -2602,13 +2780,24 @@ public final class RTXSettingsConfig {
         performanceMode = value;
 
         if(value) {
+            perfModeSavedSspt = getSsptRange();
+            perfModeSavedSsr = getSsrRange();
+            perfModeSavedRtGlossy = isRTGlossyEnabled();
+
             setSsptRange(PERF_MODE_SSPT_CHUNKS);
             setSsrRange(PERF_MODE_SSR_CHUNKS);
             setRTGlossyEnabled(false);
         } else {
-            setSsptRange(0.0f);
-            setSsrRange(0.0f);
-            setRTGlossyEnabled(true);
+            final boolean haveSnapshot =
+                    Float.isFinite(perfModeSavedSspt) &&
+                            Float.isFinite(perfModeSavedSsr);
+
+            setSsptRange(haveSnapshot ? perfModeSavedSspt : 0.0f);
+            setSsrRange(haveSnapshot ? perfModeSavedSsr : 0.0f);
+            setRTGlossyEnabled(haveSnapshot ? perfModeSavedRtGlossy : true);
+
+            perfModeSavedSspt = Float.NaN;
+            perfModeSavedSsr = Float.NaN;
         }
 
         markDirty();
@@ -3093,6 +3282,9 @@ public final class RTXSettingsConfig {
                 cloudResFloorPercent =
                         0;
 
+                cloudTemporalMode =
+                        2;
+
                 cloudFarStepDensity =
                         0.45f;
                 giRoulette =
@@ -3138,6 +3330,10 @@ public final class RTXSettingsConfig {
                 skyModelScale = 1.0f;
                 nightSkyAmbientScale = 1.0f;
                 rainSkyDimScale = 1.0f;
+                moonLightFloor = 0.35f;
+                moonDaylightDim = 0.85f;
+                fogShapeStrength = 1.0f;
+                fogDawnBoost = 1.75f;
 
                 cloudSunForwardScattering =
                         1.0f;
@@ -3345,13 +3541,21 @@ public final class RTXSettingsConfig {
                             DEFAULT_ATMOSPHERE_SETTINGS.ozoneStrength(), 0.0f, 2.0f, 0.05f)
             );
 
-            powderStrength = validCloudSetting(data.powderStrength, 3.0f, 0.0f, 3.0f, 0.05f);
+            powderStrength = validCloudSetting(data.powderStrength, 1.0f, 0.0f, 3.0f, 0.05f);
             skyModel = data.skyModel == null ? 0 : Math.max(0, Math.min(1, data.skyModel));
             skyModelScale = validCloudSetting(data.skyModelScale, 1.0f, 0.05f, 8.0f, 0.05f);
             nightSkyAmbientScale =
                     validCloudSetting(data.nightSkyAmbientScale, 1.0f, 0.0f, 2.0f, 0.05f);
             rainSkyDimScale =
                     validCloudSetting(data.rainSkyDimScale, 1.0f, 0.0f, 2.0f, 0.05f);
+            moonLightFloor =
+                    validCloudSetting(data.moonLightFloor, 0.35f, 0.0f, 1.0f, 0.05f);
+            moonDaylightDim =
+                    validCloudSetting(data.moonDaylightDim, 0.85f, 0.0f, 1.0f, 0.05f);
+            fogShapeStrength =
+                    validCloudSetting(data.fogShapeStrength, 1.0f, 0.0f, 2.0f, 0.05f);
+            fogDawnBoost =
+                    validCloudSetting(data.fogDawnBoost, 1.75f, 1.0f, 3.0f, 0.05f);
 
             auroraBrightness = validCloudSetting(data.auroraBrightness, 1.0f, 0.0f, 3.0f, 0.05f);
 
@@ -3482,9 +3686,47 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.cloudTemporalDampStrength, 0.0f, 0, 1, 0.05f),
                         validCloudSetting(data.cloudBottomOcclusion, 0.0f, 0, 1, 0.05f));
                 cloudAerialSettings = new CloudAerialSettings(
-                        validCloudSetting(data.cloudAerialStrength, 0.0f, 0, 2, 0.05f),
+                        validCloudSetting(data.cloudAerialStrength, 0.85f, 0, 2, 0.05f),
                         validCloudSetting(data.groundAerialStrength, 0.0f, 0, 2, 0.05f),
                         validCloudSetting(data.groundAerialOcclusion, 0.0f, 0, 1, 0.05f));
+                cloudWeatherStyleSettings = new CloudWeatherStyleSettings(
+                        validCloudSetting(data.cloudStormDarkness, 0.85f, 0, 2, 0.05f),
+                        validCloudSetting(data.cloudLightningStrength, 1.20f, 0, 3, 0.05f),
+                        validCloudSetting(data.cloudSunsetWarmth, 1.00f, 0, 2, 0.05f),
+                        validCloudSetting(data.cloudWeatherCoupling, 1.00f, 0, 2, 0.05f));
+                cloudLight2Settings = new CloudLight2Settings(
+                        validCloudSetting(data.cloudPowderEffect, 0.65f, 0, 2, 0.05f),
+                        validCloudSetting(data.cloudSilverSpread, 0.85f, 0, 2, 0.05f),
+                        validCloudSetting(data.cloudSharpness, 0.75f, 0, 2, 0.05f),
+                        validCloudSetting(data.cloudBaseErosion, 0.55f, 0, 1.5f, 0.05f));
+
+                if(data.cloudOverhaulVersion == null || data.cloudOverhaulVersion < CLOUD_OVERHAUL_VERSION) {
+                    if(data.cloudAerialStrength == null || data.cloudAerialStrength <= 0.01f) {
+                        cloudAerialSettings = new CloudAerialSettings(
+                                0.85f,
+                                cloudAerialSettings.groundAerialStrength(),
+                                cloudAerialSettings.groundAerialOcclusion());
+                    }
+                    planeCloudSettings = new PlaneCloudSettings(
+                            true, 6500.0f, 1.4f, 1.0f, 3.2f, 0.42f, 5, 110000.0f, 1.15f);
+                    if(ueCloud[0] < 3.0f) {
+                        ueCloud[0] = 3.0f;
+                    }
+                    if(powderStrength > 1.5f) {
+                        powderStrength = 1.0f;
+                    }
+                    cloudShapeSettings = new CloudShapeSettings(
+                            cloudShapeSettings.bottomSmoothHeight(),
+                            cloudShapeSettings.bottomSmoothPow(),
+                            cloudShapeSettings.twoTierThreshold(),
+                            0.0f);
+                    float[] hpMigrated = cloudHpSettings.toParamArray();
+                    if(hpMigrated[16] >= 0.92f) {
+                        hpMigrated[16] = 0.85f;
+                        cloudHpSettings = new CloudHpSettings(hpMigrated);
+                    }
+                    markDirty();
+                }
                 cloudSunReddening = validCloudSetting(data.cloudSunReddening, 0.0f, 0, 160, 1f);
                 cloudTopStretch = validCloudSetting(data.cloudTopStretch, 0.0f, 0, 32, 1f);
                 cloudDetileStrength = validCloudSetting(data.cloudDetileStrength, 10.0f, 0.1f, 12f, 0.1f);
@@ -3519,7 +3761,8 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.waterSimSpongeWidth, 0.0f, 0, 0.45f, 0.01f),
                         validCloudSetting(data.waterSimGaussianSource, 0.0f, 0, 1, 0.05f),
                         validCloudSetting(data.waterSimDampingScale, 1.0f, 0, 3, 0.05f),
-                        validCloudSetting(data.waterSimPropagationSpeed, 1.0f, 0, 2, 0.05f));
+                        validCloudSetting(data.waterSimPropagationSpeed, 1.0f, 0, 2, 0.05f),
+                        validCloudSetting(data.waterSimRainRippleScale, 1.5f, 0, 4, 0.05f));
                 waterWaveShapeSettings = new WaterWaveShapeSettings(
                         validCloudSetting(data.waterWaveLengthScale, 1.0f, 0.35f, 4.0f, 0.05f),
                         validCloudSetting(data.waterWaveDirection, 0.0f, -3600.0f, 3600.0f, 5.0f),
@@ -3534,7 +3777,10 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.waterFftAmplitude, 1.0f, 0, 3, 0.05f),
                         validCloudSetting(data.waterFftChoppiness, 1.0f, 0, 3, 0.05f),
                         validCloudSetting(data.waterFftTilePeriod, 10.0f, 2, 128, 1.0f),
-                        validCloudSetting(data.waterFftDetail, 1.0f, 0, 3, 0.05f));
+                        validCloudSetting(data.waterFftDetail, 1.0f, 0, 3, 0.05f),
+                        validCloudSetting(data.waterFftSwellWeight, 0.45f, 0.02f, 2.0f, 0.05f),
+                        validCloudSetting(data.waterFftDetailWeight, 0.90f, 0.02f, 3.0f, 0.05f),
+                        validCloudSetting(data.waterFftWindSpeed, 3.5f, 0.5f, 14.0f, 0.5f));
                 postProcessingSettings = new PostProcessingSettings(
                         data.postTonemapMode == null ? 0
                             : Math.max(0, Math.min(6, data.postTonemapMode)),
@@ -3554,7 +3800,10 @@ public final class RTXSettingsConfig {
                 {
                     waterWaveSettings = new WaterWaveSettings(
                             0.0f, 1.0f, 0.0f, 4.0f);
-                    waterSimWaveSettings = new WaterSimWaveSettings(0.0f, 0.0f, 1.0f, 1.0f);
+                    waterSimWaveSettings = new WaterSimWaveSettings(
+                            0.0f, 0.0f, 1.0f, 1.0f,
+                            // 2026-11-21 雨滴涟漪倍率（旧存档升级走新出厂值）
+                            1.5f);
                     save();
                 }
                 waterSssSettings = new WaterSssSettings(
@@ -3667,6 +3916,11 @@ public final class RTXSettingsConfig {
                     data.cloudResFloorPercent == null
                             ? 0
                             : Math.max(0, Math.min(100, data.cloudResFloorPercent));
+
+            cloudTemporalMode =
+                    data.cloudTemporalMode == null
+                            ? 2
+                            : Math.max(0, Math.min(2, data.cloudTemporalMode));
 
             cloudFarStepDensity =
                     (data.cloudFarStepDensity == null ||
@@ -3870,6 +4124,9 @@ public final class RTXSettingsConfig {
             cloudResFloorPercent =
                     0;
 
+            cloudTemporalMode =
+                    2;
+
             cloudFarStepDensity =
                     0.45f;
             giRoulette =
@@ -3909,6 +4166,10 @@ public final class RTXSettingsConfig {
             skyModelScale = 1.0f;
             nightSkyAmbientScale = 1.0f;
             rainSkyDimScale = 1.0f;
+            moonLightFloor = 0.35f;
+            moonDaylightDim = 0.85f;
+            fogShapeStrength = 1.0f;
+            fogDawnBoost = 1.75f;
 
             cloudSunForwardScattering =
                     1.0f;
@@ -4034,6 +4295,10 @@ public final class RTXSettingsConfig {
             data.skyModelScale = skyModelScale;
             data.nightSkyAmbientScale = nightSkyAmbientScale;
             data.rainSkyDimScale = rainSkyDimScale;
+            data.moonLightFloor = moonLightFloor;
+            data.moonDaylightDim = moonDaylightDim;
+            data.fogShapeStrength = fogShapeStrength;
+            data.fogDawnBoost = fogDawnBoost;
             data.cloudSunForwardScattering = cloudSunForwardScattering;
             data.auroraBrightness = auroraBrightness;
             data.auroraFlowSpeed = auroraFlowSpeed;
@@ -4117,6 +4382,15 @@ public final class RTXSettingsConfig {
             data.cloudAerialStrength = cloudAerialSettings.cloudAerialStrength();
             data.groundAerialStrength = cloudAerialSettings.groundAerialStrength();
             data.groundAerialOcclusion = cloudAerialSettings.groundAerialOcclusion();
+            data.cloudOverhaulVersion = CLOUD_OVERHAUL_VERSION;
+            data.cloudStormDarkness = cloudWeatherStyleSettings.stormDarkness();
+            data.cloudLightningStrength = cloudWeatherStyleSettings.lightningStrength();
+            data.cloudSunsetWarmth = cloudWeatherStyleSettings.sunsetWarmth();
+            data.cloudWeatherCoupling = cloudWeatherStyleSettings.weatherCoupling();
+            data.cloudPowderEffect = cloudLight2Settings.powderEffect();
+            data.cloudSilverSpread = cloudLight2Settings.silverSpread();
+            data.cloudSharpness = cloudLight2Settings.sharpness();
+            data.cloudBaseErosion = cloudLight2Settings.baseErosion();
             data.cloudSunReddening = cloudSunReddening;
             data.cloudTopStretch = cloudTopStretch;
             data.cloudDetileStrength = cloudDetileStrength;
@@ -4142,6 +4416,7 @@ public final class RTXSettingsConfig {
             data.waterSimGaussianSource = waterSimWaveSettings.gaussianSource();
             data.waterSimDampingScale = waterSimWaveSettings.dampingScale();
             data.waterSimPropagationSpeed = waterSimWaveSettings.propagationSpeed();
+            data.waterSimRainRippleScale = waterSimWaveSettings.rainRippleScale();
             data.waterWaveLengthScale = waterWaveShapeSettings.lengthScale();
             data.waterWaveDirection = waterWaveShapeSettings.directionDegrees();
             data.waterWaveCrestSharpness = waterWaveShapeSettings.crestSharpness();
@@ -4153,6 +4428,9 @@ public final class RTXSettingsConfig {
             data.waterFftChoppiness = waterFftSettings.choppiness();
             data.waterFftTilePeriod = waterFftSettings.tilePeriod();
             data.waterFftDetail = waterFftSettings.detail();
+            data.waterFftSwellWeight = waterFftSettings.swellWeight();
+            data.waterFftDetailWeight = waterFftSettings.detailWeight();
+            data.waterFftWindSpeed = waterFftSettings.windSpeed();
             data.postTonemapMode = postProcessingSettings.tonemapMode();
             data.postExposureStrength = postProcessingSettings.exposureStrength();
             data.postContrast = postProcessingSettings.contrast();
@@ -4220,6 +4498,9 @@ public final class RTXSettingsConfig {
 
             data.cloudResFloorPercent =
                     cloudResFloorPercent;
+
+            data.cloudTemporalMode =
+                    cloudTemporalMode;
 
             data.cloudFarStepDensity =
                     cloudFarStepDensity;
@@ -4427,6 +4708,13 @@ public final class RTXSettingsConfig {
         Float skyModelScale;
         Float nightSkyAmbientScale;
         Float rainSkyDimScale;
+        // 2026-11-16 月光两旋钮（CameraUBO.moonParams.x / .y）
+        Float moonLightFloor;
+        Float moonDaylightDim;
+        // 2026-11-16 雾形态（CameraUBO.fogMoodParams.x）。
+        // 晨雾峰值不在这里声明：Data 尾部还留着旧版雾字段组（fogSpeed ..
+        // fogGroundMist*），其中已有 `fogDawnBoost`，直接复用那一格即可。
+        Float fogShapeStrength;
         Float cloudSunForwardScattering;
         Float auroraBrightness;
         Float auroraFlowSpeed;
@@ -4503,6 +4791,15 @@ public final class RTXSettingsConfig {
         Float cloudAerialStrength;
         Float groundAerialStrength;
         Float groundAerialOcclusion;
+        Integer cloudOverhaulVersion;
+        Float cloudStormDarkness;
+        Float cloudLightningStrength;
+        Float cloudSunsetWarmth;
+        Float cloudWeatherCoupling;
+        Float cloudPowderEffect;
+        Float cloudSilverSpread;
+        Float cloudSharpness;
+        Float cloudBaseErosion;
         Float cloudSunReddening;
         Float cloudAdaptiveLightRange;
         Boolean cloudTwoTierStep;
@@ -4527,6 +4824,7 @@ public final class RTXSettingsConfig {
         Float waterSimGaussianSource;
         Float waterSimDampingScale;
         Float waterSimPropagationSpeed;
+        Float waterSimRainRippleScale;
         Float waterWaveLengthScale;
         Float waterWaveDirection;
         Float waterWaveCrestSharpness;
@@ -4538,6 +4836,9 @@ public final class RTXSettingsConfig {
         Float waterFftChoppiness;
         Float waterFftTilePeriod;
         Float waterFftDetail;
+        Float waterFftSwellWeight;
+        Float waterFftDetailWeight;
+        Float waterFftWindSpeed;
         Integer postTonemapMode;
         Float postExposureStrength;
         Float postContrast;
@@ -4631,6 +4932,9 @@ public final class RTXSettingsConfig {
                 null;
 
         Integer cloudResFloorPercent =
+                null;
+
+        Integer cloudTemporalMode =
                 null;
 
         Float cloudFarStepDensity =

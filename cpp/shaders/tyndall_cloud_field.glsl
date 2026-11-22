@@ -1,5 +1,9 @@
 #ifndef TYNDALL_CLOUD_FIELD_GLSL
 #define TYNDALL_CLOUD_FIELD_GLSL
+// 2026-11-21 统一风场：风向/阵风 helper。本文件的 4 个宿主 TU
+//（rt_test.rgen / volumetric_clouds_v3 / v5 / volumetric_light.comp）都在
+// include 本文件之前声明了 cam，契约见水体交接 §16/§17。
+#include "wind_common.glsl"
 #ifndef TYNDALL_PLANET_RADIUS
 #define TYNDALL_PLANET_RADIUS 6360000.0
 #endif
@@ -37,7 +41,11 @@ float tyndallTime()
 
 vec3 tyndallWind()
 {
-    return vec3(0.81915204429, 0.0, 0.57357643635) *
+    // 2026-11-21 统一风场：方向改读 cam.windParams.x（windDirXZ），无效时回落
+    // HP 云原方向 vec2(0.862,0.507)（原 35° 常量只差 ~4°，同族）。速度车道
+    // cloudParams1.y 与时间轴不动。
+    vec2 windDir = windDirXZ();
+    return vec3(windDir.x, 0.0, windDir.y) *
         cam.cloudParams1.y * tyndallTime();
 }
 

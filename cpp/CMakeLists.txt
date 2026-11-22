@@ -198,3 +198,47 @@ if(MSVC)
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/external/bc7enc/bc7enc.cpp
             PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif()
+
+# ---------------------------------------------------------------------------
+# RT 管线无头预编译工具（2026-11-22 冷编治理 批B）
+#
+# 动机：K1/K2 腿管线驱动冷编要 20GB 级 commit / 9.5~50+ 分钟，游戏内编译
+# 会被内存挤兑、玩家退出、进程退出打断且失败只写 stderr（rt_debug.log 静默）。
+# 本工具把同一份 ensureK1K2Pipelines() 搬进独立进程：整机资源可用、挂机
+# 跑完、成功即落盘管线缓存（rtx_pipeline_cache_<spv哈希>.bin），游戏下一次
+# 启动四条腿 cache hit（~100-200ms/条）。
+#
+# 用法：exe 与 rtx_backend.dll 同目录运行（spv/缓存都按 exe 所在目录解析）：
+#   orion_precache.exe [--adapter N]
+# 设备扩展/feature 链与 VulkanBackendMixin.java 的游戏设备注入逐位对齐，
+# 对齐失败只导致游戏侧缓存 miss（安全回落游戏内编译），不会崩溃。
+#
+# 构建时复用 rtx_backend 同一套 ${SOURCES}（JNI 入口在 exe 里只是普通符号，
+# 不会被调用）；PCH/编译选项照抄 rtx_backend。
+# ---------------------------------------------------------------------------
+add_executable(orion_precache
+        tools/precache/main.cpp
+        ${SOURCES})
+
+target_link_libraries(orion_precache PRIVATE
+        ${Vulkan_LIBRARIES}
+        "${NRD_LIB}"
+        "${NRD_SHADERMAKE_BLOB_LIB}"
+        psapi
+)
+
+target_compile_definitions(orion_precache PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        NRD_STATIC_LIBRARY=1
+)
+
+if(MSVC)
+    target_compile_options(orion_precache PRIVATE /utf-8 /MP)
+
+    target_precompile_headers(orion_precache PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/backend/OrionInternal.h)
+
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/tools/precache/main.cpp
+            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+endif()

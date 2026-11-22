@@ -202,7 +202,7 @@ PERF_L10_TIME_STALL("tlasQueueIdle", check(
 << "[RT INIT] TLAS BUILD COMPLETE\n";
 }
 VkDescriptorSetLayout createRTDescriptorSetLayout(){
-    VkDescriptorSetLayoutBinding b[94]{};
+    VkDescriptorSetLayoutBinding b[99]{};
 
     b[0].binding=0; b[0].descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; b[0].descriptorCount=1; b[0].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     b[1].binding=1; b[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; b[1].descriptorCount=1; b[1].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_COMPUTE_BIT;
@@ -774,9 +774,10 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[91].stageFlags =
         VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
-    // 2026-11-14：稀疏反射的时域历史（rgen 读上一帧反射 / 活跃像素写回）。
-    // 非活跃像素不跑 GGX 射线但保留上一帧结果 ⇒ 不再出现"0 / 1-rate"二值方波，
-    // 修掉反射逐帧闪动。资源由 Sharc.cpp 的 createGlossyHistoryImage 绑定。
+    // 2026-11-14 曾用：稀疏反射的时域历史（binding 92）。
+    // 2026-11-16 撤销：观感影响大，反射改为**不参与稀疏**（VPT_SPARSE_GLOSSY=0），
+    // 着色器不再声明本槽位，也没有任何图像绑定它。槽位本身保留不删 ——
+    // 删了会牵连后面 b[93]（RT 阶段计数器）的编号。
     b[92].binding = 92;
     b[92].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[92].descriptorCount = 1;
@@ -793,6 +794,47 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
         VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
         VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
 
+    // 2026-11-17 P2：K2 三腿材质结果中转 buffer（binding 94）。仅
+    // ORION_MAT_REUSE_LEGS=1 时 ensureMatReuseBuffer() 才写描述；关闭时着色器走
+    // 原路径不引用本槽位（与 binding 88/89 同一约定：共享 layout 先声明）。
+    b[94].binding = 94;
+    b[94].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[94].descriptorCount = 1;
+    b[94].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // 2026-11-17：本地光 NEE 硬件可见性射线的跨腿结果缓存（binding 95）。仅
+    // ORION_LOCAL_NEE_CACHE=1 时 ensureNeeVisCacheBuffer() 才写描述；键不符即退回
+    // 自己打射线，所以关闭/未绑定时行为与旧版逐位一致。
+    b[95].binding = 95;
+    b[95].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[95].descriptorCount = 1;
+    b[95].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // ========================================================================
+    // 2026-11-19 DH LOD「G-buffer 光栅光影」（rasterLod，默认关）。
+    //   96 = dhLodRasterColorImage（RGBA8，dh_lod_raster.comp 写，rgen mode=14 读）
+    //   97 = dhLodRasterDepthImage（R32F，0.0 = 无几何）
+    // 与 binding 94/95 同一约定：共享 layout 先声明；描述符仅当
+    // createDhLodRasterResources（旗标开启）执行时才写入。旗标关闭时
+    // mode=14 永不出现，着色器不动态访问这两个槽位，行为与旧版逐位一致。
+    // ========================================================================
+    b[96].binding = 96;
+    b[96].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[96].descriptorCount = 1;
+    b[96].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    b[97].binding = 97;
+    b[97].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[97].descriptorCount = 1;
+    b[97].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // 2026-11-21 P0-1：主命中世界位移 per-pixel 旁路槽（RGBA16F 全分辨率）。
+    // rgen 清槽/读回，rchit 主射线命中写槽；CALLABLE 位由下面循环自动并入。
+    b[98].binding = 98;
+    b[98].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[98].descriptorCount = 1;
+    b[98].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+
     // D1：材质 callable 也读这套描述符（landing 槽位回传）。stageFlags 不参与
     // 管线布局兼容性判定，全量放行不影响既有管线（spv 无 callable 阶段照常工作）。
     for(auto& entry : b)
@@ -802,7 +844,7 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
 
     VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     static_assert(
-        sizeof(b) / sizeof(b[0]) == 94u,
+        sizeof(b) / sizeof(b[0]) == 99u,
         "RT descriptor set layout: update this assert together with b[]"
     );
     ci.bindingCount = static_cast<uint32_t>(sizeof(b) / sizeof(b[0]));
@@ -859,6 +901,41 @@ void destroyHistoryImage(
 
     layout =
         VK_IMAGE_LAYOUT_UNDEFINED;
+}
+// SBT 句柄尺寸/对齐来自物理设备属性，与具体管线无关；懒编局不建主管线
+// SBT，但 K1/K2 腿管线与 Sharc 的 RT-bind compute 都要这两个量，必须先补上。
+void ensureSbtHandleMetrics(){
+    if(g_handleSizeAligned != 0u && g_sbtBaseAlignment != 0u)
+    {
+        return;
+    }
+
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rp{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR
+    };
+
+    VkPhysicalDeviceProperties2 props{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+    };
+    props.pNext = &rp;
+
+    auto fn =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceProperties2")
+        );
+
+    if(!fn)
+        throw std::runtime_error("vkGetPhysicalDeviceProperties2 unavailable");
+
+    fn(g_physicalDevice, &props);
+
+    auto alignUp = [](uint32_t v, uint32_t a){
+        return (v + a - 1) & ~(a - 1);
+    };
+
+    g_sbtBaseAlignment = rp.shaderGroupBaseAlignment;
+    g_handleSizeAligned =
+        alignUp(rp.shaderGroupHandleSize, rp.shaderGroupHandleAlignment);
 }
 void createRayTracingSBT(){
     constexpr uint32_t SBT_GROUP_RAYGEN = 0u;
@@ -1083,6 +1160,61 @@ bool rtPipelineDisableOptimization()
 
     return disabled;
 }
+
+// 2026-11-16：主管线默认免优化（冷编难题定案）。【同日退役：k1k2SplitEnabled
+// 强制 true 后主管线恒懒编跳过、创建点全 #if 0，本开关只剩历史意义】。
+// 现场：主管线 = 6-stage 单体（rt_test.rgen.spv 678KB），优化冷编实测
+// 669~738s，LLVM 峰值把 32GB + 双页面文件（commit 上限 ~52GB）打穿 ——
+// 14:09 局编完报 -3（RT 整局关闭），14:33 局直接 fatal "Memory allocation
+// failure" 0xC0000409。而 K1/K2 拆分（默认开）下主管线**从不 dispatch**，
+// 只做 SBT 句柄来源 + 拆分失败时的回退管线。免优化跳过 LLVM 优化段，
+// 冷编掉到几十秒级。K1/K2 四条腿保持优化版（热路径）。
+// 代价：ORION_K1_K2=0 回退单发时 RT 变慢。逃生口：ORION_RT_MAIN_NOOPT=0。
+// 四个 main 创建点必须同档（Device.cpp / boot worker / recreateMainRtPipeline /
+// 异步重建），否则 driver cache 分裂，重建时又撞一次冷编。
+bool orionMainPipelineNoOpt()
+{
+    static const bool noOpt = []() -> bool
+    {
+        const char* raw =
+            std::getenv("ORION_RT_MAIN_NOOPT");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return true;
+        }
+
+        return !(raw[0] == '0' || raw[0] == 'f' || raw[0] == 'F');
+    }();
+
+    return noOpt;
+}
+
+// 2026-11-16 主管线退役：6-stage 单体驱动冷编实测要 ~29GB commit，把 32GB +
+// 双页面文件(~52GB commit 上限)打穿（14:21 局 -3、14:33/14:56 局 fatal
+// "Memory allocation failure"）。k1k2SplitEnabled() 已强制 true，K1/K2 拆分
+// 是唯一 RT 路径，主管线恒懒编跳过，任何 env 都打不回原单管线。
+bool orionMainLazyDeferred()
+{
+#if 0
+    static const bool lazy = []() -> bool
+    {
+        const char* raw =
+            std::getenv("ORION_MAIN_LAZY");
+
+        if(raw != nullptr && raw[0] != '\0' &&
+           raw[0] != '0' && raw[0] != 'f' && raw[0] != 'F')
+        {
+            return false;
+        }
+
+        return k1k2SplitEnabled();
+    }();
+
+    return lazy;
+#endif
+    return true;
+}
 bool deviceInitMilestone(const char* name)
 {
     ++g_deviceInitStep;
@@ -1120,10 +1252,21 @@ uint32_t rtPipeRecycleSeconds()
 }
 
 // 按 initDeviceHandlesNative 里的主管线（:47460-47499 那一带）逐位重建一条同样的管线。
+// 2026-11-16 主管线退役：6-stage 单体冷编 ~29GB commit 的墙不再付第二遍，
+// g_rayTracingPipeline 恒 null（创建点全 #if 0）⇒ 本函数恒 return false，
+// 热重载/回收调用方靠这个布尔自然失效，永不触发帧中冷编。
 bool recreateMainRtPipeline()
 {
+#if 0
     if(g_device == VK_NULL_HANDLE ||
        g_rayTracingPipelineLayout == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    // 懒编局/失败局 main 不存在：在这里重建=帧中撞一次 29GB 级冷编
+    //（此前 boot 才会付的钱），必须直接拒绝。K1/K2 腿管线不经过本函数。
+    if(g_rayTracingPipeline == VK_NULL_HANDLE)
     {
         return false;
     }
@@ -1179,6 +1322,11 @@ bool recreateMainRtPipeline()
     {
         pci.flags |=
             VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+    }
+
+    if(orionMainPipelineNoOpt())
+    {
+        pci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     }
 
     auto createPipe =
@@ -1263,6 +1411,9 @@ bool recreateMainRtPipeline()
     fflush(stderr);
 
     return true;
+#endif
+
+    return false;
 }
 void recycleMainRtPipeline()
 {
@@ -1323,6 +1474,10 @@ void recycleMainRtPipeline()
 
 // ===========================================================================
 // 2026-11-02 P1：SPV 热重载（ORION_RT_PIPE_HOT_RELOAD=1）
+//
+// 2026-11-16 主管线退役注记：本特性盯的是 6-stage 主单体的 SPV，而
+// g_rayTracingPipeline 恒 null（创建点全 #if 0）⇒ 入口判空后自然失效，
+// 纯遗留。若要热重载 K1/K2 腿，需另起一套按腿管线的实现。
 //
 // 动机（本机实测，[PERF PIPE] kind=rt）：
 //   同一份 SPV 命中缓存 182.8 ms；任一变体内容变化后，主 RT 管线（6 stage）

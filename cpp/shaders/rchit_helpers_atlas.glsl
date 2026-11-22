@@ -1,292 +1,8 @@
-#ifndef MATERIAL_COMMON_GLSL
-#define MATERIAL_COMMON_GLSL
-
-float materialHitT = 0.0;
-vec3 materialRayOrigin = vec3(0.0);
-vec3 materialRayDirection = vec3(0.0, 0.0, -1.0);
-
-
-
-
-
-
-uint makeHitState(
-    uint purpose,
-    uint hitClass,
-    uint waterEvent,
-    bool glass,
-    bool glassBottom,
-    uint transparentProfile
-)
-{
-    return
-        (purpose & RT_STATE_PURPOSE_MASK) |
-        ((hitClass & 0x3u) << RT_STATE_HIT_CLASS_SHIFT) |
-        ((waterEvent & 0x3u) << RT_STATE_WATER_EVENT_SHIFT) |
-        (glass ? RT_STATE_GLASS_BIT : 0u) |
-        (glassBottom ? RT_STATE_GLASS_BOTTOM_BIT : 0u) |
-        ((transparentProfile & 0x7u) << RT_STATE_PROFILE_SHIFT);
-}
-
-#include "transparent_profile_common.glsl"
-
-struct Vertex {
-    float x, y, z;
-    float u, v;
-    float r, g, b, a;
-    float materialId;
-    float pad1;
-    float pad2;
-};
-
-layout(buffer_reference, scalar) buffer Vertices {
-    Vertex v[];
-};
-
-#if SECTION_VERTEX_32B
-struct SectionVertex32
-{
-    float x, y, z;
-    float u, v;
-    uint color;
-    float materialId;
-    float pad2;
-};
-layout(buffer_reference, scalar) buffer SectionVertices32 {
-    SectionVertex32 v[];
-};
-
-Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
-{
-    if(stride == 32u)
-    {
-        const SectionVertex32 packed = SectionVertices32(addr).v[index];
-
-        Vertex unpacked;
-        unpacked.x = packed.x;
-        unpacked.y = packed.y;
-        unpacked.z = packed.z;
-        unpacked.u = packed.u;
-        unpacked.v = packed.v;
-        unpacked.r = float(packed.color & 0xFFu) / 255.0;
-        unpacked.g = float((packed.color >> 8) & 0xFFu) / 255.0;
-        unpacked.b = float((packed.color >> 16) & 0xFFu) / 255.0;
-        unpacked.a = float((packed.color >> 24) & 0xFFu) / 255.0;
-        unpacked.materialId = packed.materialId;
-
-        const bool rainPuddle = packed.pad2 >= 64.0;
-        unpacked.pad1 = rainPuddle ? 0.25 : 0.0;
-        unpacked.pad2 = rainPuddle ? (packed.pad2 - 64.0) : packed.pad2;
-
-        return unpacked;
-    }
-
-    return Vertices(addr).v[index];
-}
-#else
-Vertex loadSectionVertex(uint64_t addr, uint , uint index)
-{
-    return Vertices(addr).v[index];
-}
-#endif
-
-layout(buffer_reference, scalar) buffer VertexMotions {
-    float motion[];
-};
-
-vec3 readVertexMotion(VertexMotions motions, uint vertexIndex)
-{
-    const uint base = vertexIndex * 3u;
-
-    return vec3(
-        motions.motion[base + 0u],
-        motions.motion[base + 1u],
-        motions.motion[base + 2u]
-    );
-}
-
-layout(std430, binding = 21, set = 0) readonly buffer SectionVertexAddressBuffer {
-    uvec4 vertexAddresses[];
-} sectionVertexAddressBuffer;
-
-#if 0
-#endif
-
-// Pure optical, world-space water ripples.  Integer time harmonics keep the
-// field continuous at the Minecraft day wrap; high-frequency slopes fade at
-// distance to avoid ray-traced/DLSS aliasing.
-struct WaterWaveSurface {
-    vec3 normal;
-};
-
-// Integer-free value hash.  Unlike sin-based shader hashes this is cheap on
-// the closest-hit path and remains deterministic for DLSS/RR reprojection.
-float rainRippleHash(vec2 p)
-{
-    p = fract(p * vec2(0.1031, 0.11369));
-    p += dot(p, p.yx + 19.19);
-    return fract((p.x + p.y) * p.x);
-}
-
-// One short-lived impact is assigned to each cell.  Testing the surrounding
-// 3x3 cells makes rings continuous at cell boundaries.  This is evaluated
-// only for the first visible water interface: no new texture, compute pass,
-// particle, BLAS instance, or hardware ray is needed.
-vec2 rainImpactRippleGradient(vec2 worldXZ, float cameraDistance)
-{
-    float rain = abs(cam.weatherParams.z - 1.0) < 0.25
-        ? clamp(cam.weatherParams.x, 0.0, 1.0)
-        : 0.0;
-    if(rain <= 0.01 || getRayPurpose(payload.state) != RT_PURPOSE_PRIMARY_SKY)
-    {
-        return vec2(0.0);
-    }
-
-    float nearFade = 1.0 - smoothstep(28.0, 72.0, cameraDistance);
-    if(nearFade <= 0.0)
-    {
-        return vec2(0.0);
-    }
-
-    // 2026-11-11：UI 旋钮。与 rchit_helpers_water.glsl 逐字同口径
-    //（两处必须一致，否则水面与地面观感会分叉）。
-    //   godRayParams2.w = size + strength * 8；<=0 ⇒ 默认 (1,1)
-    const float packedRipple = cam.godRayParams2.w;
-    float rippleSize = 1.0;
-    float rippleStrength = 1.0;
-    if(packedRipple > 0.0)
-    {
-        rippleStrength = clamp(floor(packedRipple / 8.0 + 1.0e-4), 0.0, 3.0);
-        const float rawSize = packedRipple - rippleStrength * 8.0;
-        rippleSize = clamp(rawSize <= 0.0 ? 1.0 : rawSize, 0.25, 4.0);
-    }
-    const float CELL_SIZE = 0.432 * rippleSize;
-    const float RING_SPEED = 0.336 * rippleSize;
-    const float RING_FREQUENCY = 66.66667 / rippleSize;
-    float time = uintBitsToFloat(cam.padding);
-    vec2 baseCell = floor(worldXZ / CELL_SIZE);
-    vec2 gradient = vec2(0.0);
-
-    for(int y = -1; y <= 1; ++y)
-    {
-        for(int x = -1; x <= 1; ++x)
-        {
-            vec2 cell = baseCell + vec2(float(x), float(y));
-            float seedX = rainRippleHash(cell + vec2(17.0, 43.0));
-            float seedZ = rainRippleHash(cell + vec2(71.0, 29.0));
-            float age = fract(time * mix(0.42, 1.08, rain) +
-                rainRippleHash(cell + vec2(113.0, 7.0)));
-            vec2 impact = (cell + vec2(seedX, seedZ)) * CELL_SIZE;
-            vec2 delta = worldXZ - impact;
-            float distanceToImpact = length(delta);
-            float radius = age * RING_SPEED;
-            float envelope = (1.0 - smoothstep(0.52, 1.0, age)) *
-                (1.0 - smoothstep(0.12, 0.204, distanceToImpact));
-            if(envelope <= 0.0 || distanceToImpact <= 1.0e-4)
-            {
-                continue;
-            }
-
-            float slope = cos((distanceToImpact - radius) * RING_FREQUENCY);
-            gradient += normalize(delta) * slope * envelope;
-        }
-    }
-
-    return gradient * (0.060 * rain * nearFade * rippleStrength);
-}
-
-WaterWaveSurface evaluateWaterWaveSurface(vec2 worldXZ, float waterY)
-{
-    float cameraDistance;
-    vec3 surfacePos = vec3(worldXZ.x, waterY, worldXZ.y);
-    float noV = abs(normalize(surfacePos - cam.viewInverse[3].xyz).y);
-    float horizonFade = 1.0 - exp(-4.0 * noV);
-    float projScale = float(gl_LaunchSizeEXT.y)
-        / (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
-    float waveLod = waterFftSlopeLodFromProj(surfacePos, materialHitT, projScale);
-    vec2 naturalSlope = waterNaturalWaveGradient(worldXZ, cameraDistance, horizonFade, waveLod);
-
-    float stateAndBorderMask;
-    vec2 interactionSlope =
-        waterInteractionSlope(worldXZ, stateAndBorderMask);
-    float elevationMatch = 1.0 - smoothstep(
-        0.65, 1.50, abs(waterY - cam.waterSimSurfaceAndOrigin.x)
-    );
-    vec2 gradient = waterBlendWaveSlopes(
-        naturalSlope,
-        interactionSlope * (stateAndBorderMask * elevationMatch),
-        waterWaveBlendMode()
-    );
-
-    gradient += rainImpactRippleGradient(worldXZ, cameraDistance);
-
-    WaterWaveSurface result;
-    result.normal = normalize(vec3(-gradient.x, 1.0, -gradient.y));
-    return result;
-}
-
-const int WATER_CLASSIFY_WAVE_OCTAVES = 1;
-
-WaterWaveSurface evaluateWaterWaveSurfaceClassify(vec2 worldXZ, float waterY)
-{
-    float cameraDistance;
-    vec3 surfacePos = vec3(worldXZ.x, waterY, worldXZ.y);
-    float noV = abs(normalize(surfacePos - cam.viewInverse[3].xyz).y);
-    float horizonFade = 1.0 - exp(-4.0 * noV);
-    float projScale = float(gl_LaunchSizeEXT.y)
-        / (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
-    float waveLod = waterFftSlopeLodFromProj(surfacePos, materialHitT, projScale);
-    vec2 naturalSlope =
-        waterNaturalWaveGradientCapped(
-            worldXZ,
-            cameraDistance,
-            WATER_CLASSIFY_WAVE_OCTAVES,
-            horizonFade,
-            waveLod
-        );
-
-    float stateAndBorderMask;
-    vec2 interactionSlope =
-        waterInteractionSlope(worldXZ, stateAndBorderMask);
-    float elevationMatch = 1.0 - smoothstep(
-        0.65, 1.50, abs(waterY - cam.waterSimSurfaceAndOrigin.x)
-    );
-    vec2 gradient = waterBlendWaveSlopes(
-        naturalSlope,
-        interactionSlope * (stateAndBorderMask * elevationMatch),
-        waterWaveBlendMode()
-    );
-
-    WaterWaveSurface result;
-    result.normal = normalize(vec3(-gradient.x, 1.0, -gradient.y));
-    return result;
-}
-
-#ifndef END_ORB_ENABLE
-#define END_ORB_ENABLE 1
-#endif
-
-
-
-
-
-
 #ifndef ORION_ATLAS_DYNAMIC_INDEX
-// 2026-11-10：开启 sampler2D[64] 的动态下标（Vulkan 1.0 的
-// shaderSampledImageArrayDynamicIndexing，由 VulkanBackendMixin 在 createDevice 时补）。
-// 回退：-DORION_ATLAS_DYNAMIC_INDEX=0 ⇒ 走原来的 64 路 switch。
 #define ORION_ATLAS_DYNAMIC_INDEX 0
 #endif
-
-layout(binding = 3, set = 0) uniform sampler2D blockAtlas;
-layout(binding = 36, set = 0) uniform sampler2D entityAtlases[64];
-layout(binding = 63, set = 0) uniform sampler2D entityNormalAtlases[64];
-layout(binding = 64, set = 0) uniform sampler2D entitySpecularAtlases[64];
-layout(binding = 37, set = 0) uniform sampler2D particleAtlases[3];
-layout(binding = 40, set = 0) uniform sampler2D rainStreakAtlas;
-layout(binding = 45, set = 0) uniform sampler2D voxyLodAtlas;
-layout(binding = 49, set = 0) uniform sampler2D dhBlockRatioAtlas;
-
+// 2026-11-05 B①：从 rt_test.rchit 474-1038 行原样切出的图集解码/采样 helper 段。
+// rchit 在原位置 include 回来；K2 的 rgen（ORION_K2_TRANSPORT）也 include 它。
 vec4 sampleEntityAtlas(uint textureSlot, vec2 uv)
 {
 #if ORION_ATLAS_DYNAMIC_INDEX
@@ -297,6 +13,9 @@ vec4 sampleEntityAtlas(uint textureSlot, vec2 uv)
     return textureLod(entityAtlases[textureSlot - 1u], uv, 0.0);
 #endif
 
+    // Keep every sampler operand statically indexed.  The current device is
+    // created by Java without descriptor-indexing feature negotiation, while
+    // closest-hit invocations naturally select different entity textures.
     switch(textureSlot)
     {
         case 1u: return textureLod(entityAtlases[0], uv, 0.0);
@@ -363,6 +82,70 @@ vec4 sampleEntityAtlas(uint textureSlot, vec2 uv)
         case 62u: return textureLod(entityAtlases[61], uv, 0.0);
         case 63u: return textureLod(entityAtlases[62], uv, 0.0);
         case 64u: return textureLod(entityAtlases[63], uv, 0.0);
+        case 65u: return textureLod(entityAtlases[64], uv, 0.0);
+        case 66u: return textureLod(entityAtlases[65], uv, 0.0);
+        case 67u: return textureLod(entityAtlases[66], uv, 0.0);
+        case 68u: return textureLod(entityAtlases[67], uv, 0.0);
+        case 69u: return textureLod(entityAtlases[68], uv, 0.0);
+        case 70u: return textureLod(entityAtlases[69], uv, 0.0);
+        case 71u: return textureLod(entityAtlases[70], uv, 0.0);
+        case 72u: return textureLod(entityAtlases[71], uv, 0.0);
+        case 73u: return textureLod(entityAtlases[72], uv, 0.0);
+        case 74u: return textureLod(entityAtlases[73], uv, 0.0);
+        case 75u: return textureLod(entityAtlases[74], uv, 0.0);
+        case 76u: return textureLod(entityAtlases[75], uv, 0.0);
+        case 77u: return textureLod(entityAtlases[76], uv, 0.0);
+        case 78u: return textureLod(entityAtlases[77], uv, 0.0);
+        case 79u: return textureLod(entityAtlases[78], uv, 0.0);
+        case 80u: return textureLod(entityAtlases[79], uv, 0.0);
+        case 81u: return textureLod(entityAtlases[80], uv, 0.0);
+        case 82u: return textureLod(entityAtlases[81], uv, 0.0);
+        case 83u: return textureLod(entityAtlases[82], uv, 0.0);
+        case 84u: return textureLod(entityAtlases[83], uv, 0.0);
+        case 85u: return textureLod(entityAtlases[84], uv, 0.0);
+        case 86u: return textureLod(entityAtlases[85], uv, 0.0);
+        case 87u: return textureLod(entityAtlases[86], uv, 0.0);
+        case 88u: return textureLod(entityAtlases[87], uv, 0.0);
+        case 89u: return textureLod(entityAtlases[88], uv, 0.0);
+        case 90u: return textureLod(entityAtlases[89], uv, 0.0);
+        case 91u: return textureLod(entityAtlases[90], uv, 0.0);
+        case 92u: return textureLod(entityAtlases[91], uv, 0.0);
+        case 93u: return textureLod(entityAtlases[92], uv, 0.0);
+        case 94u: return textureLod(entityAtlases[93], uv, 0.0);
+        case 95u: return textureLod(entityAtlases[94], uv, 0.0);
+        case 96u: return textureLod(entityAtlases[95], uv, 0.0);
+        case 97u: return textureLod(entityAtlases[96], uv, 0.0);
+        case 98u: return textureLod(entityAtlases[97], uv, 0.0);
+        case 99u: return textureLod(entityAtlases[98], uv, 0.0);
+        case 100u: return textureLod(entityAtlases[99], uv, 0.0);
+        case 101u: return textureLod(entityAtlases[100], uv, 0.0);
+        case 102u: return textureLod(entityAtlases[101], uv, 0.0);
+        case 103u: return textureLod(entityAtlases[102], uv, 0.0);
+        case 104u: return textureLod(entityAtlases[103], uv, 0.0);
+        case 105u: return textureLod(entityAtlases[104], uv, 0.0);
+        case 106u: return textureLod(entityAtlases[105], uv, 0.0);
+        case 107u: return textureLod(entityAtlases[106], uv, 0.0);
+        case 108u: return textureLod(entityAtlases[107], uv, 0.0);
+        case 109u: return textureLod(entityAtlases[108], uv, 0.0);
+        case 110u: return textureLod(entityAtlases[109], uv, 0.0);
+        case 111u: return textureLod(entityAtlases[110], uv, 0.0);
+        case 112u: return textureLod(entityAtlases[111], uv, 0.0);
+        case 113u: return textureLod(entityAtlases[112], uv, 0.0);
+        case 114u: return textureLod(entityAtlases[113], uv, 0.0);
+        case 115u: return textureLod(entityAtlases[114], uv, 0.0);
+        case 116u: return textureLod(entityAtlases[115], uv, 0.0);
+        case 117u: return textureLod(entityAtlases[116], uv, 0.0);
+        case 118u: return textureLod(entityAtlases[117], uv, 0.0);
+        case 119u: return textureLod(entityAtlases[118], uv, 0.0);
+        case 120u: return textureLod(entityAtlases[119], uv, 0.0);
+        case 121u: return textureLod(entityAtlases[120], uv, 0.0);
+        case 122u: return textureLod(entityAtlases[121], uv, 0.0);
+        case 123u: return textureLod(entityAtlases[122], uv, 0.0);
+        case 124u: return textureLod(entityAtlases[123], uv, 0.0);
+        case 125u: return textureLod(entityAtlases[124], uv, 0.0);
+        case 126u: return textureLod(entityAtlases[125], uv, 0.0);
+        case 127u: return textureLod(entityAtlases[126], uv, 0.0);
+        case 128u: return textureLod(entityAtlases[127], uv, 0.0);
         default: return vec4(1.0);
     }
 }
@@ -480,15 +263,58 @@ vec4 sampleParticleAtlas(uint textureSlot, vec2 uv)
     }
 }
 
+// 2026-10-03（用户要求）：雨可见度统一 2× 增益（rgen 里同名常量，两边必须一起改）。
+// 这里作用于雨条本体：albedo ×2 ⇒ 雨条辐射度 ×2（radiance = albedo × 天空辐照度）。
+const float RAIN_VISIBILITY_GAIN = 2.0;
 
 vec4 sampleRainStreakAtlas(vec2 uv)
 {
     return textureLod(rainStreakAtlas, uv, 0.0);
 }
 
+// =====================================================
+// Voxy LOD atlas sampling (v11)
+//
+// The bridge bakes one 16x16 tile per face texture into a
+// 256x256 atlas (9-level mip chain; a tile stays isolated
+// down to mip 4 = one texel) and emits one quad per LOD cell
+// face in world block coordinates.  Voxy's rasterizer picks
+// the mip from screen-space UV derivatives; a hit shader has
+// none, so texel density is reconstructed analytically:
+//
+//   cellPx = cellW * screenH / (2 tan(fov/2) * dist) * facing
+//   mip    = clamp(log2(16 / cellPx), 0, 4)
+//
+// facing = |dot(normal, rayDir)| reproduces the hardware
+// max-derivative mip choice at grazing angles (stable
+// distance terrain instead of shimmer).  Mip 4 is the hard
+// cap: below it a tile is sub-texel and neighbouring tiles
+// would bleed.  The sample UV is inset-clamped to the owning
+// tile so bilinear/trilinear filtering never crosses a tile
+// border at any mip.
+//
+// pad2 = bridgeMip + shade/256; the bridge mip is superseded
+// by the estimate above, shade stays the light modulation.
+// pad2 < 0 keeps the pre-modulated vertex-colour fallback.
+//
+// Colour space: this pipeline shades with gamma-encoded values.
+// Near terrain is texelFetch(blockAtlas) * interpColor with no
+// decode anywhere (VulkanCore uploadChunk writes byte/255 raw),
+// and rr_sdr_post applies the single global pow(1/2.2).  Voxy
+// must use the same convention or the LOD/vanilla seam shows a
+// brightness step, so the atlas sample is NOT decoded here; the
+// bridge pre-encodes its vertex bytes to cancel the sRGB decode
+// that appendVoxyLodQuads applies, leaving tint in gamma space.
+// =====================================================
+// v15: 256 -> 1024 (bridge tiles 16 -> 64 per axis, capacity 255 -> 4095).
+// VOXY_TILE_PIXELS stays 16 so texel density is unchanged; only the number of
+// addressable tiles grows.  Must track ATLAS_SIZE in the voxy bridge.
 const float VOXY_ATLAS_SIZE = 1024.0;
 const float VOXY_TILE_PIXELS = 16.0;
 
+// Disabled: decoding the atlas sample to linear is physically right but
+// inconsistent with every other material in this pipeline, which shades in
+// gamma space.  Kept as a future interface option for a linear-space pass.
 #if 0
 vec3 voxySrgbToLinear(vec3 srgb)
 {
@@ -500,6 +326,9 @@ vec3 voxySrgbToLinear(vec3 srgb)
 
 float voxyLodMip(vec3 pos0, vec3 pos1, vec3 geoNormal)
 {
+    // Both quad triangles expose the cell edge length: the first
+    // triangle's v0->v1 is a square side, the second's is the
+    // diagonal whose largest |component| equals the same side.
     vec3 edge = abs(pos1 - pos0);
     float cellW = max(edge.x, max(edge.y, edge.z));
     float projScale = float(gl_LaunchSizeEXT.y)
@@ -516,6 +345,9 @@ float voxyLodMip(vec3 pos0, vec3 pos1, vec3 geoNormal)
 
 vec2 voxyTileSafeUV(vec2 uv, vec2 uv0, vec2 uv1, vec2 uv2, float mip)
 {
+    // Encoded corner UVs are mip0 texel centres; recover the true
+    // tile origin, then inset by half a texel of the selected mip
+    // (ceil keeps the coarser trilinear level inside the tile).
     vec2 tileOrigin = min(uv0, min(uv1, uv2)) - vec2(0.5 / VOXY_ATLAS_SIZE);
     float inset = exp2(ceil(mip)) * (0.5 / VOXY_ATLAS_SIZE);
     vec2 tileSpan = vec2(VOXY_TILE_PIXELS / VOXY_ATLAS_SIZE);
@@ -561,13 +393,14 @@ float dhBlockMip(vec3 hitPos, vec3 normal)
 vec2 dhFaceUv(vec3 hitPos, float normalIndex)
 {
     vec3 pos = fract(hitPos);
-    if(normalIndex < 0.5) return vec2(pos.x, 1.0 - pos.z);
-    if(normalIndex < 1.5) return vec2(pos.x, pos.z);
-    if(normalIndex < 2.5) return vec2(1.0 - pos.x, 1.0 - pos.y);
-    if(normalIndex < 3.5) return vec2(pos.x, 1.0 - pos.y);
-    if(normalIndex < 4.5) return vec2(pos.z, 1.0 - pos.y);
-    return vec2(1.0 - pos.z, 1.0 - pos.y);
+    if(normalIndex < 0.5) return vec2(pos.x, 1.0 - pos.z);        // down
+    if(normalIndex < 1.5) return vec2(pos.x, pos.z);              // up
+    if(normalIndex < 2.5) return vec2(1.0 - pos.x, 1.0 - pos.y);  // north
+    if(normalIndex < 3.5) return vec2(pos.x, 1.0 - pos.y);        // south
+    if(normalIndex < 4.5) return vec2(pos.z, 1.0 - pos.y);        // west
+    return vec2(1.0 - pos.z, 1.0 - pos.y);                        // east
 }
+
 // =====================================================
 // DH far field: fake-texture "grit" (DH's own applyNoise)
 // =====================================================
@@ -613,6 +446,7 @@ vec3 dhFakeTextureNoise(vec3 albedo, vec3 hitPos, vec3 geoNormal)
     vec3 grid = floor(fixedPos * DH_NOISE_STEPS) / DH_NOISE_STEPS;
 
     float luminance = (albedo.r + albedo.g + albedo.b) * (1.0 / 3.0);
+    // -(2x-1)^2+1：越暗或越亮的地方噪声越弱，中间调最强。
     float amplification =
         (1.0 - pow(luminance * 2.0 - 1.0, 2.0)) * DH_NOISE_INTENSITY;
 
@@ -620,11 +454,41 @@ vec3 dhFakeTextureNoise(vec3 albedo, vec3 hitPos, vec3 geoNormal)
         dhNoiseRand(grid) * 2.0 * amplification - amplification;
     vec3 newColor = clamp(albedo + (1.0 - albedo) * randomValue, 0.0, 1.0);
 
+    // 越远越淡（DH: min(viewDist / dropoff, 1)）。viewDist 是到相机的距离。
     float viewDistance = length(hitPos - cam.viewInverse[3].xyz);
     float distanceFade = min(viewDistance / DH_NOISE_DROPOFF, 1.0);
     return mix(newColor, albedo, distanceFade);
 }
 
+// =====================================================
+// DH 平价色补偿（"LOD 那一片为什么亮一点"）
+// =====================================================
+// DH 顶点色的那个"平面色"是**在线性空间求的平均**：ClientBlockStateColorCache
+// .calculateColorFromTexture 用 srgbToLinearTable 把每个不透明 texel 转线性、
+// 加权求和，再用 linearToSrgb 编码回 8 位（见其字节码）。
+// 而近场是**逐 texel 采样贴图**、把 sRGB 字节当线性用，于是在 LOD 接缝处被
+// 降噪器平均出来的就是"同一个面所有 texel 的 sRGB 均值"。
+// encode 是凹函数 ⇒ encode(E[L]) ≥ E[encode(L)]：
+//   DH 的平面色 **永不比** 同一批 texel 的 sRGB 均値暗，贴图反差越大差得越多
+//   （树叶/石砖 >> 纯色方块）。这就是接缝两侧"同一块地，远的那半分更亮"的直接来源。
+//
+// 我们没有贴图分布，无法精确反演，只能按典型方块贴图的统计差补一个增益：
+//   反差中等的贴图（草/泥土）实测比值 ≈ 0.93，反差大的（树叶/圆石）≈ 0.81~0.84，
+//   取中间偏保守的 0.85。
+// ⚠ 2026-10-01：这个偏差**正比于合并层级**。一个 LOD quad 越粗，它平均掉的
+//   texel 越多，encode(E[L]) - E[encode(L)] 越大 ⇒ 越远越亮越灰。所以补偿不能
+//   是一个常数，必须随距离爬升。
+//
+// 实测（2026-10-01 夕阳，DH 远场草地）：远场 ≈ RGB(185,220,198)，Y=0.82、S=0.15；
+// 同屏近场 ≈ RGB(81,102,88) Y=0.38 与 RGB(54,60,34) Y=0.22 —— 亮 2~3 倍。
+//
+// 旧写法只在 tileId == 0 的平价色分支里乘一个 0.85。一旦 DH 的 blockRatioAtlas
+// 接上（publishTextures=true + 重启），顶点全部带真 tileId ⇒ 那段补偿**整段
+// 失效**，亮度爬升就回来了。现在把补偿提到两条分支**之后**统一做。
+//
+// DH_LOD_NEAR_GAIN 沿用旧值 0.85（近场档的档位不变），DH_LOD_FAR_GAIN 是最粗层
+// 的档位。刻意不压到与近场同亮 —— 远处本来就该淡一点，这里只削掉大部分爬升。
+// 观感偏亮就调小 DH_LOD_FAR_GAIN，偏暗就调大；要整体关掉把两个都设回 1.0。
 const float DH_LOD_NEAR_GAIN = 0.85;
 const float DH_LOD_FAR_GAIN = 0.65;
 const float DH_LOD_NEAR_SAT = 1.0;
@@ -643,6 +507,10 @@ vec3 dhLodColorCompensation(vec3 color, vec3 hitPos)
         0.0,
         1.0);
     vec3 gained = color * mix(DH_LOD_NEAR_GAIN, DH_LOD_FAR_GAIN, t);
+    // ⚠ 增益是**乘法**，只能压亮度，动不了彩度。而线性空间平均除了抬亮，还会把
+    //   每个通道往均值拉 ⇒ 饱和度一起被吃掉（实测远场草地 S=0.15，近场 S=0.21，
+    //   比 0.71）。所以必须另补一步：以亮度为轴等比放大彩度。
+    //   远端 1.45 ≈ 0.21/0.15 的倒数；近场档 1.0 = 不动，保证近场逐字节不变。
     float luma = dot(gained, vec3(0.2126, 0.7152, 0.0722));
     return clamp(
         mix(vec3(luma), gained, mix(DH_LOD_NEAR_SAT, DH_LOD_FAR_SAT, t)),
@@ -653,6 +521,9 @@ vec3 dhLodColorCompensation(vec3 color, vec3 hitPos)
 vec3 dhLodAlbedo(float tileId, float normalIndex, vec3 hitPos, vec3 geoNormal,
     vec3 vertexColor)
 {
+    // tileId 0 = DH 自己的"无纹理"约定，同时也是"图集还没就绪"的占位
+    // （Java 侧只在真句柄推送成功后才写 tileId，见 DhTextureHandles.isPublished）。
+    // DH 对这类方块补一层假纹理噪声（applyNoise），远场因此才有颗粒感。
     if(tileId < 0.5)
     {
         return dhLodColorCompensation(
@@ -668,6 +539,24 @@ vec3 dhLodAlbedo(float tileId, float normalIndex, vec3 hitPos, vec3 geoNormal,
         mix(vertexColor, tinted, tile.a), hitPos);
 }
 
+// =====================================================
+// DH far field: baked block light (DH vertex byte 13)
+// =====================================================
+// Java 侧把每一段的 (skyLight << 4) | blockLight 打进 DH 顶点字节 13，C++ 的
+// appendDhLodQuads 原样搬进 Vertex.a ⇒ 这里从 interpColor.a 解回来。一个 quad 的
+// 四顶点同值，重心插值精确，不需要新 attribute、不动 payload 结构。
+//
+// 为什么需要它：DH 远场在 MC 视距之外，我们的本地光（ReSTIR DI / VPT 体素光）
+// 在那片区域**没有数据**，于是夜里远场只剩 ambient + GI ⇒ 村庄/街灯那一带全黑。
+// blockLight 是唯一知道"那里有灯"的信息源。
+//
+// ⭐ 用法：作为**加性自发光**写进 payload.emission，刻意**不**乘进 albedo。
+//   1) 乘 albedo = 把光照二次计入（ambient / 直射 / GI 已经各自乘过一次），而且
+//      会把 16 级量化台阶烙在几何上 —— voxy 的 shade 就是这么被关掉的；
+//   2) emission 是加性项，且会作为命中辐射进 GI ⇒ 远场街区顺带照亮自己的邻居，
+//      与近场本地光的行为一致。
+// skyLight 刻意不参与：天空/太阳本来由 shadow ray + GI 实时算，再乘一次就是双重
+// 计光。"屋檐下的暗部"属于 RTAO/GI 的活，不该由这里补。
 const float DH_BAKED_BLOCK_GAIN = 0.25;
 const vec3 DH_BAKED_BLOCK_TINT = vec3(1.0, 0.82, 0.60);
 
@@ -680,9 +569,13 @@ float dhBlockLightLevel(float packedLight)
 vec3 dhBakedBlockLight(vec3 albedo, float packedLight)
 {
     float level = dhBlockLightLevel(packedLight) * (1.0 / 15.0);
+    // 三次方曲线：0..4 级几乎不出光，12..15 级明确发亮（对齐"火把一两格内"的观感）。
     return albedo * DH_BAKED_BLOCK_TINT * (DH_BAKED_BLOCK_GAIN * level * level * level);
 }
 
+// v10 fixed-mip sampling (bridge selected mip = LOD ring level):
+// superseded by the analytical density estimate above.  Disabled,
+// kept as a future interface option.
 #if 0
 vec3 voxyLodAlbedo(float mipShade, vec2 uv, vec3 fallback)
 {
@@ -694,759 +587,4 @@ vec3 voxyLodAlbedo(float mipShade, vec2 uv, vec3 fallback)
     float shade = mipShade - mip;
     return textureLod(voxyLodAtlas, uv, mip).rgb * shade;
 }
-#endif
-layout(binding = 4, set = 0) uniform sampler2D normalAtlas;
-layout(binding = 5, set = 0) uniform sampler2D specularAtlas;
-
-
-
-
-
-
-
-float sampleLabPBRDepth(
-    vec2 uv
-)
-{
-    float a =
-        clamp(
-            textureLod(
-                normalAtlas,
-                uv,
-                0.0
-            ).a,
-            0.0,
-            1.0
-        );
-
-
-    a +=
-        clamp(
-            1.0 - a * 1.0e20,
-            0.0,
-            1.0
-        );
-
-
-    return
-        1.0 -
-        a;
-}
-
-
-
-bool isPOMSpriteUVInBounds(
-    vec2 uv,
-    vec2 safeMin,
-    vec2 safeMax
-)
-{
-    return
-        all(greaterThanEqual(uv, safeMin)) &&
-        all(lessThanEqual(uv, safeMax));
-}
-
-
-// LabPBR `_n.a` as a height, with the "no height data" remap:
-// alpha 0 is treated as the top of the field, not the bottom.
-float pomHeightAlpha(ivec2 texel, ivec2 lo, ivec2 hi)
-{
-    texel = clamp(texel, lo, hi);
-
-    float a =
-        clamp(
-            texelFetch(normalAtlas, texel, 0).a,
-            0.0,
-            1.0
-        );
-
-    return
-        a +
-        clamp(
-            1.0 - a * 1.0e20,
-            0.0,
-            1.0
-        );
-}
-
-
-
-// 2026-10-18 视差高度场采样开关（设置界面按钮，CameraUBO.pomParams.x）：
-//   0（默认 / 旧 DLL）＝ 平滑：双线性 2x2 足迹；
-//   > 0.5               ＝ 锐利：单纹素 texelFetch。
-// 只切换高度场采样；位移 / 深度 / 自阴影 / 边界哨兵口径都不变。
-bool pomSmoothSampling()
-{
-    return cam.pomParams.x <= 0.5;
-}
-
-
-float sampleLabPBRDepthInSprite(
-    vec2 uv,
-    vec2 safeMin,
-    vec2 safeMax
-)
-{
-    vec2 atlasSizeF =
-        vec2(textureSize(normalAtlas, 0));
-
-    vec2 texelSpace =
-        uv * atlasSizeF - 0.5;
-
-    ivec2 baseTexel =
-        ivec2(floor(texelSpace));
-
-    vec2 f =
-        texelSpace - vec2(baseTexel);
-
-    ivec2 lo =
-        ivec2(floor(safeMin * atlasSizeF + 1.0e-4));
-
-    ivec2 hi =
-        ivec2(ceil(safeMax * atlasSizeF - 1.0e-4)) - ivec2(1);
-
-    hi =
-        max(hi, lo);
-
-    if(!pomSmoothSampling())
-    {
-        ivec2 sharpTexel =
-            ivec2(floor(uv * atlasSizeF));
-
-        return
-            1.0 -
-            pomHeightAlpha(sharpTexel, lo, hi);
-    }
-
-    float a00 =
-        pomHeightAlpha(baseTexel + ivec2(0, 0), lo, hi);
-
-    float a10 =
-        pomHeightAlpha(baseTexel + ivec2(1, 0), lo, hi);
-
-    float a01 =
-        pomHeightAlpha(baseTexel + ivec2(0, 1), lo, hi);
-
-    float a11 =
-        pomHeightAlpha(baseTexel + ivec2(1, 1), lo, hi);
-
-    float a =
-        mix(
-            mix(a00, a10, f.x),
-            mix(a01, a11, f.x),
-            f.y
-        );
-
-    return
-        1.0 -
-        a;
-}
-
-
-
-#define POM_TILE_SPRITE 1
-
-vec2 wrapPOMSpriteUV(
-    vec2 uv,
-    vec2 spriteMin,
-    vec2 spriteSpan
-)
-{
-    vec2 local =
-        (uv - spriteMin) /
-        max(spriteSpan, vec2(1.0e-8));
-
-    local -=
-        floor(local);
-
-    return
-        spriteMin +
-        local *
-        spriteSpan;
-}
-
-
-float sampleLabPBRDepthTiled(
-    vec2 uv,
-    vec2 spriteMin,
-    vec2 spriteSpan,
-    vec2 safeMin,
-    vec2 safeMax
-)
-{
-    return
-        sampleLabPBRDepthInSprite(
-            min(
-                wrapPOMSpriteUV(uv, spriteMin, spriteSpan),
-                safeMax
-            ),
-            safeMin,
-            safeMax
-        );
-}
-
-
-vec2 snapPOMSpriteUVToTexelCenter(
-    vec2 uv,
-    vec2 safeMin,
-    vec2 safeMax
-)
-{
-    ivec2 atlasSize = textureSize(normalAtlas, 0);
-    vec2 texel = floor(uv * vec2(atlasSize));
-    return clamp(
-        (texel + vec2(0.5)) / vec2(atlasSize),
-        safeMin,
-        safeMax
-    );
-}
-
-
-float getPOMDepthScale()
-{
-    return
-        clamp(
-            cam.historyParams.z,
-            0.0,
-            0.20
-        );
-}
-
-
-struct ParallaxHit
-{
-    vec2 uv;
-
-    float depth01;
-    float borderScale;
-
-    float depthWorld;
-    float rayTravelWorld;
-
-    vec3 worldPosition;
-
-    bool valid;
-};
-
-
-ParallaxHit traceParallax(
-    vec2 baseUV,
-    vec2 spriteMin,
-    vec2 safeMin,
-    vec2 safeMax,
-    vec2 spriteSpan,
-    mat3 tbn,
-    vec3 worldRayDirection
-)
-{
-    float pomDepthScale =
-        getPOMDepthScale();
-
-
-    if(pomDepthScale <= 1.0e-5)
-    {
-        ParallaxHit result;
-
-        result.uv =
-            baseUV;
-
-        result.depth01 =
-            0.0;
-
-        result.borderScale =
-            1.0;
-
-        result.depthWorld =
-            0.0;
-
-        result.rayTravelWorld =
-            0.0;
-
-        result.worldPosition =
-            materialRayOrigin +
-            materialRayDirection *
-            materialHitT;
-
-        result.valid =
-            false;
-
-        return result;
-    }
-
-
-
-    vec3 viewDirTS =
-        normalize(
-            transpose(tbn) *
-            (-worldRayDirection)
-        );
-
-
-    if(viewDirTS.z < 0.0)
-    {
-        viewDirTS =
-            -viewDirTS;
-    }
-
-
-    float viewZ =
-        clamp(
-            viewDirTS.z,
-            0.0,
-            1.0
-        );
-
-
-
-    const float POM_GRAZING_MIN_Z =
-        0.04;
-
-    const float POM_GRAZING_FULL_Z =
-        0.10;
-
-
-    float grazingFade =
-        smoothstep(
-            POM_GRAZING_MIN_Z,
-            POM_GRAZING_FULL_Z,
-            viewZ
-        );
-
-
-    float stableViewZ =
-        max(
-            viewZ,
-            POM_GRAZING_MIN_Z
-        );
-
-
-    float facing =
-        viewZ;
-
-
-
-    float layerDensity =
-        mix(
-            48.0,
-            32.0,
-            facing
-        );
-
-
-    layerDensity =
-        clamp(
-            layerDensity,
-            32.0,
-            48.0
-        );
-
-
-    float layerStep =
-        1.0 /
-        layerDensity;
-
-
-    vec2 totalUVOffset =
-        (
-            viewDirTS.xy /
-            stableViewZ
-        ) *
-        spriteSpan *
-        pomDepthScale *
-        grazingFade;
-
-#if POM_TILE_SPRITE
-    vec2 totalTileOffset =
-        totalUVOffset /
-        max(spriteSpan, vec2(1.0e-8));
-
-    totalTileOffset =
-        sign(totalTileOffset) *
-        min(
-            abs(totalTileOffset),
-            vec2(1.0)
-        );
-
-    totalUVOffset =
-        totalTileOffset *
-        spriteSpan;
-#endif
-
-
-    vec2 currentUV =
-        baseUV;
-
-
-    float currentLayerDepth =
-        0.0;
-
-
-    float currentMapDepth =
-        sampleLabPBRDepthInSprite(
-            currentUV,
-            safeMin,
-            safeMax
-        );
-
-
-
-    for(
-        int i = 0;
-        i < 48;
-        ++i
-    )
-    {
-        if(
-            currentLayerDepth >=
-            currentMapDepth
-        )
-        {
-            break;
-        }
-
-
-        if(currentLayerDepth >= 1.0)
-        {
-            break;
-        }
-
-
-        float nextLayerDepth =
-            min(
-                currentLayerDepth +
-                    layerStep,
-                1.0
-            );
-
-
-        vec2 nextUV =
-            baseUV -
-            totalUVOffset *
-            nextLayerDepth;
-
-#if POM_TILE_SPRITE
-        nextUV =
-            wrapPOMSpriteUV(
-                nextUV,
-                spriteMin,
-                spriteSpan
-            );
-#else
-        if(!isPOMSpriteUVInBounds(nextUV, safeMin, safeMax))
-        {
-            break;
-        }
-#endif
-
-currentUV =
-    nextUV;
-
-currentLayerDepth =
-    nextLayerDepth;
-
-currentMapDepth =
-    sampleLabPBRDepthTiled(
-        currentUV,
-        spriteMin,
-        spriteSpan,
-        safeMin,
-        safeMax
-    );
-
-    }
-
-
-    ParallaxHit result;
-
-
-    result.uv =
-        clamp(
-            currentUV,
-            safeMin,
-            safeMax
-        );
-
-
-    vec2 pomAtlasSize =
-        max(
-            vec2(textureSize(normalAtlas, 0)),
-            vec2(1.0)
-        );
-
-    vec2 edgeDistanceTexels =
-        min(
-            (result.uv - safeMin) * pomAtlasSize,
-            (safeMax - result.uv) * pomAtlasSize
-        );
-
-    float nearestEdgeTexels =
-        max(
-            min(edgeDistanceTexels.x, edgeDistanceTexels.y),
-            0.0
-        );
-
-    result.borderScale =
-        smoothstep(
-            0.0,
-            2.0,
-            nearestEdgeTexels
-        );
-
-
-    result.depth01 =
-        currentMapDepth *
-        grazingFade;
-
-
-    result.depthWorld =
-        result.depth01 *
-        pomDepthScale;
-
-
-    result.rayTravelWorld =
-        result.depthWorld /
-        stableViewZ;
-
-
-    vec3 originalWorldHit =
-        materialRayOrigin +
-        materialRayDirection *
-        materialHitT;
-
-
-    result.worldPosition =
-        originalWorldHit +
-        normalize(
-            worldRayDirection
-        ) *
-        result.rayTravelWorld;
-
-
-    result.valid =
-        true;
-
-
-    return result;
-}
-
-
-
-float tracePOMSelfShadow(
-    vec2 hitUV,
-    float hitDepth01,
-    vec2 spriteMin,
-    vec2 safeMin,
-    vec2 safeMax,
-    vec2 spriteSpan,
-    mat3 tbn,
-    vec3 worldLightDirection
-)
-{
-    float pomDepthScale =
-        getPOMDepthScale();
-
-
-    if(
-        hitDepth01 <= 0.01 ||
-        pomDepthScale <= 1.0e-5
-    )
-    {
-        return 1.0;
-    }
-
-
-    vec3 lightDirTS =
-        normalize(
-            transpose(tbn) *
-            normalize(worldLightDirection)
-        );
-
-
-    if(lightDirTS.z <= 1.0e-3)
-    {
-        return 1.0;
-    }
-
-
-    float facing =
-        clamp(
-            lightDirTS.z,
-            0.0,
-            1.0
-        );
-
-
-    float lightZ =
-        max(
-            lightDirTS.z,
-            0.05
-        );
-
-
-    float grazingBoost =
-        clamp(
-            0.25 / lightZ,
-            1.0,
-            4.0
-        );
-
-
-    const int VL_POM_SELF_SHADOW_MAX_SAMPLES = 24;
-
-
-    int sampleCount =
-        int(
-            round(
-                mix(
-                    8.0,
-                    4.0,
-                    facing
-                ) *
-                grazingBoost
-            )
-        );
-
-
-    sampleCount =
-        clamp(
-            sampleCount,
-            4,
-            VL_POM_SELF_SHADOW_MAX_SAMPLES
-        );
-
-
-    const float SELF_SHADOW_FULL_NORMALIZED_DEPTH =
-        0.02;
-
-
-    float maxBlockDepthNormalized =
-        0.0;
-
-
-    vec2 selfShadowTileOffset =
-        (
-            lightDirTS.xy /
-            lightZ
-        ) *
-        pomDepthScale;
-
-#if POM_TILE_SPRITE
-    selfShadowTileOffset =
-        sign(selfShadowTileOffset) *
-        min(
-            abs(selfShadowTileOffset),
-            vec2(1.0)
-        );
-#endif
-
-
-    for(int i = 1; i <= VL_POM_SELF_SHADOW_MAX_SAMPLES; ++i)
-    {
-        if(i > sampleCount)
-        {
-            break;
-        }
-
-
-        float progress =
-            float(i) /
-            float(sampleCount + 1);
-
-
-        float depthRise =
-            hitDepth01 *
-            progress;
-
-
-        float rayDepth =
-            hitDepth01 -
-            depthRise;
-
-
-        vec2 sampleUV =
-            hitUV +
-            selfShadowTileOffset *
-            spriteSpan *
-            depthRise;
-
-
-#if POM_TILE_SPRITE
-        float blockerDepth =
-            sampleLabPBRDepthTiled(
-                sampleUV,
-                spriteMin,
-                spriteSpan,
-                safeMin,
-                safeMax
-            );
-#else
-        if(!isPOMSpriteUVInBounds(sampleUV, safeMin, safeMax))
-        {
-            break;
-        }
-
-        float blockerDepth =
-            sampleLabPBRDepthInSprite(
-                sampleUV,
-                safeMin,
-                safeMax
-            );
-#endif
-
-
-        float blockDepth =
-            rayDepth -
-            blockerDepth -
-            0.004;
-
-
-        float blockDepthNormalized =
-            max(
-                blockDepth,
-                0.0
-            );
-
-
-        maxBlockDepthNormalized =
-            max(
-                maxBlockDepthNormalized,
-                blockDepthNormalized
-            );
-
-
-        if(
-            maxBlockDepthNormalized >=
-            SELF_SHADOW_FULL_NORMALIZED_DEPTH
-        )
-        {
-            return 0.0;
-        }
-    }
-
-
-    return
-        1.0 -
-        smoothstep(
-            0.0,
-            SELF_SHADOW_FULL_NORMALIZED_DEPTH,
-            maxBlockDepthNormalized
-        );
-}
-
-
-
-// Voxy translucent tile test: a fully covered tile is a real glass sheet, anything
-// with holes is cutout foliage that shades as opaque.  Extracted from
-// rt_test_translucent.rchit (2026-10-20) so the glass material body can run in ray
-// generation too; needs VOXY_ATLAS_SIZE / VOXY_TILE_PIXELS / voxyLodAtlas, all
-// already declared above.
-bool voxyTileIsFullyCovered(vec2 uv0, vec2 uv1, vec2 uv2)
-{
-    vec2 tileOrigin = min(uv0, min(uv1, uv2)) - vec2(0.5 / VOXY_ATLAS_SIZE);
-    vec2 tileCentre = tileOrigin
-        + vec2((VOXY_TILE_PIXELS * 0.5) / VOXY_ATLAS_SIZE);
-    return textureLod(voxyLodAtlas, tileCentre, 4.0).a >= 0.985;
-}
-
-
 #endif

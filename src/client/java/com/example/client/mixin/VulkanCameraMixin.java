@@ -52,6 +52,31 @@ public class VulkanCameraMixin {
     private Level waterEntityLastLevel = null;
     private final float[] waterBoatData = new float[WATER_ENTITY_MAX_BOATS * 5];
 
+    // 2026-11-21 尾迹 stamp（船 + 徒步玩家）：沿路径按位移间隔入队小脉冲，
+    // stamp 进波场后自行传播、实体停下后自然存留衰减 —— 取代旧"挂在实体
+    // 身上、停住即消失"的解析尾迹图案。间隔 0.75 格。
+    // 2026-11-21 顾问轮1（F4）：getDeltaMovement() 的单位是 **格/tick**（20Hz），
+    // 不是格/秒 —— 旧档阈值 0.35 直接比较导致游泳玩家（~0.28/tick）永远
+    // 触发不了、船只在满速（~0.40/tick）勉强触发。统一换算成格/秒（×20）
+    // 后再判：最低 0.5 格/s（约等于慢速划水）。
+    private static final double WATER_TRAIL_STAMP_INTERVAL_SQR = 0.75 * 0.75;
+    private static final double WATER_TRAIL_TICKS_TO_SECONDS = 20.0;
+    private static final double WATER_TRAIL_MIN_SPEED_PS = 0.5;
+    private final java.util.Map<Integer, double[]> waterTrailLastStamp =
+            new java.util.HashMap<>();
+    private double waterPlayerStampX = Double.NaN;
+    private double waterPlayerStampZ = Double.NaN;
+
+    // 2026-11-21 水体掩码：玩家周围 48×48 块在水面 Y 平面逐块查流体
+    //（水 = 255），≥100ms 或玩家块/水面变动才重扫上传。
+    private static final int WATER_SIM_MASK_EXTENT = 48;
+    private final byte[] waterSimMaskData =
+            new byte[WATER_SIM_MASK_EXTENT * WATER_SIM_MASK_EXTENT];
+    private long lastWaterSimMaskUploadNanos = 0L;
+    private int lastWaterSimMaskPlayerX = Integer.MIN_VALUE;
+    private int lastWaterSimMaskPlayerZ = Integer.MIN_VALUE;
+    private float lastWaterSimMaskSurfaceY = Float.NaN;
+
     private static final boolean RTX_DEBUG =
             Boolean.getBoolean("rtx.debug");
 
@@ -111,6 +136,89 @@ public class VulkanCameraMixin {
         cachedWaterSurfaceY = topWaterBlock.getY() +
                 topWaterState.getHeight(this.minecraft.level, topWaterBlock);
         return cachedWaterSurfaceY;
+    }
+
+    /**
+     * 2026-11-16 焦散近水门探针：回答"玩家附近有没有水面"。
+     *
+     * 旧行为：玩家不在水里时 {@link #findPlayerWaterSurfaceY} 返回 playerY ——
+     * 无信息量，后端 {@code playerY - waterSurfaceY} 的近水判据两向都错：
+     * 站海边（从未下水，surfaceY 冻结在 0）焦散图一张不生成；游过泳再走进
+     * 沙漠（surfaceY 冻结在旧水面）焦散图照跑纯浪费。
+     *
+     * 现在玩家不在水里时：96 格水平半径（= 后端焦散消费距离
+     * WATER_CAUSTIC_MAX_DISTANCE）步长 8 的网格，在玩家高度向下 32 格、
+     * 向上 8 格的垂直带里找水柱顶面；找到喂真实顶面 Y（海边 ΔY≈0 ⇒ 门开），
+     * 找不到喂 playerY - 1000 哨兵（|ΔY| = 1000 > 32 ⇒ 门关）。500ms 缓存。
+     * 玩家在水里时不走这里（走 findPlayerWaterSurfaceY，门判据也短路）。
+     * 回退 = 把调用处改回 findPlayerWaterSurfaceY(playerPosition)。
+     */
+    private static final int NEARBY_WATER_PROBE_HALF_EXTENT = 96;
+    private static final int NEARBY_WATER_PROBE_STEP = 8;
+    private static final int NEARBY_WATER_PROBE_UP_BLOCKS = 8;
+    private static final int NEARBY_WATER_PROBE_DOWN_BLOCKS = 32;
+    private static final long NEARBY_WATER_PROBE_INTERVAL_NANOS = 500_000_000L;
+    private long lastNearbyWaterProbeNanos = 0L;
+    private float cachedNearbyWaterSurfaceY = 0.0f;
+    private boolean cachedNearbyWaterValid = false;
+
+    private float findNearbyWaterSurfaceY(Vec3 playerPosition) {
+        long now = System.nanoTime();
+        if (cachedNearbyWaterValid &&
+                now - lastNearbyWaterProbeNanos < NEARBY_WATER_PROBE_INTERVAL_NANOS) {
+            return cachedNearbyWaterSurfaceY;
+        }
+        lastNearbyWaterProbeNanos = now;
+        cachedNearbyWaterValid = true;
+        // 默认哨兵：没找到水 ⇒ 后端 |playerY - surfaceY| = 1000 > 32 ⇒ 门关。
+        cachedNearbyWaterSurfaceY = (float) playerPosition.y - 1000.0f;
+
+        if (this.minecraft == null || this.minecraft.level == null) {
+            return cachedNearbyWaterSurfaceY;
+        }
+
+        BlockPos playerBlock = BlockPos.containing(playerPosition);
+        int px = playerBlock.getX();
+        int py = playerBlock.getY();
+        int pz = playerBlock.getZ();
+
+        for (int dz = -NEARBY_WATER_PROBE_HALF_EXTENT;
+                dz <= NEARBY_WATER_PROBE_HALF_EXTENT;
+                dz += NEARBY_WATER_PROBE_STEP) {
+            for (int dx = -NEARBY_WATER_PROBE_HALF_EXTENT;
+                    dx <= NEARBY_WATER_PROBE_HALF_EXTENT;
+                    dx += NEARBY_WATER_PROBE_STEP) {
+                for (int dy = NEARBY_WATER_PROBE_UP_BLOCKS;
+                        dy >= -NEARBY_WATER_PROBE_DOWN_BLOCKS;
+                        dy -= 2) {
+                    BlockPos probe = new BlockPos(px + dx, py + dy, pz + dz);
+                    FluidState state = this.minecraft.level.getFluidState(probe);
+                    if (!state.is(FluidTags.WATER)) {
+                        continue;
+                    }
+                    BlockPos topBlock = probe;
+                    FluidState topState = state;
+                    for (int climb = 0; climb < 64; ++climb) {
+                        FluidState above =
+                                this.minecraft.level.getFluidState(topBlock.above());
+                        if (!above.is(FluidTags.WATER)) {
+                            break;
+                        }
+                        topBlock = topBlock.above();
+                        topState = above;
+                    }
+                    float surfaceY = topBlock.getY() +
+                            topState.getHeight(this.minecraft.level, topBlock);
+                    if (Math.abs(surfaceY - (float) playerPosition.y) <= 32.0f) {
+                        cachedNearbyWaterSurfaceY = surfaceY;
+                        return cachedNearbyWaterSurfaceY;
+                    }
+                    // 该水柱顶面离玩家太远（悬崖俯瞰等），这一柱不再向上爬
+                    break;
+                }
+            }
+        }
+        return cachedNearbyWaterSurfaceY;
     }
 
     /**
@@ -404,7 +512,13 @@ public class VulkanCameraMixin {
                 ? Vec3.ZERO : this.minecraft.player.getDeltaMovement();
         float playerInWater = this.minecraft.player != null &&
                 this.minecraft.player.isInWater() ? 1.0f : 0.0f;
-        float waterSurfaceY = findPlayerWaterSurfaceY(playerPosition);
+        // 2026-11-16：玩家在水里走原探针（水柱顶面）；不在水里走近水探针
+        //（96 格网格找水面，找不到喂哨兵）—— 供后端焦散近水门使用，详见
+        // findNearbyWaterSurfaceY 的注释。
+        float waterSurfaceY =
+                playerInWater > 0.5f
+                        ? findPlayerWaterSurfaceY(playerPosition)
+                        : findNearbyWaterSurfaceY(playerPosition);
         float cameraInWater = isRenderCameraInWater(pos) ? 1.0f : 0.0f;
 
         NativeVulkan.updateCamera(
@@ -429,7 +543,35 @@ public class VulkanCameraMixin {
                 cameraInWater
         );
 
-        tickWaterInteractionEntities();
+        // 2026-11-21 群系水色：玩家所在群系的 vanilla 水染色 → UBO 死车道
+        // waterSimImpulse (R,G,B,valid)，着色端按海洋参照归一调制吸收/散射。
+        // 每帧一次调用（getAverageWaterColor 内部做 4 角群系混合，代价低）。
+        if (this.minecraft.level instanceof net.minecraft.client.multiplayer.ClientLevel tintLevel
+                && this.minecraft.player != null) {
+            // 本 mappings（26.x）里 BiomeColors 在 client.renderer 包，
+            // getAverageWaterColor(BlockAndTintGetter, BlockPos)。
+            final int tintRgb = net.minecraft.client.renderer.BiomeColors.getAverageWaterColor(
+                    tintLevel,
+                    BlockPos.containing(playerPosition));
+            NativeVulkan.updateWaterBiomeTint(
+                    ((tintRgb >> 16) & 0xFF) / 255.0f,
+                    ((tintRgb >> 8) & 0xFF) / 255.0f,
+                    (tintRgb & 0xFF) / 255.0f,
+                    true);
+        } else {
+            NativeVulkan.updateWaterBiomeTint(0.0f, 0.0f, 0.0f, false);
+        }
+
+        // 2026-11-19 rasterLod：把本引擎相机矩阵交给 EntityRtCapture（mode=14
+        // 用它构造本引擎 MVP，替代 DH 自己的矩阵；DhFarFieldGeometry 从那读取）。
+        // 仅拷贝两个 16 元素数组，无 Vulkan 调用。本方法是唯一权威相机入口
+        //（紧接 updateCamera 之后取值，同帧一致），与 setCameraOrigin 同一模式。
+        EntityRtCapture.setEngineCameraMatrices(
+                viewInvArray,
+                projInvArray
+        );
+
+        tickWaterInteractionEntities(waterSurfaceY);
 
         frameCount++;
 
@@ -441,11 +583,14 @@ public class VulkanCameraMixin {
      * <ul>
      *   <li>掉落物：入水沿（id 状态机）→ {@code queueWaterImpulse} 一次性脉冲；</li>
      *   <li>船（AbstractBoat 全家：船/木筏/运输船）：在水中且距玩家 ≤24 格 →
-     *       {@code updateWaterBoats} 持续移动波源，入水/离水沿另发脉冲。</li>
+     *       {@code updateWaterBoats} 持续移动波源，入水/离水沿另发脉冲；
+     *       2026-11-21 起再沿路径按 0.75 格间隔 stamp 尾迹脉冲（半径 0.60）。</li>
+     *   <li>2026-11-21：徒步玩家（非载具）同样沿路径 stamp 尾迹（半径 0.55）；
+     *       水体掩码在本轮末尾按 {@code waterSurfaceY} 平面扫描上传。</li>
      * </ul>
      * 24 格 = 水模拟盒（48×48，玩家居中）的半宽——盒外的源本来就落不进波场。
      */
-    private void tickWaterInteractionEntities() {
+    private void tickWaterInteractionEntities(float waterSurfaceY) {
         final Level level = this.minecraft == null ? null : this.minecraft.level;
         if (level == null) {
             return;
@@ -484,13 +629,15 @@ public class VulkanCameraMixin {
                     NativeVulkan.queueWaterImpulse(
                             (float) entity.getX(),
                             (float) entity.getZ(),
-                            strength
+                            strength,
+                            0.0f
                     );
                 } else if (isBoat) {
                     NativeVulkan.queueWaterImpulse(
                             (float) entity.getX(),
                             (float) entity.getZ(),
-                            -0.30f
+                            -0.30f,
+                            0.0f
                     );
                 }
             }
@@ -506,12 +653,145 @@ public class VulkanCameraMixin {
                 waterBoatData[base + 3] = (float) entity.getDeltaMovement().z;
                 waterBoatData[base + 4] = 1.5f;
                 boatCount++;
+
+                // 2026-11-21 尾迹 stamp：位移 ≥0.75 格才入队（低配雨+船共用
+                // 64 深脉冲队列，双子步每步消费至多 16 条，按距不按帧控制节奏）。
+                final net.minecraft.world.phys.Vec3 delta =
+                        entity.getDeltaMovement();
+                final double boatSpeedPS = Math.sqrt(
+                        delta.x * delta.x + delta.z * delta.z)
+                        * WATER_TRAIL_TICKS_TO_SECONDS;
+                if (boatSpeedPS > WATER_TRAIL_MIN_SPEED_PS) {
+                    final double[] lastStamp = waterTrailLastStamp.get(entityId);
+                    final double ddx = entity.getX() - (lastStamp == null
+                            ? Double.NaN : lastStamp[0]);
+                    final double ddz = entity.getZ() - (lastStamp == null
+                            ? Double.NaN : lastStamp[1]);
+                    if (lastStamp == null
+                            || ddx * ddx + ddz * ddz
+                                    >= WATER_TRAIL_STAMP_INTERVAL_SQR) {
+                        NativeVulkan.queueWaterImpulse(
+                                (float) entity.getX(),
+                                (float) entity.getZ(),
+                                (float) (0.10 + 0.06 * Math.min(boatSpeedPS, 6.0)),
+                                0.60f
+                        );
+                        waterTrailLastStamp.put(
+                                entityId,
+                                new double[]{entity.getX(), entity.getZ()}
+                        );
+                    }
+                }
             }
         }
 
         if (waterEntityWasInWater.size() > 1024) {
             waterEntityWasInWater.clear();
+            waterTrailLastStamp.clear();
         }
         NativeVulkan.updateWaterBoats(waterBoatData, boatCount);
+
+        stampPlayerWaterTrail();
+        updateWaterSimMask(waterSurfaceY);
+    }
+
+    /**
+     * 2026-11-21 徒步玩家尾迹 stamp：与船同款按位移间隔入队；坐船/坐其他
+     * 载具时不发（载具自己有 stamp，避免双份）。速度停摆即重置锚点。
+     */
+    private void stampPlayerWaterTrail() {
+        if (this.minecraft == null || this.minecraft.player == null) {
+            return;
+        }
+        final var player = this.minecraft.player;
+        if (!player.isInWater() || player.getVehicle() != null) {
+            waterPlayerStampX = Double.NaN;
+            return;
+        }
+        final net.minecraft.world.phys.Vec3 delta = player.getDeltaMovement();
+        final double speedPS = Math.sqrt(delta.x * delta.x + delta.z * delta.z)
+                * WATER_TRAIL_TICKS_TO_SECONDS;
+        if (speedPS <= WATER_TRAIL_MIN_SPEED_PS) {
+            waterPlayerStampX = Double.NaN;
+            return;
+        }
+        if (Double.isNaN(waterPlayerStampX)) {
+            waterPlayerStampX = player.getX();
+            waterPlayerStampZ = player.getZ();
+            return;
+        }
+        final double ddx = player.getX() - waterPlayerStampX;
+        final double ddz = player.getZ() - waterPlayerStampZ;
+        if (ddx * ddx + ddz * ddz >= WATER_TRAIL_STAMP_INTERVAL_SQR) {
+            NativeVulkan.queueWaterImpulse(
+                    (float) player.getX(),
+                    (float) player.getZ(),
+                    (float) (0.10 + 0.05 * Math.min(speedPS, 6.0)),
+                    0.55f
+            );
+            waterPlayerStampX = player.getX();
+            waterPlayerStampZ = player.getZ();
+        }
+    }
+
+    /**
+     * 2026-11-21 水体掩码上传：玩家周围 48×48 块、在 {@code waterSurfaceY}
+     * 平面（向下 0.01 格取整确定探针层）逐块查流体 —— 水 = 255、陆地/未加载
+     * = 0，行主序（v = z, u = x）。玩家在水里时始终跟随上传；不在水里时仅当
+     * 探针结果与上次上传的水面一致（同一片水域，如岸上远眺海面）才跟随 ——
+     * 探针找到别的水面时跳过，sim 侧保留上一张掩码（窗口错位时着色端按
+     * UV 越界回落到无掩码旧档，不会产生垃圾数据）。
+     */
+    private void updateWaterSimMask(float waterSurfaceY) {
+        if (Float.isNaN(waterSurfaceY) || waterSurfaceY < -500.0f) {
+            return;
+        }
+        if (this.minecraft == null || this.minecraft.level == null ||
+                this.minecraft.player == null) {
+            return;
+        }
+        final var player = this.minecraft.player;
+        final boolean playerInWater = player.isInWater();
+        final boolean surfaceStable = !Float.isNaN(lastWaterSimMaskSurfaceY) &&
+                Math.abs(waterSurfaceY - lastWaterSimMaskSurfaceY) <= 0.01f;
+        if (!playerInWater && !surfaceStable) {
+            return;
+        }
+
+        final BlockPos playerBlock = BlockPos.containing(player.position());
+        final boolean moved = playerBlock.getX() != lastWaterSimMaskPlayerX ||
+                playerBlock.getZ() != lastWaterSimMaskPlayerZ;
+        final boolean surfaceChanged =
+                Float.isNaN(lastWaterSimMaskSurfaceY) ||
+                Math.abs(waterSurfaceY - lastWaterSimMaskSurfaceY) > 0.01f;
+        final long now = System.nanoTime();
+        final boolean due =
+                now - lastWaterSimMaskUploadNanos >= 100_000_000L;
+        if (!due && !moved && !surfaceChanged) {
+            return;
+        }
+        lastWaterSimMaskUploadNanos = now;
+        lastWaterSimMaskPlayerX = playerBlock.getX();
+        lastWaterSimMaskPlayerZ = playerBlock.getZ();
+        lastWaterSimMaskSurfaceY = waterSurfaceY;
+
+        final int originX = playerBlock.getX() - WATER_SIM_MASK_EXTENT / 2;
+        final int originZ = playerBlock.getZ() - WATER_SIM_MASK_EXTENT / 2;
+        final int probeY = (int) Math.floor(waterSurfaceY - 0.01);
+        for (int dz = 0; dz < WATER_SIM_MASK_EXTENT; ++dz) {
+            final int rowBase = dz * WATER_SIM_MASK_EXTENT;
+            for (int dx = 0; dx < WATER_SIM_MASK_EXTENT; ++dx) {
+                final FluidState state = this.minecraft.level.getFluidState(
+                        new BlockPos(originX + dx, probeY, originZ + dz));
+                waterSimMaskData[rowBase + dx] =
+                        state.is(FluidTags.WATER) ? (byte) 0xFF : (byte) 0x00;
+            }
+        }
+        NativeVulkan.updateWaterSimMask(
+                waterSimMaskData,
+                WATER_SIM_MASK_EXTENT,
+                originX,
+                originZ
+        );
     }
 }

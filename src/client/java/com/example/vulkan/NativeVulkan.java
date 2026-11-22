@@ -42,14 +42,35 @@ public final class NativeVulkan {
      * 2026-10-17 实体交互波（掉落物/船）：一次性脉冲入队。(x, z) 是世界坐标，
      * strength 带符号（正 = 入水挤压、负 = 离水回填）。C++ 侧 FIFO（≤64 条），
      * 30 Hz 模拟 tick 时逐条消费进波场高度步。
+     *
+     * <p>2026-11-21 追加 {@code radius}：尾迹 stamp 沿路径逐个携带自己的波源
+     * 半径（格）；≤ 0 = 旧档（按入水/离水沿取固定半径 1.0/1.8）。</p>
      */
-    public static native void queueWaterImpulse(float x, float z, float strength);
+    public static native void queueWaterImpulse(
+            float x, float z, float strength, float radius);
 
     /**
      * 2026-10-17 实体交互波（船）：每帧整批替换持续移动波源列表。
      * {@code data} 每条船 5 个 float（x, z, vx, vz, 幅值倍率），{@code count} ≤ 8。
      */
     public static native void updateWaterBoats(float[] data, int count);
+
+    /**
+     * 2026-11-21 水体掩码：玩家周围 {@code extent}×{@code extent} 块（现役 48），
+     * 行主序（v=z, u=x），水面 Y 平面上逐块取流体：水 = 255、陆地 = 0。
+     * {@code (originX, originZ)} 为窗口块对齐原点；sim 用它做岸线反射与
+     * 旱地波源门控。
+     */
+    public static native void updateWaterSimMask(
+            byte[] mask, int extent, float originX, float originZ);
+
+    /**
+     * 2026-11-21 群系水色：{@code (r, g, b)} 为玩家所在群系的 vanilla 水染色
+     *（0..1），经 UBO 死车道 waterSimImpulse 进着色端，按海洋参照归一调制
+     * 吸收/散射；{@code valid=false} 时着色端回落海洋参照（逐位旧档）。
+     */
+    public static native void updateWaterBiomeTint(
+            float r, float g, float b, boolean valid);
 
     /**
      * 2026-10-29：多带一份 **sprite 矩形表**。
@@ -368,6 +389,30 @@ public final class NativeVulkan {
             float rainSkyDimScale
     );
 
+    /**
+     * 2026-11-16 月光两旋钮（车道 = CameraUBO.moonParams.x / .y）。
+     *
+     * @param lightFloor  月光能量地板 0..1：新月夜 = 满月的这一比例
+     *                    （0 = 纯物理，月亮落到地平线下就只剩环境光）
+     * @param daylightDim 白天月亮亮度 0..1：占夜间基准的比例（1 = 不压暗）
+     */
+    public static native boolean setMoonSettings(
+            float lightFloor,
+            float daylightDim
+    );
+
+    /**
+     * 2026-11-16 雾外观两旋钮（车道 = CameraUBO.fogMoodParams.x / .y）。
+     *
+     * @param shape     雾形态强度 0..2：0 = 主体积雾回到均匀灰膜旧档，
+     *                  1 = 出厂（120 格尺度的大团块厚薄不均）
+     * @param dawnBoost 晨雾峰值倍率 1..3：1 = 不增强，1.75 = 出厂
+     */
+    public static native boolean setFogMoodSettings(
+            float shape,
+            float dawnBoost
+    );
+
     /** 相位上限过渡 [0,1]：0 = 旧视觉钳制 1.05，1 = 双瓣 HG 自然峰值 2.52（默认）。 */
     public static native boolean setCloudSunForwardScattering(
             float value
@@ -432,6 +477,13 @@ public final class NativeVulkan {
     );
 
     public static native int getCloudResFloorPercent();
+
+    /** 云分帧渲染模式：0 = 全像素(原画) / 1 = 1/2棋盘 / 2 = 1/4四帧(最快)。 */
+    public static native boolean setCloudTemporalMode(
+            int mode
+    );
+
+    public static native int getCloudTemporalMode();
 
 
     /** GI 循环俄罗斯轮盘：1 = 开（出厂，省 −7.8ms 整帧）/ 0 = 旧档。 */
@@ -676,6 +728,12 @@ public final class NativeVulkan {
      * 见 RTXSettingsConfig.CloudAerialSettings.toParamArray()。
      */
     public static native boolean setCloudAerialParams(float[] params);
+
+    /** Cloud storm darkness, in-cloud lightning intensity, sunset warmth, weather coupling. */
+    public static native boolean setCloudSkyHueParams(float[] params);
+
+    /** Cloud Beer-Powder, silver-lining spread, Catmull-Rom edge sharpness, base erosion. */
+    public static native boolean setCloudLight2Params(float[] params);
 
     /**
      * 2026-10-03 薄层 SSS 四件套（参考 HPWater BSDF 的 thinLayerSSS）：
@@ -1809,6 +1867,15 @@ public final class NativeVulkan {
             );
         }
 
+        // 2026-11-21 持久化修复：本地光范围系数此前只在 UI「确认」时下发，
+        // 重启后 native 回默认而 UI 显示存档值（显示≠实际）。补启动恢复。
+        // 摘除本段即回到旧行为。
+        if(!setLocalLightMaxDistance(
+                RTXSettingsConfig.getLocalLightMaxDistance()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore local light max distance");
+        }
+
         RTXSettingsConfig.SunVisualSettings sunVisuals =
                 RTXSettingsConfig.getSunVisualSettings();
         if(!setSunVisualSettings(
@@ -1842,6 +1909,18 @@ public final class NativeVulkan {
                 RTXSettingsConfig.getRainSkyDimScale()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore sky model settings");
+        }
+        if(!setMoonSettings(
+                RTXSettingsConfig.getMoonLightFloor(),
+                RTXSettingsConfig.getMoonDaylightDim()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore moon settings");
+        }
+        if(!setFogMoodSettings(
+                RTXSettingsConfig.getFogShapeStrength(),
+                RTXSettingsConfig.getFogDawnBoost()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore fog mood settings");
         }
         if(!setCloudSunForwardScattering(
                 RTXSettingsConfig.getCloudSunForwardScattering()
@@ -1941,6 +2020,11 @@ public final class NativeVulkan {
                 RTXSettingsConfig.getCloudResFloorPercent()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore cloud res floor");
+        }
+        if(!setCloudTemporalMode(
+                RTXSettingsConfig.getCloudTemporalMode()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore cloud temporal mode");
         }
         if(!setCloudFarStepDensity(
                 RTXSettingsConfig.getCloudFarStepDensity()
@@ -2110,10 +2194,25 @@ public final class NativeVulkan {
                 RTXSettingsConfig.getFogGroundMistSettings();
         if(!setFogGroundMistParams(fogGroundMist.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore fog ground mist settings");
+        // 2026-11-21 持久化修复：雾光学（卷流强度/色调 RGB）此前只在 UI「确认」时
+        // 下发，重启后 native 回默认而 UI 显示存档值。补启动恢复。摘除本段即回到旧行为。
+        if(!setFogOpticsParams(
+                RTXSettingsConfig.getFogOpticsSettings().toParamArray()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore fog optics params");
+        }
         RTXSettingsConfig.CloudAerialSettings cloudAerial =
                 RTXSettingsConfig.getCloudAerialSettings();
         if(!setCloudAerialParams(cloudAerial.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud aerial settings");
+        RTXSettingsConfig.CloudWeatherStyleSettings weatherStyle =
+                RTXSettingsConfig.getCloudWeatherStyleSettings();
+        if(!setCloudSkyHueParams(weatherStyle.toParamArray()))
+            System.err.println("[RTX CONFIG] Failed to restore cloud weather style settings");
+        RTXSettingsConfig.CloudLight2Settings cloudLight2 =
+                RTXSettingsConfig.getCloudLight2Settings();
+        if(!setCloudLight2Params(cloudLight2.toParamArray()))
+            System.err.println("[RTX CONFIG] Failed to restore cloud light2 settings");
         RTXSettingsConfig.WaterSssSettings waterSss = RTXSettingsConfig.getWaterSssSettings();
         if(!setWaterSssParams(waterSss.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore water SSS settings");
@@ -2133,6 +2232,25 @@ public final class NativeVulkan {
                 clouds.sunlightStrength()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore cloud settings");
+        }
+
+        // 2026-11-21 持久化修复：UE 云八项参数此前只在 UI「确认」时逐项下发，
+        // 重启后 native 回默认而 UI 显示存档值。补启动恢复（与 UI apply 相同的
+        // 逐项模式，纯状态拷贝无 Vulkan 调用）。摘除本段即回到旧行为。
+        float[] ueCloudSaved = RTXSettingsConfig.getUeCloudAll();
+        for(int i = 0;
+                i < RTXSettingsConfig.UE_CLOUD_PARAM_COUNT && i < ueCloudSaved.length;
+                ++i) {
+            if(!setUeCloudParam(i, ueCloudSaved[i]))
+                System.err.println("[RTX CONFIG] Failed to restore ue cloud param #" + i);
+        }
+
+        // 2026-11-21 持久化修复：云隙（开关/强度/宽度）此前只在 UI「确认」时下发，
+        // 重启后 native 回默认而 UI 显示存档值。补启动恢复。摘除本段即回到旧行为。
+        if(!setCloudGapParams(
+                RTXSettingsConfig.getCloudGapSettings().toParamArray()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore cloud gap params");
         }
 
         RTXSettingsConfig.VolumetricFogSettings fog =
@@ -2179,6 +2297,15 @@ public final class NativeVulkan {
                 rainWall.distance()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore rain wall settings");
+        }
+
+        // 2026-11-21 持久化修复：水面雨滴涟漪（大小/强度）此前只在 UI「确认」时
+        // 下发，重启后 native 回默认而 UI 显示存档值（显示≠实际）。补启动恢复。
+        // 摘除本段即回到旧行为。
+        if(!setRainRippleParams(
+                RTXSettingsConfig.getRainRippleSettings().toParamArray()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore rain ripple params");
         }
 
         RTXSettingsConfig.WaterStyleSettings waterStyle =

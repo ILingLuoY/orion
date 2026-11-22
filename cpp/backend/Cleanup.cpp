@@ -209,6 +209,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
 
         // 2026-11-05 B：K1/K2 拆分资源
         destroyK1LandingBuffer();
+        // P2 跨腿材质复用中转 buffer（binding 94）
+        destroyMatReuseBuffer();
         destroyK1K2Pipeline();
 
 
@@ -276,6 +278,14 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
 
         g_motionLayout =
             VK_IMAGE_LAYOUT_UNDEFINED;
+
+        // 2026-11-21 P0-1：主命中世界位移旁路槽（binding 98）。
+        destroyHistoryImage(
+            g_hitOffsetImage,
+            g_hitOffsetMemory,
+            g_hitOffsetView,
+            g_hitOffsetLayout
+        );
 
 
         if(g_dlssDepthView)
@@ -407,7 +417,6 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
         destroyCloudV3Resources();
         destroyCloudV4Resources();
         destroySkyAtmosphereResources();
-        destroyWaterDetailNormalResources();
         destroyEntityPbrFallbackResources();
         destroyWaterCausticResources();
         destroyWaterCausticMapResources();
@@ -1006,6 +1015,10 @@ destroySharcUpdatePipeline();
 
     // 2026-11-02 屏幕空间降级链（SSR + SSPT）资源
     destroySSHybridResources();
+
+    // 2026-11-19 DH LOD「G-buffer 光栅」资源（rasterLod 开启时非空；
+    // 内部含等待空闲 + 全量重建，旗标关闭时同样是空操作）。
+    destroyDhLodRasterResources();
 
     releaseSharedPipelineCache();
 

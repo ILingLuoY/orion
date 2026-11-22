@@ -270,7 +270,12 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_publi
 //   [19]    variant override (0 auto, 1..4 forced)
 //   [20]    DH near clip plane (blocks, DH recomputes it every frame)
 //   [21]    DH far clip plane  (blocks)
-//   [22..23] reserved
+//   [22]    2026-11-19 rasterLod 旗标（原 reserved）：Java 侧
+//           -Dorion.dh.rasterLod（默认 false）经由本通道下发。放在矩阵
+//           校验之前 ⇒ 旗标与矩阵有效性解耦（mode=14 时矩阵来自本引擎，
+//           DH 自己的矩阵可能是旧值）。在 invalidate 的全零载荷里本位也
+//           为 0 ⇒ 世界切换那一帧旗标瞬时关断，下一帧 push 即恢复。
+//   [23]    reserved
 //
 // An all-zero matrix is the "invalidate" signal: Java sends it on world change,
 // and the far field then falls back to the stage-1 passthrough instead of
@@ -303,6 +308,11 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_updat
     const jsize copyLength = length < 40 ? 24 : 40;
     float values[40] = {};
     env->GetFloatArrayRegion(payload, 0, copyLength, values);
+
+    // 2026-11-19 rasterLod 旗标（[22]，见上方载荷注释）。必须在矩阵校验之前
+    // 解析：旗标开关不依赖矩阵有效性。false = 所有 rasterLod 路径短路，
+    // 行为与未接入前逐位一致。
+    g_dhRasterLodEnabled = values[22] > 0.5f;
 
     bool anyMatrixValue = false;
     bool allFinite      = std::isfinite(values[20]) && std::isfinite(values[21]);

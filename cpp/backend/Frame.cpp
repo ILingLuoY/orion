@@ -470,6 +470,22 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->visQueryAb[1] = (visQueryMask & 0x2u) != 0u ? 1u : 0u;
     ubo->visQueryAb[2] = (visQueryMask & 0x4u) != 0u ? 1u : 0u;
     ubo->visQueryAb[3] = 0u;
+
+    // 2026-11-17 P2 跨腿材质复用闸门（ORION_MAT_REUSE_LEGS / ORION_MAT_REUSE_ASSERT）。
+    // 2026-11-17 晚已定案：**默认开**（Settings.cpp 的 matReuseLegsEnabled() 在不设
+    // env 时返回 true），即生产路径上 SUN 腿解析一次、LOC/I 腿读回灌，ev_primary 3→1。
+    // 反向对照：ORION_MAT_REUSE_LEGS=0/f/F 回到三条腿各自原地解析的逐位旧行为。
+    // env 只读一次，改完重启客户端生效。lane0 再与三腿/四腿模式相与：③ 两腿模式
+    // 没有 SUN(A) 生产者，复用臂不生效，中转缓冲也不分配。⑤ 四腿模式生产者 = SUNA。
+    ubo->matReuseAb[0] =
+        (matReuseLegsEnabled() &&
+         (k2FourSplitEnabled() || k2ThreeSplitEnabled())) ? 1u : 0u;
+    ubo->matReuseAb[1] = matReuseAssertEnabled() ? 1u : 0u;
+    // [2] = 本地光 NEE 可见性跨腿缓存开关（binding 95），[3] = 本帧标记。
+    // 后者让记录天然带帧号：读到上一帧的记录会因标记不符直接退回自己打射线。
+    ubo->matReuseAb[2] = localNeeVisCacheEnabled() ? 1u : 0u;
+    ubo->matReuseAb[3] =
+        static_cast<uint32_t>(static_cast<int32_t>(frameCount) + 1);
     ubo->dhFarFieldParams[0] = dhTexturesAvailable() ? 1.0f : 0.0f;
     ubo->dhFarFieldParams[1] = dhFarFieldMatrixAvailable() ? 1.0f : 0.0f;
     ubo->dhFarFieldParams[2] = g_dhFarFieldNear;
@@ -790,10 +806,17 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->cameraInWater =
         cameraInWater > 0.5f ? 1u : 0u;
     g_cameraInWater.store(ubo->cameraInWater, std::memory_order_relaxed);
-    ubo->waterSimImpulseX = g_waterSimPendingImpulseX;
-    ubo->waterSimImpulseZ = g_waterSimPendingImpulseZ;
-    ubo->waterSimImpulseStrength = g_waterSimPendingImpulseStrength;
-    ubo->waterSimImpulseSurfaceY = g_waterSimLastSurfaceY;
+    // 2026-11-21 车道改写：GLSL vec4 waterSimImpulse 原装玩家入水脉冲
+    //（着色端零读者 —— sim 侧走 push 常量不经此路），改载群系水色
+    // (R, G, B, valid)。2026-11-21 顾问轮1（F6）：C++ 字段同步改名为
+    // waterBiomeTintR/G/B/Valid（布局零变化），语义见 rt_test.rgen
+    // waterBiomeTint() 注释。玩家入水脉冲量走 Water.cpp push
+    //（g_waterSimPendingImpulse*）。
+    ubo->waterBiomeTintR = g_waterBiomeTintR.load();
+    ubo->waterBiomeTintG = g_waterBiomeTintG.load();
+    ubo->waterBiomeTintB = g_waterBiomeTintB.load();
+    ubo->waterBiomeTintValid =
+        g_waterBiomeTintValid.load() ? 1.0f : 0.0f;
 
     ubo->weatherParams[0] = std::clamp(static_cast<float>(rainLevel), 0.0f, 1.0f);
     g_waterWeatherRain.store(ubo->weatherParams[0]);
@@ -848,9 +871,28 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     populateSkyModelParams(ubo->skyModelParams);
     populateMoonParams(ubo->moonParams);
     populateFogMoodParams(ubo->fogMoodParams);
+    populateWindParams(ubo->windParams);
     populateGalaxyParams(ubo->galaxyParams);
     populateGodRayParams(ubo->godRayParams);
     populateGroundMistParams(ubo->godRayParams + 4);
+
+    // 2026-11-20（根因修复）：volumetric_light.comp 的入口判据是
+    //     if(cam.godRayParams0.x < 0.5 || |dimension-1| >= 0.25) → 写中性值
+    // 而这个 .x 车道**从未被写入过**（本仓库只写过 godRayParams0.z = 湿度包络），
+    // 于是它恒为 0 ⇒ 每个像素都写 rgb=0 / a=1，整条老链在"运行但不出画面"。
+    // GPU 回读实证：[GODRAY PROBE] rgb mean=0.000000 a mean=1.000000。
+    // 这里补上真正的开关（与 C++ 的 g_godRayEnabled 同源），放在 populate 之后。
+    ubo->godRayParams[0] = g_godRayEnabled.load() ? 1.0f : 0.0f;
+    {
+        static uint32_t gateProbeCounter = 0u;
+        if((gateProbeCounter++ % 300u) == 0u)
+        {
+            RTLogFlushed(std::string("[GODRAY GATE] master=") +
+                std::to_string(ubo->godRayParams[0]) +
+                " dimension=" + std::to_string(ubo->weatherParams[2]) +
+                " godRayParams0z=" + std::to_string(ubo->godRayParams[2]));
+        }
+    }
 
     // 2026-11-13：湿度时间包络（约 3 秒时间常数）→ godRayParams0.z（空闲车道）。
     // 目的：雨停/开始时，"雾顶硬边"与"平流雾出现"不要在一帧内跳变。
@@ -2883,13 +2925,6 @@ if(!g_dlssGFeatureInitialized)
     );
 
 
-    // 2026-11-14：稀疏反射的时域历史（binding 92）。
-    createGlossyHistoryImage(
-        renderWidth,
-        renderHeight
-    );
-
-
     createGlassAlphaBlendImages(
         renderWidth,
         renderHeight
@@ -2923,9 +2958,28 @@ if(g_dlssOutputImage == VK_NULL_HANDLE ||
         );
     }
 
+    // 2026-11-21 P0-1：主命中世界位移旁路槽，与 motion 图同分辨率、同重建时机。
+    if(g_hitOffsetImage == VK_NULL_HANDLE ||
+       g_hitOffsetWidth != renderWidth ||
+       g_hitOffsetHeight != renderHeight)
+    {
+        createHitOffsetImage(
+            renderWidth,
+            renderHeight
+        );
+    }
+
     // 2026-11-11 太阳可见度滤波的资源（ORION_SUNVIS=1 才建；内部自门控）。
     // 必须在描述符集存在之后、本帧录制之前：它要往 binding 90/91 写视图。
     createSunVisResources(
+        renderWidth,
+        renderHeight
+    );
+
+    // 2026-11-19 DH LOD「G-buffer 光栅」的资源（rasterLod 旗标开启才建；
+    // 内部自门控）。输出图 + compute 管线 + 记录流 SSBO + binding 96/97
+    // 视图。与上面同约：描述符集已存在、本帧录制之前。实现见 Lod.cpp。
+    createDhLodRasterResources(
         renderWidth,
         renderHeight
     );
@@ -3270,9 +3324,6 @@ if(rrGuideBarrierCount > 0)
     // 2026-11-04 A1：GI 时域历史 clear + 帧内屏障（needsClear 只在重建帧为真）。
     prepareGiTemporalHistoryImages(cmd);
 
-    // 2026-11-14：反射时域历史的 clear（只在重建帧）+ 帧内屏障。
-    prepareGlossyHistoryImage(cmd);
-
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SETUP);
 
     perfL10CpuPhaseAdvance(PERF_L10_CPU_P_WATER);
@@ -3330,11 +3381,7 @@ if(rrGuideBarrierCount > 0)
             cloudPassHeight = std::min(
                 std::max(cloudPassHeight, floorHeight), g_dlssOutputHeight);
         }
-        // 2026-11-16：远云脱离 RR 后，云层会被**直接**放大到显示分辨率。
-        // 若云 pass 仍按（超性能档下很小的）渲染分辨率跑，只是把"RR 糊一层"
-        // 换成"双线性糊一层"。这里按显示分辨率的固定比例给云兜底分辨率。
-        //   ORION_CLOUD_FARBAND_RES：0..1，默认 0.5；0 表示不兜底（保持旧尺寸）。
-        if(cloudFarBandSplitActive())
+        else if(cloudFarBandSplitActive())
         {
             static const double s_fraction = []() -> double
             {
@@ -3342,9 +3389,9 @@ if(rrGuideBarrierCount > 0)
 
                 if(raw == nullptr)
                 {
-                    // 2026-11-16 性能：默认 0.33（≈3x 上采样时的渲染分辨率）。
-                    // 0.5 更锐但云 pass 约 +2.8ms；0 完全不加分辨率（零成本）。
-                    return 0.33;
+                    // Default 0.50 of display res: razor-sharp under DLSS RR Ultra Performance
+                    // while staying fast via empty-space skipping and leaner light marching.
+                    return 0.50;
                 }
 
                 const double value = std::atof(raw);
@@ -3377,6 +3424,15 @@ if(rrGuideBarrierCount > 0)
 
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SFAR);
 
+    // ===================================================================
+    // 2026-11-19 DH LOD「G-buffer 光栅」每帧派发（rasterLod，默认关）。
+    // 位置 = RT 主派发（traceK1K2）之前、与 recordSunShadowFarMap 同一
+    // 「rgen 之前」段：K1 mode=14 在本帧 rgen 里读这两张图，同一
+    // command buffer 内的 dispatch -> barrier -> trace 顺序即同步。
+    // 旗标关闭时内部首行短路，不录任何命令，行为与改前逐位一致。
+    // ===================================================================
+    recordDhLodRasterPass(cmd);
+
     recordSharcZeroFillIfNeeded(cmd);
 recordSharcUpdate(cmd, renderWidth, renderHeight);
     rtCheckpoint(cmd, "frame:post-sharc-update");
@@ -3384,11 +3440,16 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
 
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SHARCUP);
 
+    // 懒编局 main 不存在；这些绑定只服务主管线 dispatch（trace fallback 等），
+    // K1/K2 路径绑回时也有同样的守卫。
+    if(g_rayTracingPipeline != VK_NULL_HANDLE)
+    {
     vkCmdBindPipeline(
         cmd,
         VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
         g_rayTracingPipeline
     );
+    }
     vkCmdBindDescriptorSets(
 
         cmd,
@@ -3426,11 +3487,16 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
     recordGiHalfPass(cmd, renderWidth, renderHeight);
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_GI);
 
+    // 懒编局 main 不存在；这些绑定只服务主管线 dispatch（trace fallback 等），
+    // K1/K2 路径绑回时也有同样的守卫。
+    if(g_rayTracingPipeline != VK_NULL_HANDLE)
+    {
     vkCmdBindPipeline(
         cmd,
         VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
         g_rayTracingPipeline
     );
+    }
     vkCmdBindDescriptorSets(
         cmd,
         VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -3446,8 +3512,9 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
 
     recordGlassAlphaBlendPrepare(cmd);
 
-    // 2026-11-05 B：K1(主视线)→landing→K2(传输) 两发（2026-11-06 起默认开，ORION_K1_K2=0 回退）；
-    // 未启用/管线失败时回退单发主管线，路径与旧版逐位一致。
+    // 2026-11-05 B：K1(主视线)→landing→K2(传输) 多发拆分管线 = 唯一 RT 路径
+    //（2026-11-16 主管线退役定案：6-stage 主单体创建点全 #if 0，单发 fallback
+    // 随之消失——traceK1K2 失败=腿创建失败，整局无 RT 属既有口径）。
     rtCheckpoint(cmd, "frame:trace-start");
     if(!traceK1K2(
            cmd,
@@ -3455,16 +3522,24 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
            renderHeight
        ))
     {
-        trace(
-            cmd,
-            &g_raygenRegion,
-            &g_missRegion,
-            &g_hitRegion,
-            &g_callableRegion,
-            renderWidth,
-            renderHeight,
-            1
-        );
+        // 腿创建失败时整局无 RT：空管线 dispatch 会直接 AV，这里必须挡住。
+#if 0
+        // 2026-11-16 退役：g_rayTracingPipeline 恒 null，单发主管线 fallback
+        // 不复存在（回滚 = 还原三处 main 创建点后去掉本 #if 0）。
+        if(g_rayTracingPipeline != VK_NULL_HANDLE)
+        {
+            trace(
+                cmd,
+                &g_raygenRegion,
+                &g_missRegion,
+                &g_hitRegion,
+                &g_callableRegion,
+                renderWidth,
+                renderHeight,
+                1
+            );
+        }
+#endif
     }
     rtCheckpoint(cmd, "frame:trace-done");
     rtSpikeTrace = rtMark();
@@ -5251,11 +5326,14 @@ sl::ResourceTag outputTag(
 
 
 
+        if(g_rayTracingPipeline != VK_NULL_HANDLE)
+        {
         vkCmdBindPipeline(
             cmd,
             VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
             g_rayTracingPipeline
         );
+        }
 
 
         vkCmdBindDescriptorSets(

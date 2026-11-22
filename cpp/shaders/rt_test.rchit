@@ -307,6 +307,11 @@ layout(std430, binding = 17, set = 0) readonly buffer LocalLightBuffer
 
 #include "material_resolve.glsl"
 
+// 2026-11-21 P0-1：主命中世界位移 per-pixel 旁路槽（binding 98，RGBA16F 全分辨率）。
+// rgen 每像素清槽、主射线返回后读回；本 TU 主射线命中时把 resolve 算出的世界位移写回。
+// 只在本 TU 声明 —— rcall / K2 内联 TU 不引用该图（material_resolve.glsl 顶部说明）。
+layout(binding = 98, set = 0, rgba16f) coherent uniform image2D hitOffsetImage;
+
 void main()
 {
     // RT 计数器：closest-hit 被硬件派发执行即计一次（含 purpose-5 可见性探针；
@@ -358,6 +363,80 @@ void main()
     // makeTraceState 播种）；次级射线（玻璃留 K1 的行内输运）继续走完整解析。
     if(getRayPurpose(payload.state) == RT_PURPOSE_PRIMARY_SKY)
     {
+        // 2026-11-21 P0-1（K1 补写站）：拆分模式下主射线在本分支早退，从不进入
+        // resolveHitMaterial，binding 98 的写槽端（main 的 resolve 之后）因此永不执行
+        // ⇒ 实体自身运动 MV 仍是常量 0。这里只补"顶点运动采样"一件事：不解材质、
+        // 不采样图集、不做 POM、不改 payload，算完写槽后照原样 return。
+        //
+        // 语义与 material_resolve.glsl:164-208（P0-1 主写站）逐条对齐：
+        //   · 身份取上方刚播种的 payload.normal（.x 实例槽 / .y 图元 / .z attribs.x）
+        //     与 payload.roughness(=attribs.y)，重心坐标同构；
+        //   · 步长/索引布局按 sectionAddressEntry.w 分派（地形 32B 与索引化 quad）；
+        //   · sectionAddressEntry.z == 0 ⇒ 该段无运动数据，位移保持 0，整块不写；
+        //   · Δcam 判据**必须**保持 any(notEqual(offset, 0))，禁止改成 .z != 0
+        //     （动态层每帧给未配对段补整段 0，.z 分不出"有效零位移"与"未配对"，
+        //      照改会重现 2026-10-22 走动时实体/粒子双倍位移鬼影）。
+        //   · 与 material_resolve.glsl 的同一算法若日后调整必须同步两处。
+        // 写槽约束：本像素要么写"真实位移 + valid=1"，要么整块不写（rgen 已先清成 0），
+        // 不产生第三种半状态；天空/未命中走 rmiss，不执行本段。
+        const uint k1InstanceIndex = uint(payload.normal.x + 0.5);
+        const uint k1PrimitiveIndex = uint(payload.normal.y + 0.5);
+        const vec3 k1Barycentrics = vec3(
+            1.0 - payload.normal.z - payload.roughness,
+            payload.normal.z,
+            payload.roughness);
+        const uvec4 k1SectionEntry =
+            sectionVertexAddressBuffer.vertexAddresses[k1InstanceIndex];
+        const uint64_t k1RawAddr = packUint2x32(k1SectionEntry.xy);
+
+        if(k1RawAddr != 0ul && k1SectionEntry.z != 0u)
+        {
+            const bool k1IndexedQuads = (k1SectionEntry.w & 1u) != 0u;
+            const uint k1QuadBase = (k1PrimitiveIndex >> 1u) * 4u;
+            uint k1i0;
+            uint k1i1;
+            uint k1i2;
+            if(k1IndexedQuads)
+            {
+                k1i0 = k1QuadBase;
+                if((k1PrimitiveIndex & 1u) == 0u)
+                {
+                    k1i1 = k1QuadBase + 1u;
+                    k1i2 = k1QuadBase + 2u;
+                }
+                else
+                {
+                    k1i1 = k1QuadBase + 2u;
+                    k1i2 = k1QuadBase + 3u;
+                }
+            }
+            else
+            {
+                k1i0 = k1PrimitiveIndex * 3u;
+                k1i1 = k1i0 + 1u;
+                k1i2 = k1i0 + 2u;
+            }
+
+            VertexMotions k1Motions =
+                VertexMotions(k1RawAddr + uint64_t(k1SectionEntry.z));
+
+            vec3 k1WorldOffset =
+                readVertexMotion(k1Motions, k1i0) * k1Barycentrics.x +
+                readVertexMotion(k1Motions, k1i1) * k1Barycentrics.y +
+                readVertexMotion(k1Motions, k1i2) * k1Barycentrics.z;
+
+            if(any(notEqual(k1WorldOffset, vec3(0.0))))
+            {
+                k1WorldOffset +=
+                    cam.prevViewInverse[3].xyz -
+                    cam.viewInverse[3].xyz;
+            }
+
+            imageStore(
+                hitOffsetImage,
+                ivec2(gl_LaunchIDEXT.xy),
+                vec4(k1WorldOffset, 1.0));
+        }
         return;
     }
 #endif
@@ -399,5 +478,27 @@ void main()
         return;
     }
 
+    // RT 计数器：此处是 K1 命中侧真正执行"完整材质解析"的唯一入口
+    // （purpose 5 早退 / K1 主射线早退 / 消融档 17 都在上面已经 return，不计入）。
+    // invocation 私有累加，main 末尾一次 atomicAdd。
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntHitMateval(getRayPurpose(payload.state) == RT_PURPOSE_PRIMARY_SKY);
+    #endif
     resolveHitMaterial(gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT);
+
+    // 2026-11-21 P0-1：主射线命中把世界位移写进旁路槽。目的闸与
+    // material_resolve.glsl 运动块同一道（RT_PURPOSE_PRIMARY_SKY）：次级反射/AO/
+    // GI/探针命中不进本分支，不会覆盖主像素槽。坐标用 gl_LaunchIDEXT.xy，与 rgen
+    // 清槽/读回的槽位索引一致。
+    if(getRayPurpose(payload.state) == RT_PURPOSE_PRIMARY_SKY)
+    {
+        imageStore(
+            hitOffsetImage,
+            ivec2(gl_LaunchIDEXT.xy),
+            vec4(g_hitWorldOffset, g_hitOffsetValid ? 1.0 : 0.0));
+    }
+
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntFlushHit();
+    #endif
 }

@@ -19,6 +19,11 @@ layout(set = 0, binding = 3) uniform WaterSimEntities
     vec4 entityBoats[8];
     vec4 entityBoatParams[8];
 } simEntities;
+
+// 2026-11-21 水体掩码（48×48 R8，块分辨率，1 = 水 / 0 = 陆地）。
+// 宿主按块扫描玩家周围 48×48 窗口上传；origin 随上传一起走 push。
+layout(set = 0, binding = 4) uniform sampler2D waterSimMask;
+
 layout(push_constant) uniform WaterSimulationPush
 {
     uvec4 layersAndFlags;
@@ -30,7 +35,67 @@ layout(push_constant) uniform WaterSimulationPush
     float waveShapeAngle;
     float waveShapeCrest;
     float waveShapeWarp;
+    // 2026-11-21 交互波升级：雨涟漪 / 水体掩码 / 尾迹 stamp（与 C++
+    // WaterSimPushConstants 逐字节对齐，新增 7 个 4 字节标量，总 112B）。
+    float rainStrength;
+    uint simStepIndex;
+    float maskOriginX;
+    float maskOriginZ;
+    uint maskEnabled;
+    // 2026-11-21 雨滴涟漪强度倍率（UI「雨滴涟漪」，0 = 关，出厂 1.5）。
+    float rainRippleScale;
+    // 2026-11-21 顾问轮1：1/掩码边长（单点真相，替代着色端字面量 48.0）。
+    float invMaskExtent;
 } pushData;
+
+// 9 点各向同性拉普拉斯开关（1 = 新档，0 = 逐位回 5 点旧档）。
+// 5 点模板的波前呈菱形、轴向传播偏快；9 点（轴向:对角 = 1:0.5，归一化到
+// 与 5 点同量纲）4 阶各向同性。最大特征值 |λ|max = 16/3 < 8 ⇒ 现有
+// laplacianCoeff ≤ 0.45 的稳定域不变。
+#ifndef WATER_SIM_ISOTROPIC_LAPLACIAN
+#define WATER_SIM_ISOTROPIC_LAPLACIAN 1
+#endif
+
+// 雨点涟漪（sim 大滴点缀）：每子步确定性撒点预算（rain²·BUDGET，≤ 16）。
+// 2026-11-21 顾问轮1 路线定档：细密雨环由消费端解析层
+//（rchit_helpers_water.glsl / rt_test_translucent.rchit 的
+// rainImpactRippleGradient，增益已 3×）承担——sim 网格奈奎斯特 ~0.19m，
+// 结构上长不出 <0.35m 的锐环。本 sim 保留极少量**大滴**当重雨点缀：
+// 墨西哥帽零均值 stamp（水面不可压缩 ⇒ 坑缘挤起一圈隆起，消低频塌陷）。
+#ifndef WATER_SIM_RAIN_DROP_BUDGET
+#define WATER_SIM_RAIN_DROP_BUDGET 6.0
+#endif
+
+uint waterSimPcgHash(uint v)
+{
+    v = v * 747796405u + 2891336453u;
+    uint w = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+// 零均值墨西哥帽（LoG）：中心 -1 凹陷，r=√2·σ 处 +0.135 隆起环。
+// 正负体积相平 ⇒ 不留低频洼地，能量全部进扩张环波段。
+float rainMexicanHat(vec2 delta, float radius)
+{
+    float r = length(delta);
+    if(r >= radius) return 0.0;
+    float sigma = radius * 0.32;
+    float u2 = (r * r) / (2.0 * sigma * sigma);
+    float window = 1.0 - smoothstep(radius * 0.75, radius, r);   // 消截断台阶
+    return (1.0 - u2) * exp(-u2) * window;
+}
+
+// 2026-11-21 顾问轮1（F3）：单点水体掩码（1 = 水）。0.45/0.55 陡肩保留
+// LINEAR 对方块直角的微倒角、去掉旧 0.35/0.65 的 3 texel 吸波软肩。
+float sampleWaterMask(vec2 worldPos)
+{
+    if(pushData.maskEnabled == 0u) return 1.0;
+    vec2 uv = (worldPos - vec2(pushData.maskOriginX, pushData.maskOriginZ)) *
+        pushData.invMaskExtent;
+    if(any(lessThanEqual(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0))))
+        return 1.0;
+    return smoothstep(0.45, 0.55, texture(waterSimMask, uv).r);
+}
 
 const ivec2 RESOLUTION = ivec2(512);
 
@@ -380,19 +445,91 @@ void main()
     float right = readState(sourceTexel + ivec2(1, 0)).x;
     float down = readState(sourceTexel + ivec2(0, -1)).x;
     float up = readState(sourceTexel + ivec2(0, 1)).x;
+    // 对角邻居（down = -z，up = +z，与上方 4 邻居同约定）。
+    float downLeft = readState(sourceTexel + ivec2(-1, -1)).x;
+    float downRight = readState(sourceTexel + ivec2(1, -1)).x;
+    float upLeft = readState(sourceTexel + ivec2(-1, 1)).x;
+    float upRight = readState(sourceTexel + ivec2(1, 1)).x;
+
+    // 2026-11-21 顾问轮1（F3）：预传播 Neumann 岸墙。掩码逐邻居采样，
+    // 陆地邻居回读中心高度（零法向通量 ∂h/∂n=0 ⇒ 反射系数 +1），取代旧
+    // "传播后 velocity 清零 + 1 格软肩吸收"的耗散边界（旧档波进软肩 5 步
+    // 被乘 ~0.5⁵，反射率不足 3%，观感是泥滩吸收）。
+    const float texelWorld = cam.waterSimSurfaceAndOrigin.w;
+    float maskL  = sampleWaterMask(worldPosition + vec2(-1.0, 0.0) * texelWorld);
+    float maskR  = sampleWaterMask(worldPosition + vec2( 1.0, 0.0) * texelWorld);
+    float maskD  = sampleWaterMask(worldPosition + vec2( 0.0,-1.0) * texelWorld);
+    float maskU  = sampleWaterMask(worldPosition + vec2( 0.0, 1.0) * texelWorld);
+    float maskDL = sampleWaterMask(worldPosition + vec2(-1.0,-1.0) * texelWorld);
+    float maskDR = sampleWaterMask(worldPosition + vec2( 1.0,-1.0) * texelWorld);
+    float maskUL = sampleWaterMask(worldPosition + vec2(-1.0, 1.0) * texelWorld);
+    float maskUR = sampleWaterMask(worldPosition + vec2( 1.0, 1.0) * texelWorld);
+    float centerMask = sampleWaterMask(worldPosition);
+
+    // 陆地邻居回读中心高度（零通量）；水邻居保持原值。
+    left      = mix(height, left,      maskL);
+    right     = mix(height, right,     maskR);
+    down      = mix(height, down,      maskD);
+    up        = mix(height, up,        maskU);
+    downLeft  = mix(height, downLeft,  maskDL);
+    downRight = mix(height, downRight, maskDR);
+    upLeft    = mix(height, upLeft,    maskUL);
+    upRight   = mix(height, upRight,   maskUR);
 
     float stepScale = clamp(pushData.updateAndImpulse.x * 30.0, 0.25, 1.5);
+#if WATER_SIM_ISOTROPIC_LAPLACIAN
+    // 2026-11-21 顾问轮1（F1）：4:1 Mehrstellen 归一化模板（a=2/3, b=1/6,
+    // center=-10/3）。9 点模板的 ∇²u 系数是 (a+2b)——对角邻居 e_x²=1 而非
+    // 1/2，旧 2:1 档（a=2/3,b=1/3）实际放大 4/3（波速 ×1.155、Courant ×4/3）。
+    // 4:1 令 4 阶项 ∝ ∇⁴（方向各向异性消除），a+2b=1 精确等于 h²∇²u；
+    // 4 texel 波长方向速度误差 0.4%（5 点 +5.4%）。
+    float laplacian = (left + right + down + up) * (2.0 / 3.0) +
+        (downLeft + downRight + upLeft + upRight) * (1.0 / 6.0) -
+        (10.0 / 3.0) * height;
+#else
     float laplacian = left + right + down + up - 4.0 * height;
+#endif
     float speedKnob = clamp(pushData.waveSpeed, 0.0, 2.0);
-    float laplacianCoeff = min(0.185 * speedKnob * speedKnob, 0.45);
+    // 稳定上限（顾问轮1）：leapfrog 两行合并后等效 Courant = coeff·stepScale²，
+    // 须 ≤ 4/|λ|max = 0.75（4:1 模板 |λ|max = 16/3）。宿主已固定
+    // stepScale = 1.0（15 Hz 内 2 子步）⇒ 上限 0.58 留 23% 余量。
+    // 旧档隐患：stepScale 常态卡 1.5（s²=2.25）+ 4/3 错误，波速滑条 >1.35 即发散。
+    float laplacianCoeff = min(0.185 * speedKnob * speedKnob, 0.58);
     velocity += laplacianCoeff * stepScale * laplacian;
     height += velocity * stepScale;
     velocity -= 0.0014 * stepScale * height;
     velocity *= max(0.0, 1.0 - 0.026 * stepScale * dampingScale) * spongeRetention;
     height *= max(0.0, 1.0 - 0.010 * stepScale * dampingScale);
 
+    // 岸线微阻尼：贴岸水体格（8 邻掩码均值 < 1）按比例吃掉部分反射能量，
+    // 防小水洼永动驻波；开阔水 edgeMask = 1 ⇒ 无操作。
+    float edgeMask = (maskL + maskR + maskD + maskU +
+                      maskDL + maskDR + maskUL + maskUR) * 0.125;
+    velocity *= mix(0.88, 1.0, edgeMask);
+
     float neighborMean = 0.25 * (left + right + down + up);
-    height = mix(height, neighborMean, 0.035);
+    // 0.035 → 0.012：4:1 模板下棋盘抑制需求降低（顾问轮1 F1），
+    // 少抹雨环等短波长内容的锐度。
+    height = mix(height, neighborMean, 0.012);
+
+    // 陆地格（顾问轮1 F3）：速度清零；高度向水邻居均值松弛（跨岸梯度 → 0，
+    // 消费端中心差分不再产生岸线亮边），无水邻居时 ~1 秒内归零。
+    if(centerMask < 0.5)
+    {
+        velocity = 0.0;
+        float maskSum = maskL + maskR + maskD + maskU +
+                        maskDL + maskDR + maskUL + maskUR;
+        if(maskSum > 0.01)
+        {
+            height = (maskL * left + maskR * right + maskD * down +
+                      maskU * up + maskDL * downLeft + maskDR * downRight +
+                      maskUL * upLeft + maskUR * upRight) / maskSum;
+        }
+        else
+        {
+            height *= 0.80;
+        }
+    }
 
     if(pushData.layersAndFlags.z != 0u)
     {
@@ -402,14 +539,16 @@ void main()
         {
             float gaussianRadius = isExitingWater ? 1.00 : 1.80;
             height += (pushData.updateAndImpulse.w * 2.2) *
-                gaussianWaveSource(eventDelta, gaussianRadius) * spongeRetention;
+                gaussianWaveSource(eventDelta, gaussianRadius) *
+                centerMask * spongeRetention;
         }
         else
         {
             float impulseRadius = isExitingWater ? 1.00 : 1.80;
             float impulseRings  = isExitingWater ? 2.00 : 3.50;
             height += (pushData.updateAndImpulse.w * 2.2) *
-                concentricRipples(eventDelta, impulseRadius, impulseRings) * spongeRetention;
+                concentricRipples(eventDelta, impulseRadius, impulseRings) *
+                centerMask * spongeRetention;
         }
     }
 
@@ -419,20 +558,60 @@ void main()
         const vec4 entityImpulse = simEntities.entityImpulses[entityIndex];
         const vec2 eventDelta = worldPosition - entityImpulse.xy;
         const bool isExitingWater = entityImpulse.z < 0.0;
+        // 2026-11-21 尾迹 stamp：.w > 0 时作为 stamp 半径（Java 沿路径
+        // 逐 stamp 传半径），否则保持入水/离水沿的固定半径档。
+        const float impulseRadius = entityImpulse.w > 0.001
+            ? entityImpulse.w
+            : (isExitingWater ? 1.00 : 1.80);
+        const float impulseRings = entityImpulse.w > 0.001
+            ? impulseRadius * 2.0
+            : (isExitingWater ? 2.00 : 3.50);
         if(sourceMode > 0.5)
         {
             height += (entityImpulse.z * 2.2) *
-                gaussianWaveSource(eventDelta, isExitingWater ? 1.00 : 1.80) *
-                spongeRetention;
+                gaussianWaveSource(eventDelta, impulseRadius) *
+                centerMask * spongeRetention;
         }
         else
         {
             height += (entityImpulse.z * 2.2) *
-                concentricRipples(
-                    eventDelta,
-                    isExitingWater ? 1.00 : 1.80,
-                    isExitingWater ? 2.00 : 3.50) *
-                spongeRetention;
+                concentricRipples(eventDelta, impulseRadius, impulseRings) *
+                centerMask * spongeRetention;
+        }
+    }
+
+    // 2026-11-21 雨点涟漪（sim 大滴点缀）：每子步确定性撒点（seed = 步计数），
+    // 墨西哥帽零均值 stamp（中心凹陷 + 坑缘隆起）。数量 ∝ rain²·BUDGET，
+    // 旱地由 centerMask 门控。rainRippleScale = 降雨页「雨波纹明显度」
+    //（0~3，与解析细雨环层同一个旋钮，见 rchit_helpers_water.glsl）。
+    const float rainRippleStrength =
+        clamp(pushData.rainStrength, 0.0, 1.0) *
+        max(pushData.rainRippleScale, 0.0);
+    if(rainRippleStrength > 0.01)
+    {
+        uint rainSeed = pushData.simStepIndex * 1977913189u + 0x9E3779B9u;
+        const uint dropCount = min(
+            uint(rainRippleStrength * rainRippleStrength *
+                 WATER_SIM_RAIN_DROP_BUDGET) + 1u,
+            16u);
+        for(uint dropIndex = 0u; dropIndex < dropCount; ++dropIndex)
+        {
+            rainSeed = waterSimPcgHash(rainSeed);
+            const float dropU = float(rainSeed & 0xFFFFu) / 65535.0;
+            rainSeed = waterSimPcgHash(rainSeed);
+            const float dropV = float(rainSeed & 0xFFFFu) / 65535.0;
+            rainSeed = waterSimPcgHash(rainSeed);
+            const float dropAmp = 0.30 + 0.32 * float(rainSeed & 0xFFu) / 255.0;
+            const vec2 dropWorld = cam.waterSimSurfaceAndOrigin.yz +
+                vec2(dropU, dropV) *
+                (float(RESOLUTION.x) * cam.waterSimSurfaceAndOrigin.w);
+            const vec2 dropDelta = worldPosition - dropWorld;
+            if(dot(dropDelta, dropDelta) < 0.1764)   // 0.42 格截断（σ=0.134）
+            {
+                height -= rainRippleStrength * dropAmp * 2.2 *
+                    rainMexicanHat(dropDelta, 0.42) *
+                    centerMask * spongeRetention;
+            }
         }
     }
 
@@ -448,23 +627,13 @@ void main()
         float boatRipples = (sourceMode > 0.5)
             ? gaussianWaveSource(relative, 1.60)
             : concentricRipples(relative, 1.60, 3.0);
-        height += boatScale * (0.121 + 0.088 * clamp(speed, 0.0, 2.5)) *
-            boatRipples * spongeRetention;
-
-        if(speed > 0.035)
-        {
-            const vec2 forward = velocityXZ / max(speed, 1.0e-4);
-            const float behind = -dot(relative, forward);
-            const float lateral = dot(relative, vec2(-forward.y, forward.x));
-            const float wakeLength = 1.8 + 1.25 * clamp(speed, 0.0, 3.0);
-            const float wakeWidth = 0.34 + 0.12 * clamp(speed, 0.0, 2.0);
-            const float wakePattern =
-                cos(behind * 6.5) * exp(-abs(lateral) / wakeWidth);
-            const float wakeEnvelope = smoothstep(0.05, 0.40, behind) *
-                (1.0 - smoothstep(wakeLength * 0.70, wakeLength, behind));
-            height += boatScale * 0.0528 * clamp(speed, 0.0, 3.0) *
-                (wakePattern * wakeEnvelope) * spongeRetention;
-        }
+        // 2026-11-21：底噪随速度淡入（静止船不再持续泵能量）；解析尾迹
+        // 图案整体删除 —— 尾迹改由 Java 沿路径 stamp（queueWaterImpulse
+        // 带 .w 半径），stamp 进场后随波方程传播、船停后自然存留衰减。
+        height += boatScale *
+            (0.121 * smoothstep(0.03, 0.30, speed) +
+             0.088 * clamp(speed, 0.0, 2.5)) *
+            boatRipples * centerMask * spongeRetention;
     }
 
     if(pushData.layersAndFlags.w != 0u)
@@ -472,29 +641,15 @@ void main()
         vec2 playerPosition = cam.playerPositionAndWater.xz;
         vec2 velocityXZ = cam.playerVelocityAndSpeed.xz;
         float speed = length(velocityXZ);
-        vec2 forward = velocityXZ / max(speed, 1.0e-4);
         vec2 relative = worldPosition - playerPosition;
 
         float bodyRipples = (sourceMode > 0.5)
             ? gaussianWaveSource(relative, 1.20)
             : concentricRipples(relative, 1.20, 3.0);
+        // 2026-11-21：解析尾迹图案删除（同船，改 Java 路径 stamp）；
+        // 游泳底噪保留（玩家静止时仍有人体起伏反馈）。
         height += (0.121 + 0.088 * clamp(speed, 0.0, 2.5)) * bodyRipples *
-            spongeRetention;
-
-        if(speed > 0.035)
-        {
-            float behind = -dot(relative, forward);
-            float lateral = dot(relative, vec2(-forward.y, forward.x));
-            float wakeLength = 1.8 + 1.25 * clamp(speed, 0.0, 3.0);
-            float wakeWidth = 0.34 + 0.12 * clamp(speed, 0.0, 2.0);
-
-            float wakePattern = cos(behind * 6.5) * exp(-abs(lateral) / wakeWidth);
-            float wakeEnvelope = smoothstep(0.05, 0.40, behind) *
-                (1.0 - smoothstep(wakeLength * 0.70, wakeLength, behind));
-
-            height += 0.0528 * clamp(speed, 0.0, 3.0) * (wakePattern * wakeEnvelope) *
-                spongeRetention;
-        }
+            centerMask * spongeRetention;
     }
 
     const float windStrength = clamp(pushData.waveParams.y, 0.0, 2.0);
@@ -535,9 +690,12 @@ void main()
                 gaussianWaveSource(
                     windQuery - windPosition,
                     windOrbit[windIndex].y * radiusScale * warpJitter) *
-                spongeRetention;
+                centerMask * spongeRetention;
         }
     }
+
+    // （2026-11-21 顾问轮1：旧"陆地高度 0.965 逐步塌缩"已删除——陆地格改由
+    // 上方 Neumann 块整体接管：速度清零 + 向水邻居均值松弛。）
 
     if(spongeWidth <= 0.0)
     {

@@ -1,0 +1,88 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ============================================================================
+// 焦散泼溅解析（2026-11-20）
+//
+// 输入：water_caustic_map.comp 用 imageAtomicAdd 累加出来的光子计数
+//       （R32_UINT，1024² × 2 层，无 mip）。
+// 输出：宿主既有的 RGBA16F 焦散图 **mip 0**（两层），mip 1..7 仍由宿主的
+//       vkCmdBlitImage 链生成，消费端口径不变。
+//
+// 三件事，顺序不能反：
+//   1) 5×5 高斯模糊。泼溅是"每桶 1 个光子"的离散直方图，平水时恰好每桶 1；
+//      折叠处多个光子挤进同一桶，邻桶空 ⇒ 不模糊就是颗粒。模糊半径 2 纹素
+//      = 0.25 格，正好把焦散线的宽度定在"波浪曲率"和"图分辨率"之间。
+//      对应 HPWater 的 AtrousDenoiseFirst（他们 3×3 + 亮度权重；我们这里没有
+//      屏幕空间的阴影边界要防漏，普通高斯即可）。
+//   2) 归一：平水 = 1（"未扰动波前"的旧契约）。模糊核归一后均值仍是 1。
+//   3) 软膝压缩：与旧实现逐字相同的 knee=2 / ceiling=6 —— 消费端的
+//      focus 曲线是按这组数标定的，换掉它就得重新标亮度。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform usampler2DArray causticAccum;
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2DArray causticOutput;
+
+layout(push_constant) uniform WaterCausticMapPush
+{
+    vec4 sunDirection;   // 与本算子无关，结构体保持一致
+    vec4 params;         // w = 解析强度（百分之一，100 = 1.0）
+} pc;
+
+const uint CAUSTIC_RESOLUTION = 1024u;
+const int RES_I = 1024;
+
+// 5×5 二项核（[1 4 6 4 1]ᵀ × [1 4 6 4 1] / 256）：可分离、C1、无负数。
+const float KERNEL[5] = float[](1.0, 4.0, 6.0, 4.0, 1.0);
+
+uint loadWrapped(ivec2 p, int layer)
+{
+    const ivec2 wrapped = ivec2(
+        (p.x % RES_I + RES_I) % RES_I,
+        (p.y % RES_I + RES_I) % RES_I);
+    return texelFetch(causticAccum, ivec3(wrapped, layer), 0).r;
+}
+
+// 软膝压缩：knee 以下线性（斜率 1），knee 以上单调、C1、向 ceiling 渐近。
+float compressDensity(float raw)
+{
+    const float KNEE = 2.0;
+    const float CEILING = 6.0;
+    if(raw <= KNEE)
+    {
+        return raw;
+    }
+    return KNEE + (CEILING - KNEE) *
+        (1.0 - exp(-(raw - KNEE) / (CEILING - KNEE)));
+}
+
+void main()
+{
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    const int layer = int(gl_GlobalInvocationID.z);
+
+    if(texel.x >= RES_I || texel.y >= RES_I || layer >= 2)
+    {
+        return;
+    }
+
+    float sum = 0.0;
+    float weightSum = 0.0;
+    for(int j = 0; j < 5; ++j)
+    {
+        for(int i = 0; i < 5; ++i)
+        {
+            const float w = KERNEL[i] * KERNEL[j];
+            sum += float(loadWrapped(texel + ivec2(i - 2, j - 2), layer)) * w;
+            weightSum += w;
+        }
+    }
+
+    const float density = compressDensity(sum / weightSum);
+    imageStore(
+        causticOutput,
+        ivec3(texel, layer),
+        vec4(max(density, 0.20)));
+}

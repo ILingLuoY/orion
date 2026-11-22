@@ -251,7 +251,7 @@ vec2 rainImpactRippleGradient(vec2 worldXZ, float cameraDistance)
             float distanceToImpact = length(delta);
             float radius = age * RING_SPEED;
             float envelope = (1.0 - smoothstep(0.52, 1.0, age)) *
-                (1.0 - smoothstep(0.12, 0.204, distanceToImpact));
+                (1.0 - smoothstep(0.16, 0.30, distanceToImpact));
             if(envelope <= 0.0 || distanceToImpact <= 1.0e-4)
             {
                 continue;
@@ -262,8 +262,9 @@ vec2 rainImpactRippleGradient(vec2 worldXZ, float cameraDistance)
         }
     }
 
-    // Match the confirmed visible ground-ripple amplitude.
-    return gradient * (0.060 * rain * nearFade * rippleStrength);
+    // 2026-11-21 顾问轮1：与 rchit_helpers_water.glsl 同口径同步——0.060 → 0.170
+    //（地面水洼口径在水面上弱 5~10 倍）+ 环包络 0.204 → 0.30。
+    return gradient * (0.170 * rain * nearFade * rippleStrength);
 }
 
 WaterWaveSurface evaluateWaterWaveSurface(vec2 worldXZ, float waterY)
@@ -446,16 +447,41 @@ float getTimeDrivenSunElevation()
 float getTimeDrivenSkyLightRadianceScale()
 {
     float elevation = getTimeDrivenSunElevation();
-    return elevation >= 0.0
-        ? elevation * TIME_DRIVEN_SUN_NOON_SCALE
-        : -elevation * TIME_DRIVEN_MOON_NOON_SCALE;
+    if(elevation >= 0.0)
+    {
+        return elevation * TIME_DRIVEN_SUN_NOON_SCALE;
+    }
+    // 2026-11-16 自查修正：夜间项必须用**月亮真实高度**。
+    // 旧式 -elevation（太阳下沉深度）成立的前提是"月亮恒在太阳正对面"；
+    // 月亮按月相移动后该前提没了 —— 月亮已经落山，水面反射 / 焦散仍会按
+    // "月亮在天顶"给月光。这里与 rt_test.rgen 的
+    // getClearTimeDrivenSkyLightRadianceScale 同口径（本文件是方位锥公式，
+    // 高度就是 sin(moonAngle)，与 getTimeDrivenSunElevation 同一量纲）。
+    const float TWO_PI = 6.28318530718;
+    float moonAngle = fract(
+        fract(cam.historyParams.w) + cam.sssParams.z + 0.5) * TWO_PI;
+    float moonHeight = clamp(sin(moonAngle), 0.0, 1.0);
+    float moonIllumination = 0.5 + 0.5 * cos(
+        TWO_PI * clamp(cam.sssParams.z, 0.0, 1.0));
+    return moonHeight * moonIllumination * TIME_DRIVEN_MOON_NOON_SCALE;
 }
 
 vec3 getTimeDrivenSkyLightDirection()
 {
-    return getTimeDrivenSunElevation() >= 0.0
-        ? getTimeDrivenSunDirection()
-        : -getTimeDrivenSunDirection();
+    if(getTimeDrivenSunElevation() >= 0.0)
+    {
+        return getTimeDrivenSunDirection();
+    }
+    // 2026-11-16：夜间光源 = 真实月亮位置（按月相沿日轨移动）。
+    // 满月（月相 0）时与本文件旧的 -sunDirection 逐位等价。
+    // 本文件不 include sky_model_common.glsl，故按**本文件自己的**方位锥公式
+    // 内联（必须与上面 getTimeDrivenSunDirection 同族，否则日月不同轨）。
+    const float TWO_PI = 6.28318530718;
+    vec3 horizontalAzimuth = normalize(vec3(0.5, 0.0, 0.3));
+    float moonAngle = fract(
+        fract(cam.historyParams.w) + cam.sssParams.z + 0.5) * TWO_PI;
+    return normalize(
+        horizontalAzimuth * cos(moonAngle) + vec3(0.0, sin(moonAngle), 0.0));
 }
 
 layout(binding = 3, set = 0) uniform sampler2D blockAtlas;
@@ -1397,10 +1423,17 @@ void main()
         attribs.x
     );
     payload.roughness = attribs.y;
+    // RT 计数器：玻璃/半透明命中侧的"完整材质解析"入口，一次 resolve 计 1。
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntHitMatevalGlass();
+    #endif
     resolveHitMaterialGlass(
         gl_WorldRayOriginEXT,
         gl_WorldRayDirectionEXT,
         vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y)
     );
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntFlushHit();
+    #endif
 }
 

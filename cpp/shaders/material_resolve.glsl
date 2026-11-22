@@ -30,6 +30,14 @@
 #ifndef MATERIAL_RESOLVE_GLSL
 #define MATERIAL_RESOLVE_GLSL
 
+// 2026-11-21 P0-1：rchit 算出的主命中世界位移，经 per-pixel 旁路图（binding 98）
+// 回传 rgen。这里**只暴露全局量**：image 声明与 imageStore 放在引用该槽的 rchit main
+// 里（rt_test.rchit），本头文件不引用该图 —— 否则 rcall TU（rt_test_material.rcall）
+// 与 K2 内联 TU（rgen_k2_material_inline.glsl）会被迫静态绑定 binding 98，
+// 而它们的描述符写法不在本轮范围内（蓝图 §3.3 风险 3）。
+vec3 g_hitWorldOffset = vec3(0.0);
+bool g_hitOffsetValid = false;
+
 void resolveHitMaterial(vec3 rayOrigin, vec3 rayDirection)
 {
     // 未命中：rt_test.rmiss 已经把 hitDistance 置 -1 并把天空辐亮度写进 albedo，
@@ -186,6 +194,18 @@ void resolveHitMaterial(vec3 rayOrigin, vec3 rayDirection)
                     cam.viewInverse[3].xyz;
             }
         }
+
+        // 2026-11-21 P0-1：把 rchit 算好的世界位移交给全局量，由本 TU 的 main 写进
+        // binding 98 旁路槽（头文件不直接引用该图，见文件顶部说明）。
+        //
+        // ⚠ Δcam 判据必须保持上面的保守写法 any(notEqual(hitWorldOffset, vec3(0)))，
+        // 禁止改成 sectionAddressEntry.z != 0u：.z != 0 只能表示"该图元属于带运动段
+        // 的动态角色"，而动态层每帧都会给未配对/静止段补整段 0（Geometry.cpp:
+        // 1013-1028），.z 非零却无法区分"有效零相对位移"与"未配对全零段"。改成
+        // .z 会让未配对段凭空获得等于相机平移的 MV，重现 2026-10-22 记录的走动时
+        // 实体/粒子双倍位移鬼影（见本块上方 2026-10-22 注释）。
+        g_hitWorldOffset = hitWorldOffset;
+        g_hitOffsetValid = true;
 
     }
 
@@ -604,6 +624,12 @@ bool isRtWeatherRain =
 
     // =====================================================
     // DH FAR-FIELD LOD —— DH 远场几何的专属命中着色器
+    //
+    // 2026-11-19 rasterLod（挂载点⑤，原规格行号 :620-742）：rasterLod=true 时
+    // DH 键已从 BLAS/TLAS/角色表结构性摘除（C++ 挂载点②③④），isDhLod 永远
+    // 为 false ⇒ 本分支不可达，无需额外旗标位（本 TU 未声明相机 UBO）。远场
+    // 着色改由 dh_lod_raster.comp（顶点色直写）+ K1 mode=14 重打光承担；本段    // 公式（albedo/噪声/补偿/baked light）保留不动，供回退路线 B 复用。
+    // 旗标关闭时行为与改前逐位一致。
     //
     // 这是"读 DH 数据 → 自己网格化 → 进 TLAS"这条统一路径的入口：远场几何命中后
     // 写出与近场完全相同的 payload 契约，因此它自动参与 GI / 阴影 / 反射 / 体积光，

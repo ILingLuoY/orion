@@ -291,6 +291,14 @@ bool beginAsyncRtPipelineRebuild(const char* reason)
         return false;
     }
 
+    // 懒编/失败时主管线不存在，重建无从谈起（否则会在帧中撞 10 分钟级编译）。
+    // 2026-11-16 主管线退役后 g_rayTracingPipeline 恒 null ⇒ 本函数永远在此
+    // 返回 false；下方重建代码为主管线专属遗留（唯一调用方=主管线热重载）。
+    if(g_rayTracingPipeline == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
     if(!asyncRtPipelineRebuildSupported())
     {
         return false;
@@ -386,6 +394,12 @@ bool beginAsyncRtPipelineRebuild(const char* reason)
     {
         state.pipelineCreateInfo.flags |=
             VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+    }
+
+    if(orionMainPipelineNoOpt())
+    {
+        state.pipelineCreateInfo.flags |=
+            VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     }
 
     if(state.createDeferredOperation(
@@ -550,6 +564,22 @@ void rtBootPipelineCompileWorker()
 
     try
     {
+        if(orionMainLazyDeferred()) // 2026-11-16 恒 true：主管线退役，k1k2SplitEnabled 强制 true
+        {
+            // 懒编：K1/K2 拆分管线是唯一 RT 路径，主管线从不 dispatch。
+            // 6-stage 单体冷编要 ~29GB commit（32GB 内存+双 pagefile 顶 ~52GB
+            // 必爆，见 orionMainLazyDeferred 注释），跳过它冷编只剩 4 条腿。
+            g_rtMainPipelineLazy.store(true, std::memory_order_release);
+            destroyBootShaderModules(mods);
+            // 不建主管线 SBT，但 K1/K2 腿管线要 g_handleSizeAligned/g_sbtBaseAlignment
+            ensureSbtHandleMetrics();
+            RTLogFlushed(
+                "[RT BOOT] main pipeline retired (split-only; K1/K2 legs only)"
+            );
+        }
+#if 0
+        else
+        {
         VkPipelineShaderStageCreateInfo stages[6]{};
 
         stages[0]={
@@ -642,7 +672,7 @@ void rtBootPipelineCompileWorker()
                 ? VK_NULL_HANDLE
                 : getSharedPipelineCache();
 
-        if(rtPipelineDisableOptimization())
+        if(rtPipelineDisableOptimization() || orionMainPipelineNoOpt())
         {
             pci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         }
@@ -671,10 +701,15 @@ void rtBootPipelineCompileWorker()
         );
 
         destroyBootShaderModules(mods);
+        } // else（非懒编的 main 编译路径）
+#endif // 2026-11-16 主管线退役：6-stage 单体编译路径整体屏蔽（回滚 = 去 #if 0/#endif 并还原 orionMainLazyDeferred/k1k2SplitEnabled）
 
-        // SBT 只依赖主管线（句柄取自 g_rayTracingPipeline，与 K1/K2 无关），
-        // 所以 main 一成就能建；K1/K2 随后。
-        createRayTracingSBT();
+        // SBT 句柄取自 g_rayTracingPipeline；主管线退役后恒跳过。
+        // K1/K2 用自己的 g_k1k2SbtBuffer（Sharc.cpp 从腿管线自取句柄），不受影响。
+        if(g_rayTracingPipeline != VK_NULL_HANDLE)
+        {
+            createRayTracingSBT();
+        }
 
         ensureK1K2Pipelines();
 

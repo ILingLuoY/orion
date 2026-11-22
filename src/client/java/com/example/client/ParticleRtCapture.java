@@ -1,6 +1,7 @@
 package com.example.client;
 
 import com.example.vulkan.NativeVulkan;
+import com.example.vulkan.RustBridge;
 import com.example.client.config.RTXSettingsConfig;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.systems.RenderSystem;
@@ -136,6 +137,26 @@ public final class ParticleRtCapture {
 
     private ParticleRtCapture() {}
 
+    // ===== Rust 天气内核（orion_farfield，-Dorion.rustWeather=true 启用；见 HANDOFF-2026-11-17 §8）=====
+    private static final boolean RUST_WEATHER = Boolean.getBoolean("orion.rustWeather");
+    private static boolean weatherRustSnapshotReady;
+    private static int weatherRustSnapshotVLim;
+    private static int weatherRustSnapshotMLim;
+    private static final ByteBuffer weatherParamsBuf = ByteBuffer
+            .allocateDirect(37 * 4).order(ByteOrder.nativeOrder());
+    private static final ByteBuffer weatherPlanBuf = ByteBuffer
+            .allocateDirect(MAX_RT_RAIN_DROPS * 7 * 4).order(ByteOrder.nativeOrder());
+    private static final ByteBuffer weatherHeightBuf = ByteBuffer
+            .allocateDirect(MAX_RT_RAIN_DROPS * 4).order(ByteOrder.nativeOrder());
+    private static final ByteBuffer weatherPrecipBuf = ByteBuffer
+            .allocateDirect(MAX_RT_RAIN_DROPS).order(ByteOrder.nativeOrder());
+    private static final ByteBuffer weatherFlakeHBuf = ByteBuffer
+            .allocateDirect(MAX_RT_RAIN_DROPS * 2 * 4).order(ByteOrder.nativeOrder());
+    private static final ByteBuffer weatherRustSnapshotV = ByteBuffer
+            .allocateDirect(MAX_RT_WEATHER_QUADS * 6 * BYTES_PER_VERTEX).order(ByteOrder.nativeOrder());
+    private static final ByteBuffer weatherRustSnapshotM = ByteBuffer
+            .allocateDirect(MAX_RT_WEATHER_QUADS * 6 * 3 * Float.BYTES).order(ByteOrder.nativeOrder());
+
     private static final long WEATHER_RAIN_REBUILD_INTERVAL_NANOS = 50_000_000L;
     private static long weatherRainLastBuildNanos;
     private static boolean weatherRainWasActive;
@@ -175,7 +196,17 @@ public final class ParticleRtCapture {
         if(shouldRebuildWeather())
         {
             weatherQuadCount = 0;
-            buildRtWeather();
+            weatherRustSnapshotReady = false;
+            if (RUST_WEATHER) {
+                try {
+                    buildRtWeatherRust();
+                } catch (Throwable failure) {
+                    System.out.println("[RUST-WEATHER] failed, fallback to Java: " + failure);
+                }
+            }
+            if (!weatherRustSnapshotReady) {
+                buildRtWeather();
+            }
         }
         genericParticleBudget = particleBudget;
         publishAtlas(0, TextureAtlas.LOCATION_PARTICLES);
@@ -345,11 +376,21 @@ public final class ParticleRtCapture {
     }
 
     public static void endFrame() {
-        if (weatherQuadCount + nearestCount > 0) {
+        final boolean rustWeather = RUST_WEATHER && weatherRustSnapshotReady;
+        if (rustWeather || weatherQuadCount + nearestCount > 0) {
             particleVertices.clear();
             particleMotion.clear();
-            for (int index = 0; index < weatherQuadCount; ++index) {
-                emitQuad(particleVertices, weatherQuads[index]);
+            if (rustWeather) {
+                // Rust 已在重建帧把天气顶点打包进快照；非重建帧也照搬快照（原 Java 路径
+                // 是每帧从 weatherQuads 重新 emit，这里改成逐字节拷贝，语义等价）
+                particleVertices.put(weatherRustSnapshotV.duplicate().position(0).limit(weatherRustSnapshotVLim));
+                particleVertices.position(weatherRustSnapshotVLim);
+                particleMotion.put(weatherRustSnapshotM.duplicate().position(0).limit(weatherRustSnapshotMLim));
+                particleMotion.position(weatherRustSnapshotMLim);
+            } else {
+                for (int index = 0; index < weatherQuadCount; ++index) {
+                    emitQuad(particleVertices, weatherQuads[index]);
+                }
             }
             for (int index = 0; index < nearestCount; ++index) {
                 emitQuad(particleVertices, nearest[index]);
@@ -415,6 +456,145 @@ public final class ParticleRtCapture {
      * {@link #RT_SNOW_FLAKES_PER_CELL} camera-facing snowflake billboards per
      * cell ({@code appendWeatherSnow}) that sample the atlas's bottom half.
      */
+    /**
+     * Rust 天气内核路径（-Dorion.rustWeather=true 时启用）：
+     * off_weather_plan（纯数学探针坐标）→ Java 逐格探针（getHeight/getPrecipitationAt，
+     * 与原路径同量同序）→ off_weather_build（seed/jitter/近衰减/emit 打包全在 Rust）。
+     * 结果写进快照缓冲（每帧由 endFrame 拷进上传流）；任何一步失败都回落 Java 路径。
+     * 对拍与 A/B：rust/orion-farfield/bench/OrionFarFieldBench.java（4 场景 PASS，7.34x）。
+     */
+    private static void buildRtWeatherRust() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.level == null || minecraft.player == null || !minecraft.level.isRaining()) {
+            return;
+        }
+        float rain = minecraft.level.getRainLevel(1.0F);
+        if (rain <= 0.01F) {
+            return;
+        }
+        int requestedDrops =
+                (int)((64.0F + rain * 192.0F) * RT_RAIN_DENSITY_SCALE *
+                        RTXSettingsConfig.getRainSettings().densityScale());
+        int dropCount = Math.min(requestedDrops, MAX_RT_RAIN_DROPS);
+        float seconds = System.nanoTime() * 1.0e-9F;
+        RTXSettingsConfig.RainSettings rainLook = RTXSettingsConfig.getRainSettings();
+        final float rainScale = rainLook.streakLength() * 0.5F;
+        weatherRainHalfWidth = rainHalfWidthBlocks(rainLook);
+        final float rainBrightness = rainLook.brightness();
+        final int rainColor = ARGB.colorFromFloat(
+                rainLook.opacity(),
+                Math.min(RT_RAIN_TINT_RED * rainBrightness, 1.0F),
+                Math.min(RT_RAIN_TINT_GREEN * rainBrightness, 1.0F),
+                Math.min(RT_RAIN_TINT_BLUE * rainBrightness, 1.0F));
+        RTXSettingsConfig.SnowSettings snowLook = RTXSettingsConfig.getSnowSettings();
+        int snowCellCount = Math.min(
+                (int)((64.0F + rain * 192.0F)
+                        * RT_RAIN_DENSITY_SCALE * snowLook.densityScale()),
+                MAX_RT_RAIN_DROPS);
+        final float snowBrightness = snowLook.brightness();
+        final int snowColor = ARGB.colorFromFloat(
+                snowLook.opacity(),
+                Math.min(RT_SNOW_TINT_RED * snowBrightness, 1.0F),
+                Math.min(RT_SNOW_TINT_GREEN * snowBrightness, 1.0F),
+                Math.min(RT_SNOW_TINT_BLUE * snowBrightness, 1.0F));
+        final float cellSpacing =
+                RAIN_CELL_SPACING * BASE_WEATHER_GRID_SIZE / WEATHER_GRID_SIZE;
+        final int anchorX = (int)Math.floor(minecraft.player.getX() / cellSpacing);
+        final int anchorZ = (int)Math.floor(minecraft.player.getZ() / cellSpacing);
+        final float eyeY = (float)minecraft.player.getEyeY();
+        final Quaternionf cameraRotation = minecraft.gameRenderer.mainCamera().rotation();
+        final float rainFill =
+                Math.min(1.0F, (float)dropCount / (float)MAX_RT_RAIN_DROPS);
+        final float snowFill =
+                Math.min(1.0F, (float)snowCellCount / (float)MAX_RT_RAIN_DROPS);
+        final float anyFill = Math.max(rainFill, snowFill);
+        final float playerX = (float)minecraft.player.getX();
+        final float playerZ = (float)minecraft.player.getZ();
+        final float gust = 1.0F
+                + 0.35F * (float)Math.sin(seconds * 0.85F)
+                + 0.20F * (float)Math.sin(seconds * 2.31F + 1.7F);
+        final float rainWindScale = (0.45F + 0.55F * rain) * gust;
+        final float rainWindX = 0.32F * rainWindScale;
+        final float rainWindZ = 0.11F * rainWindScale;
+
+        if (!RustBridge.available()) {
+            return;
+        }
+
+        // params（字段序 = Rust WeatherParams，冻结；对照 rust/orion-farfield/src/lib.rs）
+        ByteBuffer pbuf = weatherParamsBuf;
+        pbuf.clear();
+        pbuf.putFloat(playerX).putFloat(playerZ).putFloat(eyeY).putFloat(seconds);
+        pbuf.putFloat(cellSpacing);
+        pbuf.putInt(anchorX).putInt(anchorZ);
+        pbuf.putInt(WEATHER_GRID_SIZE).putInt(MAX_RT_RAIN_DROPS).putInt(MAX_RT_WEATHER_QUADS);
+        pbuf.putFloat(anyFill).putFloat(rainFill).putFloat(snowFill);
+        pbuf.putFloat(rainScale).putFloat(weatherRainHalfWidth).putFloat(rainWindX).putFloat(rainWindZ);
+        pbuf.putInt(rainColor).putInt(snowColor);
+        pbuf.putFloat(cameraRotation.x).putFloat(cameraRotation.y)
+                .putFloat(cameraRotation.z).putFloat(cameraRotation.w);
+        pbuf.putFloat(snowLook.fallSpeedScale()).putFloat(snowLook.swayBlocks())
+                .putFloat(snowLook.sizeScale());
+        pbuf.putFloat(RT_RAIN_NEAR_FADE_INNER).putFloat(RT_RAIN_NEAR_FADE_OUTER);
+        pbuf.putFloat(RT_SNOW_TILE_V_BASE).putFloat(RT_SNOW_FALL_MIN).putFloat(RT_SNOW_FALL_MAX)
+                .putFloat(RT_SNOW_SWAY_FREQUENCY).putFloat(RT_SNOW_FLAKE_MIN_SIZE).putFloat(RT_SNOW_FLAKE_MAX_SIZE);
+        pbuf.putInt(RT_RAIN_MARKER).putInt(RT_SNOW_MARKER);
+        pbuf.putInt(RT_SNOW_FLAKES_PER_CELL);
+        pbuf.flip();
+
+        weatherPlanBuf.clear();
+        final int cells = RustBridge.weatherPlan(pbuf, weatherPlanBuf);
+        if (cells != MAX_RT_RAIN_DROPS) {
+            return;
+        }
+
+        // 探针循环（同量同序：base 高度全格；precip 全格；SNOW 格才探两片雪的摆后高度）
+        // 注意：weatherPlanBuf 不 flip——Rust 经 segment 写入不会推进 Java position，
+        // 此刻 position 已是 0、limit 是全容量，直接按绝对序读取即可（flip 会把 limit 归 0 导致下溢）
+        weatherHeightBuf.clear();
+        weatherPrecipBuf.clear();
+        weatherFlakeHBuf.clear();
+        for (int cell = 0; cell < MAX_RT_RAIN_DROPS; ++cell) {
+            final int probeBx = weatherPlanBuf.getInt();
+            final int probeBz = weatherPlanBuf.getInt();
+            final int f0Bx = weatherPlanBuf.getInt();
+            final int f0Bz = weatherPlanBuf.getInt();
+            final int f1Bx = weatherPlanBuf.getInt();
+            final int f1Bz = weatherPlanBuf.getInt();
+            weatherPlanBuf.getInt(); // flags（SNOW 判据已由 precipCode 决定，Java 只按它探雪片）
+            weatherHeightBuf.putInt(minecraft.level.getHeight(
+                    Heightmap.Types.MOTION_BLOCKING, probeBx, probeBz));
+            Biome.Precipitation precipitation = minecraft.level.getPrecipitationAt(
+                    weatherProbe.set(probeBx, (int)eyeY, probeBz));
+            final int precipCode = precipitation == Biome.Precipitation.NONE ? 0
+                    : precipitation == Biome.Precipitation.RAIN ? 1 : 2;
+            weatherPrecipBuf.put((byte) precipCode);
+            if (precipCode == 2) {
+                weatherFlakeHBuf.putInt(minecraft.level.getHeight(
+                        Heightmap.Types.MOTION_BLOCKING, f0Bx, f0Bz));
+                weatherFlakeHBuf.putInt(minecraft.level.getHeight(
+                        Heightmap.Types.MOTION_BLOCKING, f1Bx, f1Bz));
+            } else {
+                weatherFlakeHBuf.putInt(0).putInt(0);
+            }
+        }
+        weatherPlanBuf.position(0);
+        weatherHeightBuf.flip();
+        weatherPrecipBuf.flip();
+        weatherFlakeHBuf.flip();
+
+        weatherRustSnapshotV.clear();
+        weatherRustSnapshotM.clear();
+        final int quads = RustBridge.weatherBuild(pbuf, weatherHeightBuf, weatherPrecipBuf,
+                weatherFlakeHBuf, weatherRustSnapshotV, weatherRustSnapshotM);
+        if (quads < 0 || quads > MAX_RT_WEATHER_QUADS) {
+            return;
+        }
+        weatherRustSnapshotVLim = quads * 6 * BYTES_PER_VERTEX;
+        weatherRustSnapshotMLim = quads * 6 * 3 * Float.BYTES;
+        weatherRustSnapshotReady = true;
+    }
+
     private static void buildRtWeather() {
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.level == null || minecraft.player == null || !minecraft.level.isRaining()) {

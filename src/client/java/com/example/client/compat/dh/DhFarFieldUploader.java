@@ -3,9 +3,11 @@ package com.example.client.compat.dh;
 import com.example.client.compat.FarFieldGate;
 import com.example.client.compat.FarFieldWindow;
 import com.example.vulkan.NativeVulkan;
+import com.example.vulkan.RustBridge;
 import net.minecraft.client.Minecraft;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -96,6 +98,26 @@ public final class DhFarFieldUploader {
     private static final AtomicBoolean JOB_IN_FLIGHT = new AtomicBoolean();
     private static final AtomicLong GENERATION = new AtomicLong();
 
+    // ===== 分帧派发（P2，2026-11-18；-Dorion.dh.frameBatch=false 回旧整单路径做基线）=====
+    private static final boolean FRAME_BATCH =
+            !"false".equals(System.getProperty("orion.dh.frameBatch", "true"));
+    /** 批量转换内核开关（-Dorion.dh.rustConvert=false 回逐节 Java convert 基线）。 */
+    private static final boolean RUST_CONVERT =
+            !"false".equals(System.getProperty("orion.dh.rustConvert", "true"));
+    private static final int SECTIONS_PER_FRAME =
+            Math.max(4, Math.min(24, Integer.getInteger("orion.dh.dispatchSectionsPerFrame", 12)));
+    private static final long BYTES_PER_FRAME =
+            Math.max(1L, Long.getLong("orion.dh.dispatchBytesPerFrame", 8L * 1024 * 1024));
+    /** 待传节队列：pos → 最新 Section（DH 重构建换新对象时以新替旧，天然去重） */
+    private static final Map<Long, DhLodMeshSink.Section> PENDING = new ConcurrentHashMap<>();
+    /** 待撤下队列：pos 不再被 DH 启用清单覆盖 */
+    private static final Map<Long, Boolean> PENDING_REMOVES = new ConcurrentHashMap<>();
+    /** 排序缓存：仅在 PENDING 规模变化或玩家移动 ≥8 格时重排（渲染线程 O(P log P)） */
+    private static volatile List<DhLodMeshSink.Section> sortSnapshot;
+    private static volatile int sortedSize = -1;
+    private static volatile double sortCenterX = Double.NaN;
+    private static volatile double sortCenterZ = Double.NaN;
+
     private DhFarFieldUploader() {
     }
 
@@ -145,6 +167,23 @@ public final class DhFarFieldUploader {
                 || Math.max(Math.abs(x - lastSyncX), Math.abs(z - lastSyncZ))
                 >= DhFlags.LOD_MOVE_THRESHOLD;
         final boolean needData = uploadedQuads < 0;
+
+        if (FRAME_BATCH) {
+            // 分帧派发（P2）：差集按节流触发入队；切片每帧派发，背压留在 PENDING（在飞单不丢触发机会）
+            if ((due || movedEnough || needData) && !JOB_IN_FLIGHT.get()) {
+                if (DhLodMeshSink.enabledCount() == 0) {
+                    DhLodMeshSink.prune();
+                } else {
+                    lastSyncFrame = frame;
+                    lastSyncX = x;
+                    lastSyncZ = z;
+                    syncDiff();
+                }
+            }
+            dispatchFrameSlice(x, z);
+            return;
+        }
+
         if (!(due || movedEnough || needData)) return;
         if (JOB_IN_FLIGHT.get()) return;
 
@@ -190,7 +229,102 @@ public final class DhFarFieldUploader {
             return;
         }
 
-        dispatch(wanted, toUpload, toRemove, quads, textured);
+        dispatch(wanted, toUpload, toRemove, quads, textured, 0);
+    }
+
+    /**
+     * 分帧派发（P2）：sync 只做差集入队（PENDING/PENDING_REMOVES），本方法每帧取
+     * 近处优先的一帧切片（默认 12 节/8MB，双限取先）交给 worker，背压留在 PENDING。
+     * 触发与控量见类注释与 HANDOFF §11；-Dorion.dh.frameBatch=false 回旧整单路径。
+     */
+    private static void syncDiff() {
+        DhLodMeshSink.prune();
+        final List<DhLodMeshSink.Section> desired = DhLodMeshSink.renderCut();
+
+        final boolean textured = DhFlags.PUBLISH_TEXTURES && DhTextureHandles.isPublished();
+        final long textureBit = textured ? 1L : 0L;
+
+        final Map<Long, Long> wanted = new HashMap<>(desired.size() * 2);
+        for (DhLodMeshSink.Section section : desired) {
+            wanted.put(section.pos, section.serial * 2L + textureBit);
+        }
+
+        // 待传：版本与 UPLOADED 不一致的节入队（以最新 Section 对象覆盖，天然去重）
+        for (DhLodMeshSink.Section section : desired) {
+            final long version = section.serial * 2L + textureBit;
+            if (!Long.valueOf(version).equals(UPLOADED.get(section.pos))) {
+                PENDING.put(section.pos, section);
+            }
+        }
+        // 待撤：UPLOADED 里不再被启用的节
+        for (Long pos : UPLOADED.keySet()) {
+            if (!wanted.containsKey(pos)) PENDING_REMOVES.put(pos, Boolean.TRUE);
+        }
+        // PENDING 里已不被启用 → 移入撤下并出队；版本已一致（早前切片已传）→ 出队
+        PENDING.keySet().removeIf(pos -> {
+            if (wanted.containsKey(pos)) return false;
+            PENDING_REMOVES.put(pos, Boolean.TRUE);
+            return true;
+        });
+        PENDING.keySet().removeIf(pos ->
+                Long.valueOf(wanted.get(pos)).equals(UPLOADED.get(pos)));
+    }
+
+    private static void dispatchFrameSlice(double px, double pz) {
+        if ((PENDING.isEmpty() && PENDING_REMOVES.isEmpty()) || JOB_IN_FLIGHT.get()) return;
+
+        // 排序缓存：规模变化或玩家移动 ≥8 格才重排（渲染线程 O(P log P)）
+        final int size = PENDING.size();
+        if (sortSnapshot == null || sortedSize != size
+                || Math.abs(px - sortCenterX) >= 8.0 || Math.abs(pz - sortCenterZ) >= 8.0) {
+            final List<DhLodMeshSink.Section> snapshot = new ArrayList<>(PENDING.values());
+            snapshot.sort(Comparator
+                    .comparingInt(DhFarFieldUploader::chebyshev)
+                    .thenComparing(s -> -s.serial));
+            sortSnapshot = snapshot;
+            sortedSize = size;
+            sortCenterX = px;
+            sortCenterZ = pz;
+        }
+
+        final boolean textured = DhFlags.PUBLISH_TEXTURES && DhTextureHandles.isPublished();
+        final long textureBit = textured ? 1L : 0L;
+
+        final List<DhLodMeshSink.Section> slice = new ArrayList<>();
+        final Map<Long, Long> wantedSlice = new HashMap<>();
+        long sliceBytes = 0;
+        int sliceQuads = 0;
+        for (DhLodMeshSink.Section section : sortSnapshot) {
+            final long version = section.serial * 2L + textureBit;
+            if (Long.valueOf(version).equals(UPLOADED.get(section.pos))) continue; // 早前切片已传
+            slice.add(section);
+            wantedSlice.put(section.pos, version);
+            sliceQuads += section.quadCount();
+            sliceBytes += section.quads.length;
+            if (slice.size() >= SECTIONS_PER_FRAME || sliceBytes >= BYTES_PER_FRAME) break;
+        }
+        for (DhLodMeshSink.Section section : slice) PENDING.remove(section.pos); // 进切片即出队
+
+        final List<Long> removes = new ArrayList<>(PENDING_REMOVES.keySet());
+        PENDING_REMOVES.clear();
+
+        if (slice.isEmpty() && removes.isEmpty()) return;
+        dispatch(wantedSlice, slice, removes, sliceQuads, textured, PENDING.size() + removes.size());
+    }
+
+    /** 切比雪夫距离（与 DhLodMeshSink.distance 同语义，视图中心取玩家所在格）。 */
+    private static int chebyshev(DhLodMeshSink.Section s) {
+        final int cx = (int) Math.floor(sortCenterX);
+        final int cz = (int) Math.floor(sortCenterZ);
+        return Math.max(
+                axisGap(s.minBlockX, s.minBlockX + s.blockWidth, cx),
+                axisGap(s.minBlockZ, s.minBlockZ + s.blockWidth, cz));
+    }
+
+    private static int axisGap(int lo, int hi, int c) {
+        if (c < lo) return lo - c;
+        if (c > hi) return c - hi;
+        return 0;
     }
 
     /**
@@ -200,7 +334,7 @@ public final class DhFarFieldUploader {
      *                 就不再修改，跨线程读是安全的。
      */
     private static void dispatch(Map<Long, Long> wanted, List<DhLodMeshSink.Section> sections,
-                                 List<Long> toRemove, int quads, boolean textured) {
+                                 List<Long> toRemove, int quads, boolean textured, int pendingTotal) {
         final long generation = GENERATION.get();
         if (!JOB_IN_FLIGHT.compareAndSet(false, true)) return;
         WORKER.execute(() -> {
@@ -209,9 +343,27 @@ public final class DhFarFieldUploader {
                 final long start = System.nanoTime();
                 int uploaded = 0;
                 long bytes = 0;
-                for (DhLodMeshSink.Section section : sections) {
+                byte[][] batchOut = null;
+                if (RUST_CONVERT && RustBridge.available()) {
+                    try {
+                        final byte[][] srcs = new byte[sections.size()][];
+                        final int[] widths = new int[sections.size()];
+                        for (int i = 0; i < sections.size(); i++) {
+                            srcs[i] = sections.get(i).quads;
+                            widths[i] = sections.get(i).blockWidth;
+                        }
+                        batchOut = RustBridge.convertSectionsBatch(srcs, widths, textured);
+                    } catch (Throwable failure) {
+                        log("[RUST-DH] batch failed, per-section fallback: " + failure);
+                        batchOut = null;
+                    }
+                }
+                for (int index = 0; index < sections.size(); index++) {
                     if (generation != GENERATION.get()) return;
-                    final byte[] converted = convert(section, textured);
+                    final DhLodMeshSink.Section section = sections.get(index);
+                    final byte[] converted = (batchOut != null && batchOut[index] != null)
+                            ? batchOut[index]
+                            : convert(section, textured);
                     if (converted.length == 0) {
                         NativeVulkan.uploadDhLodSection(section.pos, wanted.get(section.pos),
                                 section.minBlockX, section.minHeight, section.minBlockZ,
@@ -235,7 +387,7 @@ public final class DhFarFieldUploader {
                 uploadedSections += uploaded;
                 removedSections += removed;
                 syncDone(uploaded, removed, sections.size(), quads, bytes,
-                        (System.nanoTime() - start) / 1_000_000L);
+                        (System.nanoTime() - start) / 1_000_000L, pendingTotal);
             } catch (Throwable failure) {
                 log("转换/上传失败：" + failure);
             } finally {
@@ -245,13 +397,16 @@ public final class DhFarFieldUploader {
     }
 
     private static void syncDone(int uploaded, int removed, int sectionCount, int quads, long bytes,
-                                 long millis) {
+                                 long millis, int pendingLeft) {
         syncs++;
         uploadedQuads = quads;
         log("增量：上传 " + uploaded + " 节 / 撤下 " + removed + " 节"
                 + "（本轮应画 " + sectionCount + " 节 quad=" + quads + " 转换字节=" + bytes
                 + " 耗时=" + millis + "ms）"
                 + " ｜ " + DhLodMeshSink.stats());
+        if (pendingLeft > 0) {
+            log("帧批：本批 " + uploaded + " 节，PENDING 剩 " + pendingLeft + " 节待后续帧派发");
+        }
         if (uploaded + removed > 0) {
             log("层级 " + DhLodMeshSink.levelHistogram());
         }
@@ -363,6 +518,10 @@ public final class DhFarFieldUploader {
         released = true;
         DhLodMeshSink.clear();
         GENERATION.incrementAndGet();
+        PENDING.clear();
+        PENDING_REMOVES.clear();
+        sortSnapshot = null;
+        sortedSize = -1;
         if (!UPLOADED.isEmpty()) {
             UPLOADED.clear();
             uploadedQuads = -1;

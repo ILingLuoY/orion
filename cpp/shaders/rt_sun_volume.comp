@@ -1,0 +1,103 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// ===========================================================================
+// 2026-11-12：太阳可见性体积（S1）
+//
+// 目的：给体积雾的**太阳项**提供射线级严格的遮挡，替代"2D 阴影图 + PCF"。
+//
+// 为什么只做近处 32 格：
+//   太阳阴影图（1024², ±160 格）的空间精度是 0.31 格，边缘问题来自 PCF 与
+//   "无数据"判据，而不是分辨率。真正漏光的是**近场**（洞穴里 5~30 格处的
+//   洞顶/岩壁）。所以这里覆盖 [near, 32] 格——与 ReSTIR froxel 体积同一个
+//   距离范围（VOL_RESTIR_MAX_DISTANCE = 32），32 格外继续用阴影图兜底。
+//
+// 布局：相机视锥对齐的 3D 图（r8），每 texel 一条朝太阳的 ray query。
+//   尺寸固定 64×64×32：满足体积雾 16 步 march 的取样精度，且与窗口分辨率解耦
+//   （不需要随分辨率重建资源）。
+//   深度映射必须与 vol_restir_composite.comp 同口径：
+//     viewZ = near + pow(sliceT, VOL_RESTIR_DEPTH_EXPONENT) * VOL_RESTIR_MAX_DISTANCE
+//   因此下面两个常量必须与 OrionInternal.h 的 VOL_RESTIR_DEPTH_EXPONENT /
+//   VOL_RESTIR_MAX_DISTANCE 保持一致。
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(set = 0, binding = 1) uniform accelerationStructureEXT sceneTlas;
+layout(r8, set = 0, binding = 2) uniform writeonly image3D sunVisibilityOut;
+
+#include "sky_model_common.glsl"
+
+// 必须与 OrionInternal.h 一致
+const float SUN_VIS_MAX_DISTANCE = 32.0;   // VOL_RESTIR_MAX_DISTANCE
+const float SUN_VIS_EXPONENT = 2.0;        // VOL_RESTIR_DEPTH_EXPONENT
+
+// 射线长度：略超过体积的对角覆盖，保证"这条柱子后面有没有东西"能判到底。
+const float SUN_VIS_RAY_LENGTH = 48.0;
+
+void main()
+{
+    const ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    const ivec3 size = imageSize(sunVisibilityOut);
+
+    if(any(greaterThanEqual(coord, size)))
+    {
+        return;
+    }
+
+    const vec2 uv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+    vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+
+    const vec4 viewPosition = cam.projInverse * vec4(ndc, 1.0, 1.0);
+    const vec3 viewTarget = abs(viewPosition.w) > 1.0e-6
+        ? viewPosition.xyz / viewPosition.w
+        : viewPosition.xyz;
+    const vec3 worldDirection = normalize(
+        (cam.viewInverse * vec4(normalize(viewTarget), 0.0)).xyz);
+
+    const vec3 cameraPosition = cam.viewInverse[3].xyz;
+    const vec3 cameraForward = -normalize(cam.viewInverse[2].xyz);
+    const float cosAngle = max(dot(worldDirection, cameraForward), 1.0e-3);
+
+    const float nearPlane = max(cam.cameraParams.x, 1.0e-3);
+    const float sliceT = (float(coord.z) + 0.5) / float(size.z);
+    const float viewZ = nearPlane +
+        pow(sliceT, SUN_VIS_EXPONENT) * SUN_VIS_MAX_DISTANCE;
+
+    const vec3 worldPos = cameraPosition + worldDirection * (viewZ / cosAngle);
+
+    const vec3 sunDir = sunDirection();
+
+    // 太阳贴地/落下：按"不遮挡"写，交给阴影图那边的既有语义。
+    if(sunDir.y <= 0.02)
+    {
+        imageStore(sunVisibilityOut, coord, vec4(1.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    rayQueryEXT query;
+    rayQueryInitializeEXT(
+        query,
+        sceneTlas,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        0xFFu,
+        worldPos,
+        0.05,
+        sunDir,
+        SUN_VIS_RAY_LENGTH);
+
+    while(rayQueryProceedEXT(query)) {}
+
+    const bool blocked =
+        rayQueryGetIntersectionTypeEXT(query, true) !=
+        gl_RayQueryCommittedIntersectionNoneEXT;
+
+    imageStore(sunVisibilityOut, coord, vec4(blocked ? 0.0 : 1.0, 0.0, 0.0, 1.0));
+}

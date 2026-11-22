@@ -46,7 +46,13 @@ OUT_DIR = os.path.join(ROOT, "perf", "step0")
 # 所以这张表必须跟着 C++ 的枚举走。
 GPU_SCOPES = ["vli", "far", "setup", "wsim", "wfft", "wcaus", "caus",
               "cloudpipe", "rtpipe", "sfar", "sharcup", "sky", "gi", "trace",
+              "k1", "k2sun", "k2loc", "k2i",
               "rt", "snear", "height", "cloud", "dlss", "sdr", "blit", "fg", "tail"]
+
+# 2026-11-17：C++ 把 trace 段拆成四腿（PERF_L10_GPU_B_TRACE 之后插了 K1/K2SUN/
+# K2LOC/K2I 四个边界）。为了让所有以 trace 为锚点的历史对照继续成立，这里把
+# 「trace + 四腿」重新合成为一个派生字段 trace，四腿各自的值仍单独保留。
+LEG_SCOPES = ["trace", "k1", "k2sun", "k2loc", "k2i"]
 
 # 归因锚点。2026-10-28 之前这里是 "rt"，但 rt 段现在只剩 SHaRC resolve
 # （实测 0.02 ms 恒定，SHaRC 默认关），主 RayGen 的 20+ ms 记在 **trace** 上。
@@ -77,6 +83,8 @@ STAGE_NAMES = {
     14: "rrOff",             # force GI roulette OFF (the only arm that can ADD work)
     15: "spare15",           # 2026-10-21: 原 noIndirectPom 撤销（POM 不可砍），槽位保留
     16: "noVoxelDda",        # 2026-10-13: 体素 DDA 遍历（棱缝门 + 本地光二级弹射）
+    39: "noLocalVoxOcc",     # 2026-11-17: 只关本地光路径的保守体素 DDA
+    40: "noLocalRis1",       # 2026-11-17: RIS 候选 16 -> 1
 }
 
 # 2026-10-08: 5/6/7 were NO-OPS in the deployed build.  Their predicates had no live
@@ -196,6 +204,10 @@ def parse_log(path, offset=0):
                 w["frame"] = d.get("frameMs") if isinstance(d.get("frameMs"), float) else None
                 for s in GPU_SCOPES:
                     w[s] = d.get(s) if isinstance(d.get(s), float) else None
+                # 四腿齐全 ⇒ trace = trace(前导) + k1 + k2sun + k2loc + k2i，
+                # 这样所有以 trace 为锚点的对照（含历史局）都在同一口径上。
+                if all(isinstance(w.get(s), float) for s in LEG_SCOPES):
+                    w["trace"] = sum(w[s] for s in LEG_SCOPES)
                 if w["frame"] is not None:
                     windows.append(w)
             elif "[RT STAGE CNT]" in line:
@@ -206,6 +218,9 @@ def parse_log(path, offset=0):
                     "rays": d.get("rays"),
                     "hits": d.get("hits"),
                     "mateval": d.get("mateval"),
+                    "ev_primary": d.get("ev_primary"),
+                    "ev_secondary": d.get("ev_secondary"),
+                    "ev_glass": d.get("ev_glass"),
                     "frames": d.get("frames"),
                 })
             elif "[PERF L10 CPU]" in line:
@@ -535,10 +550,15 @@ def report(paths, top=1):
                 rays = c["rays"] if isinstance(c["rays"], float) else 0.0
                 hits = c["hits"] if isinstance(c["hits"], float) else 0.0
                 mate = c["mateval"] if isinstance(c["mateval"], float) else 0.0
-                print("    win=%-3s rays=%-9d hits=%-9d mateval=%-9d frames=%d"
-                      % (c["win"], int(rays), int(hits), int(mate), int(fr)))
-                print("      per-frame: rays=%.2f hits=%.2f mateval=%.2f"
-                      % (rays / fr, hits / fr, mate / fr))
+                evp = c["ev_primary"] if isinstance(c["ev_primary"], float) else 0.0
+                evs = c["ev_secondary"] if isinstance(c["ev_secondary"], float) else 0.0
+                evg = c["ev_glass"] if isinstance(c["ev_glass"], float) else 0.0
+                print("    win=%-3s rays=%-9d hits=%-9d mateval=%-9d ev_primary=%-9d ev_secondary=%-9d ev_glass=%-9d frames=%d"
+                      % (c["win"], int(rays), int(hits), int(mate),
+                         int(evp), int(evs), int(evg), int(fr)))
+                print("      per-frame: rays=%.2f hits=%.2f mateval=%.2f primary=%.2f secondary=%.2f glass=%.2f"
+                      % (rays / fr, hits / fr, mate / fr,
+                         evp / fr, evs / fr, evg / fr))
                 if px:
                     print("      per-pixel: rays=%.3f hits=%.3f mateval=%.3f"
                           % (rays / px, hits / px, mate / px))

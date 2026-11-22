@@ -1,0 +1,108 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ===========================================================================
+// Volumetric Fog & Volumetric Light — Pass 4/4: Full-Res Exact-Depth Apply
+//
+// Samples the pre-integrated 3D froxel volume (binding 28, hardware trilinear)
+// at each pixel's exact Reversed-Z sceneDepth (binding 5) and composites
+// directly onto the RT scene buffer (binding 24).
+//
+// Works identically whether volumetric clouds are ON or OFF, with zero low-res
+// silhouette haloing and exact occlusion against all RT & DH geometry.
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(set = 0, binding = 5) uniform sampler2D sceneDepth;
+layout(rgba16f, set = 0, binding = 24) uniform image2D applySceneColor;
+layout(set = 0, binding = 28) uniform sampler3D fogIntegrated;
+
+layout(push_constant) uniform FogFroxelPush
+{
+    vec4 params; // x = layers, y = maxDistance, z = unused, w = unused
+} pc;
+
+#include "fog_froxel_common.glsl"
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(applySceneColor);
+    if(pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    if(cam.cloudParams7.x < 0.5 || cam.waterSimState.w != 0u)
+    {
+        return;
+    }
+
+    const int layers = max(int(pc.params.x + 0.5), 2);
+    const float maxDistance = max(pc.params.y > 1.0 ? pc.params.y : cam.cloudParams8.w, 16.0);
+    const float startDistance = clamp(cam.cloudParams9.x, 0.0, maxDistance);
+
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    const ivec2 depthSize = textureSize(sceneDepth, 0);
+    float rawDepth = 0.0;
+    if(depthSize == size)
+    {
+        rawDepth = texelFetch(sceneDepth, pixel, 0).r;
+    }
+    else if(depthSize.x > 0 && depthSize.y > 0)
+    {
+        const ivec2 depthCoord = clamp(ivec2(uv * vec2(depthSize)), ivec2(0), depthSize - ivec2(1));
+        rawDepth = texelFetch(sceneDepth, depthCoord, 0).r;
+    }
+
+    const float sceneDistance = fogSceneDistanceForDepth(uv, rawDepth, cam.projInverse);
+    const float evalDistance = min(sceneDistance, maxDistance);
+    if(evalDistance <= startDistance + 1.0e-3)
+    {
+        return;
+    }
+
+    const bool isSolidGeometry = (rawDepth > 1.0e-5);
+    const float lookupDistance = isSolidGeometry
+        ? max(startDistance, evalDistance - 0.18)
+        : evalDistance;
+    float w = fogDistanceToIntegratedW(lookupDistance, maxDistance, layers);
+    const float ign01 = fogInterleavedGradientNoise(vec2(pixel), cam.frameCount);
+    const float ditherGate = smoothstep(startDistance, startDistance + 4.0, lookupDistance) *
+        (1.0 - smoothstep(maxDistance * 0.90, maxDistance, lookupDistance));
+    const float signedIgn = isSolidGeometry
+        ? (-ign01 * 0.45)
+        : ((ign01 - 0.5) * 0.70);
+    const float wMin = 0.5 / float(layers);
+    const float wMax = (float(layers) - 0.5) / float(layers);
+    w = clamp(w + signedIgn * (1.0 / float(layers)) * ditherGate, wMin, wMax);
+    vec4 fog = textureLod(fogIntegrated, vec3(uv, w), 0.0);
+
+    if(!all(equal(fog, fog)))
+    {
+        return;
+    }
+    fog.rgb = max(fog.rgb, vec3(0.0));
+    fog.a = clamp(fog.a, 0.0, 1.0);
+
+    if(fog.a >= 0.9999 && dot(fog.rgb, vec3(1.0)) <= 1.0e-5)
+    {
+        return;
+    }
+
+    if(any(greaterThan(fog.rgb, vec3(8.0))))
+    {
+        const vec3 over = max(fog.rgb - vec3(8.0), vec3(0.0));
+        fog.rgb = min(fog.rgb, vec3(8.0)) + over / (vec3(1.0) + over * 0.25);
+    }
+
+    vec4 scene = imageLoad(applySceneColor, pixel);
+    scene.rgb = max(scene.rgb, vec3(0.0)) * fog.a + fog.rgb;
+    imageStore(applySceneColor, pixel, scene);
+}

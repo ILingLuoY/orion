@@ -8,9 +8,24 @@
 // 层数只受用户设置 mirrorBounceLimit(1..8) 约束，与表面粗糙度/距离无关。
 //
 // 两个开关（都在 CameraUBO 里，运行时改，不需重编）：
-//   cam.giRayParams.w        > 0.5 ⇒ RR 生效      （ORION_GLOSSY_RR，默认开）
-//   cam.pomSecondaryParams.y > 0.5 ⇒ 层数 LOD 生效（ORION_GLOSSY_STEP_LOD，默认开）
+//   cam.giRayParams.w        > 0.5 ⇒ RR 生效      （ORION_GLOSSY_RR，默认开，=0 关）
+//   cam.pomSecondaryParams.y > 0.5 ⇒ 层数 LOD 生效（ORION_GLOSSY_STEP_LOD，默认关，=1 开）
+//
+// 2026-11-16：上面两行的默认值此前与 Settings.cpp 不一致（代码要求 =1 才开，
+// 注释写"默认开"），导致 RR 这份"半成品"实际从未生效。现在以代码为准对齐：
+// RR 默认开（Settings.cpp 改成 =0 才关），层数 LOD 保持默认关（仍是 A/B 开关）。
 // ============================================================================
+
+// 2026-11-16：glossy RR 的两个调节旋钮（编译期，便于 A/B 出数）。
+// 语义与回退见下方 RR 块。
+#ifndef GLOSSY_RR_DEPTH_RAMP
+#define GLOSSY_RR_DEPTH_RAMP 0.5
+#endif
+
+#ifndef GLOSSY_RR_SURVIVAL_FLOOR
+#define GLOSSY_RR_SURVIVAL_FLOOR 0.35
+#endif
+
 uint orionGlossyRrSeed()
 {
     return (uint(gl_LaunchIDEXT.x) * 1973u +
@@ -202,26 +217,61 @@ for(
             hit.state |= RT_STATE_GI_NO_POM_BIT;
         }
 
-        // RR：throughput 已衰减到可忽略时按概率终止，并对存活者除以 q 补偿
-        // （无偏：只改方差，不改期望）。第一跳不抽签，保证主反射始终存在。
+        // ================================================================
+        // 2026-11-16：俄罗斯轮盘从"固定阈值筛选"改成 GI 同形的**存活概率模型**。
+        //
+        // 旧写法（q < 0.30 才掷骰，存活概率 = q）在镜面链上形同虚设：金属每跳
+        // 只乘一个 Fresnel（0.9+），q 永远 > 0.3 ⇒ RR 一次也不触发，深度完全由
+        // 整数 mirrorBounceLimit 决定 ⇒ "镜子里映镜子少一层"肉眼可见，且空房间
+        // 和堆满镜面的房间付一样的射线钱。
+        //
+        //   term      = (1 - q) + GLOSSY_RR_DEPTH_RAMP * depthRamp
+        //   depthRamp = max(0, pathStep / cap - 0.4)   // 前 40% cap 不参与
+        //   survival  = clamp(1 - term, 0.35, 1)
+        //   存活      ⇒ throughput /= survival          // 无偏，权重 ≤ 2.86×
+        //
+        // 语义：q 越高（镜面越亮、Fresnel 越接近 1）越难终止；越接近 cap 越容易
+        // 终止 ⇒ 同一条链里亮的自动多弹、暗的自动早停，**期望**深度低于 cap，
+        // 但 cap 仍是硬上限（纯镜面的 :433 判断照样先返回）。第一跳不抽签，保证
+        // 主反射始终存在；抽签用私有 RNG state，不动主采样流。
+        //
+        // 0.35 的地板只抬方差、不引入偏差（推导见 docs/decisions/russian-roulette.md）。
+        // 回退：ORION_GLOSSY_RR=0 整块不执行；或 -DGLOSSY_RR_DEPTH_RAMP=0 只留亮度项；
+        //       -DGLOSSY_RR_SURVIVAL_FLOOR=1.0 回到"只抽签不减预算"的极端保守档。
+        // ================================================================
         if(orionGlossyRrEnabled() && pathStep > 0)
         {
             const float orionQ =
                 clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.0, 1.0);
 
+            // 萤火虫闸：throughput 已 ≈ 0 的路径继续抽签，只会把 1/0.02 的权重
+            // 抬得更离谱。改动前同样是硬 return，行为不变。
             if(orionQ < 0.02)
             {
                 return accumulatedRadiance;
             }
 
-            if(orionQ < 0.30)
+            const float orionDepthRamp =
+                max(
+                    0.0,
+                    float(pathStep) / float(max(orionGlossyBounceLimit, 1)) - 0.4
+                );
+
+            const float orionSurvival =
+                clamp(
+                    1.0 - ((1.0 - orionQ) + GLOSSY_RR_DEPTH_RAMP * orionDepthRamp),
+                    GLOSSY_RR_SURVIVAL_FLOOR,
+                    1.0
+                );
+
+            if(orionSurvival < 1.0)
             {
-                if(orionGlossyRandNext(orionGlossyRrState) > orionQ)
+                if(orionGlossyRandNext(orionGlossyRrState) > orionSurvival)
                 {
                     return accumulatedRadiance;
                 }
 
-                throughput /= orionQ;
+                throughput /= orionSurvival;
             }
         }
 
@@ -860,8 +910,9 @@ waterInterfaceStepCount +=
     1;
 
         hitNormal =
-            stabilizeWaterInterfaceNormal(
-                hitNormal
+            waterInterfaceNormalForRay(
+                hitNormal,
+                currentDirection
             );
 
         bool exitingWater =
@@ -1275,8 +1326,16 @@ float traceWaterReflectedSun(
     // Flat water = 1 (no change).  Uncovered texels stay 0
     // and must read as "unperturbed", hence the > 0 test.
     // =================================================
+    // 2026-11-20 Remix 核心对齐：Remix 的反射瓣只吃场景辐亮度，**不采焦散图**
+    //（translucent_surface_material_interaction.slangh 的
+    // CalcSpecularReflectionSample 没有任何 caustic 输入）。这里原来的
+    // 1 + (d-1)*4（clamp 到 6）在掠射 F≈1 时会把波纹打成过曝白斑，
+    // 且新泼溅图的 floor=0.20 会让平坦水面落进"负增益"档（黑洞）。
+    // 置 false = 纯 Fresnel 镜面太阳；改 true 回旧档做 A/B。
+    const bool WATER_REFLECT_CAUSTIC_ENABLED = false;
     float reflectedCausticGain = 1.0;
-    if(cam.waterFftParams.y > 0.0 && cam.waterFftParams2.w > 0.5)
+    if(WATER_REFLECT_CAUSTIC_ENABLED &&
+       cam.waterFftParams.y > 0.0 && cam.waterFftParams2.w > 0.5)
     {
         float projScale = float(rtLaunchSize().y) /
             (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
@@ -1285,16 +1344,19 @@ float traceWaterReflectedSun(
             length(receiverPos - cam.viewInverse[3].xyz),
             projScale);
         // 2026-11-01：宿主改成 compute 生产，反射参考面从 +4 格抬到 +16 格
-        // （覆盖到水面以上 32 格）。图的键仍是"源水面坐标"，所以要按接收面的
-        // **实际高度**扣掉平坦反射位移 —— 否则 2~8 格（洞穴顶/桥下，最常见）
-        // 会过冲成大光斑，30 格处又会偏小。
+        // （覆盖到水面以上 32 格）。
+        // 2026-11-20 泼溅重构：图的键从"源水面点"换成"接收面"（落在 16 格
+        // 参考面上的位置）。所以采样点 = 接收面沿**平坦反射方向**退到 16 格
+        // 面的那一点：receiver - out.xz * ((16 - h) / out.y)，out = (-sun.xz, sun.y)。
         const float reflectHeight = max(
             waterHitPos.y - cam.waterSimSurfaceAndOrigin.x, 0.0);
+        const float mapReflectHeight = 16.0;
         const vec2 flatReflectOffset = vec2(-sunDirection.x, -sunDirection.z) *
-            (reflectHeight / max(abs(sunDirection.y), 0.02));
+            ((mapReflectHeight - reflectHeight) /
+                max(abs(sunDirection.y), 0.02));
         float causticDensity = textureLod(
             waterReflectCausticMap,
-            (waterHitPos.xz - flatReflectOffset) /
+            (waterHitPos.xz + flatReflectOffset) /
                 max(cam.waterFftParams.x, 1.0e-3),
             causticLod).r;
         if(causticDensity > 1.0e-4)

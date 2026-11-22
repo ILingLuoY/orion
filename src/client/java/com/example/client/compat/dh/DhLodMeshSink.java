@@ -6,6 +6,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.PriorityQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
@@ -216,14 +217,17 @@ public final class DhLodMeshSink {
         final long target = (long) (MAX_STORED_BYTES * EVICT_TARGET_RATIO);
         final LongOpenHashSet live = new LongOpenHashSet(enabled);
 
-        final List<Section> byPriority = new ArrayList<>(SECTIONS.values());
-        byPriority.sort(Comparator
-                .comparingInt((Section s) -> live.contains(s.pos) ? 1 : 0)
-                .thenComparing(Comparator.comparingInt(DhLodMeshSink::distance).reversed()));
+        // P3：复合键堆（非在用先、距离降序，与原排序同键）O(N) 建堆，pop 到 target 即停，
+        // 替代全表排序（风暴期只淘汰 k 个时省 O(N log N)→O(N + k log N)）
+        final PriorityQueue<Section> byPriority = new PriorityQueue<>(Math.max(1, SECTIONS.size()),
+                Comparator.comparingInt((Section s) -> live.contains(s.pos) ? 1 : 0)
+                        .thenComparing(Comparator.comparingInt(DhLodMeshSink::distance).reversed()));
+        byPriority.addAll(SECTIONS.values());
 
         long stored = STORED_BYTES.get();
         boolean droppedLive = false;
-        for (Section section : byPriority) {
+        Section section;
+        while ((section = byPriority.poll()) != null) {
             if (stored <= target) break;
             if (live.contains(section.pos)) droppedLive = true;
             stored -= section.quads.length;
@@ -293,18 +297,17 @@ public final class DhLodMeshSink {
      */
     private static void makeRoom(long incomingPos, int previousBytes, int incomingBytes) {
         final LongOpenHashSet live = new LongOpenHashSet(enabled);
+        // P3：单趟建堆（仅收非在用、非 incoming，距离降序）O(N)，逐 pop 淘汰至预算内 O(k log N)，
+        // 替代 while+全表扫的 O(k·N)；距离键在本次调用内不变（视图中心同帧），语义与原实现等价
+        final PriorityQueue<Section> victims = new PriorityQueue<>(Math.max(1, SECTIONS.size()),
+                Comparator.comparingInt(DhLodMeshSink::distance).reversed());
+        for (Section section : SECTIONS.values()) {
+            if (section.pos == incomingPos) continue;
+            if (live.contains(section.pos)) continue;
+            victims.add(section);
+        }
         while (STORED_BYTES.get() - previousBytes + incomingBytes > MAX_STORED_BYTES) {
-            Section victim = null;
-            int victimDistance = -1;
-            for (Section section : SECTIONS.values()) {
-                if (section.pos == incomingPos) continue;
-                if (live.contains(section.pos)) continue;
-                final int distance = distance(section);
-                if (distance > victimDistance) {
-                    victimDistance = distance;
-                    victim = section;
-                }
-            }
+            final Section victim = victims.poll();
             if (victim == null) return;
             EVICTED.incrementAndGet();
             remove(victim.pos);

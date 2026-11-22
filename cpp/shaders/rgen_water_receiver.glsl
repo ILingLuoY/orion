@@ -7,6 +7,43 @@
 // apply (1-F), while TIR reflects.  This removes the old roulette flicker
 // without adding paths or changing water-surface normals.
 // =====================================================
+#ifndef WATER_VOLUME_INSCATTER_V2
+#define WATER_VOLUME_INSCATTER_V2 1
+#endif
+#ifndef WATER_RECEIVER_GI_ADAPTIVE_GATE
+#define WATER_RECEIVER_GI_ADAPTIVE_GATE 1
+#endif
+
+// ===========================================================================
+// 2026-11-18：**水面像素的射线预算降级**（用户："靠近水面的超级掉帧"）。
+//
+// 实测（本局 18:5x）：同一场景，远离水面 k2sun=0.5 ms，靠近水面 0.5 → 5 → 20 → 36 ms，
+// 全帧 41 ms。原因：水面像素的**整套着色**（反射/折射 walker、界面循环、
+// 太阳透射 march、焦散 + SSS）都跑在 K2-SUN 这条腿里（rgen_main_body.glsl:1938
+// 的"水像素的着色在此完整结束"），所以成本 ∝ 水的屏幕占比。
+//
+// 原有机制 perfL10WaterAdaptiveScale 只把**距离阈值**收紧（除以 0.35），
+// 并不减少每条射线的步数 —— 近处水像素仍然 6 步全开，所以在 36 ms 时它救不了。
+//
+// 这里补一档按帧时间的**步数/预算**降级：
+//   · 16 ms 以下：0（完全不介入，与改动前逐位相同）
+//   · 16–30 ms：线性上升
+//   · 30 ms 以上：1（walker 砍到 2 步、界面循环砍到 1 步、太阳 march 砍到 1 步）
+// 帧时间恢复后会自己回到全质量，不需要重启。
+// ===========================================================================
+float perfL10WaterLoad()
+{
+    const float frameMs =
+        cam.rtSampleParams.w;
+
+    if(frameMs <= 0.0)
+    {
+        return 0.0;
+    }
+
+    return clamp((frameMs - 16.0) / 14.0, 0.0, 1.0);
+}
+
 vec3 tracePrimaryWaterReceiverIndirectReworked(
     vec3 receiverPos,
     vec3 receiverNormal,
@@ -75,7 +112,17 @@ const float WATER_EXTINCTION_DISTANCE =
     // 影响小；潜水看波光时 GI 会略暗/略带状。回退 = 改回 6。
     const int MAX_WATER_INTERFACE_STEPS = 3;
 
-    for(int pathStep = 0; pathStep <= MAX_WATER_INTERFACE_STEPS; ++pathStep)
+    // 2026-11-18：重载时这个预算也砍到 1 步（见 perfL10WaterLoad）。
+    // 3 步的原始理由是"水→第二透射面→接收面"这类 4 跳链路；重载下宁可少那
+    // 一层嵌套，也不让整帧掉到 40 ms。
+    // 2026-11-18（重构，Remix thin-walled 口径）：水下 GI 的界面步数固定 1。
+    // 原来的 3 步理由是多界面链路（水→第二透射面→接收面），但每一跳都要一次
+    // 完整 trace + 材质解析；在全分辨率下这是 K2-SUN 腿的主项之一。
+    // 代价：只解析第一层界面（叠水/水后玻璃的 GI 会略暗），与 Remix 一致。
+    // 回退：改回下面的 MAX_WATER_INTERFACE_STEPS。
+    const int waterInterfaceBudget = 1;
+
+    for(int pathStep = 0; pathStep <= waterInterfaceBudget; ++pathStep)
     {
         hit.hitDistance = 1.0;
         hit.state = makeTraceState(
@@ -189,11 +236,15 @@ float scatterAmount = 0.0;
         }
 
         bool exitingWater = hitMaterialId > 1.5;
+        // 2026-11-20（第二版）：掠射视线下界面法线收敛到平面，折射/反射/判定
+        // 全部与三角形无关 —— 见 rgen_trace_helpers.glsl 的
+        // waterInterfaceNormalForRay 说明。陡视角逐位保留波浪法线。
         vec3 interfaceNormal =
-            stabilizeWaterInterfaceNormal(payload.normal);
-        float cosTheta = clamp(
-            -dot(currentDirection, interfaceNormal), 0.0, 1.0
-        );
+            waterInterfaceNormalForRay(payload.normal, currentDirection);
+        // 2026-11-20：Fresnel 余弦改用稳定版（平面余弦），否则逐三角形的波浪
+        // 法线在掠射视角下把 (1-F) 打到 0 ⇒ 该三角形下面的水底整块变黑
+        // （用户报的"水底闪烁黑三角"）。见 rgen_trace_helpers.glsl 的同名说明。
+        float cosTheta = waterFresnelCosine(currentDirection, interfaceNormal);
         float fresnelX = 1.0 - cosTheta;
         float fresnelX2 = fresnelX * fresnelX;
         float fresnel = WATER_F0 +
@@ -291,21 +342,37 @@ float perfL10WaterAdaptiveScale()
     return mix(1.0, 0.35, tightness);
 }
 
+// =====================================================
+// 2026-11-18：**水面像素的射线预算降级**（用户："靠近水面的超级掉帧"）。
+//
+// 实测（本局 18:5x）：同一场景，远离水面 k2sun=0.5 ms，靠近水面 0.5 → 5 → 20 → 36 ms，
+// 全帧 41 ms。原因：水面像素的**整套着色**（反射/折射 walker、界面循环、
+// 太阳透射 march、焦散 + SSS）都跑在 K2-SUN 这条腿里（rgen_main_body.glsl:1938
+// 的"水像素的着色在此完整结束"），所以成本 ∝ 水的屏幕占比。
+// 原有机制 perfL10WaterAdaptiveScale 只把**距离阈值**收紧（除以 0.35），
+// 并不减少每条射线的步数 —— 近处水像素仍然 6 步全开，所以在 36 ms 时它救不了。
+//
+// ===========================================================================
+// 2026-11-18（最终口径，对齐 RTX Remix 的 thin-walled 水面）：
+// **单次事件**。这个函数现在恒返回 1，是一个编译期常量 —— 不引入参数、
+// 不产生第二份内联副本（此前用"参数 + min()"的写法，NV 编译器在冷编时要几分钟）。
+//
+// 依据：dxvk-remix 的水面 = 一层薄壁半透明表面，
+//   · 反射/透射在**一个事件**里按 Fresnel 解析合成（brdf.slangh:520-539 的
+//     闭式几何级数，内部多次反射用级数求和而不是循环）；
+//   · 折射射线靠 penetrateSurface **继续走同一条路径**，介质吸收按真实距离
+//     Beer-Lambert 一次算完（translucent_surface_material_interaction.slangh:516-525）；
+//   · 因此他们的水面代价与水的屏幕占比无关。
+//
+// 实测（本局 23:10）：水面占屏时 k2sun 1.5 → 6 → 12 → 20 → 23.6 ms，
+// 全帧 31 ms。根因是这里按距离档跑 3–6 步 × 反射/折射两瓣。
+//
+// 代价（已知）：看穿两层以上的水/玻璃（叠水、水后玻璃）只解析第一层。
+// 回退：把 return 1 改回下面的 tierSteps（旧档 = 距离分档 + 帧时间收紧）。
+// ===========================================================================
 int waterTransparentWalkerSteps(float lodDistance)
 {
-    // 2026-10-08（B）：距离档跟着实测帧时间收紧（口径见
-    // perfL10WaterAdaptiveScale；未启用时 scale = 1.0 ⇒ 逐位旧档）。
-    const float adaptiveScale =
-        perfL10WaterAdaptiveScale();
-
-    const float scaledDistance =
-        lodDistance / adaptiveScale;
-
-    return scaledDistance < WATER_WALKER_FULL_DISTANCE
-        ? WATER_WALKER_STEPS_FULL
-        : (scaledDistance < WATER_WALKER_MID_DISTANCE
-            ? WATER_WALKER_STEPS_MID
-            : WATER_WALKER_STEPS_FAR);
+    return 1;
 }
 
 // =====================================================
@@ -425,6 +492,11 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColor();
 
     bool waterSunVisibilityTraced =
         false;
+
+    const bool entrySunValid = g_waterEntrySunValid;
+    const vec3 entrySunTrans = g_waterEntrySunTransmittance;
+    const float entryCloudShadow = g_waterEntryCloudShadow;
+    g_waterEntrySunValid = false;
 
 
     bool insideWater =
@@ -606,6 +678,16 @@ if(payload.hitDistance < 0.0)
                 ) +
                 fallbackLocalDirect;
 
+#if WATER_VOLUME_INSCATTER_V2
+            const vec3 fallbackExtinction =
+                WATER_ABSORPTION * 1.35 +
+                WATER_SCATTER_COLOR * WATER_SCATTERING * 0.35;
+            return
+                accumulatedWaterScattering +
+                throughput *
+                exp(-fallbackExtinction * payload.hitDistance) *
+                fallbackRadiance;
+#else
             return
                 throughput *
                 exp(
@@ -613,6 +695,7 @@ if(payload.hitDistance < 0.0)
                     payload.hitDistance
                 ) *
                 fallbackRadiance;
+#endif
         }
     }
 
@@ -689,23 +772,67 @@ if(insideWater)
     transmissionInfo.waterPathLength +=
         hitDistance;
 
-    // =====================================================================
-    // 2026-10-03 参考重构第 2 步（HPWaterBSDFLibary.hlsl 的
-    // diffR = G_entry × T_entry × S_volume）：**水上看向水下那段水柱的入散射**。
-    //
-    // 参考的 S_volume 由 WaterVolumetrics 射线步进得到（指数步进 EXP_FACTOR = 12，
-    // 每步 CaculateScatteredLight = scatterColor × phase × exp(-extinction·d) × dt）。
-    // 我们这里本来就是**逐格步进**（每个水体 LOD 格一次迭代、hitDistance = 该格行程），
-    // 所以按同一数学的闭式累加：
-    //     S += scatterColor × phase(cosθ) × skyRadiance × (1 - exp(-ext·d)) × T_entry
-    // T_entry = 当前 throughput（入射光到本格前已被外层格衰减的透过率），
-    // (1 - exp(-ext·d)) 是本格内的积分（逐步累加的闭式等价）。
-    // 相位复用 3820 那套（含 waterParams.w 的 HPWater 物理相位分支）。
-    // 亮度对账：与水下解析式 underwaterScatter 取同一常量
-    // UNDERWATER_COLUMN_SCATTER_BOOST = 4.0 ⇒ 水上/水下亮度一致。
-    // 互斥：相机在水里时由 applyUnderwaterWaterColumn 负责（避免重复计账）⇒
-    // 这里只在相机不在水里时累加。
-    // =====================================================================
+#if WATER_VOLUME_INSCATTER_V2
+    const vec3 sigmaA = WATER_ABSORPTION * 1.35;
+    const vec3 sigmaS = WATER_SCATTER_COLOR * WATER_SCATTERING * 0.35;
+    const vec3 sigmaT = sigmaA + sigmaS;
+
+    if(cam.waterSimState.w == 0u)
+    {
+        const vec3 singleScatAlbedo = sigmaS / max(sigmaT, vec3(1.0e-5));
+        const vec3 skyLightDir = getTimeDrivenSkyLightDirection();
+        const float muV = max(abs(currentDirection.y), 0.15);
+        const float sinAirSq = max(0.0, 1.0 - skyLightDir.y * skyLightDir.y);
+        const float muS = sqrt(max(1.0 - sinAirSq / (WATER_IOR * WATER_IOR), 0.16));
+        const float kDepth = 1.0 + muV / muS;
+
+        const float scatterCos = dot(currentDirection, skyLightDir);
+        vec3 volumePhase;
+        if(cam.waterParams.w > 0.5)
+        {
+            float rayleigh = (3.0 / (4.0 * 3.14159265359)) *
+                (1.0 + scatterCos * scatterCos);
+            float mie = min(underwaterHGPhase(scatterCos, 0.65), 1.6);
+            vec3 phase3 = vec3(0.18, 0.42, 1.0) * (rayleigh * 0.12) +
+                vec3(mie * 0.88);
+            volumePhase = mix(phase3, vec3(0.26), 0.45);
+        }
+        else
+        {
+            volumePhase = vec3(
+                mix(min(underwaterHGPhase(scatterCos, 0.6), 1.4), 0.25, 0.45));
+        }
+
+        const float waterEntryCos = clamp(skyLightDir.y, 0.0, 1.0);
+        const float waterEntryFresnel = WATER_F0 +
+            (1.0 - WATER_F0) * pow(1.0 - waterEntryCos, 5.0);
+
+        const vec3 directIntegral =
+            (vec3(1.0) - exp(-sigmaT * (kDepth * hitDistance))) / kDepth;
+        const vec3 directSunVis = entrySunValid
+            ? (entrySunTrans * entryCloudShadow)
+            : vec3(waterSunVisibility);
+        const vec3 directInScatter =
+            getTimeDrivenSkyLightColor() * 3.2 * getTimeDrivenSkyLightRadianceScale() *
+            (1.0 - waterEntryFresnel) * directSunVis *
+            singleScatAlbedo * volumePhase * directIntegral;
+
+        const float openSkyGate = entrySunValid
+            ? clamp(max(entrySunTrans.r, max(entrySunTrans.g, entrySunTrans.b)), 0.0, 1.0)
+            : waterSunVisibility;
+        const vec3 skyZenith =
+            samplePhysicalClearSkyForAerialPerspective(vec3(0.0, 1.0, 0.0));
+        const vec3 ambientIntegral = vec3(1.0) - exp(-sigmaT * hitDistance);
+        const vec3 ambientInScatter =
+            skyZenith * 0.22 * openSkyGate * singleScatAlbedo * ambientIntegral;
+
+        accumulatedWaterScattering += throughput * (directInScatter + ambientInScatter);
+    }
+
+    const vec3 absorption = exp(-sigmaT * hitDistance);
+    throughput *= absorption;
+    waterColumnFactor *= absorption;
+#else
     if(cam.waterSimState.w == 0u)
     {
         vec3 volumeExtinction = waterAbsorptionColor() + waterScatterColor();
@@ -724,11 +851,6 @@ if(insideWater)
             volumePhase = vec3(underwaterHGPhase(scatterCos, 0.6));
         }
         vec3 stepInScatter = vec3(1.0) - exp(-volumeExtinction * hitDistance);
-        // 2026-10-03 参考重构（HPWater WaterEvaluateBSDF）：**G_entry 入射菲涅尔分工**。
-        // 参考在进水体前先乘 T_entry = 1 - F(NdotL)（入射侧），出射侧另有
-        // T_exit = 1 - F(NdotV)（我们的 P1/P1b 已用 (1-F) 承担）。
-        // 这里补入射侧：阳光穿过（近水平的）水面进入水体时，被菲涅尔镜面反射掉的那
-        // 部分能量不该参与入散射 ⇒ 用太阳仰角当入射角（水平水面下的正确入射角）。
         float waterEntryCos = clamp(getTimeDrivenSkyLightDirection().y, 0.0, 1.0);
         float waterEntryFresnel = WATER_F0 +
             (1.0 - WATER_F0) * pow(1.0 - waterEntryCos, 5.0);
@@ -737,12 +859,9 @@ if(insideWater)
             getTimeDrivenSkyLightColor() * getTimeDrivenSkyLightRadianceScale() *
             volumePhase * stepInScatter * throughput *
             (1.0 - waterEntryFresnel) *
-            // 太阳可见性门控（见入口 trace 处注释）：无太阳照到的水体
-            // （洞穴/室内）该项归零 —— SSS 不该在黑暗里发光。
             waterSunVisibility *
             UNDERWATER_COLUMN_SCATTER_BOOST;
     }
-
 
     const vec3 WATER_GLASS_TINT =
         vec3(
@@ -751,10 +870,8 @@ if(insideWater)
             0.78
         );
 
-
     const float WATER_END_DISTANCE =
         16.0;
-
 
     float waterFade =
         clamp(
@@ -764,12 +881,9 @@ if(insideWater)
             1.0
         );
 
-
-    // 保持浅水透明，深水逐渐加厚
     waterFade =
         waterFade *
         waterFade;
-
 
     vec3 absorption =
         exp(
@@ -777,11 +891,8 @@ if(insideWater)
             hitDistance
         );
 
-
     throughput *= absorption;
 
-
-    // 青色玻璃厚度
     throughput =
         mix(
             throughput,
@@ -789,8 +900,6 @@ if(insideWater)
             waterFade
         );
 
-
-    // 深水降低透射
     throughput *=
         mix(
             1.0,
@@ -798,10 +907,6 @@ if(insideWater)
             waterFade
         );
 
-    // 2026-11-16：把与 throughput 同源的水体乘法逐段同步累乘进相机水柱
-    // 透射器（Beer 吸收 × GLASS_TINT 混色 × 深水 0.15 压透），opaque 接收器
-    // 命中时存进 transmissionInfo 供焦散复用 —— 焦散端旧的单发公式在多段
-    // 水程（水+玻璃+水）时与实际累乘不等，复用后以实值为准。
     waterColumnFactor *= absorption;
     waterColumnFactor =
         mix(
@@ -815,6 +920,7 @@ if(insideWater)
             0.15,
             waterFade
         );
+#endif
 }
 
 
@@ -935,7 +1041,12 @@ vec3 waterReceiverLocalDirect =
 surfaceRadiance +=
     waterReceiverLocalDirect;
 
+#if WATER_RECEIVER_GI_ADAPTIVE_GATE
+if(insideWater && enableWaterReceiverGI &&
+   max(throughput.r, max(throughput.g, throughput.b)) > 0.12)
+#else
 if(insideWater && enableWaterReceiverGI)
+#endif
 {
     surfaceRadiance +=
         tracePrimaryWaterReceiverIndirectReworked(
@@ -954,9 +1065,16 @@ if(insideWater && enableWaterReceiverGI)
 }
 
 
+#if WATER_VOLUME_INSCATTER_V2
+return
+    accumulatedWaterScattering +
+    throughput *
+    surfaceRadiance;
+#else
 return
     throughput *
     surfaceRadiance;
+#endif
 }
 
 // 2026-11-16 修「walker 整段死代码」：上面这个 } 原本缺失——
@@ -1002,8 +1120,9 @@ if(hitMaterialId >= 2.5)
 // Another water interface
 
         hitNormal =
-            stabilizeWaterInterfaceNormal(
-                hitNormal
+            waterInterfaceNormalForRay(
+                hitNormal,
+                currentDirection
             );
 
 // =====================================================

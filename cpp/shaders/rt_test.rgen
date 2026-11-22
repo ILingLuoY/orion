@@ -178,6 +178,12 @@ uniform image2D depthImage;
 layout(binding = 62, set = 0, rg16f)
 uniform image2D dlssMotionImage;
 
+// 2026-11-21 P0-1：主命中世界位移 per-pixel 旁路槽（binding 98，RGBA16F 全分辨率）。
+// 本文件每像素清槽；主射线返回后 imageLoad 读回 xyz（a<0.5 = 无写入，按 0 处理）。
+// rchit 写槽端见 rt_test.rchit；半分辨率 GI 变体不参与本信道（见 rgen_main_body 守卫）。
+layout(binding = 98, set = 0, rgba16f)
+uniform image2D hitOffsetImage;
+
 // 2026-10-22：MV 改为 **UV 单位**（宿主 mvecScale=(1,1)，官方 §6.0 的
 // "values in [-1,1] ⇒ scale {1,1}"）。此宏仅保留历史兼容，新代码不再分支。
 #define MOTION_VECTOR_UV_UNITS 1
@@ -304,9 +310,13 @@ uniform image2D giHalfImage;
 // 2026-11-12 ④ K2-D 再拆分：K2-D → K2-SUN（水+太阳直射/GGX/SSS/RTAO，写本图）
 // + K2-LOC（局部光/水面反射太阳/GGX 镜面，**load-add-store 复用本图**），
 // K2-I 照旧整图载入 ⇒ 不需要新 binding/新图像。
+// 2026-11-22 ⑤ K2-SUN 再拆分：SUN → K2-SUNA（水+RTAO，写本图）+ K2-SUNB
+//（阴影+GGX+植被SSS，**load-add 复用本图**）—— 同一套 load-add 先例第三次
+// 复用，仍不需要新 binding/新图像。
 // ============================================================================
 #if defined(ORION_K2_DIRECT_STAGE) || defined(ORION_K2_INDIRECT_STAGE) \
-    || defined(ORION_K2_DIRECT_SUN_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)
+    || defined(ORION_K2_DIRECT_SUN_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) \
+    || defined(ORION_K2_DIRECT_SUN_STAGE_A) || defined(ORION_K2_DIRECT_SUN_STAGE_B)
 layout(binding = 89, set = 0, rgba32f)
 uniform image2D k2DirectImage;
 #endif
@@ -375,14 +385,6 @@ uniform image2D glassAlphaBlendVolumeImage;
 // =====================================================
 layout(binding = 78, set = 0, r8ui)
 uniform readonly uimage2D sparseActiveMaskImage;
-
-// =====================================================
-// 2026-11-14 稀疏反射的时域历史（宿主 binding 92，rgba16f，渲染分辨率）。
-// 活跃像素写本帧反射结果，非活跃像素读上一帧结果 ⇒ 不出现 0/1-rate 方波。
-// 每个 invocation 只读写自己那一个 texel，无需 ping-pong。
-// =====================================================
-layout(binding = 92, set = 0, rgba16f)
-uniform image2D glossyHistoryImage;
 
 // =====================================================
 // 2026-11-01 档 2：近场太阳阴影图（宿主 binding 79）。
@@ -834,7 +836,24 @@ uint perfL10Stage()
     // 是最后一处要手改的地方。
     // 2026-11-07：上限 35 -> 38（36/37/38 = SER 探针 flags / RR 0.9 上限 / SER 键精简）。
     // 必须同步 OrionInternal.h 的 PERF_L10_ABLATION_STAGE_COUNT 与名字表。
-    return clamp(cam.perfAblationStage.x, 0u, 38u);
+    return clamp(cam.perfAblationStage.x, 0u, 40u);
+}
+
+// 2026-11-17：本地光 NEE 的**内部**二分（局 F 已实测这条链在 K1/LOC/I 三腿共付 1.57 ms，
+// 而 localPerPix≈0 说明硬件射线几乎不发，钱在射线之后的 RIS 候选扫描与保守体素 DDA 上）。
+//   39 = noLocalVoxOcc：只跳过 `vptVoxelPathBlocked` 的保守体素 DDA，硬件射线与 RIS 照跑。
+//       得到的 Δ 就是那条 DDA 的价格。
+//   40 = noLocalRis1：只把 RIS 候选数从 16 压到 1（同一函数同时用于归一化分母，因此无偏），
+//       硬件射线与体素 DDA 照跑。得到的 Δ 就是 15 个候选随机 buffer 读的价格。
+// 两档都只改本地光这一路，不动太阳/AO/GI 的采样口径。
+bool perfL10DisableLocalVoxelOcclusion()
+{
+    return perfL10Stage() == 39u;
+}
+
+bool perfL10LocalRisSingleProposal()
+{
+    return perfL10Stage() == 40u;
 }
 
 // 2026-11-07：三档 SER/RR 的 A/B 臂。base（stage 0）下三个谓词恒 false，
@@ -1084,7 +1103,12 @@ bool giRouletteEnabledForVariant()
 // 多界面水柱 / 玻璃堆场景的积分精度，不再钳制透射观感（用户诉求：透射
 // 统一随水深，浅清深浊）。
 #ifndef WATER_SUN_MARCH_STEPS
-#define WATER_SUN_MARCH_STEPS 3
+// 2026-11-18（重构，按 RTX Remix thin-walled 口径）：默认 1 步。
+// Remix 的薄壁水面把介质吸收按**一次** Beer-Lambert 算完（
+// translucent_surface_material_interaction.slangh:516-525），不做多界面 march；
+// 多界面精度只在叠水/玻璃堆场景有意义，而那类场景在 425k 像素的全分辨率下
+// 会直接把 K2-SUN 腿顶到 40 ms。回退：-DWATER_SUN_MARCH_STEPS=3。
+#define WATER_SUN_MARCH_STEPS 1
 #endif
 int perfL10MarchSteps(vec3 worldPos)
 {
@@ -1097,6 +1121,13 @@ int perfL10MarchSteps(vec3 worldPos)
     if(farDistance <= 0.0)
     {
         return WATER_SUN_MARCH_STEPS;
+    }
+    // 2026-11-18：重载时太阳透射 march 也砍到 1 步（见 rgen_water_receiver.glsl
+    // 的 perfL10WaterLoad 说明）。这是近水 36 ms 那一档的最后一刀：水面像素
+    // 每个界面步都会走一次这个 march，重载下整帧会到 40 ms 以上。
+    if(cam.rtSampleParams.w > 22.0)
+    {
+        return 1;
     }
     // 2026-11-16：远档 1 → 2 步。11-15 的"耗尽即返回透射"修复假设
     // "出射后剩余是明确的天空直线"，但岸边遮挡物正好在这段空气直线里：
@@ -3160,6 +3191,12 @@ bool vptReprojectPreviousPixel(
 
 uint vptRisProposalCount()
 {
+    // 2026-11-17 stage 40：只留 1 个候选。归一化分母用的是同一个函数
+    //（:3789 / :7395），所以仍然是同一个估计量，不是偏置臂。
+    if(perfL10LocalRisSingleProposal())
+    {
+        return 1u;
+    }
 #if VPT_RIS_PROPOSAL_OVERRIDE
     return clamp(cam.perfSecondary.x, 1u, 32u);
 #else
@@ -3188,6 +3225,120 @@ vec3 evaluateVPTDirectLightReservoirTail(
     bool shadingActive,
     inout uint rngState
 );
+
+// ============================================================================
+// 本地光 NEE 硬件可见性射线的跨腿缓存（binding 95）
+//
+// 背景：同一帧 K1 / K2LOC / K2I 三条腿会对同一个接收点、同一个选中光样本各打一条
+// 完全相同的可见性射线（局 F 实测这条链合计 1.57 ms，其中体素 DDA 只占 0.28 ms，
+// 主体是射线本身）。这里把射线的返回透射率按 (pixel, 本 invocation 第几次 NEE 调用)
+// 存下来，后续腿命中即复用。
+//
+// 正确性边界（重要）：记录带 64 位键 + 本帧标记，只有**两者都逐位相同**才复用；
+// 否则自己打一条并把结果写回。因此键不匹配只会白跑、不会算错；键相同则意味着同一
+// 线段、同一帧静态 TLAS，遍历结果必然相同 —— 复用不引入任何画面差异。
+// 槽位固定 4 个/像素（主命中 + 2 次弹射），超出即退回自己打射线。
+// 总闸 cam.matReuseAb.z（ORION_LOCAL_NEE_CACHE），默认 0 = 完全走旧路径。
+// ============================================================================
+#ifndef VPT_NEE_VIS_SLOTS
+#define VPT_NEE_VIS_SLOTS 4
+#endif
+
+layout(std430, binding = 95, set = 0) buffer LocalNeeVisCache
+{
+    uint records[];
+} neeVisCache;
+
+// 每 invocation 私有的 NEE 调用序号（raygen 的模块级变量本来就是 invocation 私有，
+// 每次 dispatch 从 0 开始）。用它当槽位下标，保证"第几次估值"跨腿可对齐。
+uint g_neeVisCallIndex = 0u;
+
+void neeVisCacheFold(inout uint h0, inout uint h1, uint w)
+{
+    h0 = (h0 ^ w) * 16777619u;
+    h1 = (h1 + w) * 2246822519u;
+    h1 ^= (h1 >> 15u);
+}
+
+void neeVisCacheKey(
+    vec3 origin,
+    vec3 target,
+    float entryDistance,
+    uint cullMask,
+    out uint keyLo,
+    out uint keyHi)
+{
+    uint h0 = 2166136261u;
+    uint h1 = 0x9e3779b9u;
+
+    neeVisCacheFold(h0, h1, floatBitsToUint(origin.x));
+    neeVisCacheFold(h0, h1, floatBitsToUint(origin.y));
+    neeVisCacheFold(h0, h1, floatBitsToUint(origin.z));
+    neeVisCacheFold(h0, h1, floatBitsToUint(target.x));
+    neeVisCacheFold(h0, h1, floatBitsToUint(target.y));
+    neeVisCacheFold(h0, h1, floatBitsToUint(target.z));
+    neeVisCacheFold(h0, h1, floatBitsToUint(entryDistance));
+    neeVisCacheFold(h0, h1, cullMask);
+
+    keyLo = h0;
+    keyHi = h1;
+}
+
+vec3 traceVptLocalLightVisibilityCached(
+    vec3 origin,
+    vec3 target,
+    float targetVoxelEntryDistance,
+    uint cullMask)
+{
+    if(cam.matReuseAb.z == 0u)
+    {
+        return traceVptLocalLightVisibility(
+            origin, target, targetVoxelEntryDistance, cullMask);
+    }
+
+    const uint callIndex = g_neeVisCallIndex;
+    g_neeVisCallIndex = callIndex + 1u;
+
+    if(callIndex >= uint(VPT_NEE_VIS_SLOTS))
+    {
+        return traceVptLocalLightVisibility(
+            origin, target, targetVoxelEntryDistance, cullMask);
+    }
+
+    uint keyLo = 0u;
+    uint keyHi = 0u;
+    neeVisCacheKey(
+        origin, target, targetVoxelEntryDistance, cullMask, keyLo, keyHi);
+
+    const uint pixelLinear =
+        gl_LaunchIDEXT.y * uint(gl_LaunchSizeEXT.x) + gl_LaunchIDEXT.x;
+    const uint base =
+        (pixelLinear * uint(VPT_NEE_VIS_SLOTS) + callIndex) * 8u;
+    const uint frameTag = cam.matReuseAb.w;
+
+    if(neeVisCache.records[base + 5u] == frameTag &&
+       neeVisCache.records[base] == keyLo &&
+       neeVisCache.records[base + 1u] == keyHi)
+    {
+        return vec3(
+            uintBitsToFloat(neeVisCache.records[base + 2u]),
+            uintBitsToFloat(neeVisCache.records[base + 3u]),
+            uintBitsToFloat(neeVisCache.records[base + 4u]));
+    }
+
+    vec3 transmittance = traceVptLocalLightVisibility(
+        origin, target, targetVoxelEntryDistance, cullMask);
+
+    neeVisCache.records[base] = keyLo;
+    neeVisCache.records[base + 1u] = keyHi;
+    neeVisCache.records[base + 2u] = floatBitsToUint(transmittance.x);
+    neeVisCache.records[base + 3u] = floatBitsToUint(transmittance.y);
+    neeVisCache.records[base + 4u] = floatBitsToUint(transmittance.z);
+    neeVisCache.records[base + 5u] = frameTag;
+    neeVisCache.records[base + 6u] = callIndex;
+
+    return transmittance;
+}
 
 vec3 evaluateVPTRISDirectLightingSingle(
     vec3 hitPos,
@@ -3758,7 +3909,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
     // 2026-10-07：方块光维持 0xff（含玩家自身代理）—— 只有移动光源那一路改 mask，
     // 见 DYNAMIC_LIGHT_CULL_MASK 的说明。
     vec3 transmittance = VPT_LOCAL_NEE_VISIBILITY_RAY
-        ? traceVptLocalLightVisibility(
+        ? traceVptLocalLightVisibilityCached(
             receiverOrigin,
             selectedSample,
             targetVoxelEntryDistance,
@@ -3776,7 +3927,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
 #if VPT_LOCAL_CONSERVATIVE_VOXEL_OCCLUSION
     // 见 vptVoxelPathBlocked：补齐"硬件射线从两块相接的棱缝里滑过去"这条漏光路径
     // （用户报的"方块角落的亮线"正好沿棱出现）。
-    if(vptVoxelPathBlocked(
+    if(!perfL10DisableLocalVoxelOcclusion() && vptVoxelPathBlocked(
         receiverOrigin,
         selectedSample,
         selectedBlock,
@@ -4091,7 +4242,7 @@ vec3 evaluateDynamicLightRISDirect(
         0.05
     );
     vec3 transmittance = VPT_LOCAL_NEE_VISIBILITY_RAY
-        ? traceVptLocalLightVisibility(
+        ? traceVptLocalLightVisibilityCached(
             receiverOrigin,
             selectedPosition,
             targetDistance,
@@ -4850,22 +5001,78 @@ float waterStyleWaveScale()
 
 // 0.0 = the legacy blue-teal water, 1.0 = the turquoise Waterlight look.
 // Density scale rides on absorption so "clearer / murkier" is one dial.
+// ---------------------------------------------------------------------------
+// 2026-11-21 群系水色：vanilla 的水顶点染色进入 RT 水色链。Java 每帧把玩家
+// 所在群系的水色（BiomeColors.getAverageWaterColor）发进 UBO 死车道
+//（2026-11-21 顾问轮1 F6 改名：waterSimImpulse → waterBiomeTint，C++ 字段
+// 同步改名，字节布局零变化；该 vec4 着色端原为零读者，sim 侧走 push）。
+// GLSL (x,y,z,w) = (R, G, B, valid)。调制以 vanilla 海洋参照 #3F76E4 归一：
+// 群系=海洋时逐位旧档。
+//
+// 2026-11-21 顾问轮1 F5（P1-5a）公式 v2：sRGB→线性 + Beer-Lambert 对数吸收
+// 反演 + 亮度归一散射。v1 的两处瑕疵——①对 S×T 与 a×(1-T) 双重色度调制
+//（亮群系"散射暴涨+吸收暴跌"发荧光）；②线性 (1-T) 与 Beer-Lambert 失配
+//（透射率 T=e^{-σa d} 的严格反演是 σa ∝ -ln(T)，且 sRGB 直接比率压暗暗通道）。
+// v2：吸收 = (-ln(T_lin)/-ln(ocean_lin))^0.75（0.75 幂柔和化，防双重过饱和）；
+// 散射 = (T_lin/ocean_lin)^0.6 经亮度归一（保留 35% 真实明度差、抑制 65%
+// 曝光漂移）⇒ waterScatteringAmount 无需随 tint 缩放。
+// ---------------------------------------------------------------------------
+const vec3 WATER_BIOME_TINT_OCEAN = vec3(0.2471, 0.4627, 0.8941);
+// 海洋参照 sRGB→线性（0.2471/0.4627/0.8941 的 2.2 次幂，宿主预算好的字面量）
+const vec3 WATER_BIOME_TINT_OCEAN_LIN = vec3(0.0462, 0.1835, 0.7816);
+
+#ifndef WATER_BIOME_TINT_STRENGTH
+#define WATER_BIOME_TINT_STRENGTH 1.0
+#endif
+
+vec3 waterBiomeTint()
+{
+    if(cam.waterBiomeTint.w < 0.5)
+    {
+        return WATER_BIOME_TINT_OCEAN;
+    }
+    return clamp(cam.waterBiomeTint.xyz, vec3(0.0), vec3(1.0));
+}
+
 vec3 waterAbsorptionColor()
 {
+    vec3 tint = mix(
+        WATER_BIOME_TINT_OCEAN,
+        waterBiomeTint(),
+        clamp(WATER_BIOME_TINT_STRENGTH, 0.0, 1.0)
+    );
+    vec3 tintLin = pow(max(tint, vec3(0.02)), vec3(2.2));
+    vec3 rawAbsMod = (-log(clamp(tintLin, vec3(0.02), vec3(0.98)))) /
+                     (-log(WATER_BIOME_TINT_OCEAN_LIN));
+    vec3 biomeModulate = clamp(
+        pow(rawAbsMod, vec3(0.75)), vec3(0.25), vec3(6.0)
+    );
     return mix(
         vec3(0.18, 0.055, 0.018),
         vec3(0.24, 0.045, 0.055),
         clamp(cam.waterStyleParams0.y, 0.0, 1.0)
-    ) * clamp(cam.waterStyleParams0.z, 0.25, 4.0);
+    ) * clamp(cam.waterStyleParams0.z, 0.25, 4.0) * biomeModulate;
 }
 
 vec3 waterScatterColor()
 {
+    vec3 tint = mix(
+        WATER_BIOME_TINT_OCEAN,
+        waterBiomeTint(),
+        clamp(WATER_BIOME_TINT_STRENGTH, 0.0, 1.0)
+    );
+    vec3 tintLin = pow(max(tint, vec3(0.02)), vec3(2.2));
+    vec3 rawScatMod = pow(tintLin / WATER_BIOME_TINT_OCEAN_LIN, vec3(0.60));
+    float lumaRatio = dot(rawScatMod, vec3(0.2126, 0.7152, 0.0722));
+    vec3 biomeModulate = clamp(
+        rawScatMod / mix(1.0, max(lumaRatio, 0.15), 0.65),
+        vec3(0.25), vec3(2.0)
+    );
     return mix(
         vec3(0.05, 0.22, 0.28),
         vec3(0.05, 0.34, 0.30),
         clamp(cam.waterStyleParams0.y, 0.0, 1.0)
-    );
+    ) * biomeModulate;
 }
 
 float waterScatteringAmount()
@@ -5187,7 +5394,7 @@ vec2 evaluateRainPuddleRippleGradient(vec2 worldXZ)
             vec2 delta = worldXZ - impact;
             float distanceToImpact = length(delta);
             float envelope = (1.0 - smoothstep(0.52, 1.0, age)) *
-                (1.0 - smoothstep(0.12, 0.204, distanceToImpact));
+                (1.0 - smoothstep(0.16, 0.30, distanceToImpact));
             if(envelope <= 0.0 || distanceToImpact <= 1.0e-4)
             {
                 continue;
@@ -5199,11 +5406,11 @@ vec2 evaluateRainPuddleRippleGradient(vec2 worldXZ)
         }
     }
 
-    // Keep the confirmed visible normal amplitude while reducing the ring
-    // footprint.  This remains a nine-cell analytic evaluation with no extra
-    // ray, texture, allocation, or dispatch cost.
-    // 2026-10-03（用户要求）：雨滴涟漪可见度 ×2（RAIN_VISIBILITY_GAIN）。
-    return gradient * (0.060 * rain * rippleStrength) * RAIN_VISIBILITY_GAIN;
+    // 2026-11-21 顾问轮1（修复②）：与水面两份副本同步口径——0.060 → 0.170
+    //（地面水洼旧口径在雨天整体变暗的画面里更弱）+ 环包络 0.204 → 0.30。
+    // RAIN_VISIBILITY_GAIN ×2（2026-10-03 用户要求）保留 ⇒ 地面有效振幅 0.34
+    //（平地薄膜无 FFT 波浪竞争，可以比水面 0.170 强）。
+    return gradient * (0.170 * rain * rippleStrength) * RAIN_VISIBILITY_GAIN;
 }
 
 // -------------------------------------------------------------------------
@@ -7010,7 +7217,7 @@ vec3 vptLocalEmitterSampleTransmittance(
     }
 
     vec3 transmittance = VPT_LOCAL_NEE_VISIBILITY_RAY
-        ? traceVptLocalLightVisibility(
+        ? traceVptLocalLightVisibilityCached(
             receiverOrigin,
             selectedSample,
             targetVoxelEntryDistance,
@@ -7022,7 +7229,7 @@ vec3 vptLocalEmitterSampleTransmittance(
             targetVoxelEntryDistance
         );
 #if VPT_LOCAL_CONSERVATIVE_VOXEL_OCCLUSION
-    if(vptVoxelPathBlocked(
+    if(!perfL10DisableLocalVoxelOcclusion() && vptVoxelPathBlocked(
         receiverOrigin,
         selectedSample,
         selectedBlock,

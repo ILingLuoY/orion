@@ -250,13 +250,24 @@ bool orionParcompEnabled()
     static const bool cached = []()
     {
         const char* raw = std::getenv("ORION_RT_PARCOMP");
-        // 默认开；="0" 关（回退开关）。
-        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
+
+        // 2026-11-15：默认**改为关闭**（原默认开）。依据当天实测：
+        //   parcomp 走 6~8 个 join 线程，驱动后端编译器每线程一套独立编译
+        //   上下文 ⇒ 峰值主机内存 ≈ 线程数倍。当天 4 次 parcomp 全量冷编里
+        //   3 次驱动把编译失败（OOM）吞掉后返回"成功"管线，首次 dispatch 即
+        //   在 nvoglv64+0xF5B5DC AV；另 1 次编译线程 ucrtbase fail-fast。
+        //   同步路径同一份 SPV 编到 669 s 才明确报 VK_ERROR_OUT_OF_HOST_MEMORY
+        //   （result=-3）—— 明确失败好过"坏管线 + 驱动里崩"。
+        //   代价：冷编时间回到 8~17 分钟（16 GB 机器上 6 线程本就更早撞内存墙，
+        //   并行并没有带来实际好处）。
+        // 打开方式：ORION_RT_PARCOMP=1（大内存机器自选）。
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
     }();
     return cached;
 }
 
-// 0 = 不覆盖（用 min(maxJoin, 硬件线程, 8)）；>0 = 强制线程数。
+// 0 = 不覆盖（默认 1 个 join 线程）；>0 = 强制线程数（2026-11-16 起多线程
+// 只能靠它显式打开）。
 uint32_t orionParcompThreadOverride()
 {
     static const uint32_t cached = []()
@@ -346,10 +357,10 @@ OrionParcompResult orionParcompAttempt(
 
         out.maxJoin = maxJoin;
 
-        uint32_t threads =
-            std::min<uint32_t>(maxJoin, std::thread::hardware_concurrency());
-
-        threads = std::min<uint32_t>(threads, 8u);
+        // 2026-11-16：默认单线程。此前 parcomp 一开就 min(maxJoin, 硬件, 8) 个
+        // join 线程，16GB 机器上并行 LLVM 正是冷编 OOM/驱动 AV 的推手；现在
+        // 要 1 个以上 join 线程必须显式 ORION_RT_PARCOMP_THREADS>1。
+        uint32_t threads = 1u;
 
         const uint32_t overrideThreads = orionParcompThreadOverride();
 
@@ -496,6 +507,44 @@ OrionParcompResult orionParcompAttempt(
 
 } // namespace
 
+// 2026-11-15：RTPSO 冷编峰值主机内存 20~30 GB（NV 后端编译器），16 GB 机器
+// 极易撞 commit 上限 —— 当天实测同步路径编到 669 s 后 result=-3
+// （VK_ERROR_OUT_OF_HOST_MEMORY）。创建前先把我们自己手里可让的缓冲还回去：
+//   · PBR 纹理上传 staging（> 64 MB 的大块；函数内部先等 fence 再销毁，安全）
+//   · 其它大块 staging 走同一入口，将来加新缓冲只需在这里追加
+// force=false：每进程只在第一次 RT 管线创建前做一次，避免逐条管线反复重建
+// staging；force=true：OOM 重试前再收一次。
+double orionReleaseBuffersForRtCompile(bool force)
+{
+    static bool sReleased = false;
+
+    if(sReleased && !force)
+    {
+        return 0.0;
+    }
+
+    sReleased = true;
+
+    const double freedMb = releaseHugeTextureUploadStaging();
+
+    if(freedMb > 0.0)
+    {
+        char text[224] = {};
+
+        std::snprintf(
+            text,
+            sizeof(text),
+            "[PERF PIPE] kind=rt-mem-release freedStagingMB=%.1f force=%d",
+            freedMb,
+            force ? 1 : 0
+        );
+
+        orionPipelineDiagEmit(text);
+    }
+
+    return freedMb;
+}
+
 VkResult OrionCreateRayTracingPipelineTimed(
     const char* label,
     uint32_t createInfoCount,
@@ -531,6 +580,33 @@ VkResult OrionCreateRayTracingPipelineTimed(
         (label != nullptr) ? label : "?",
         stageCount
     );
+
+    // 2026-11-15：冷编让路 —— 本进程第一次 RT 管线创建前先把可让的缓冲还回去
+    // （依据见 orionReleaseBuffersForRtCompile 的注释）。
+    orionReleaseBuffersForRtCompile(false);
+
+    // 2026-11-22 批A：编译前打 commit 水位。RT 冷编的 OOM（result=-3）前兆
+    // 就是 commit 逼近上限（2026-11-21 夜实测：空闲 4GB 时磨 45 分钟后 -3；
+    // 空闲 28GB 时 3.5 分钟完成 k1）。>=90% 附提示，照现有 hint 风格。
+    {
+        MEMORYSTATUSEX commitMem{};
+        commitMem.dwLength = sizeof(commitMem);
+        if(GlobalMemoryStatusEx(&commitMem))
+        {
+            char commitBuf[192]{};
+            std::snprintf(
+                commitBuf,
+                sizeof(commitBuf),
+                "[PERF PIPE] preCompile commitLoad=%lu%% availCommitMB=%.0f%s",
+                static_cast<unsigned long>(commitMem.dwMemoryLoad),
+                static_cast<double>(commitMem.ullAvailPageFile) /
+                    (1024.0 * 1024.0),
+                commitMem.dwMemoryLoad >= 90u
+                    ? " hint=closeAppsOrRaisePagefile"
+                    : "");
+            RTLogFlushed(commitBuf);
+        }
+    }
 
     // 2026-11-11 并行冷编尝试：deferred op + N 线程 join；任何失败回退同步。
     OrionParcompResult par;
@@ -625,6 +701,69 @@ VkResult OrionCreateRayTracingPipelineTimed(
     if(result == VK_SUCCESS && pipelineCache != VK_NULL_HANDLE)
     {
         orionPersistPipelineCacheDeferred();
+    }
+
+    // 2026-11-15：OOM（result=-3 / VK_ERROR_OUT_OF_HOST_MEMORY）单独处理。
+    // 旧行为：直接返回错误，不释放任何东西，重试也排除 -3（内存不会自己回来）。
+    // 但 deferred/parcomp 路径会把同样的 OOM **吞掉**后返回"成功"管线（句柄非空
+    // 且 result=0），首次 dispatch 即在 nvoglv64+0xF5B5DC AV —— 当天复现三次。
+    // 新行为：明确失败 → 先释放我们自己的缓冲 → 重试一次 → 仍失败则把错误交回
+    // 调用方（走"无 RT"降级），绝不让可疑管线进入渲染路径。
+    if(result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+       result == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+    {
+        const double freedMb = orionReleaseBuffersForRtCompile(true);
+
+        char oomText[320] = {};
+
+        std::snprintf(
+            oomText,
+            sizeof(oomText),
+            "[PERF PIPE] kind=rt-oom spv=%s result=%d freedStagingMB=%.1f "
+            "retrying=1 hint=raisePagefileOrCloseApps",
+            name,
+            static_cast<int>(result),
+            freedMb
+        );
+
+        orionPipelineDiagEmit(oomText);
+
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        const auto oomRetryStart = std::chrono::steady_clock::now();
+        const VkResult oomRetry = createPipe(
+            g_device,
+            VK_NULL_HANDLE,
+            pipelineCache,
+            createInfoCount,
+            pCreateInfos,
+            nullptr,
+            pPipelines
+        );
+        const double oomRetryMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - oomRetryStart
+            ).count();
+
+        char oomRetryText[256] = {};
+
+        std::snprintf(
+            oomRetryText,
+            sizeof(oomRetryText),
+            "[PERF PIPE] kind=rt-oom-retry spv=%s retryResult=%d ms=%.1f",
+            name,
+            static_cast<int>(oomRetry),
+            oomRetryMs
+        );
+
+        orionPipelineDiagEmit(oomRetryText);
+
+        if(oomRetry == VK_SUCCESS && pipelineCache != VK_NULL_HANDLE)
+        {
+            orionPersistPipelineCacheDeferred();
+        }
+
+        return oomRetry;
     }
 
     // 2026-11-06 SER -3 定案：INITIALIZATION_FAILED 不是 shader/SER 本身，而是

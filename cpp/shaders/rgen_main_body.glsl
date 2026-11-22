@@ -204,6 +204,18 @@ void main() {
         return;
     }
 
+#if !GI_HALFRES
+    // 2026-11-21 P0-1：per-pixel 旁路槽清槽。样本循环**外**每像素无条件清一次
+    //（vec4(0)，a=0 = 无有效偏移）；miss / 未被本帧重写的像素读回按 0 处理。
+    // 不能每条射线清：多样本共享同一槽位，后写覆盖先写（蓝图 §3.6）。
+    // 半分辨率 GI 变体不参与本信道：其 LaunchID 是半分辨率坐标，写全分辨率图会
+    // 错位（蓝图 §3.6 / 风险 1）；读回侧同样被 #if !GI_HALFRES 守卫。
+    imageStore(
+        hitOffsetImage,
+        ivec2(gl_LaunchIDEXT.xy),
+        vec4(0.0, 0.0, 0.0, 0.0));
+#endif
+
     // [0] 被统计的像素数（所有比率的分母）
     perfRayStatAdd(0u, 1u);
 
@@ -470,6 +482,24 @@ vec3 primaryHitWorldOffset =
         0.0
     );
 
+#if !GI_HALFRES
+// 2026-11-21 P0-1：从旁路槽（binding 98）读回 rchit 算好的主命中世界位移。
+// xyz = 世界位移，a = 有效标记；a < 0.5（miss / 未被本帧写过）按 vec3(0) 处理。
+// 守卫与现有 MV 写出同节奏（!GI_HALFRES 且 s==0，见下方 dlssMotionImage 写出块）：
+// 只取首样本值，避免多样本互相覆盖后的随机性。K2 传输腿走 landing 重建，槽内为
+// 清后 0，与改动前硬编码 vec3(0) 逐位一致。
+if(s == 0)
+{
+    const vec4 hitOffsetSlot =
+        imageLoad(hitOffsetImage, ivec2(gl_LaunchIDEXT.xy));
+
+    if(hitOffsetSlot.a >= 0.5)
+    {
+        primaryHitWorldOffset = hitOffsetSlot.xyz;
+    }
+}
+#endif
+
 // 2026-10-24：主射线是否命中了粒子。必须与 hitDistance/prevOffset **同一时刻**
 // 取走 —— 之后的 reflection/AO/shadow/GI 每次 traceRay 都会重写 payload.state
 //（与上面 prevOffset 的注释同一约束）。消费者：循环外的 TransparencyHint 写入。
@@ -527,9 +557,81 @@ primaryViewDirectionForWater = worldDir.xyz;
     // ③/④：稳定路径走内联 resolveHitMaterial（ORION_K2_MATERIAL_INLINE）；
     // D1 callable 路径硬崩 parked，借 landing 槽位回传（material_callable.glsl）。
 #ifdef ORION_K2_MATERIAL_INLINE
+    // P2 跨腿材质复用（运行期闸门 cam.matReuseAb.x = ORION_MAT_REUSE_LEGS，默认 0）。
+    // 关闭：三条腿各自原地 resolveHitMaterial，与旧行为逐位一致。
+    // 打开：SUN 解析一次后落中转 buffer（binding 94），LOC/I 读回灌进 payload、
+    // 跳过解析。下标与 landing 记录同式（同像素同样本）。
+    const uint matReuseIdx =
+        matReuseRecordIndex(
+            uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x), s);
+    const bool matReuseOn = cam.matReuseAb.x != 0u;
+    const bool matReuseAssert = cam.matReuseAb.y != 0u;
+#if defined(ORION_K2_DIRECT_SUN_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_A)
+    // 生产者腿（K2-SUN / ⑤ K2-SUNA）：照常解析一次；复用打开则把材质快照落
+    // 中转 buffer。⑤ 拆腿后 SUNA 独揽生产行（SUNB 的水像素由 SUNA 覆盖、
+    // 地形像素也在 SUNA 预 fork 落记录），SUNB 与 LOC/I 一样做消费者。
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntMateval();
+    #endif
     resolveHitMaterial(
         origin.xyz,
         worldDir.xyz);
+    if(matReuseOn)
+    {
+        matReuseStore(matReuseIdx);
+    }
+#elif defined(ORION_K2_DIRECT_SUN_STAGE_B) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_INDIRECT_STAGE)
+    // 消费者腿（K2-LOC / K2-I）：复用打开时读记录灌回、跳过解析；校验臂双跑比对。
+    if(matReuseOn)
+    {
+        MatReuseRecord reuseRecord;
+        if(matReuseLoad(matReuseIdx, reuseRecord))
+        {
+            if(matReuseAssert)
+            {
+                // 校验臂：先缓存复用值，再原地解析一次，逐位比对；payload 留解析结果。
+                #ifdef ORION_RT_STAGE_COUNTERS
+                rtCntMateval();
+                #endif
+                resolveHitMaterial(
+                    origin.xyz,
+                    worldDir.xyz);
+                matReuseAssertCompare(reuseRecord);
+            }
+            else
+            {
+                matReuseApply(reuseRecord);
+            }
+        }
+        else
+        {
+            // 无有效生产者记录（防御路径）：退回原地解析。
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntMateval();
+            #endif
+            resolveHitMaterial(
+                origin.xyz,
+                worldDir.xyz);
+        }
+    }
+    else
+    {
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntMateval();
+        #endif
+        resolveHitMaterial(
+            origin.xyz,
+            worldDir.xyz);
+    }
+#else
+    // 其余 K2 变体（单发 K2 / ③ K2-D / 内联版 / 各 SER 等）：不参与复用，原路径。
+    #ifdef ORION_RT_STAGE_COUNTERS
+    rtCntMateval();
+    #endif
+    resolveHitMaterial(
+        origin.xyz,
+        worldDir.xyz);
+#endif
 #else
     matCallableResolveToLanding(
         origin.xyz,
@@ -1584,11 +1686,94 @@ if (matId > 0.5 && matId < 2.5) {
                 // 只保留上面的 s==0 水面 RR guide 段（无成本重算，guide 语义与
                 // 主变体逐位一致），着色本体替换为图像载入。
                 sampleColor = k2DirectFromImage.rgb;
-#elif defined(ORION_K2_DIRECT_LOCAL_STAGE)
-                // ④ K2-LOC：水像素着色归 K2-SUN，本变体在水出口只 continue
-                //（不 store —— k2DirectImage 里已是 K2-SUN 落的完整水色）。
+#elif defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_B)
+                // ④ K2-LOC / ⑤ K2-SUNB：水像素着色归 K2-SUN(A)，本变体在水
+                // 出口只 continue（不 store —— k2DirectImage 里已是 K2-SUN(A)
+                // 落的完整水色）。
                 sampleColor = vec3(0.0);
 #else
+#ifndef WATER_UNDERWATER_SNELL_WINDOW
+#define WATER_UNDERWATER_SNELL_WINDOW 1
+#endif
+#ifndef WATER_CAUSTIC_FRESNEL_EXIT
+#define WATER_CAUSTIC_FRESNEL_EXIT 1
+#endif
+#if WATER_UNDERWATER_SNELL_WINDOW
+if(matId > 1.5 && cam.waterSimState.w != 0u)
+{
+    // Water -> Air interface viewed from underwater: exact Snell's Window + TIR mirror.
+    // material_resolve already oriented `normal` toward the incoming underwater ray (downward).
+    vec3 exitRefrDir = refract(worldDir.xyz, normal, 1.33);
+    vec3 exitReflDir = normalize(reflect(worldDir.xyz, normal));
+
+    if(dot(exitRefrDir, exitRefrDir) < 1.0e-6)
+    {
+        // Total Internal Reflection: pure underwater mirror (50% ray savings vs dual-lobe).
+        WaterTransmissionInfo exitTirInfo;
+        sampleColor = tracePrimaryTransparentRadiance(
+            hitPos + normal * 0.01,
+            exitReflDir,
+            true,
+            sunDir,
+            false,
+            primaryHitDistance,
+            hitPos,
+            true,
+            false,
+            exitTirInfo
+        );
+    }
+    else
+    {
+        // Inside Snell's Window (< 48.6° from vertical): refracted sky/sun/clouds + rim reflection.
+        vec3 exitRefrDirN = normalize(exitRefrDir);
+        float cosExitAir = clamp(dot(exitRefrDirN, -normal), 0.0, 1.0);
+        float efX = 1.0 - cosExitAir;
+        float efX2 = efX * efX;
+        float exitFresnel = R0 + (1.0 - R0) * (efX2 * efX2) * efX;
+
+        WaterTransmissionInfo exitAirInfo;
+        vec3 transmittedAirRadiance = tracePrimaryTransparentRadiance(
+            hitPos - normal * 0.01,
+            exitRefrDirN,
+            false,
+            sunDir,
+            false,
+            primaryHitDistance,
+            hitPos,
+            false,
+            false,
+            exitAirInfo
+        );
+
+        vec3 reflectedUnderwaterRadiance = vec3(0.0);
+        if(exitFresnel > 0.03)
+        {
+            WaterTransmissionInfo exitReflInfo;
+            reflectedUnderwaterRadiance = tracePrimaryTransparentRadiance(
+                hitPos + normal * 0.01,
+                exitReflDir,
+                true,
+                sunDir,
+                false,
+                primaryHitDistance,
+                hitPos,
+                true,
+                false,
+                exitReflInfo
+            );
+        }
+
+        sampleColor = mix(
+            transmittedAirRadiance,
+            reflectedUnderwaterRadiance,
+            exitFresnel
+        );
+    }
+}
+else
+#endif
+{
                 // 2026-10-22 水面点太阳可见性：一次 trace 同时喂给 GGX 高光
                 // （evaluatePrimaryWaterSunLighting）和下面的镜面天空反射。反射 walker 只在撞到几何时
                 // 才有遮挡，日冕瓣（±8°）能从遮挡物边缘漏进 miss ⇒ 阴影里的
@@ -1613,6 +1798,10 @@ if (matId > 0.5 && matId < 2.5) {
                         ) <= 0.0;
 #endif
                 }
+                float waterSurfaceCloudShadow =
+                    (sunDir.y > 0.02 && !waterSurfaceSunOccluded)
+                        ? c3CloudSunTransmittance(hitPos + sunDir * 0.001, sunDir)
+                        : 0.0;
 
                 // A one-sample Fresnel roulette chooses either sky
                 // reflection or water transmission for a whole pixel.  With
@@ -1638,7 +1827,14 @@ if (matId > 0.5 && matId < 2.5) {
                         primaryHitDistance,
                         // 相机可见的水面命中点 = 本像素的精确历史键。
                         hitPos,
-                        waterSurfaceSunOccluded,
+                        // 2026-11-20 Remix 核心对齐：镜面 walker 只负责"环境辐亮度"
+                        // 这一半（Remix：reflection = F × scene）。日盘/日冕由下面
+                        // evaluatePrimaryWaterSunLighting 的 dirac 瓣显式给，
+                        // 若这里再把 rmiss 的日盘 + pow(sunDot,64) 日冕带回来，
+                        // 同一份太阳会被算两遍 —— 掠射时 F≈1，就是近水那片白光。
+                        // 故恒定置 bit 14/15（不再只在被遮挡时屏蔽）。
+                        // 回退：把本实参改回 waterSurfaceSunOccluded。
+                        true,
                         // 2026-11-16：反射瓣 —— 撞到别的水面走镜面
                         //（WATER_REFLECTION_LOBE_MIRROR），不折射进水。
                         true,
@@ -1665,6 +1861,9 @@ if (matId > 0.5 && matId < 2.5) {
                 else
                 {
                     WaterTransmissionInfo transmittedTransmissionInfo;
+                    g_waterEntrySunValid = true;
+                    g_waterEntrySunTransmittance = waterSurfaceSunTransmittance;
+                    g_waterEntryCloudShadow = waterSurfaceCloudShadow;
                     vec3 transmittedRadiance =
                         tracePrimaryTransparentRadiance(
                             hitPos -
@@ -1673,7 +1872,11 @@ if (matId > 0.5 && matId < 2.5) {
                             refrDir,
                             true,
                             sunDir,
+#if WATER_RECEIVER_GI_ADAPTIVE_GATE
+                            (fresnel < 0.88),
+#else
                             true,
+#endif
                             primaryHitDistance,
                             // 相机可见的水面命中点 = 本像素的精确历史键。
                             hitPos,
@@ -1682,6 +1885,7 @@ if (matId > 0.5 && matId < 2.5) {
                             false,
                             transmittedTransmissionInfo
                             );
+                    g_waterEntrySunValid = false;
 
                     // Below the Fresnel crossover this pixel is primarily
                     // the lit receiver seen through water, so RR must not use
@@ -1718,35 +1922,41 @@ if (matId > 0.5 && matId < 2.5) {
                     // 2026-10-06 近水降本：焦散的距离闸（常量见 caustics 常量块）。
                     // 2026-10-08（B）：再乘上帧时间反馈环 —— 帧时间越紧，焦散越早
                     // 停算（未启用时 scale = 1.0 ⇒ 与改动前逐位相同）。
+#if WATER_CAUSTIC_FRESNEL_EXIT
+                    if(fresnel < 0.95 &&
+                       primaryHitDistance <
+                       WATER_CAUSTIC_MAX_DISTANCE * perfL10WaterAdaptiveScale())
+                    {
+                        g_waterEntrySunValid = true;
+                        g_waterEntryCloudShadow = waterSurfaceCloudShadow;
+                        sampleColor +=
+                            evaluatePrimaryWaterReceiverCaustics(
+                                hitPos,
+                                transmittedTransmissionInfo,
+                                sunDir
+                            ) * (1.0 - fresnel);
+                        g_waterEntrySunValid = false;
+                    }
+#else
                     if(primaryHitDistance <
                        WATER_CAUSTIC_MAX_DISTANCE * perfL10WaterAdaptiveScale())
                     {
+                        g_waterEntrySunValid = true;
+                        g_waterEntryCloudShadow = waterSurfaceCloudShadow;
                         sampleColor +=
                             evaluatePrimaryWaterReceiverCaustics(
                                 hitPos,
                                 transmittedTransmissionInfo,
                                 sunDir
                             );
+                        g_waterEntrySunValid = false;
                     }
+#endif
 
                     // 2026-10-22 A+B：SSS / 波峰透光的太阳门控改口径。
-                    //
-                    // A 可见性：复用上面（19254）已经为**同一水面点、同一光源方向**
-                    //   算好的 waterSurfaceSunTransmittance（traceSunTransmittance
-                    //   ThroughWater：不透明几何 return vec3(0.0)，玻璃按染色、水体
-                    //   按 Beer 逐段衰减）。删掉此前这里重复的二值射线 —— 旧口径只有
-                    //   miss/hit 二值，被玻璃/半透明遮挡时完全不削弱，且多一发 trace。
-                    // B 云影：补乘 c3CloudSunTransmittance。直射（21199）/ 水面高光
-                    //   （8328）/ 透射焦散（13740）/ 玻璃高光（15002）都乘它，只有
-                    //   SSS 一直缺 ⇒ 云影下的水面照样满功率散射。函数带单入口缓存
-                    //   （4389），同一着色点重复查询几乎零成本。
-                    // 光源在地平线下时 waterSurfaceSunTransmittance 为 vec3(0.0)
-                    // ⇒ 两项本就为 0（与旧档一致）。
                     float waterSssCloudShadow =
                         (cam.waterParams.x > 0.001 && sunDir.y > 0.02)
-                            ? c3CloudSunTransmittance(
-                                hitPos + sunDir * 0.001,
-                                sunDir)
+                            ? waterSurfaceCloudShadow
                             : 0.0;
 
                     // 批次3-P1：波峰透光（透射光的窄前向散射瓣，按 (1-F) 计权
@@ -1781,30 +1991,19 @@ if (matId > 0.5 && matId < 2.5) {
                         waterSssCloudShadow;
 
                     // 批次3-P1c（2026-10-03 参考重构第 2 步余项）：**多散射 / 前向散射**。
-                    // 参考的做法是屏幕空间模糊采样：HPSampleCameraColor()（mip 钳到
-                    // 2..6）+ _MultiScatterScale，把"水面之后那个颜色"糊回水体里当多次
-                    // 散射。我们 rgen 里没有屏幕空间颜色绑定（查过：无 history/prev/
-                    // color 型纹理），所以改用**精确追踪到的接收器辐亮度**
-                    // transmittedRadiance —— 它本身就是"水面之后、已被水体吸收与散射
-                    // 过的那个颜色"，物理上与参考要采样的量同源，而且没有屏幕空间模糊
-                    // 的拖影/断层。
-                    // 权重：水柱自身的散射份额 (1 − T) × 散射系数；水色与浓度继续由既有
-                    // 滑杆控制；整体倍率是常量（太强/太弱改这里）。
                     if(transmittedTransmissionInfo.reachedUnderwaterReceiver > 0.5)
                     {
+#if WATER_VOLUME_INSCATTER_V2
+                        const float kWaterMultiScatterScale = 0.9;
+#else
                         const float kWaterMultiScatterScale = 2.0;
+#endif
                         vec3 waterMultiExtinction =
                             waterAbsorptionColor() + waterScatterColor();
                         float waterMultiPath = clamp(
                             transmittedTransmissionInfo.waterPathLength, 0.05, 60.0);
                         vec3 waterMultiShare = vec3(1.0) -
                             exp(-waterMultiExtinction * waterMultiPath);
-                        // 2026-10-05 次表面散射只响应水面上方的光源：水下
-                        // 发光体自己的辐亮度（×10 自发光 + VLI 邻接辉光）没
-                        // 有穿过水面进入水体，从多散射源里扣除 —— 否则水下
-                        // 灯正上方的水面会叠出一块 SSS 亮斑。非发光接收器
-                        //（海底沙地等）扣除量为 0 ⇒ 逐位旧档。被水体吞吐
-                        // 压到 0 以下不可能（两项同吞吐口径），max 防数值。
                         vec3 waterMultiSource = max(
                             transmittedRadiance -
                                 transmittedTransmissionInfo.receiverSelfEmissionRadiance,
@@ -1814,21 +2013,6 @@ if (matId > 0.5 && matId < 2.5) {
                             waterMultiShare *
                             (kWaterMultiScatterScale * (1.0 - fresnel));
                     }
-
-                    // Shoreline foam: additive white ribbon near the visible
-                    // waterline.  Damped by Fresnel so grazing reflections
-                    // keep the surface reading as water, not as a white
-                    // overlay.  Inside the transmission branch: a fully
-                    // reflected pixel shows no underwater floor, so no foam.
-                    // 2026-09-20: disabled per user request -- the depth the
-                    // foam reads is a 1 m voxel staircase, so the noise-then-
-                    // threshold result still traces blocky contours. Kept
-                    // for reference; re-enable only with a continuous depth
-                    // field (e.g. several jittered receiver probes).
-                    // 2026-10-26 21:1x: 路线 B 持久泡沫图已随用户定档整条回退，
-                    // 岸线注入调用一并摘除（注入/采样函数在下方 #if 0 保留）。
-                    // 2026-11-16 清理：#if 0 调用块与 evaluateShoreFoam 函数
-                    // 一并删除（泡沫整族退役，git 历史里可找回）。
                 }
 
                 // The reflected/transmitted walkers do not contain an
@@ -1843,6 +2027,7 @@ if (matId > 0.5 && matId < 2.5) {
                         sunDir,
                         waterSurfaceSunTransmittance
                     );
+}
 
                 // =====================================================
                 // 2026-10-26 Persistent foam, sampled once (Crest route B).
@@ -1864,20 +2049,22 @@ if (matId > 0.5 && matId < 2.5) {
 
 #endif // ORION_K2_INDIRECT_STAGE（③：水着色半段归 K2-D，K2-I 用图像载入替换）
 
-#if defined(ORION_K2_DIRECT_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE)
+#if defined(ORION_K2_DIRECT_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE) \
+    || defined(ORION_K2_DIRECT_SUN_STAGE_A)
                 // ③ K2-D 水出口：水像素的着色在此完整结束（镜面反射/天空/
                 // 折射全在 sampleColor 里），落 k2DirectImage 后交棒 K2-I。
                 // a = 0：水像素不消费 rtaoFactor（K2-I 水支直接取 rgb）。
                 // ④ K2-SUN 同一出口（水着色半段归 SUN）。
+                // ⑤ K2-SUNA 同一出口（四腿拆分后水着色半段归 SUNA）。
                 imageStore(
                     k2DirectImage,
                     pixelCoord,
                     vec4(sampleColor, 0.0)
                 );
                 continue;
-#elif defined(ORION_K2_DIRECT_LOCAL_STAGE)
-                // ④ K2-LOC 水出口：不 store —— k2DirectImage 已由 K2-SUN
-                // 落完整水色，LOC 对水像素无直射附加项。
+#elif defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_B)
+                // ④ K2-LOC / ⑤ K2-SUNB 水出口：不 store —— k2DirectImage 已由
+                // K2-SUN(A) 落完整水色，本腿对水像素无直射附加项。
                 continue;
 #endif
 
@@ -2291,6 +2478,7 @@ else if(
                         // depth in the RR depth image for it.
                         rrTransparentReceiverIsPane =
                             true;
+                    }
 
 
 // 2026-11-03：玻璃后面是天空/远场（没有接收面）时，上面那两条 albedo
@@ -2306,10 +2494,17 @@ else if(
                                 rrGlassPaneTransmissionFilter,
                                 vec3(0.05),
                                 vec3(1.0));
+#if !RR_STABLE_GLASS_RADIANCE && (GI_GLASS_RECEIVER_GUIDE_MODE == 3)
+                        rrNormalRoughness =
+                            vec4(
+                                glassSurface.normal,
+                                PANE_SOLID_ROUGHNESS
+                            );
+#endif
                     }
 #endif
 
-#if GI_GLASS_DOMINANT_GUIDE && !RR_STABLE_GLASS_RADIANCE
+#if GI_GLASS_DOMINANT_GUIDE && !RR_STABLE_GLASS_RADIANCE && (GI_GLASS_RECEIVER_GUIDE_MODE != 3)
                         // Route A: the merge above assumed transmission owns
                         // this pane pixel.  When the mirror lobe actually
                         // carries more energy, that assumption is what makes a
@@ -2420,7 +2615,6 @@ else if(
                             }
                         }
 #endif
-                    }
                 }
 #endif
 // ④ K2 死分支摘除：玻璃（matId>=2.5）由全功能 translucent rchit 写进 state，
@@ -2502,8 +2696,11 @@ vec3 materialF0 =
 // K1 精简 rchit 不做材质求值，切点在解析之前落身份（见 else 顶部的
 // ORION_K1_PRIMARY 段）。
 
-// ④ ④-K2-LOC 不编译 RTAO/阴影/GGX/SSS（归 K2-SUN）。
-#if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_LOCAL_STAGE)
+// ④ ④-K2-LOC / ⑤ K2-SUNB 不编译 RTAO/阴影/GGX/SSS（归 K2-SUN / K2-SUNA）。
+// ⑤ 拆腿：SUNA 只编译 RTAO（:2695 本体），阴影/GGX/SSS 归 SUNB（:3111 门）；
+// RTAO 的 rtaoFactor 不进阴影簇（只进出口 alpha）⇒ 这是依赖干净的切线。
+#if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
                 // ==========================================
                 // 步骤 3: RTAO (8 条短距离遮蔽射线)
                 // ==========================================
@@ -2769,11 +2966,17 @@ if(aoSamples > 0)
         );
 }
 #elif defined(ORION_K2_DIRECT_LOCAL_STAGE)
-// ④ K2-LOC：直射级（RTAO/阴影/GGX/SSS）归 K2-SUN，本体不编译。这里的桩只补
-// 共享区表达式仍引用的最小量；局部光/镜面的真值由 LOC 自己的块（下方 B/C）
-// 求值，出口做 load-add 叠加，**不**走 K2-I 的整图载入桩。
+// ④ K2-LOC：直射级（RTAO/阴影/GGX/SSS）归 K2-SUN，本体不编译对应段。这里的
+// 桩只补共享区表达式仍引用的最小量；局部光/镜面的真值由 LOC 自己的块（下方
+// B/C）求值，出口做 load-add 叠加，**不**走 K2-I 的整图载入桩。
 const float rtaoFactor = 1.0;
 const float NdotL = max(0.0, dot(normal, sunDir));
+#elif defined(ORION_K2_DIRECT_SUN_STAGE_B)
+// ⑤ K2-SUNB：只桩 rtaoFactor（共享区若有引用则取 1.0；SUNB 出口的 a 来自
+// imageLoad 原样携带，实际不读它）。⚠ NdotL **不在**这里桩——阴影簇门内
+// （:3121 门）自己定义 float NdotL，SUNB 编译该门 ⇒ 桩里再定义会撞车
+// （LOC 桩需要它是因为 LOC 排除了该门，SUNB 不排除）。
+const float rtaoFactor = 1.0;
 #else
 // ============================================================================
 // ③ K2-I 桩：直射级（RTAO/阴影/GGX/SSS/局部光/水面太阳/镜面）已由 K2-D 求值。
@@ -2918,8 +3121,10 @@ vec3 brdfWeight =
 // 所以这里不再引入任何新变量 —— 下面 update / query 两处都直接用 brdfWeight。
 // ============================================================================
 
-// ④ 同上：阴影段归 K2-SUN，K2-LOC 不编译。
-#if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_LOCAL_STAGE)
+// ③④⑤ 同上：阴影段 K2-D/K2-SUN/K2-SUNB 编译，K2-LOC/K2-I/SUNA 不编译
+//（⑤ 拆腿：SUNA 只产 RTAO，阴影+GGX+SSS 归 SUNB）。
+#if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A)
                 // ==========================================
                 // 步骤 4: Direct Shadow (4 条软阴影射线)
                 // ==========================================
@@ -3943,7 +4148,11 @@ if(
 )
 {
     const float REFERENCE_DEFAULT_POROSITY = 0.2;
-    const float REFERENCE_POROSITY_ABSORPTION = 0.4;
+    // 2026-11-21 修复③：0.4 → 0.9。旧档满潮湿只暗 albedo 的
+    // wetness·√0.2·0.4 ≈ 18% —— 雨天全场景本来就暗，用户实测"地面潮湿
+    // 几乎看不见"。提到 0.9 ⇒ 满潮湿 ~40% 变暗，与参考包的孔隙吸收
+    // 上限口径一致。
+    const float REFERENCE_POROSITY_ABSORPTION = 0.9;
 
     rainGroundWetness =
         getOverworldRainStrength() *
@@ -4516,6 +4725,31 @@ if(matId > 0.2 && matId < 0.45)
                     vec4(directLight, rtaoFactor)
                 );
                 continue;
+#elif defined(ORION_K2_DIRECT_SUN_STAGE_A)
+                // ==========================================
+                // ⑤ K2-SUNA 不透明出口：本腿只产 RTAO（直射由 SUNB 求值）。
+                // rgb 先落 0 占位（SUNB 稍后 load-add 叠加），a = rtaoFactor
+                // 原样携带给 LOC/K2-I。
+                // ==========================================
+                imageStore(
+                    k2DirectImage,
+                    pixelCoord,
+                    vec4(0.0, 0.0, 0.0, rtaoFactor)
+                );
+                continue;
+#elif defined(ORION_K2_DIRECT_SUN_STAGE_B)
+                // ==========================================
+                // ⑤ K2-SUNB 不透明出口：阴影+GGX+植被SSS 的直射 **load-add**
+                // 叠加进 SUNA 已落的占位（照 K2-LOC 出口模式，rgb 通道相加，
+                // a 原样携带 rtaoFactor）。K2-LOC / K2-I 照旧无感知。
+                // ==========================================
+                const vec4 k2DirectAccum = imageLoad(k2DirectImage, pixelCoord);
+                imageStore(
+                    k2DirectImage,
+                    pixelCoord,
+                    vec4(k2DirectAccum.rgb + directLight, k2DirectAccum.a)
+                );
+                continue;
 #endif
 
 
@@ -4554,7 +4788,8 @@ if(DBG_SPLIT_ABLATION)
 }
 
 // ④ 局部光 RIS/二级弹射归 K2-LOC（K2-SUN 不编译）。
-#if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE)
+#if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
 // Opaque primary receivers use full ReSTIR DI. Glass and water retain their
 // dedicated paths, so no transparent-layer history participates in reprojection.
 // （Orion indirect.rgen.slang:57）。XOR 保留乘法乘积的逐位结构，会让
@@ -4723,7 +4958,8 @@ if(DBG_SPLIT_ABLATION)
 #endif // ORION_K2_INDIRECT_STAGE（③：局部光 RIS/二级弹射归 K2-D）
 
 // ④ 水面反射太阳/GGX 镜面/spec guide 快照归 K2-LOC（K2-SUN 不编译）。
-#if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE)
+#if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
                     // =====================================================
 // Explicit Sun -> Water -> Receiver reflection
 // =====================================================
@@ -4906,7 +5142,7 @@ if(cam.ssHybridParams.z < 0.5f)
 // 代价：反射射线回到逐像素全采样（10-30 口径约 6.29 ms，SER 之后更便宜）。
 // A/B：-DVPT_SPARSE_GLOSSY=1 回到"非活跃像素不跑反射"（省射线，但会闪）。
 #ifndef VPT_SPARSE_GLOSSY
-#define VPT_SPARSE_GLOSSY 1
+#define VPT_SPARSE_GLOSSY 0
 #endif
 #if VPT_SPARSE_GLOSSY
 if(!vptPixelActive)
@@ -5132,27 +5368,6 @@ glossyReflectionLight =
     glossyLodWeight;
 }
 
-// 2026-11-14：稀疏反射的时域复用（binding 92）。
-// 非活跃像素本帧不跑 GGX，但不能写 0 —— 写 0 与活跃像素的完整值交替，
-// 而 RR 用表面 MV 重投影反射内容本身就不准，方波一来就显形为"反射闪动"。
-// 这里改成读上一帧的反射结果：每像素每帧仍有一个真实样本（新的或旧的），
-// 时域上没有样本丢失 ⇒ 不需要 1/rate 补偿（见 sparseGlossyScale）。
-#if VPT_SPARSE_GLOSSY
-if(!vptPixelActive)
-{
-    glossyReflectionLight =
-        imageLoad(glossyHistoryImage, pixelCoord).rgb;
-}
-else
-{
-    imageStore(
-        glossyHistoryImage,
-        pixelCoord,
-        vec4(glossyReflectionLight, 1.0)
-    );
-}
-#endif
-
 if(s == 0 && matId <= 0.5)
 {
 #ifndef VPT_STABLE_SPEC_HIT_DISTANCE
@@ -5233,7 +5448,8 @@ if(s == 0 && matId <= 0.5)
 #endif
 // ④ GI/稀疏合成/公共尾段：主变体 + K2-I 编译；K2-D/K2-SUN/K2-LOC 全部不编译。
 #if !defined(ORION_K2_DIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
-    && !defined(ORION_K2_DIRECT_LOCAL_STAGE)
+    && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
                 // ==========================================
                 // 步骤 5: GI Bounce (2 次弹射路径追踪)
                 // ==========================================
@@ -6322,18 +6538,19 @@ if (nextMaterialId > 0.5)
 #endif
 
     vec3 interfaceNormal =
-        stabilizeWaterInterfaceNormal(
-            nextNormal
+        waterInterfaceNormalForRay(
+            nextNormal,
+            currentDir
         );
 
+    // 2026-11-20：Fresnel 余弦改用稳定版（水平水面取平面余弦 |dir.y|）。
+    // 逐三角形的波浪法线在掠射视角下让 F→1、透射→0，水底整块变黑成三角；
+    // 折射/反射的**方向**仍用 interfaceNormal（波浪法线），观感不变。
+    // 详见 rgen_trace_helpers.glsl 的 waterFresnelCosine 说明。
     float cosTheta =
-        clamp(
-            -dot(
-                currentDir,
-                interfaceNormal
-            ),
-            0.0,
-            1.0
+        waterFresnelCosine(
+            currentDir,
+            interfaceNormal
         );
 
     float waterFresnel =
@@ -7486,10 +7703,13 @@ const float sparseSunScale = sparseTermScale;
 const float sparseSunScale = 1.0;
 #endif
 
-// 反射项的缩放恒为 1：无论走"满采样"（VPT_SPARSE_GLOSSY=0）还是
-// "稀疏 + 时域复用"（=1），每像素每帧都拿到一个真实反射样本，
-// 没有任何样本被丢弃 ⇒ 乘 1/rate 反而会让镜面偏亮。
+// 反射项的 1/rate 补偿：只有它真的被稀疏（VPT_SPARSE_GLOSSY=1）时才该乘。
+// 默认（0）反射逐像素满采样，乘了就是整屏镜面偏亮 1/rate 倍。
+#if VPT_SPARSE_GLOSSY
+const float sparseGlossyScale = sparseTermScale;
+#else
 const float sparseGlossyScale = 1.0;
+#endif
 
 vec3 litColor =
     directLight * sparseSunScale +
@@ -7807,7 +8027,8 @@ sampleColor =
 
 // ④ aerial/累积段归 K2-I；K2-D/K2-SUN/K2-LOC 不编译。
 #if !defined(ORION_K2_DIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
-    && !defined(ORION_K2_DIRECT_LOCAL_STAGE)
+    && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
         // Apply the camera-to-first-visible-surface segment once.  Misses
         // already contain the physical sky from rmiss, and applying this
         // after all water/glass composition prevents double-fogging their
@@ -7835,7 +8056,8 @@ sampleColor =
 
 // ④ 公共尾段（compose/guide/输出）归 K2-I；K2-D/K2-SUN/K2-LOC 不编译。
 #if !defined(ORION_K2_DIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
-    && !defined(ORION_K2_DIRECT_LOCAL_STAGE)
+    && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
     // ==========================================
     // Perf-1.1
     // Custom Temporal removed from RayGen.
@@ -8069,10 +8291,14 @@ imageStore(
 // =====================================================
 int dhFarModeRequested = int(cam.dhFarFieldLight.x + 0.5);
 
+// 2026-11-19 rasterLod（mode=14）：外门放宽 —— mode=14 时本项目光栅 color/depth
+// 图替代 DH 贴图源，不再依赖 dhFarFieldParams.x（DH 纹理发布态）。其余 mode
+// 的门不变（dhFarModeRequested 由 Java 推送，rasterLod 关闭时永远到不了 14）。
 #ifndef ORION_K2_TRANSPORT
 // K2 编出 DH 远场整块：它由 dhFarFieldOurs > 0.5 守卫，而 K2 只处理 opaque
 // 像素（dhFarFieldOurs 恒 0），K1 已为 miss/水/玻璃像素做完 DH 合成。
-if (cam.dhFarFieldParams.x > 0.5
+if ((cam.dhFarFieldParams.x > 0.5 || dhFarModeRequested == 14
+        || dhFarModeRequested == 15)
     && dhFarModeRequested >= 0
     && dhFarFieldOurs > 0.5) {
     // 上下翻转与色彩空间的完整推导见 dhFarTextureUv 与下面的 dhFarGamma 注释。
@@ -8083,8 +8309,15 @@ if (cam.dhFarFieldParams.x > 0.5
     float dhFarDepthCenter = dhFarDepthAt(pixelCoord);
 
     if (dhFarDepthIsGeometry(dhFarDepthCenter)) {
+        // 2026-11-19 rasterLod（mode=14）：颜色源换成本项目光栅 pass 的 RGBA8 图
+        //（binding 96，dhLodRasterColorAt）——替代 DH 贴图源（texture(dhFarColor)）。
+        // 两者都是 display 编码的顶点色 ⇒ 下面的 gamma 解码 / 强度 / 雾机制
+        // 原样复用。深度源已在 dhFarDepthAt 内按 mode=14 切换 ⇒ 上面的几何
+        // 判据对两种源同构（depth ∈ (0,1]）。mode≠14 时条件与改前逐位一致。
         vec3 dhFarSampled =
-            texture(dhFarColor, dhFarUv).rgb;
+            (dhFarModeRequested == 14)
+                ? dhLodRasterColorAt(pixelCoord)
+                : texture(dhFarColor, dhFarUv).rgb;
 
         // =====================================================
         // ⚠ 色彩空间定案（09-23，证据来自直接读 DH 3.3.2 的 jar）：
@@ -8133,7 +8366,7 @@ if (cam.dhFarFieldParams.x > 0.5
         //   ⑤ 距离来源（蓝=解析首选 / 红=矩阵 / 绿=z 镜像 / 黄=长度兜底）
         //   ⑥ 距离灰度（远处亮；整片压成一个灰度 ⇒ 深度语义反了）
         // 先展开成这四档，后面所有分支（含下面 1/2/5/6 的诊断档判定）都不用改。
-        if (dhFarMode == 7) {
+        if (dhFarMode == 7 || dhFarMode == 15) {
             float dhFarDiagSlot = clamp(
                 (float(pixelCoord.x) + 0.5) / max(float(size.x), 1.0),
                 0.0,
@@ -8628,7 +8861,8 @@ imageStore(rrDiffuseAlbedoImage, pixelCoord, vec4(rrDiffuseAlbedo, 1.0));
             } else if (dhFarMode == 6) {
                 // 距离灰度：近处暗、远处亮（按 DH 的 far 归一）。用来确认深度语义
                 // 没有搞反 —— 搞反的话地形会整片压到同一个灰度。
-                currentColor = vec3(clamp(dhFarDistance / dhFarFar, 0.0, 1.0));
+                currentColor = vec3(clamp(dhFarDistance
+                    / (dhFarFar > 4.0 ? dhFarFar : 2048.0), 0.0, 1.0));
             } else if (dhFarMode == 10) {
                 // 覆盖掩码（回答"某个现象是不是我们涂上去的"）：
                 //   白 = 我们在这里用 DH 的内容接管（且重建点在合理世界高度内）
@@ -8699,9 +8933,10 @@ imageStore(rrDiffuseAlbedoImage, pixelCoord, vec4(rrDiffuseAlbedo, 1.0));
                 vec3 dhFarLit =
                     mix(dhFarLinear, dhFarOurLit, dhFarStrength) * dhFarGain;
 
-                if (dhFarMode == 4) {
+                if (dhFarMode == 4 || dhFarMode == 14) {
                     // 我们的晴空大气透视接管远场，于是近场与远场处在同一套空气里，
-                    // 而不是各说各话。
+                    // 而不是各说各话。（2026-11-19 rasterLod：mode=14 镜像 mode=4
+                    // 的雾机制 —— 距离来自本项目光栅深度经同一套重建机器，见上。）
                     dhFarLit = applyClearSkyAerialPerspective(
                         dhFarLit,
                         dhFarCameraPos,

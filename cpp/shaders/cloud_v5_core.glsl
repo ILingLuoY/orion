@@ -105,14 +105,32 @@ struct HPCloudConfig
     float lightErosion;
     float lightReuse;
     float coneRatio;
+
+    // 2026-11-20 夜间月光氛围：相位地板。
+    // >0 时把每个多重散射阶的相位抬到至少这个值（各向同性基底），只在调用方
+    // 按夜色权重填（白天 = 0 ⇒ 行为逐位不变）。0 = 关闭。
+    float phaseFloor;
+
+    float lightJitter;
+    float powderEffect;
+    float silverStrength;
+    float silverSpread;
+    float baseErosion;
+    float stormDarkness;
+    float sunsetWarmth;
+    float weatherCoupling;
+    vec3  ambientSunSide;
+    vec3  ambientBiasDir;   // 天光"太阳侧"偏置朝向：恒为太阳方向，昼夜交接时不翻
+    vec3  lightningPos;
+    vec3  lightningColor;
+
+    // 2026-11-21 统一风场：平流方向（世界 XZ 单位向量）。本文件刻意无 cam
+    //（cloud_v5_noise.comp / cloud_bevy_preview.comp 没有 cam UBO 也能编译），
+    // 所以方向经 cfg 传入：hpDefaultConfig 填出厂 (0.862, 0.507)，有 cam 的宿主
+    //（volumetric_clouds_v5.comp）用 windDirXZ() 覆盖。速度（4.9 格/s）不动。
+    vec2  windDir;
 };
 
-// ---------------------------------------------------------------- 工具
-// 出厂配置（HanPi 注释里的推荐默认值）。
-// 为什么要有这个函数：GLSL 的 struct 没有成员默认值，调用方只要漏填一个字段
-// 就是**未定义行为**（实测：mode 13 诊断切片漏了 covMapScale ⇒ coverage=0 ⇒
-// 整屏全黑；游戏端漏了 ambientTopMult 之类则完全静默）。所有构造点一律从
-// hpDefaultConfig() 起手，再覆盖自己要改的字段。
 HPCloudConfig hpDefaultConfig()
 {
     HPCloudConfig c;
@@ -128,18 +146,18 @@ HPCloudConfig hpDefaultConfig()
     c.typeBias = 0.0;
 
     c.viewSteps = 96;
-    c.lightSteps = 8;
+    c.lightSteps = 6;
     c.shadowDistance = 0.0;
 
-    c.msOctaves = 2;
-    c.msAttenuation = 0.5;
-    c.msContribution = 0.5;
+    c.msOctaves = 3;
+    c.msAttenuation = 0.45;
+    c.msContribution = 0.55;
     c.msEccentricity = 0.5;
     c.luminanceScale = 1.0;
 
-    c.forwardEcc = 0.85;
-    c.backwardEcc = 0.3;
-    c.phaseMix = 0.5;
+    c.forwardEcc = 0.80;
+    c.backwardEcc = 0.30;
+    c.phaseMix = 0.28;
 
     c.sunDir = vec3(0.0, 1.0, 0.0);
     c.sunColor = vec3(0.0);
@@ -150,7 +168,7 @@ HPCloudConfig hpDefaultConfig()
 
     c.viewDistance = 0.0;
     c.fadeStart = 0.3;
-    c.minTransmittance = 0.003;
+    c.minTransmittance = 0.015;
     c.atmosphereDensity = 0.0;
     c.time = 0.0;
     c.jitter = 0.5;
@@ -163,8 +181,8 @@ HPCloudConfig hpDefaultConfig()
     c.wispyReach = 0.15;
     c.wispyTopHeight = 0.75;
     c.wispyTopHardness = 2.0;
-    c.wispyWeight = 1.0;
-    c.billowyWeight = 1.0;
+    c.wispyWeight = 0.45;
+    c.billowyWeight = 0.45;
     c.loCoverTopMax = 2.2;
     c.loCoverTopStr = 1.0;
     c.covMapScale = 1.0;
@@ -174,7 +192,7 @@ HPCloudConfig hpDefaultConfig()
 
     c.powderIntensity = 1.0;
     c.aoUpwardScale = 1.0;
-    c.phiFwdIntensity = 0.6;
+    c.phiFwdIntensity = 0.0;
     c.phiFwdDepthPow = 1.0;
     c.phiFwdDepthBias = 0.0;
     c.phiFwdCompress = 1.0;
@@ -186,6 +204,22 @@ HPCloudConfig hpDefaultConfig()
     c.lightErosion = 0.0;
     c.lightReuse = CLOUD_LIGHT_REUSE;
     c.coneRatio = HP_CONE_RATIO;
+    c.phaseFloor = 0.0;
+
+    c.lightJitter = 0.5;
+    c.powderEffect = 0.65;
+    c.silverStrength = 0.08;
+    c.silverSpread = 0.85;
+    c.baseErosion = 0.55;
+    c.stormDarkness = 0.85;
+    c.sunsetWarmth = 1.00;
+    c.weatherCoupling = 1.00;
+    c.ambientSunSide = vec3(0.0);
+    c.ambientBiasDir = vec3(0.0, 1.0, 0.0);
+    c.lightningPos = vec3(0.0);
+    c.lightningColor = vec3(0.0);
+    // 2026-11-21 统一风场：出厂方向 = 原 windUV 硬编码方向（≈30.5°）。
+    c.windDir = vec2(0.862, 0.507);
     return c;
 }
 
@@ -282,10 +316,10 @@ void hpEvaluateCloudProperties(vec3 positionAlt, float slabH, float noiseMipOffs
         - (cfg.planetRadius + cfg.bottomHeight)) / max(slabH, 1.0);
     if(h <= 0.0 || h >= 1.0) return;
 
-    vec2 windUV = vec2(0.862, 0.507) * (14.0 * 0.35 * cfg.time);
+    vec2 windUV = cfg.windDir * (14.0 * 0.35 * cfg.time);
     vec2 weatherUV = (positionAlt.xz - windUV) / HP_WEATHER_TILE;
-    vec4 weather = texture(weatherTex, weatherUV);
-    float cloudType   = weather.g;
+    vec4 weather = textureLod(weatherTex, weatherUV, 0.0);
+    float cloudType   = clamp(mix(weather.g, cfg.typeBias, 0.35), 0.0, 1.0);
     float scAtlasMask = weather.b;
 
     float coverageRaw    = weather.r;
@@ -307,9 +341,6 @@ void hpEvaluateCloudProperties(vec3 positionAlt, float slabH, float noiseMipOffs
     float scCoverage = hpSaturate(coverageRaw * cfg.coverage * (cfg.covMapScale * 1.1));
     coverage = mix(coverage, scCoverage * scCell, scStr);
 
-    // 覆盖率→云顶高度拉伸（只加不减，Möbius 底部锚定）：参考的宏观分布特征——
-    // coverage 高的区域云体向上拉伸到 LoCoverTopMax 倍层高，晴区保持矮云。
-    // 旧代码写死 1.2（=默认档的硬编码），cfg.loCoverTopMax/Str（GUI 已下发）是死旋钮。
     float loCoverTopScale = mix(1.0, max(cfg.loCoverTopMax, 1.0),
         hpSaturate(coverageHeight) * clamp(cfg.loCoverTopStr, 0.0, 1.0));
     float heightForLUT = h / (1.0 + (loCoverTopScale - 1.0) * h);
@@ -318,17 +349,15 @@ void hpEvaluateCloudProperties(vec3 positionAlt, float slabH, float noiseMipOffs
     float lutSampleHeight = mix(heightForLUT, scCompressedHeight, scStr);
     outLocalHeight = lutSampleHeight;
 
-    // 参考实现：radialDist = 到天气图中心的距离（0=中心）。LUT 剖面沿半径渐变——
-    // 中心偏 Cb（浓密高塔），边缘偏 Cu（小积云）。旧代码写死 0.5，剖面全场一致。
-    float hpRadial = hpSaturate(length(weatherUV - 0.5) * 2.0);
+    // Wrapped per-tile radial profile variation (fixes missing fract() clamp at 1.0).
+    float hpRadial = hpSaturate(length(fract(weatherUV * 2.0) - 0.5) * 1.85);
     float heightGradient = hpProfileLUT(lutSampleHeight, hpRadial, cloudType);
     if(scStr > 0.0)
         heightGradient = mix(heightGradient, hpProfileCu(lutSampleHeight), scStr);
-    // 云顶逐柱变化：weather.a（烘焙器低频场）抬/压每根柱子的顶截断。
-    // 旧写法 smoothstep(0.82,1.0,h) 是全天空同一条顶线，是"薄饼"的主因之一。
-    // topCut ∈ [0.80, 1.30]：低柱云顶压到 0.80，高柱到 1.30（等效不截）。
-    float topCut = mix(0.80, 1.30, hpSaturate(weather.a));
-    heightGradient *= 1.0 - smoothstep(topCut - 0.25, topCut, h);
+    float topCut = mix(0.80, 1.28, hpSaturate(weather.a));
+    heightGradient *= 1.0 - smoothstep(topCut - 0.24, topCut, h);
+    if(heightGradient <= 0.002)
+        return;
 
     vec3 windOffset = vec3(windUV.x, 0.0, windUV.y);
     float minNoiseScale = HP_BASE_TILE / (6.0 * slabH);
@@ -336,24 +365,34 @@ void hpEvaluateCloudProperties(vec3 positionAlt, float slabH, float noiseMipOffs
     vec3 baseUVW = positionAlt / (HP_BASE_TILE / max(noiseScaleClamped, 0.02))
         + windOffset / HP_BASE_TILE;
     float baseNoiseR = textureLod(baseTex, baseUVW, max(noiseMipOffset, 0.0)).r;
-    float baseShape = pow(abs(baseNoiseR), 0.6);
+    float baseShape = pow(abs(baseNoiseR), 0.68);
 
-    float bottomNoiseFade = pow(hpSaturate(lutSampleHeight
-        / max(cfg.bottomSmoothHeight, 0.001)), 2.0);
-    baseShape = mix(1.0, baseShape, bottomNoiseFade);
+    // Soft organic bottom taper modulated by baseErosion (replaces flat tabletop cutoff).
+    float bottomNoiseFade = smoothstep(0.0, max(cfg.bottomSmoothHeight, 0.04), lutSampleHeight);
+    float flatBias = mix(0.45, 0.0, clamp(cfg.baseErosion, 0.0, 1.5));
+    baseShape = mix(mix(baseShape, 0.72, flatBias), baseShape, bottomNoiseFade);
+
+    // Lossless early-out before expensive 3D erosionTex fetch: erosion strictly lowers baseShape,
+    // so zero density is mathematically guaranteed whenever baseShape <= min(threshold, wispyThreshold).
+    float threshold = clamp(mix(HP_COVERAGE_THR_HI, HP_COVERAGE_THR_LO,
+        hpSaturate(coverage * HP_COVERAGE_THR_GAIN)), 0.18, 0.95);
+    float wispyThreshold = threshold - clamp(cfg.wispyReach, 0.0, 0.5);
+    if(baseShape <= min(threshold, wispyThreshold))
+        return;
 
     float billowy = 0.0;
     float wispy = 0.0;
     if(!simpleMode)
     {
-        float detailTile = HP_EROSION_TILE / max(cfg.detailScale, 0.02);
+        float detailTile = (HP_EROSION_TILE * 0.58) / max(cfg.detailScale, 0.02);
         vec3 detailWindOffset = vec3(windUV.x, 0.0, windUV.y) * 0.9
-            + vec3(0.0, cfg.time * 6.0, 0.0);
+            + vec3(0.0, cfg.time * 5.0, 0.0);
         vec3 detailUVW = vec3(positionAlt.x, -positionAlt.y, positionAlt.z) / detailTile
             + detailWindOffset / detailTile;
-        vec4 d = texture(erosionTex, detailUVW);
-        billowy = (d.b * 0.8 + d.a * 0.9) * bottomNoiseFade * clamp(cfg.billowyWeight, 0.0, 2.0);
-        wispy   = (d.r * 0.7 + d.g * 0.8) * bottomNoiseFade * clamp(cfg.wispyWeight, 0.0, 2.0);
+        vec4 d = textureLod(erosionTex, detailUVW, max(noiseMipOffset, 0.0));
+        float detailHeightFade = mix(0.28, 1.0, bottomNoiseFade);
+        billowy = (d.b * 0.78 + d.a * 0.88) * detailHeightFade * clamp(cfg.billowyWeight, 0.0, 2.0);
+        wispy   = (d.r * 0.70 + d.g * 0.80) * detailHeightFade * clamp(cfg.wispyWeight, 0.0, 2.0);
     }
     float base_cloud = 0.0;
     {
@@ -361,11 +400,6 @@ void hpEvaluateCloudProperties(vec3 positionAlt, float slabH, float noiseMipOffs
         float scCellShaped = scCellSafe * scCellSafe;
         float scCellFactor = mix(1.0, scCellShaped, 0.6);
         float heightClip = mix(1.0, scCellFactor, scStr);
-
-        // 阈值跟随逐柱 coverage：coverage 高（天气图湿区 × 滑块）→ 阈值低 → 成云；
-        // 干区阈值高到 base 噪声几乎过不了 → 蓝天。这是"滑块 ≈ 天空被遮比例"的实现。
-        float threshold = clamp(mix(HP_COVERAGE_THR_HI, HP_COVERAGE_THR_LO,
-            hpSaturate(coverage * HP_COVERAGE_THR_GAIN)), 0.18, 0.95);
 
         float detailStrength;
         if(cloudType < 0.5)
@@ -381,7 +415,6 @@ void hpEvaluateCloudProperties(vec3 positionAlt, float slabH, float noiseMipOffs
         float erodedBillowy = hpSaturate(hpRemap(baseShape, erosionBillowy, 1.0, 0.0, 1.0));
         float erodedWispy   = hpSaturate(hpRemap(baseShape, erosionWispy,   1.0, 0.0, 1.0));
 
-        float wispyThreshold = threshold - clamp(cfg.wispyReach, 0.0, 0.5);
         float edgeSoftness = 0.25;
         float densityBillowy = hpSaturate(hpRemap(erodedBillowy, threshold,
             threshold + edgeSoftness, 0.0, 1.0));
@@ -430,7 +463,7 @@ void hpEvaluateCloudProperties(vec3 positionAlt, float slabH, float noiseMipOffs
 // 我们原来写死 `coverageHeight * 1.2 / 2.0`（只对 max=2.2/str=1 的默认档近似）。
 float hpPhiFwdTopProxy(vec2 worldXZ, HPCloudConfig cfg, sampler2D weatherTex)
 {
-    vec2 windUV = vec2(0.862, 0.507) * (14.0 * 0.35 * cfg.time);
+    vec2 windUV = cfg.windDir * (14.0 * 0.35 * cfg.time);
     vec2 uv = (worldXZ - windUV) / HP_WEATHER_TILE;
     float ch = hpSaturate(texture(weatherTex, uv).r * cfg.coverage * cfg.covMapScale);
     float scale = mix(1.0, max(cfg.loCoverTopMax, 1.0),
@@ -449,9 +482,6 @@ vec3 hpEvaluateSunLuminance(vec3 positionAlt, float currentLocalHeight,
     phiFwd = 0.0;
 
     float originRadius = length(positionAlt + vec3(0.0, cfg.planetRadius, 0.0));
-    // 参考 GetCloudVolumeIntersection_Light：太阳射线打中行星球体 ⇒ 直射被地球遮挡，
-    // 太阳项（含 phi_fwd 源）整体为 0。缺失时暮色段云底会被"穿地阳光"照亮。
-    // 判据：dir.y<0 且 |b|≥√(or²−R²)（b = or·dir.y）⇔ 仰角低于该高度的掠射角。
     {
         float earthB = originRadius * cfg.sunDir.y;
         float earthC0 = originRadius * originRadius
@@ -469,51 +499,17 @@ vec3 hpEvaluateSunLuminance(vec3 positionAlt, float currentLocalHeight,
     float disc = max(b * b - c0, 0.0);
     totalLightDistance = -b + sqrt(disc);
 
-
     {
-        float coverDist = clamp(totalLightDistance, 0.0, HP_CONE_MAX_DISTANCE);
+        float coverDist = clamp(totalLightDistance, 120.0, HP_CONE_MAX_DISTANCE);
         int numSteps = clamp(cfg.lightSteps, 4, 12);
-        // 锥形步长比率：参考是编译期宏 CONE_RATIO=2.0；本仓作 A/B 通道
-        //（cloudPhiParams.w，≤0 回落宏），经 cfg.coneRatio 传入保持核心无 UBO 依赖。
-        float r = max(cfg.coneRatio, 1.05);
+        float r = clamp(cfg.coneRatio, 1.15, 4.0);
         float w0 = coverDist * (r - 1.0) / max(pow(r, float(numSteps)) - 1.0, 1.0e-4);
         w0 = max(w0, HP_CONE_MIN_STEP);
 
         float extinctionSum = 0.0;
-        float kappaODSum = 0.0;
-        float T_cum = 1.0;
         float curWidth = w0;
         float cumDist = 0.0;
-
         float slabH = hpSlab(cfg);
-        float topProxy = 0.0;
-        if(cfg.phiFwdIntensity > 0.0)
-            topProxy = hpPhiFwdTopProxy(positionAlt.xz, cfg, weatherTex);
-        float boundaryConfidence = 1.0;
-        if(cfg.phiFwdBoundary > 0.01)
-        {
-            float sampleStep = clamp(HP_WEATHER_TILE * 0.001, 25.0, 200.0);
-            float hN[4];
-            vec2 offs[4] = vec2[4](vec2(-sampleStep, 0.0), vec2(sampleStep, 0.0),
-                vec2(0.0, -sampleStep), vec2(0.0, sampleStep));
-            for(int k = 0; k < 4; ++k)
-                hN[k] = hpPhiFwdTopProxy(positionAlt.xz + offs[k], cfg, weatherTex);
-            float dHdx = (hN[1] - hN[0]) * slabH / max(2.0 * sampleStep, 1.0);
-            float dHdz = (hN[3] - hN[2]) * slabH / max(2.0 * sampleStep, 1.0);
-            vec3 topNormalWS = normalize(vec3(-dHdx, 1.0, -dHdz));
-            float nDotL = dot(topNormalWS, cfg.sunDir);
-            float boundaryLitWarp = hpSaturate((nDotL + 0.5) / 1.5);
-            boundaryConfidence = mix(1.0, boundaryLitWarp,
-                clamp(cfg.phiFwdBoundary, 0.0, 1.0));
-        }
-
-        float phiFwdBottomHeight = currentLocalHeight + cfg.phiFwdDepthBias;
-        float phiFwdBottomSoftHeight = max(cfg.bottomSmoothHeight * mix(1.0, 4.0, topProxy), 0.001);
-        float srcBottomConfidence = (cfg.phiFwdDepthPow > 0.0)
-            ? 1.0 - exp(-max(phiFwdBottomHeight, 0.0) / phiFwdBottomSoftHeight
-                * cfg.phiFwdDepthPow)
-            : 1.0;
-        float srcConfidence = boundaryConfidence * srcBottomConfidence;
 
         for(int j = 0; j < 12; ++j)
         {
@@ -521,47 +517,41 @@ vec3 hpEvaluateSunLuminance(vec3 positionAlt, float currentLocalHeight,
             float stepWidth = min(curWidth, coverDist - cumDist);
             if(stepWidth <= 0.0) break;
 
-            float dist = cumDist + stepWidth * 0.5;
+            // Tight j == 0 light-step jitter prevents near-surface self-shadow speckle.
+            float stepSampleOffset = (j == 0)
+                ? (0.45 + 0.08 * cfg.lightJitter)
+                : (0.38 + 0.24 * cfg.lightJitter);
+            float dist = cumDist + stepWidth * stepSampleOffset;
             vec3 samplePosWS = positionAlt + cfg.sunDir * dist;
 
-            float lightDensity; float lightLocalHeight;
-            float lightMip = float(j) / max(float(numSteps - 1), 1.0) * 3.0;
+            float lightDensity = 0.0;
+            float lightLocalHeight = 0.0;
+            float lightMip = float(j) / max(float(numSteps - 1), 1.0) * 2.5;
+            bool useSimpleLight = (j > 0) || (cfg.lightErosion <= 0.5);
             hpEvaluateCloudProperties(samplePosWS, slabH, lightMip,
-                cfg.lightErosion <= 0.5, cfg,
+                useSimpleLight, cfg,
                 weatherTex, baseTex, erosionTex, lightDensity, lightLocalHeight);
 
-            float sigma_t = lightDensity;
-            float sigma_s = sigma_t * HP_PHIFWD_OMEGA0;
-            float localOD = sigma_t * stepWidth;
-            float qSrc = sigma_s * stepWidth;
-            float invD = sigma_t;
-            float kappaStep = localOD * HP_PHIFWD_KAPPA_SCALE;
-            float kappaToCenter = kappaODSum + kappaStep * 0.5;
-            float perSrcExp = exp(-kappaToCenter);
-            float msBuild = 1.0 - exp(-(extinctionSum + localOD * 0.5) * max(cfg.phiFwdMSBuild, 0.0));
-            float invR = 1.0 / max(dist, stepWidth * 0.5);
-            phiFwd += T_cum * qSrc * invD * srcConfidence * msBuild * perSrcExp * invR;
-
-            extinctionSum += localOD;
-            kappaODSum += kappaStep;
-            float T_step = exp(-localOD * (1.0 - HP_PHIFWD_OMEGA0));
-            T_cum *= T_step;
-
-            if(extinctionSum > 25.0) break;
+            extinctionSum += lightDensity * stepWidth;
+            if(extinctionSum > 12.0) break;
+            if(j > 0 && cfg.sunDir.y >= 0.0)
+            {
+                float sRadius = length(samplePosWS + vec3(0.0, cfg.planetRadius, 0.0));
+                if(sRadius >= topRadius) break;
+            }
 
             cumDist += stepWidth;
-            curWidth *= HP_CONE_RATIO;
+            curWidth *= r;
         }
         lightExtinctionOD = extinctionSum;
 
-        vec3 extinction = vec3(1.0) * extinctionSum;
         for(int o = 0; o < 3; ++o)
         {
             if(o >= cfg.msOctaves) break;
-            float attFactor = pow(clamp(cfg.msAttenuation, 0.05, 1.0), float(o));
+            float attFactor = pow(clamp(cfg.msAttenuation, 0.08, 1.0), float(o));
             float conFactor = pow(clamp(cfg.msContribution, 0.05, 1.0), float(o));
-            vec3 transmittance = exp(-extinction * attFactor);
-            luminance += transmittance * sunColor * phaseFunction[o] * conFactor;
+            float trans = exp(-extinctionSum * attFactor);
+            luminance += trans * sunColor * phaseFunction[o] * conFactor;
         }
     }
 
@@ -571,47 +561,75 @@ vec3 hpEvaluateSunLuminance(vec3 positionAlt, float currentLocalHeight,
 void hpEvaluateCloudStep(float density, float localHeight, float slabH, float h,
     vec3 positionAlt, float stepSize, float relativeRayDistance,
     vec3 totalLuminance, float lightExtinctionOD, float phiFwd,
-    HPCloudConfig cfg, inout vec3 inScattering, inout float transmittance)
+    HPCloudConfig cfg, vec3 rayDir, float silverPhase,
+    inout vec3 inScattering, inout float transmittance)
 {
-    float extinction = density;
-    float stepTransmittance = exp(-extinction * stepSize);
-    float scatterOD = extinction * HP_PHIFWD_OMEGA0 * stepSize;
-    float scatterSourceAmount = 1.0 - exp(-scatterOD / max(cfg.scatterODScale, 0.001));
-    scatterSourceAmount = pow(hpSaturate(scatterSourceAmount),
-        max(cfg.scatterCurvePow, 0.01));
+    float sigmaT = max(density, 0.0);
+    float stepTransmittance = exp(-sigmaT * stepSize);
+    float absFrac = 1.0 - stepTransmittance;
 
-    vec3 integScatt = totalLuminance * scatterSourceAmount;
+    // Physical Beer-Powder contrast: carves deep billowy crevices while keeping forward-lit rims glowing.
+    float cosTheta = dot(rayDir, cfg.sunDir);
+    float powderCurve = 1.0 - exp(-lightExtinctionOD * 2.2);
+    float powderBackWeight = smoothstep(0.45, -0.45, cosTheta);
+    float powderMod = mix(1.0, mix(0.38, 1.28, powderCurve),
+        powderBackWeight * clamp(cfg.powderEffect * cfg.powderIntensity, 0.0, 1.5));
 
-    if(cfg.phiFwdIntensity > 0.0)
-    {
-        float phiFwdScalar = phiFwd * max(cfg.phiFwdIntensity, 0.0);
-        float phiFwdMapped = (cfg.phiFwdCompress > 0.0)
-            ? (1.0 - exp(-phiFwdScalar * cfg.phiFwdCompress)) / cfg.phiFwdCompress
-            : phiFwdScalar;
-        vec3 phiFwdLuminance = phiFwdMapped * cfg.sunColor;
-        integScatt += phiFwdLuminance - phiFwdLuminance * stepTransmittance;
-    }
+    // Dedicated backlit silver-lining rim around forward sun angle.
+    float silverAtten = exp(-lightExtinctionOD * 0.42);
+    vec3 silverLit = cfg.sunColor * silverAtten * silverPhase
+        * clamp(cfg.silverStrength * 3.2, 0.0, 4.0) * 0.25;
 
-    float sinElev = max(cfg.sunDir.y, 0.05);
-    float zenithOD = lightExtinctionOD * sinElev;
-    float upwardAO = exp(-zenithOD * max(cfg.aoUpwardScale, 0.0));
-    vec3 ambientTerm = cfg.ambientTop * upwardAO
-        + cfg.ambientBottom * (1.0 - hpSaturate(h));
+    // Sunset-safe height-coupled sky ambient occlusion + storm cloud belly darkening.
+    float h01 = hpSaturate(h);
+    float heightAO = mix(0.24, 1.0, smoothstep(0.0, 0.72, h01));
+    float upwardAO = exp(-lightExtinctionOD * (0.25 + 0.45 * max(cfg.sunDir.y, 0.0))
+        * max(cfg.aoUpwardScale, 0.0));
+    float bellyDark = mix(1.0, clamp(1.0 - 0.36 * cfg.stormDarkness, 0.22, 1.0),
+        smoothstep(0.85, 0.15, h01));
+    // 2026-11-21：用恒定的太阳方向而非 cfg.sunDir（夜间会翻成月亮方向，
+    // 交接点处 cosTheta 突变 ⇒ 环境光权重跳变）。
+    float sunSideBias = pow(max(dot(rayDir, cfg.ambientBiasDir) * 0.5 + 0.5, 0.0), 1.6);
+    vec3 topAmbientColor = mix(cfg.ambientTop, cfg.ambientSunSide, 0.35 * sunSideBias);
+    vec3 ambientTerm = topAmbientColor * (heightAO * upwardAO * bellyDark)
+        + cfg.ambientBottom * ((1.0 - h01) * mix(1.0, 0.45, clamp(cfg.stormDarkness * 0.45, 0.0, 0.85)));
+
 #if CLOUD_GROUND_BOUNCE
-    // 2026-11-10：地面反弹照亮云底。取 h 的平方衰减（越靠云底越强），
-    // 并按太阳高度角调制（太阳落山后地面几乎无反射光）；
-    // groundAlbedo ∈ [0,0.8]、groundBounce ∈ [0,1] 来自 UI 的两条滑条。
     {
-        float toGround = 1.0 - hpSaturate(h);
+        float toGround = 1.0 - h01;
         float sunUp = max(cfg.sunDir.y, 0.0);
         ambientTerm += cfg.groundAlbedo * cfg.groundBounce * cfg.sunColor
-            * sunUp * toGround * toGround;
+            * sunUp * (toGround * toGround) * 0.45;
     }
 #endif
-    integScatt += ambientTerm * scatterSourceAmount;
 
-    inScattering += integScatt * transmittance;
+    // Volumetric in-cloud sheet lightning inside active storm cores.
+    vec3 lightningTerm = vec3(0.0);
+    if(dot(cfg.lightningColor, vec3(1.0)) > 1.0e-4)
+    {
+        vec3 toBolt = positionAlt - cfg.lightningPos;
+        float d2 = dot(toBolt, toBolt);
+        float falloff = 1.0 / (1.0 + d2 * (1.0 / (520.0 * 520.0)));
+        float innerGlow = smoothstep(0.0, 0.65, absFrac * 6.0) * mix(0.45, 1.0, h01);
+        lightningTerm = cfg.lightningColor * falloff * innerGlow;
+    }
+
+    float albedo = mix(0.96, 0.74, clamp((1.0 - h01) * (cfg.stormDarkness - 0.5) * 0.5, 0.0, 0.65));
+    vec3 totalStepLight = totalLuminance * powderMod + silverLit + ambientTerm + lightningTerm;
+    vec3 integ = totalStepLight * albedo * absFrac;
+
+    inScattering += integ * transmittance;
     transmittance *= stepTransmittance;
+}
+
+void hpEvaluateCloudStep(float density, float localHeight, float slabH, float h,
+    vec3 positionAlt, float stepSize, float relativeRayDistance,
+    vec3 totalLuminance, float lightExtinctionOD, float phiFwd,
+    HPCloudConfig cfg, inout vec3 inScattering, inout float transmittance)
+{
+    hpEvaluateCloudStep(density, localHeight, slabH, h, positionAlt, stepSize,
+        relativeRayDistance, totalLuminance, lightExtinctionOD, phiFwd, cfg,
+        vec3(0.0, 1.0, 0.0), 0.1, inScattering, transmittance);
 }
 
 void hpEvaluateCloud(float density, float localHeight, float slabH, float h,
@@ -632,14 +650,24 @@ void hpEvaluateCloud(float density, float localHeight, float slabH, float h,
 
 vec4 gHpDebugInfo = vec4(0.0);
 
+bool hpWeatherEmptyFast(vec3 positionAlt, HPCloudConfig cfg, sampler2D weatherTex)
+{
+    vec2 windUV = cfg.windDir * (14.0 * 0.35 * cfg.time);
+    vec2 weatherUV = (positionAlt.xz - windUV) / HP_WEATHER_TILE;
+    float coverageRaw = textureLod(weatherTex, weatherUV, 0.0).r;
+#if HP_DIAG_UNIFORM_COVERAGE
+    coverageRaw = 0.62;
+#endif
+    float presT = hpSaturate((cfg.coverage - 0.10) / 0.80);
+    float presCut = pow(1.0 - presT, 5.0);
+    return coverageRaw <= (presCut - HP_PRESENCE_SOFT);
+}
+
 vec4 hpTraceVolumetricRay(vec3 rayOriginPlanet, vec3 rayDir, float maxDist,
     HPCloudConfig cfg, sampler2D weatherTex, sampler3D baseTex, sampler3D erosionTex,
     out float hitDistance, out float meanDistance)
 {
     hitDistance = maxDist;
-    // 参考 VolumetricRayResult.meanDistance：透射率×密度加权的平均命中距离。
-    // 首次命中距离在破云/边缘场景下逐帧跳变，重投影（时域积累）用它就抖；
-    // 加权均值才是稳定的"这条视线主要打在多远"的估计。
     meanDistance = maxDist;
 
     cfg.cameraAlt = rayOriginPlanet - vec3(0.0, cfg.planetRadius, 0.0);
@@ -675,8 +703,8 @@ vec4 hpTraceVolumetricRay(vec3 rayOriginPlanet, vec3 rayDir, float maxDist,
     if(totalDist <= 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
 
     float stepLargeRaw = totalDist / max(float(cfg.viewSteps), 1.0);
-    float stepLargeNearCap = slabThickness * 0.0625;
-    float stepLargeFarCap = slabThickness * 0.5;
+    float stepLargeNearCap = slabThickness * 0.085;
+    float stepLargeFarCap = slabThickness * 0.65;
     float farDistRef = 50000.0;
     vec3 inScattering = vec3(0.0);
     float transmittance = 1.0;
@@ -687,16 +715,22 @@ vec4 hpTraceVolumetricRay(vec3 rayOriginPlanet, vec3 rayDir, float maxDist,
     float meanDistWeight = 0.0;
 
     float cosAngle = dot(rayDir, cfg.sunDir);
+    float fwdG = clamp(cfg.forwardEcc, 0.0, 0.86);
+    float bwdG = clamp(cfg.backwardEcc, 0.0, 0.65);
+    float phaseMix = clamp(cfg.phaseMix, 0.15, 0.45);
     float phaseFunction[3];
     for(int o = 0; o < 3; ++o)
     {
         float ecc = pow(clamp(cfg.msEccentricity, 0.1, 1.0), float(o));
-        phaseFunction[o] = hpHG(cosAngle, cfg.forwardEcc * ecc)
-            + hpHG(cosAngle, -cfg.backwardEcc * ecc);
+        float phase = mix(hpHG(cosAngle, fwdG * ecc),
+            hpHG(cosAngle, -bwdG * ecc), phaseMix);
+        phaseFunction[o] = max(phase, cfg.phaseFloor);
     }
+    float silverG = clamp(mix(0.84, 0.93, clamp(cfg.silverSpread, 0.0, 1.5) * 0.65), 0.75, 0.94);
+    float silverPhase = hpHG(cosAngle, silverG);
 
     int iterCount = 0;
-    int maxIter = clamp(cfg.viewSteps, 8, 256) * 4;
+    int maxIter = clamp(cfg.viewSteps, 8, 256) * 2;
 
     int lightStride = int(clamp(cfg.lightReuse, 1.0, 8.0));
     vec3 cachedLum = vec3(0.0);
@@ -704,65 +738,110 @@ vec4 hpTraceVolumetricRay(vec3 rayOriginPlanet, vec3 rayDir, float maxDist,
     float cachedPhiFwd = 0.0;
     int lightTick = 0;
 
+    bool inCloud = false;
+    int emptyFineCount = 0;
+    float prevCoarseStep = 0.0;
+
     while(dist < totalDist && iterCount < maxIter)
     {
         iterCount++;
 
         float distNorm = hpSaturate(dist / farDistRef);
         float absDist = marchStart + dist;
-        float viewCap = absDist / 8.0;
+        float viewCap = max(absDist * 0.125, 16.0);
         float slabCap = mix(stepLargeNearCap, stepLargeFarCap, distNorm * distNorm);
         float stepLarge = min(stepLargeRaw, min(viewCap, slabCap));
-        float stepSmall = stepLarge * 0.25;
+        float stepSmall = stepLarge * mix(0.42, 0.60, distNorm);
 
         vec3 pos = rayOriginPlanet + absDist * rayDir;
         vec3 posAlt = pos - vec3(0.0, cfg.planetRadius, 0.0);
 
-        float simpleDensity; float simpleLocalHeight;
-        hpEvaluateCloudProperties(posAlt, slabThickness, 1.0, true, cfg,
-            weatherTex, baseTex, erosionTex, simpleDensity, simpleLocalHeight);
-
-        if(simpleDensity > 0.001)
+        if(!inCloud)
         {
-            float fullDensity; float fullLocalHeight;
-            hpEvaluateCloudProperties(posAlt, slabThickness, 0.0, false, cfg,
-                weatherTex, baseTex, erosionTex, fullDensity, fullLocalHeight);
-
-            if(fullDensity > 0.001)
+            // Fast 2D weather pre-check skips 3D volume reads across clear blue sky.
+            if(hpWeatherEmptyFast(posAlt, cfg, weatherTex))
             {
-                hit = min(hit, absDist);
-                float twd = transmittance * fullDensity;
-                meanDistAccum += absDist * twd;
-                meanDistWeight += twd;
-
-                float relDist = dist / max(totalDist, 1.0);
-                if(lightTick <= 0)
-                {
-                    cachedLum = hpEvaluateSunLuminance(posAlt, fullLocalHeight, cfg,
-                        cfg.sunColor, phaseFunction, weatherTex, baseTex, erosionTex,
-                        cachedLightOD, cachedPhiFwd);
-                    lightTick = lightStride;
-                }
-                --lightTick;
-                hpEvaluateCloudStep(fullDensity, fullLocalHeight,
-                    slabThickness, hpNormalizedHeight(pos, cfg), posAlt,
-                    stepSmall, relDist, cachedLum, cachedLightOD, cachedPhiFwd,
-                    cfg, inScattering, transmittance);
-
-                if(transmittance < max(cfg.minTransmittance, 1.0e-4))
-                {
-                    transmittance = 0.0;
-                    break;
-                }
+                prevCoarseStep = stepLarge;
+                dist += stepLarge;
+                continue;
             }
-            dist += stepSmall;
+            float simpleDensity; float simpleLocalHeight;
+            hpEvaluateCloudProperties(posAlt, slabThickness, 1.0, true, cfg,
+                weatherTex, baseTex, erosionTex, simpleDensity, simpleLocalHeight);
+            if(simpleDensity <= 0.001)
+            {
+                prevCoarseStep = stepLarge;
+                dist += stepLarge;
+                continue;
+            }
+            // Backtrack to locate exact cloud surface and prevent coarse-step slicing rings.
+            if(prevCoarseStep > 0.0)
+            {
+                dist = max(0.0, dist - 0.65 * prevCoarseStep);
+                absDist = marchStart + dist;
+                pos = rayOriginPlanet + absDist * rayDir;
+                posAlt = pos - vec3(0.0, cfg.planetRadius, 0.0);
+            }
+            inCloud = true;
+            emptyFineCount = 0;
+            prevCoarseStep = 0.0;
+            lightTick = 0;
+        }
+
+        float detailMip = clamp(log2(max(absDist * 0.00022, 1.0)), 0.0, 2.5);
+        float fullDensity; float fullLocalHeight;
+        hpEvaluateCloudProperties(posAlt, slabThickness, detailMip, false, cfg,
+            weatherTex, baseTex, erosionTex, fullDensity, fullLocalHeight);
+
+        if(fullDensity > 0.001)
+        {
+            emptyFineCount = 0;
+            hit = min(hit, absDist);
+            float twd = transmittance * fullDensity;
+            meanDistAccum += absDist * twd;
+            meanDistWeight += twd;
+
+            float relDist = dist / max(totalDist, 1.0);
+            int adaptiveStride = lightStride
+                + (absDist > 8000.0 ? 1 : 0)
+                + (absDist > 22000.0 ? 1 : 0)
+                + (transmittance < 0.15 ? 1 : 0);
+            if(lightTick <= 0)
+            {
+                HPCloudConfig lightCfg = cfg;
+                lightCfg.lightSteps = absDist > 22000.0 ? min(cfg.lightSteps, 4)
+                    : (absDist > 10000.0 ? min(cfg.lightSteps, 5) : cfg.lightSteps);
+                cachedLum = hpEvaluateSunLuminance(posAlt, fullLocalHeight, lightCfg,
+                    lightCfg.sunColor, phaseFunction, weatherTex, baseTex, erosionTex,
+                    cachedLightOD, cachedPhiFwd);
+                lightTick = adaptiveStride;
+            }
+            --lightTick;
+            hpEvaluateCloudStep(fullDensity, fullLocalHeight,
+                slabThickness, hpNormalizedHeight(pos, cfg), posAlt,
+                stepSmall, relDist, cachedLum, cachedLightOD, cachedPhiFwd,
+                cfg, rayDir, silverPhase, inScattering, transmittance);
+
+            if(transmittance < max(cfg.minTransmittance, 0.025))
+            {
+                transmittance = 0.0;
+                break;
+            }
         }
         else
         {
-            dist += stepLarge;
+            emptyFineCount++;
+            if(emptyFineCount >= 2)
+            {
+                inCloud = false;
+                emptyFineCount = 0;
+                prevCoarseStep = 0.0;
+                dist += stepLarge;
+                continue;
+            }
         }
+        dist += stepSmall;
     }
-
 
     hitDistance = hit;
     meanDistance = (meanDistWeight > 0.0) ? meanDistAccum / meanDistWeight : hit;
@@ -879,74 +958,71 @@ float hpGradient2D(vec2 p, float tile)
     return mix(mix(n00, n10, u.x), mix(n01, n11, u.x), u.y);
 }
 
-// ---- mode 0：weather 2D ----
-// A 通道 = 云顶高度变化（0..1，低频）。原先写死 0.5 纯浪费；没有逐柱云顶差
-// 整层就是"薄饼"——v5slice 实测云底/云顶沿 10 km 剖面基本等高。两档 value 噪声
-// 给出 ~24 km / ~12 km 的天气尺度起伏。
+// ---- mode 0: weather 2D (512^2) ----
+// Rich domain-warped cumulus fronts, clear blue-sky gaps, storm cell distribution, and height variation.
 vec4 hpRenderWeather(vec2 uv)
 {
-    const float tile = 8.0;
+    const float tile = 4.0;
     vec2 p = uv * tile;
     vec2 warp = vec2(
-        hpValue2D(p * 2.0 + 71.3, 16.0) - 0.5,
-        hpValue2D(p * 2.0 + 137.9, 16.0) - 0.5) * 1.6;
+        hpGradient2D(p * 1.0 + vec2(3.7, 11.1), 4.0),
+        hpGradient2D(p * 1.0 + vec2(17.3, 5.9), 4.0)) * 0.85;
     vec2 q = p + warp;
-    // 覆盖率倍频：必须包含**大尺度天气系统**（24/12 km 级聚簇）。
-    // 参考用的是带天气系统的天气图（大片云区 / 大片晴区）；旧烘焙最大特征只有
-    // 6 km ⇒ 云均匀撒满全天，"分布怪"的主因。均值保持 0.5 ⇒ (cov-0.5)*2.4+0.66
-    // 的重映射均值不变（0.66），覆盖率标定不受影响。
-    float cov = 0.30 * (hpGradient2D(q * 0.5 + 3.1, 4.0) + 0.5)
-              + 0.28 * (hpGradient2D(q * 1.0 + 17.9, 8.0) + 0.5)
-              + 0.24 * (hpGradient2D(q * 2.0 + 41.3, 16.0) + 0.5)
-              + 0.18 * (hpGradient2D(q * 4.0 + 71.3, 32.0) + 0.5);
-    cov = clamp((cov - 0.5) * 2.4 + 0.66, 0.0, 1.0);
-    float type = clamp(0.5 + 0.9 * (hpValue2D(p * 0.25 + 91.1, 2.0) - 0.5), 0.0, 1.0);
-    float blob = 0.62 * hpWorley2D(p * 0.75, 6.0)
-               + 0.38 * hpWorley2D(p * 1.5 + 7.31, 12.0);
-    float scMask = smoothstep(0.55, 0.85, blob);
-    float topVar = 0.65 * (hpValue2D(p * 0.5 + 51.7, 4.0))
-                 + 0.35 * (hpValue2D(p * 1.0 + 133.7, 8.0));
-    return vec4(cov, type, scMask, clamp(topVar, 0.0, 1.0));
+    float c1 = hpGradient2D(q * 0.5 + vec2(3.1, 7.2), 2.0) * 0.5 + 0.5;
+    float c2 = hpGradient2D(q * 1.0 + vec2(17.9, 2.3), 4.0) * 0.5 + 0.5;
+    float c3 = hpGradient2D(q * 2.0 + vec2(41.3, 19.7), 8.0) * 0.5 + 0.5;
+    float c4 = hpGradient2D(q * 4.0 + vec2(71.3, 53.1), 16.0) * 0.5 + 0.5;
+    float cov = 0.34 * c1 + 0.32 * c2 + 0.22 * c3 + 0.12 * c4;
+    cov = clamp((cov - 0.5) * 2.5 + 0.60, 0.0, 1.0);
+
+    float typeRaw = 0.65 * c1 + 0.35 * c2;
+    float type = clamp((typeRaw - 0.32) * 1.65, 0.0, 1.0);
+    float blob = 0.62 * hpWorley2D(q * 1.0, 4.0)
+               + 0.38 * hpWorley2D(q * 2.0 + vec2(7.31, 4.19), 8.0);
+    float scMask = smoothstep(0.45, 0.82, blob);
+    float topVar = clamp(
+        0.45 * (hpGradient2D(p * 1.0 + vec2(51.7, 12.3), 4.0) * 0.5 + 0.5) +
+        0.35 * cov +
+        0.20 * (hpGradient2D(p * 2.0 + vec2(133.7, 29.1), 8.0) * 0.5 + 0.5),
+        0.0, 1.0);
+    return vec4(cov, type, scMask, topVar);
 }
 
-// ---- mode 1：base 3D（R = PerlinWorley）----
+// ---- mode 1: base 3D (128^3, max tile 24 = 5.3 voxels/cell -> Nyquist-safe billows) ----
 vec4 hpRenderBase(vec3 coord)
-{
-    const vec3 tile = vec3(12.0, 12.0, 12.0);
-    vec3 p = coord * tile;
-    float perlin = 0.360 * hpPerlin3D(p, tile)
-                 + 0.330 * hpPerlin3D((p * 2.0 + 11.7).zyx, tile * 2.0)
-                 + 0.310 * hpPerlin3D((p * 4.0 + 23.1).yxz, tile * 4.0);
-    perlin = perlin * 0.5 + 0.5;
-    float wf = 0.55 * hpWorley3D(p, tile)
-             + 0.45 * hpWorley3D((p * 2.0 + 5.7).zyx, tile * 2.0);
-    float pw = wf + perlin * (1.0 - wf);
-    pw = clamp((pw - 0.40) / 0.68, 0.0, 1.0);
-    return vec4(pw, 0.0, 0.0, 1.0);
-}
-
-// ---- mode 2：erosion 3D（RGBA = WispyLo / WispyHi / BillowyLo / BillowyHi）----
-// ⚠ 倍频必须是**整数**：hash 的平铺靠 mod(cell, tile)，tile 一旦是 4.5 / 12.6
-// 这种非整数，"最后一个格胞"和"第一个格胞"就不是同一个 hash ⇒ 体积里出现
-// 一整块**硬边接缝平面**。2026-10-25 实测：原来的 2.1 / 4.1 / 8.3 / 0.75 / 3.1 / 6.3
-// 在云体内部切出 3~4 道水平硬边（远看就是"千层饼"横条），先被误判成步进量化，
-// 二分到 --erosion 0 才定位到 detail 噪声。整数倍频既有同样频谱，又保持可平铺。
-vec4 hpRenderDetail(vec3 coord)
 {
     const vec3 tile = vec3(6.0, 6.0, 6.0);
     vec3 p = coord * tile;
-    float wispyLo = 0.65 * hpPerlin3D(p, tile)
-                  + 0.35 * hpPerlin3D((p * 2.0 + 7.3).zyx, tile * 2.0);
-    float wispyHi = 0.60 * hpPerlin3D((p * 4.0 + 17.9).yxz, tile * 4.0)
-                  + 0.40 * hpPerlin3D((p * 8.0 + 23.7).zyx, tile * 8.0);
-    float billowyLo = 0.625 * hpWorley3D(p, tile)
-                    + 0.375 * hpWorley3D((p * 2.0 + 9.1).zyx, tile * 2.0);
-    float billowyHi = 0.625 * hpWorley3D((p * 3.0 + 13.9).yxz, tile * 3.0)
-                    + 0.375 * hpWorley3D((p * 6.0 + 27.3).zyx, tile * 6.0);
-    return vec4(clamp(wispyLo * 0.5 + 0.5, 0.0, 1.0),
-        clamp(wispyHi * 0.5 + 0.5, 0.0, 1.0),
-        clamp(billowyLo, 0.0, 1.0),
-        clamp(billowyHi, 0.0, 1.0));
+    float perlin = 0.50 * hpPerlin3D(p, tile)
+                 + 0.32 * hpPerlin3D((p * 2.0 + 11.7).zyx, tile * 2.0)
+                 + 0.18 * hpPerlin3D((p * 4.0 + 23.1).yxz, tile * 4.0);
+    perlin = perlin * 0.5 + 0.5;
+    float wf = 0.55 * hpWorley3D(p, tile)
+             + 0.30 * hpWorley3D((p * 2.0 + 5.7).zyx, tile * 2.0)
+             + 0.15 * hpWorley3D((p * 4.0 + 13.3).yxz, tile * 4.0);
+    float pw = wf + perlin * (1.0 - wf);
+    pw = clamp((pw - 0.34) / 0.66, 0.0, 1.0);
+    return vec4(pw, wf, perlin, 1.0);
+}
+
+// ---- mode 2: erosion 3D (64^3, integer tiles 4/8/16 >= 4 voxels/cell -> zero sand aliasing) ----
+vec4 hpRenderDetail(vec3 coord)
+{
+    const vec3 tile = vec3(4.0, 4.0, 4.0);
+    vec3 p4 = coord * tile;
+    float pLo  = hpPerlin3D(p4, tile) * 0.5 + 0.5;
+    float pMid = hpPerlin3D((p4 * 2.0 + 7.3).zyx, tile * 2.0) * 0.5 + 0.5;
+    float pHi  = hpPerlin3D((p4 * 4.0 + 17.9).yxz, tile * 4.0) * 0.5 + 0.5;
+    float wispyLo = clamp(0.65 * pLo + 0.35 * pMid, 0.0, 1.0);
+    float wispyHi = clamp(0.60 * pMid + 0.40 * pHi, 0.0, 1.0);
+
+    // Inverted distance (1 - Worley) carves crisp crevices while preserving bulbous puffs.
+    float wLo  = clamp(1.0 - hpWorley3D(p4 + vec3(1.1, 2.3, 0.7), tile), 0.0, 1.0);
+    float wMid = clamp(1.0 - hpWorley3D((p4 * 2.0 + 9.1).zyx, tile * 2.0), 0.0, 1.0);
+    float wHi  = clamp(1.0 - hpWorley3D((p4 * 4.0 + 13.9).yxz, tile * 4.0), 0.0, 1.0);
+    float billowyLo = clamp(0.62 * wLo + 0.38 * wMid, 0.0, 1.0);
+    float billowyHi = clamp(0.62 * wMid + 0.38 * wHi, 0.0, 1.0);
+    return vec4(wispyLo, wispyHi, billowyLo, billowyHi);
 }
 #endif
 #endif

@@ -185,6 +185,8 @@ float g_waterSimPendingImpulseX = 0.0f;
 float g_waterSimPendingImpulseZ = 0.0f;
 float g_waterSimPendingImpulseStrength = 0.0f;
 float g_waterSimLastSurfaceY = 0.0f;
+// 2026-11-16：焦散近水门的"玩家附近水面 Y"（见 OrionInternal.h 注释）。
+float g_waterNearbySurfaceY = 0.0f;
 bool g_waterSimOriginValid = false;
 float g_waterSimOriginX = 0.0f;
 float g_waterSimOriginZ = 0.0f;
@@ -201,6 +203,28 @@ std::mutex g_waterSimEntityMutex;
 std::deque<WaterSimImpulseEvent> g_waterSimImpulseQueue;
 float g_waterSimBoatData[WATER_SIM_MAX_ENTITIES * 5] = {};
 int32_t g_waterSimBoatCount = 0;
+// 2026-11-21 水体掩码 + sim 步计数（雨点确定性撒点种子）。
+uint32_t g_waterSimStepCounter = 0u;
+VkImage g_waterSimMaskImage = VK_NULL_HANDLE;
+VkDeviceMemory g_waterSimMaskMemory = VK_NULL_HANDLE;
+VkImageView g_waterSimMaskView = VK_NULL_HANDLE;
+VkBuffer g_waterSimMaskBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_waterSimMaskBufferMemory = VK_NULL_HANDLE;
+void* g_waterSimMaskMapped = nullptr;
+bool g_waterSimMaskValid = false;
+bool g_waterSimMaskDirty = false;
+bool g_waterSimMaskLayoutReady = false;
+float g_waterSimMaskOriginX = 0.0f;
+float g_waterSimMaskOriginZ = 0.0f;
+std::mutex g_waterSimMaskMutex;
+// 2026-11-21 群系水色：初始 = 海洋参照 #3F76E4（Java 未发前逐位旧档）。
+std::atomic<float> g_waterBiomeTintR{0.247059f};
+std::atomic<float> g_waterBiomeTintG{0.462745f};
+std::atomic<float> g_waterBiomeTintB{0.894118f};
+std::atomic<bool> g_waterBiomeTintValid{false};
+// 2026-11-21 顾问轮1：独立「雨滴涟漪」倍率全局已删——sim 大滴与解析细雨环
+// 统一走降雨页「雨波纹明显度」（g_rainRippleStrength）。
+
 const std::chrono::steady_clock::time_point g_waterWaveEpoch =
     std::chrono::steady_clock::now();
 std::atomic<bool> g_waterCausticMapAvailable{false};
@@ -274,8 +298,26 @@ VkImageView g_fogScreenColorView = VK_NULL_HANDLE;
 VkImage g_fogScreenDistImage = VK_NULL_HANDLE;
 VkDeviceMemory g_fogScreenDistMemory = VK_NULL_HANDLE;
 VkImageView g_fogScreenDistView = VK_NULL_HANDLE;
+VkImage g_fogFroxelShadowImage = VK_NULL_HANDLE;
+VkDeviceMemory g_fogFroxelShadowMemory = VK_NULL_HANDLE;
+VkImageView g_fogFroxelShadowView = VK_NULL_HANDLE;
+VkImage g_fogFroxelLightHistoryImage = VK_NULL_HANDLE;
+VkDeviceMemory g_fogFroxelLightHistoryMemory = VK_NULL_HANDLE;
+VkImageView g_fogFroxelLightHistoryView = VK_NULL_HANDLE;
+VkImage g_fogFroxelIntegratedImage = VK_NULL_HANDLE;
+VkDeviceMemory g_fogFroxelIntegratedMemory = VK_NULL_HANDLE;
+VkImageView g_fogFroxelIntegratedView = VK_NULL_HANDLE;
+uint32_t g_fogFroxelWidth = 0u;
+uint32_t g_fogFroxelHeight = 0u;
+std::atomic<bool> g_fogFroxelHistoryNeedsClear{true};
 VkPipeline g_fogFroxelDensityPipeline = VK_NULL_HANDLE;
 VkPipelineLayout g_fogFroxelDensityPipelineLayout = VK_NULL_HANDLE;
+VkPipeline g_fogFroxelLightPipeline = VK_NULL_HANDLE;
+VkPipelineLayout g_fogFroxelLightPipelineLayout = VK_NULL_HANDLE;
+VkPipeline g_fogScreenApplyPipeline = VK_NULL_HANDLE;
+VkPipelineLayout g_fogScreenApplyPipelineLayout = VK_NULL_HANDLE;
+VkPipeline g_fogScreenMarchPipeline = VK_NULL_HANDLE;
+VkPipelineLayout g_fogScreenMarchPipelineLayout = VK_NULL_HANDLE;
 VkPipeline g_fogFroxelCompositePipeline = VK_NULL_HANDLE;
 VkPipelineLayout g_fogFroxelCompositePipelineLayout = VK_NULL_HANDLE;
 VkImageLayout g_volumetricCloudLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -472,10 +514,6 @@ VkPipelineLayout g_skyAtmospherePipelineLayout = VK_NULL_HANDLE;
 VkPipeline g_skyAtmospherePipeline = VK_NULL_HANDLE;
 VkImageLayout g_skyScatteringLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 VkImageLayout g_skyTransmittanceLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-VkImage g_waterDetailNormalImage = VK_NULL_HANDLE;
-VkDeviceMemory g_waterDetailNormalMemory = VK_NULL_HANDLE;
-VkImageView g_waterDetailNormalView = VK_NULL_HANDLE;
-VkSampler g_waterDetailNormalSampler = VK_NULL_HANDLE;
 VkImage g_waterCausticImage = VK_NULL_HANDLE;
 VkDeviceMemory g_waterCausticMemory = VK_NULL_HANDLE;
 VkImageView g_waterCausticView = VK_NULL_HANDLE;
@@ -578,6 +616,9 @@ VkDescriptorSet g_rayTracingDescriptorSet=VK_NULL_HANDLE;
 VkDescriptorSetLayout g_rayTracingDescriptorSetLayout=VK_NULL_HANDLE;
 VkPipelineLayout g_rayTracingPipelineLayout=VK_NULL_HANDLE;
 VkPipeline g_rayTracingPipeline=VK_NULL_HANDLE;
+// 懒编生效时为 true（boot worker 主动跳过 main 编译）。与"main 编译失败"区分：
+// 失败=整局 RT 关闭；懒编=K1/K2 独立管线照常跑，仅 fallback 路径不可用。
+std::atomic<bool> g_rtMainPipelineLazy{false};
 bool g_nrdReady = false;
 nrd::Instance* g_nrdInstance = nullptr;
 uint32_t g_nrdWidth = 0u;
@@ -743,6 +784,14 @@ VkDeviceMemory g_motionMemory = VK_NULL_HANDLE;
 VkImageView g_motionView = VK_NULL_HANDLE;
 uint32_t g_motionWidth = 0;
 uint32_t g_motionHeight = 0;
+// 2026-11-21 P0-1：主命中世界位移 per-pixel 旁路槽（binding 98，RGBA16F 全分辨率）。
+// rgen 每像素清槽，rchit 主射线命中写回 xyz=offset / a=valid，rgen 主射线返回后读回。
+VkImage g_hitOffsetImage = VK_NULL_HANDLE;
+VkDeviceMemory g_hitOffsetMemory = VK_NULL_HANDLE;
+VkImageView g_hitOffsetView = VK_NULL_HANDLE;
+uint32_t g_hitOffsetWidth = 0;
+uint32_t g_hitOffsetHeight = 0;
+VkImageLayout g_hitOffsetLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 
 
@@ -806,16 +855,6 @@ VkImageLayout g_giTemporalHistoryLayouts[2] =
 uint32_t g_giTemporalHistoryWidth = 0u;
 uint32_t g_giTemporalHistoryHeight = 0u;
 bool g_giTemporalHistoryNeedsClear = false;
-
-// 2026-11-14：稀疏反射的时域历史（binding 92）。单张 rgba16f、渲染分辨率，
-// 无 ping-pong —— 每个 invocation 只读写自己那一个 texel，没有跨像素依赖。
-VkImage g_glossyHistoryImage = VK_NULL_HANDLE;
-VkDeviceMemory g_glossyHistoryMemory = VK_NULL_HANDLE;
-VkImageView g_glossyHistoryView = VK_NULL_HANDLE;
-VkImageLayout g_glossyHistoryLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-uint32_t g_glossyHistoryWidth = 0u;
-uint32_t g_glossyHistoryHeight = 0u;
-bool g_glossyHistoryNeedsClear = true;
 
 
 VkImage g_alphaBlendGbufferImage = VK_NULL_HANDLE;
@@ -1145,7 +1184,7 @@ VkDeviceMemory g_ssHzbMemory = VK_NULL_HANDLE;
 uint32_t g_ssHzbLevelCount = 0u;
 VkPipeline g_ssHzbPipeline = VK_NULL_HANDLE;
 std::atomic<float> g_ueCloudParams[UE_CLOUD_PARAM_COUNT] = {
-    {1.0f}, {0.5f}, {0.5f}, {1.0f}, {0.15f}, {1.0f}, {0.35f}, {1.0f}
+    {3.0f}, {0.5f}, {0.5f}, {1.0f}, {0.15f}, {1.0f}, {0.35f}, {1.0f}
 };
 
 // 2026-10-31：语义从"最远距离（格）"改成"整体距离系数"（1.0 = 标准）。
@@ -1191,6 +1230,7 @@ std::atomic<float> g_planeCloudOctaves{5.0f};
 std::atomic<float> g_planeCloudFadeDistance{100000.0f};
 std::atomic<float> g_planeCloudBrightness{1.0f};
 std::atomic<uint32_t> g_cloudResFloorPercent{0u};
+std::atomic<uint32_t> g_cloudTemporalMode{2u};
 std::atomic<float> g_cloudFarStepDensity{0.45f};
 std::atomic<bool> g_cloudFadeFollowsRrMode{true};
 std::atomic<float> g_cloudTwoTierStep{1.0f};
@@ -1267,6 +1307,15 @@ VkBuffer g_cloudFogLightGridBound = VK_NULL_HANDLE;
 std::atomic<float> g_cloudTemporalDamp{0.0f};
 std::atomic<float> g_groundAerialStrength{0.0f};
 std::atomic<float> g_groundAerialOcclusion{0.0f};
+std::atomic<float> g_cloudAerialStrength{0.85f};
+std::atomic<float> g_cloudStormDarkness{0.85f};
+std::atomic<float> g_cloudLightningStrength{1.20f};
+std::atomic<float> g_cloudSunsetWarmth{1.00f};
+std::atomic<float> g_cloudWeatherCoupling{1.00f};
+std::atomic<float> g_cloudPowderEffect{0.65f};
+std::atomic<float> g_cloudSilverSpread{0.85f};
+std::atomic<float> g_cloudSharpness{0.75f};
+std::atomic<float> g_cloudBaseErosion{0.55f};
 std::atomic<float> g_cloudProfileType{0.25f};
 std::atomic<float> g_cloudProfileTypeSpread{0.0f};
 std::atomic<float> g_cloudWispyStrength{0.25f};
@@ -1297,6 +1346,12 @@ std::atomic<float> g_skyModelScale{1.0f};
 //   g_skyRainDim      = 雨天/雷暴天空压暗倍率（0 = 不压暗，1 = 出厂，>1 更狠）
 std::atomic<float> g_skyNightAmbient{1.0f};
 std::atomic<float> g_skyRainDim{1.0f};
+// 2026-11-16 月光两旋钮（车道 = CameraUBO.moonParams.x / .y）：
+//   g_moonLightFloor  = 月光能量地板（新月夜 = 满月的这一比例；0 = 纯物理）
+//   g_moonDaylightDim = 白天月亮亮度（占夜间基准的比例；1 = 不压暗）
+// 出厂 0.35 / 0.85：月牙夜能看清路，白天也看得见月亮（旧档是 0 / 0.60）。
+std::atomic<float> g_moonLightFloor{0.35f};
+std::atomic<float> g_moonDaylightDim{0.85f};
 std::atomic<float> g_auroraStrength{0.0f};
 std::atomic<float> g_auroraBrightness{1.0f};
 std::atomic<float> g_auroraFlowSpeed{1.0f};
@@ -1325,7 +1380,13 @@ std::atomic<float> g_fogViewDistance{256.0f};
 std::atomic<uint32_t> g_fogSteps{16u};
 std::atomic<float> g_fogExtinction{0.020f};
 std::atomic<float> g_fogRainBoost{2.0f};
-std::atomic<float> g_fogDawnBoost{1.8f};
+// 2026-11-16：1.8 -> 1.75（与前一轮硬编码档对齐；现在接进 UI 车道
+// CameraUBO.fogMoodParams.y，此前这个 atomic 全工程零读者）。
+std::atomic<float> g_fogDawnBoost{1.75f};
+// 2026-11-16 雾形态强度（车道 = CameraUBO.fogMoodParams.x）：
+//   0 = 主体积雾回到"纯解析指数"的均匀灰膜（改动前观感）
+//   1 = 出厂：120 格尺度的大团块厚薄不均
+std::atomic<float> g_fogShapeStrength{1.0f};
 std::atomic<bool> g_fogGroundMistEnabled{true};
 std::atomic<float> g_fogGroundMistHeight{1.0f};
 std::atomic<float> g_fogGroundMistExtinction{0.15f};
@@ -2000,6 +2061,18 @@ VkStridedDeviceAddressRegionKHR g_k2locRaygenRegion{};
 VkStridedDeviceAddressRegionKHR g_k2locMissRegion{};
 VkStridedDeviceAddressRegionKHR g_k2locHitRegion{};
 VkStridedDeviceAddressRegionKHR g_k2locCallableRegion{};
+// ⑤ K2-SUN 再拆分（默认开，ORION_K2_SPLIT3=0 回退 ④ 三腿）：K2-SUNA（水+RTAO）
+// + K2-SUNB（阴影+GGX+植被SSS，load-add 复用 binding 89）。全局量定义跟随 ④。
+VkPipeline g_k2sunAPipeline = VK_NULL_HANDLE;
+VkPipeline g_k2sunBPipeline = VK_NULL_HANDLE;
+VkStridedDeviceAddressRegionKHR g_k2sunARaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunAMissRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunAHitRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunACallableRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunBRaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunBMissRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunBHitRegion{};
+VkStridedDeviceAddressRegionKHR g_k2sunBCallableRegion{};
 VkImage g_k2DirectImage = VK_NULL_HANDLE;
 VkDeviceMemory g_k2DirectMemory = VK_NULL_HANDLE;
 VkImageView g_k2DirectView = VK_NULL_HANDLE;
@@ -2008,6 +2081,17 @@ uint32_t g_k2DirectWidth = 0u;
 uint32_t g_k2DirectHeight = 0u;
 VkBuffer g_k1LandingBuffer = VK_NULL_HANDLE;
 VkDeviceMemory g_k1LandingMemory = VK_NULL_HANDLE;
+// P2 跨腿材质复用中转 buffer（binding 94）；复用开关关闭时保持空。
+VkBuffer g_matReuseBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_matReuseMemory = VK_NULL_HANDLE;
+uint32_t g_matReuseWidth = 0u;
+uint32_t g_matReuseHeight = 0u;
+uint32_t g_matReuseSlots = 0u;
+// 本地光 NEE 可见性跨腿缓存（binding 95）；开关关闭时保持空。
+VkBuffer g_neeVisCacheBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_neeVisCacheMemory = VK_NULL_HANDLE;
+uint32_t g_neeVisCacheWidth = 0u;
+uint32_t g_neeVisCacheHeight = 0u;
 VkBuffer g_k1k2SbtBuffer = VK_NULL_HANDLE;
 VkDeviceMemory g_k1k2SbtMemory = VK_NULL_HANDLE;
 VkStridedDeviceAddressRegionKHR g_k1RaygenRegion{};
@@ -2214,7 +2298,7 @@ bool g_waterFftLastUpdateValid = false;
 float g_waterFftTimeSeconds = 0.0f;
 std::atomic<bool> g_waterFftAvailable{false};
 bool g_waterFftUpdatedThisFrame = false;
-std::atomic<float> g_waterFftWindSpeed{7.0f};
+std::atomic<float> g_waterFftWindSpeed{3.5f};  // 2026-11-20「风速」出厂值：3.5 ⇒ 时间标量 0.5×
 std::atomic<float> g_waterFftWindDirection{45.0f};
 std::atomic<float> g_waterFftTilePeriod{128.0f};
 std::atomic<float> g_waterFftAmplitude{1.0f};
@@ -2222,7 +2306,21 @@ std::atomic<float> g_waterFftChoppiness{1.0f};
 std::atomic<float> g_waterFftDetail{1.0f};
 std::atomic<float> g_waterFftRateHz{30.0f};
 std::atomic<float> g_waterFftSwellGain{1.0f};
+// 2026-11-20 波面 cascade 配平（GUI「涌浪权重 / 短波权重」）：
+//   waterFftSwellWeight → CameraUBO.waterFftParams2.z（原 swellGain 车道，着色端
+//                         已无消费者）
+//   waterFftDetailWeight→ CameraUBO.waterFftParams2.x（原 windDirection 车道，
+//                         只有已停用的解析波路径读它）
+std::atomic<float> g_waterFftSwellWeight{0.45f};
+std::atomic<float> g_waterFftDetailWeight{0.90f};
 std::atomic<float> g_waterWeatherRain{0.0f};
+
+// 2026-11-21 统一风场（GUI「风向 / 风强 / 阵风」）→ CameraUBO.windParams +
+// waterFftPush 风向（waterFftDispatch）。出厂 30.5° = HP 云原硬编码方向
+// vec2(0.862,0.507)，出厂时云/雾逐位不变、水波谱从 45° 转到与云同向。
+std::atomic<float> g_windAngle{30.5f};
+std::atomic<float> g_windStrength{1.0f};
+std::atomic<float> g_windGust{0.4f};
 std::atomic<bool>  g_waterFftEnabled{true};
 VkImage g_waterCausticMapImage = VK_NULL_HANDLE;
 VkDeviceMemory g_waterCausticMapMemory = VK_NULL_HANDLE;
@@ -2240,6 +2338,12 @@ VkDescriptorSet g_waterCausticMapDescriptorSet = VK_NULL_HANDLE;
 VkPipelineLayout g_waterCausticMapPipelineLayout = VK_NULL_HANDLE;
 VkImageView g_waterCausticMapStorageView = VK_NULL_HANDLE;
 VkPipeline g_waterCausticMapPipeline = VK_NULL_HANDLE;
+VkImage g_waterCausticAccumImage = VK_NULL_HANDLE;
+VkDeviceMemory g_waterCausticAccumMemory = VK_NULL_HANDLE;
+VkImageView g_waterCausticAccumView = VK_NULL_HANDLE;
+VkSampler g_waterCausticAccumSampler = VK_NULL_HANDLE;
+VkDescriptorSet g_waterCausticResolveDescriptorSet = VK_NULL_HANDLE;
+VkPipeline g_waterCausticResolvePipeline = VK_NULL_HANDLE;
 int64_t g_leakProbeInsideBytes = 0;
 int64_t g_leakProbeOutsideBytes = 0;
 uint64_t g_leakProbeEnterBytes = 0u;
@@ -2259,6 +2363,36 @@ uint64_t g_vliTableReinsertTotal = 0u;
 std::unordered_map<uint64_t, DhLodSection> g_dhLodSections;
 std::unordered_map<uint64_t, uint64_t> g_dhLodSpatialOwners;
 std::vector<uint64_t> g_dhLodSpatialSnapshot;
+
+// ---------------------------------------------------------------------------
+// 2026-11-19 DH LOD「G-buffer 光栅光影」全局资源（rasterLod 开启时才非空）。
+// 语义见 OrionInternal.h 对应 extern 块的注释；实现见 Lod.cpp。
+// ---------------------------------------------------------------------------
+bool g_dhRasterLodEnabled = false;
+VkImage g_dhLodRasterColorImage = VK_NULL_HANDLE;
+VkDeviceMemory g_dhLodRasterColorMemory = VK_NULL_HANDLE;
+VkImageView g_dhLodRasterColorView = VK_NULL_HANDLE;
+VkImage g_dhLodRasterDepthImage = VK_NULL_HANDLE;
+VkDeviceMemory g_dhLodRasterDepthMemory = VK_NULL_HANDLE;
+VkImageView g_dhLodRasterDepthView = VK_NULL_HANDLE;
+VkImageLayout g_dhLodRasterColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+VkImageLayout g_dhLodRasterDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+uint32_t g_dhLodRasterWidth = 0u;
+uint32_t g_dhLodRasterHeight = 0u;
+VkPipeline g_dhLodRasterPipeline = VK_NULL_HANDLE;
+VkPipelineLayout g_dhLodRasterPipelineLayout = VK_NULL_HANDLE;
+VkDescriptorSetLayout g_dhLodRasterSetLayout = VK_NULL_HANDLE;
+VkDescriptorPool g_dhLodRasterDescriptorPool = VK_NULL_HANDLE;
+VkDescriptorSet g_dhLodRasterSet = VK_NULL_HANDLE;
+VkBuffer g_dhLodRasterRecordDevice = VK_NULL_HANDLE;
+VkDeviceMemory g_dhLodRasterRecordDeviceMemory = VK_NULL_HANDLE;
+VkBuffer g_dhLodRasterRecordStaging = VK_NULL_HANDLE;
+VkDeviceMemory g_dhLodRasterRecordStagingMemory = VK_NULL_HANDLE;
+void* g_dhLodRasterRecordStagingMapped = nullptr;
+VkDeviceSize g_dhLodRasterRecordCapacity = 0u;
+bool g_dhLodRasterGrowRequested = false;
+uint64_t g_dhLodRasterTlasSkips = 0u;
+
 VkImageView g_sunShadowFarPublishedView = VK_NULL_HANDLE;
 bool g_sunShadowFarPublishedReady = false;
 

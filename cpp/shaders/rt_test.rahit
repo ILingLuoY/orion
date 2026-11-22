@@ -961,10 +961,22 @@ void main() {
         // 2026-10-27：玻璃族用固定 alpha（贴图 alpha 只作颜色）。
         // 不再取 atlasSample.a —— 边框 texel 是 1.0，侧面整块落在边框上 ⇒ 实心。
         // 致密体（遮光玻璃等）仍按 profile 抬高不透明度。
-        const float chainAlpha = max(
-            GLASS_FIXED_ALPHA,
-            1.0 - clamp(getTransparentProfileTransmissionAnyHit(chainProfileRaw),
-                        0.0, 1.0));
+        // 2026-11-21：清玻璃边框 Alpha-Cutout —— 与 rchit 同一判定（宏说明见
+        // glass_chain_common.glsl）。边框的 chainAlpha 取贴图 alpha(≈1.0)，越过
+        // 下方的 OPAQUENESS_THRESHOLD 分支 ⇒ return 作为遮挡终止、不记录层，
+        // 与 rchit 把该命中归为 RT_HIT_OPAQUE 保持一致。
+        const bool chainCutoutBorder =
+            VPT_GLASS_CUTOUT_BORDER != 0 &&
+            materialId < 2.05 &&
+            glassVertexFactorIsFaceShade(vertexColor.rgb) &&
+            atlasSample.a >= VPT_GLASS_CUTOUT_THRESHOLD;
+
+        const float chainAlpha = chainCutoutBorder
+            ? 1.0
+            : max(
+                GLASS_FIXED_ALPHA,
+                1.0 - clamp(getTransparentProfileTransmissionAnyHit(chainProfileRaw),
+                            0.0, 1.0));
 #if VPT_GLASS_ALPHA_BLEND_DEFERRED_COMPOSITE
         // =====================================================
         // 2026-10-28：**清玻璃必须当空气跳过**。

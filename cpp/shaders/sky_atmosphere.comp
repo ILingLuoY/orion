@@ -94,6 +94,32 @@ float saturate(float value)
 #define TWILIGHT_CAP_STRENGTH 0.0
 #endif
 
+// =============================================================================
+// 2026-11-16 日出 / 日落氛围项（三组，全部烘进同一张天空 LUT）
+//
+// 为什么需要：太阳**仍在地平线以上**的那一段（-8°..+19°）目前只有物理单次
+// 散射。物理是对的，但观感偏"薄"——真实日出/日落最容易识别的三样东西，在
+// 本工程的 LUT 分辨率 + 曝光下几乎看不出来：
+//   ① 贴地平线的**金色亮带**：太阳方位最强，向上 ~10° 快速衰减；
+//   ② 反日侧的**金星带**（Belt of Venus）：地平线上方 5~12° 的粉紫带；
+//   ③ 金星带下方的**地球本影**（Earth's shadow）：反日侧一条偏暗的带子。
+// ②③ 是"朝霞 / 晚霞"和"普通蓝天"的分水岭，纯 Rayleigh+Mie 不会自己长出来
+//（它们来自多次散射 + 地球曲率遮挡，单次散射模型里没有）。
+//
+// 三个窗口都严格门控在太阳高度 -0.14..+0.34 之间 ⇒ 正午与深夜逐位不变。
+// 位置在 rain/thunder 天气处理**之前**，所以雨天会被正常压暗去饱和。
+// 调法：任一常量置 0 即整项编译掉（也可用 -D 覆盖做 A/B）。
+// =============================================================================
+#ifndef SKY_SUNSET_BAND_STRENGTH
+#define SKY_SUNSET_BAND_STRENGTH 0.42
+#endif
+#ifndef SKY_VENUS_BELT_STRENGTH
+#define SKY_VENUS_BELT_STRENGTH 0.16
+#endif
+#ifndef SKY_EARTH_SHADOW_STRENGTH
+#define SKY_EARTH_SHADOW_STRENGTH 0.18
+#endif
+
 #include "sky_sun_common.glsl"
 
 
@@ -345,6 +371,98 @@ void main()
             (0.12 + 0.88 * horizonWeight * azimuthGain) *
             SKY_TWILIGHT_STRENGTH * nightSkyScale;
     }
+
+    // -----------------------------------------------------------------------
+    // 2026-11-16 日出/日落氛围项（宏与完整说明见文件顶部）
+    // -----------------------------------------------------------------------
+    if((SKY_SUNSET_BAND_STRENGTH > 0.0 || SKY_VENUS_BELT_STRENGTH > 0.0) &&
+       sunElevationB > -0.20 && sunElevationB < 0.34)
+    {
+        // =====================================================
+        // 2026-11-16：金带与金星带的窗口**拆开**。
+        //
+        // 加入"蓝调时刻"之后必须重新分时段，否则暖项会盖住它：
+        //   金带   0 ~ -4°（太阳还在地平线上或刚落下）—— 再晚就让位给蓝调
+        //   金星带 -3° 满值，一直延续到 -11.5°（反日侧的粉紫带本来就长）
+        //   蓝调   -8° 峰值（见下面的独立块）
+        // 三者叠在一起是"暖→粉→蓝"的真实落日序列。
+        // =====================================================
+        float goldWindow = smoothstep(-0.09, -0.01, sunElevationB) *
+            (1.0 - smoothstep(0.14, 0.34, sunElevationB));
+        float sunsetWindow = smoothstep(-0.20, -0.06, sunElevationB) *
+            (1.0 - smoothstep(0.14, 0.34, sunElevationB));
+
+        // 方位分解。direction.y≈0 时方位向量退化成 0，用 1e-4 兜底
+        //（与上面 twilight 块同法）。
+        vec3 sunAzimuth = normalize(vec3(sunDirB.x, 1.0e-4, sunDirB.z));
+        vec3 dirAzimuth = normalize(vec3(direction.x, 1.0e-4, direction.z));
+        float sunAzDot = dot(dirAzimuth, sunAzimuth);
+
+        float aboveHorizon = max(direction.y, 0.0);
+
+        // ① 金色地平线带：2.6° 亮芯 + 9° 宽晕，朝太阳方位加权。
+        //    色相沿用 twilightPalette（黄昏橘红 / 清晨橘粉），保证与太阳已落到
+        //    地平线以下时那段暮光同色，两者在 -1° 附近衔接不跳色。
+        float bandShape = 0.55 * exp(-aboveHorizon / 0.045) +
+            0.45 * exp(-aboveHorizon / 0.16);
+        float bandAzimuth = max(sunAzDot, 0.0);
+        bandAzimuth *= bandAzimuth;
+        radiance += twilightPalette(sunElevationB) *
+            SKY_SUNSET_BAND_STRENGTH * goldWindow * bandShape * bandAzimuth;
+
+        // ② 金星带：反日方位，中心 6.6°、半宽 4.5°。清晨偏玫瑰、黄昏偏暖粉。
+        //    方位权重 2026-11-17 自查修正：原来用 max(-cos,0)^1.6，在**正侧方
+        //    （±90°）恰好归零** —— 而金带那边 pow(cos,2) 也在同一方位归零
+        //    ⇒ 落日时"太阳左右 90°"的天区既没有金带也没有金星带，出现一条
+        //    空的过渡带。真实金星带是横跨反日侧的宽弧，可以延伸到 ±90°。
+        //    改成 (0.5 - 0.5·cos)：反日点 1.0、正侧方 0.5、太阳方位 0。
+        float venusAzimuth = pow(clamp(0.5 - 0.5 * sunAzDot, 0.0, 1.0), 1.4);
+        float venusOffset = (direction.y - 0.115) / 0.078;
+        float venusHeight = exp(-venusOffset * venusOffset);
+        vec3 venusHue = mix(vec3(0.90, 0.50, 0.62), vec3(0.74, 0.46, 0.64),
+            twilightEveningWeight());
+        radiance += venusHue * SKY_VENUS_BELT_STRENGTH * sunsetWindow *
+            venusHeight * venusAzimuth;
+
+        // ③ 地球本影：金星带下方 0..3.5° 反日侧的暗带（乘性，最多 -18%）。
+        //    它把「亮带 / 暗带 / 粉带」三层拉开，是落日层次感的主要来源。
+        float shadowOffset = aboveHorizon / 0.045;
+        radiance *= 1.0 - SKY_EARTH_SHADOW_STRENGTH * sunsetWindow *
+            venusAzimuth * exp(-shadowOffset * shadowOffset);
+    }
+    // -----------------------------------------------------------------------
+    // 2026-11-16 蓝调时刻（Blue Hour）—— FH6 的"傍晚"时段后半段。
+    //
+    // 上面 twilight 块是**暖**余晖（橘红/粉，太阳 -0..-4°）。它退场之后天空
+    // 会转成一段纯度很高的**深蓝**（太阳 -4°..-12°），这才是落日序列的收尾，
+    // 也是摄影里最常等的那十分钟。此前这段只靠物理散射 + 极小的夜底光，
+    // 整片偏灰、没有色相。
+    //
+    // 峰值取 -0.14 rad（-8°）：
+    //   上沿 -0.055（-3°）归零 —— 那一刻金带还在，不该有蓝
+    //   下沿 -0.26（-15°）归零 —— 之后交给 nightAmount 的夜底光
+    // 垂直渐变：地平线偏青蓝、天顶偏靛紫（真实蓝调是上深下亮）。
+    // 回退：SKY_BLUE_HOUR_STRENGTH = 0。
+    // -----------------------------------------------------------------------
+#ifndef SKY_BLUE_HOUR_STRENGTH
+#define SKY_BLUE_HOUR_STRENGTH 0.18
+#endif
+    if(SKY_BLUE_HOUR_STRENGTH > 0.0 && sunElevationB < -0.04)
+    {
+        float blueWindow = smoothstep(-0.26, -0.14, sunElevationB) *
+            (1.0 - smoothstep(-0.14, -0.055, sunElevationB));
+
+        if(blueWindow > 0.0)
+        {
+            float blueHorizonWeight = exp(-max(direction.y, 0.0) / 0.32);
+            vec3 blueHue = mix(vec3(0.20, 0.40, 0.78), vec3(0.13, 0.20, 0.52),
+                smoothstep(0.0, 0.55, direction.y));
+            // 雨/雷暴由后面的同一条天气链压暗去饱和，这里不用单独门控。
+            radiance += blueHue * SKY_BLUE_HOUR_STRENGTH * blueWindow *
+                (0.35 + 0.65 * blueHorizonWeight);
+        }
+    }
+
     radiance += SKY_LUT_SKY_EXTRA_SCALE * (
         evaluateAurora(direction, sunElevationB));
     float rainSky = clamp(cam.weatherParams.x * rainSkyScale, 0.0, 1.0);

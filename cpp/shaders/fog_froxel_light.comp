@@ -1,0 +1,700 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// ===========================================================================
+// Volumetric Fog & Volumetric Light — Pass 2/4: Volumetric Lighting + 3D Temporal Accumulation
+//
+// Evaluates at each froxel's temporally-jittered world position:
+//   1. Exact RT ray-query sun/moon geometric visibility (cullMask 0x08u, no ForceOpaque:
+//      solid blocks & OMM foliage block; glass windows & water let sunbeams pass;
+//      hand/player/particles excluded). ZERO wall light-leak.
+//   2. Real cloud-gap shadow map (binding 14) aligned with V5 volumetric clouds.
+//   3. Physically-correct Beer-Lambert sun self-shadow transmittance exp(-sunTau).
+//   4. Sky ambient in-scattering (attenuated in underground caves via skyOpenness).
+//   5. Local light scattering (torches/lanterns/lava) with short shadow rays when
+//      VolReSTIR is off.
+//   6. 3D temporal reprojection & EMA accumulation against previous frame's lit volume
+//      (binding 26, hardware 3D trilinear) -> smooth, crisp, zero-flicker volumetric shafts!
+//
+// Output (binding 23, rgba16f):
+//   RGB = in-scattered radiance per block
+//   A   = total extinction sigmaT per block
+// ===========================================================================
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(set = 0, binding = 5) uniform sampler2D sceneDepth;
+layout(set = 0, binding = 14) uniform sampler2D cloudShadowMap;
+layout(set = 0, binding = 16) uniform accelerationStructureEXT fogTlas;
+layout(rgba16f, set = 0, binding = 18) uniform readonly image3D fogDensityRead;
+layout(rgba16f, set = 0, binding = 23) uniform writeonly image3D fogLightOut;
+layout(set = 0, binding = 26) uniform sampler3D fogLightHistory;
+
+layout(push_constant) uniform FogFroxelPush
+{
+    vec4 params; // x = layers, y = maxDistance, z = historyValid(0/1), w = cloudShadowValid(0/1)
+} pc;
+
+#include "fog_froxel_common.glsl"
+#include "sky_model_common.glsl"
+#include "sky_sun_common.glsl"
+#include "clear_sky_aerial.glsl"
+#include "local_light_grid_common.glsl"
+
+const float FOG_HAZE_ALBEDO           = 0.90;
+const float FOG_SHAFT_EXTINCTION_FRAC = 0.12;
+const float FOG_SUN_RAY_MAX_DIST      = 256.0;
+const float FOG_RAY_TMIN              = 0.01;
+const float FOG_CLOUD_SHADOW_EXTENT   = 512.0;
+const float FOG_LOCAL_LIGHT_MAX_DIST  = 80.0;
+const float FOG_RADIANCE_CLAMP        = 16.0;
+
+shared float sCellMinDist[4][4];
+shared float sCellMaxDist[4][4];
+shared vec2  sCellFarUv[4][4];
+
+// Exact geometric visibility ray query (1 = lit, 0 = occluded).
+// Confirms solid OMM/cutout/entity triangles while letting glass (SBT 2) and water (SBT 3) pass.
+float fogTraceVisibility(vec3 origin, vec3 dir, float maxDist)
+{
+    if(maxDist <= FOG_RAY_TMIN)
+    {
+        return 1.0;
+    }
+    rayQueryEXT query;
+    rayQueryInitializeEXT(
+        query,
+        fogTlas,
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        FOG_WORLD_CULL_MASK,
+        origin,
+        FOG_RAY_TMIN,
+        dir,
+        maxDist);
+
+    int guard = 0;
+    while(rayQueryProceedEXT(query) && ++guard < 64)
+    {
+        if(rayQueryGetIntersectionTypeEXT(query, false) ==
+           gl_RayQueryCandidateIntersectionTriangleEXT)
+        {
+            const uint sbtOffset =
+                rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(query, false);
+            if(sbtOffset != 2u && sbtOffset != 3u)
+            {
+                rayQueryConfirmIntersectionEXT(query);
+            }
+        }
+    }
+
+    if(guard >= 64)
+    {
+        return 0.0;
+    }
+
+    return (rayQueryGetIntersectionTypeEXT(query, true) !=
+        gl_RayQueryCommittedIntersectionNoneEXT) ? 0.0 : 1.0;
+}
+
+// View-ray line-of-sight check from camera/start up to targetDist (1 = unoccluded, 0 = behind wall).
+float fogTraceViewLineOfSight(vec3 camOrigin, vec3 viewDir, float tStart, float targetDist)
+{
+    const float tMin = max(tStart, FOG_RAY_TMIN);
+    if(targetDist <= tMin + 0.02)
+    {
+        return 1.0;
+    }
+    rayQueryEXT query;
+    rayQueryInitializeEXT(
+        query,
+        fogTlas,
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        FOG_WORLD_CULL_MASK,
+        camOrigin,
+        tMin,
+        viewDir,
+        targetDist);
+
+    int guard = 0;
+    while(rayQueryProceedEXT(query) && ++guard < 64)
+    {
+        if(rayQueryGetIntersectionTypeEXT(query, false) ==
+           gl_RayQueryCandidateIntersectionTriangleEXT)
+        {
+            const uint sbtOffset =
+                rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(query, false);
+            if(sbtOffset != 2u && sbtOffset != 3u)
+            {
+                rayQueryConfirmIntersectionEXT(query);
+            }
+        }
+    }
+
+    if(guard >= 64)
+    {
+        return 0.0;
+    }
+
+    return (rayQueryGetIntersectionTypeEXT(query, true) !=
+        gl_RayQueryCommittedIntersectionNoneEXT) ? 0.0 : 1.0;
+}
+
+// Cloud-gap transmittance from rt_cloud_shadow.comp (binding 14).
+float fogSampleCloudShadow(vec3 worldPos, vec3 cameraPos, vec3 lightDir)
+{
+    if(pc.params.w < 0.5 || cam.cloudParams1.w < 0.5 || cam.cloudParams4.y < 0.5)
+    {
+        return 1.0;
+    }
+    if(lightDir.y <= 0.02)
+    {
+        return 1.0;
+    }
+
+    const float cloudBottom = max(cam.cloudParams0.x, 1.0);
+    const float camToCloud = max(cloudBottom - cameraPos.y, 0.0);
+    const float camSlant = min(camToCloud / max(lightDir.y, 0.12), 4096.0);
+    const vec2 shadowOriginXZ = cameraPos.xz + lightDir.xz * camSlant;
+
+    const float heightToCloud = max(cloudBottom - worldPos.y, 0.0);
+    const float slant = min(heightToCloud / max(lightDir.y, 0.12), 4096.0);
+    const vec2 cloudHitXZ = worldPos.xz + lightDir.xz * slant;
+
+    const vec2 relXZ = (cloudHitXZ - shadowOriginXZ) / FOG_CLOUD_SHADOW_EXTENT;
+    const float edgeDist = max(abs(relXZ.x), abs(relXZ.y));
+    if(edgeDist >= 1.0)
+    {
+        return 1.0;
+    }
+
+    const vec2 uv = relXZ * 0.5 + 0.5;
+    float rawTrans = textureLod(cloudShadowMap, uv, 0.0).r;
+
+    // Apply user cloud-gap strength & width controls (cloudParams4.zw).
+    const float gapStrength = clamp(cam.cloudParams4.z, 0.0, 4.0);
+    const float gapWidth = clamp(cam.cloudParams4.w, 0.0, 1.0);
+    float shaped = pow(clamp(rawTrans, 0.0, 1.0), max(gapStrength, 0.05));
+    shaped = smoothstep(clamp(0.45 * (1.0 - gapWidth), 0.0, 0.45), 1.0, shaped);
+
+    const float edgeFade = smoothstep(0.82, 1.0, edgeDist);
+    return mix(shaped, 1.0, edgeFade);
+}
+
+// Local lights scattering (torches, lanterns, lava) when VolReSTIR is disabled.
+vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
+{
+    const float localStrength = clamp(cam.fogExtrasParams.x, 0.0, 4.0);
+    if(localStrength <= 0.001 || scatterCoeff <= 1.0e-5)
+    {
+        return vec3(0.0);
+    }
+    const uint totalLights = fogLightBuffer.header.x;
+    if(totalLights == 0u)
+    {
+        return vec3(0.0);
+    }
+
+    const ivec3 baseCell = localLightGridCellCoord(worldPos);
+    const int minX = localLightGridNeighborMinOffset(worldPos.x);
+    const int maxX = localLightGridNeighborMaxOffset(worldPos.x);
+    const int minY = localLightGridNeighborMinOffset(worldPos.y);
+    const int maxY = localLightGridNeighborMaxOffset(worldPos.y);
+    const int minZ = localLightGridNeighborMinOffset(worldPos.z);
+    const int maxZ = localLightGridNeighborMaxOffset(worldPos.z);
+    const uint packedBase = localLightGridPackedIndexBase();
+
+    // Keep top 4 strongest local lights at this froxel, then shadow-test only those.
+    vec3 bestPos[4];
+    vec3 bestContrib[4];
+    float bestScore[4];
+    for(int i = 0; i < 4; ++i)
+    {
+        bestScore[i] = 0.0;
+        bestPos[i] = vec3(0.0);
+        bestContrib[i] = vec3(0.0);
+    }
+
+    int checked = 0;
+    for(int dz = minZ; dz <= maxZ && checked < 48; ++dz)
+    for(int dy = minY; dy <= maxY && checked < 48; ++dy)
+    for(int dx = minX; dx <= maxX && checked < 48; ++dx)
+    {
+        uint firstIdx = 0u;
+        uint count = 0u;
+        if(!localLightGridLookupCell(baseCell + ivec3(dx, dy, dz), firstIdx, count))
+        {
+            continue;
+        }
+        const uint limit = min(count, 24u);
+        for(uint k = 0u; k < limit && checked < 48; ++k)
+        {
+            ++checked;
+            const uint lightIdx = fogLightGrid.words[packedBase + firstIdx + k];
+            if(lightIdx >= totalLights)
+            {
+                continue;
+            }
+            const LocalLightGPU light = fogLightBuffer.lights[lightIdx];
+            const float emission = light.worldPosEmission.w;
+            if(emission <= 0.01)
+            {
+                continue;
+            }
+            const uint typeCode = light.meta.x;
+            const vec3 toLight = light.worldPosEmission.xyz - worldPos;
+            const float dist2 = dot(toLight, toLight);
+            const float range = vptLocalLightRange(typeCode, emission);
+            if(dist2 >= range * range)
+            {
+                continue;
+            }
+            const float d = sqrt(max(dist2, 0.25));
+            const float rangeFade = vptLocalLightRangeFade(d, typeCode, emission);
+            const float atten = rangeFade / (dist2 + 1.5);
+            const vec3 lightColor = localLightProfileColor(typeCode);
+            const float lumens = localLightProfileBrightness(typeCode, emission);
+            const float cosL = dot(viewDir, toLight / d);
+            const float phaseL = fogPhaseHaze(cosL, 0.35);
+            const vec3 contrib = lightColor * (lumens * LOCAL_LIGHT_ENERGY_SCALE * atten * phaseL);
+            const float score = dot(contrib, vec3(0.2126, 0.7152, 0.0722));
+
+            int worstSlot = 0;
+            for(int s = 1; s < 4; ++s)
+            {
+                if(bestScore[s] < bestScore[worstSlot])
+                {
+                    worstSlot = s;
+                }
+            }
+            if(score > bestScore[worstSlot])
+            {
+                bestScore[worstSlot] = score;
+                bestPos[worstSlot] = light.worldPosEmission.xyz;
+                bestContrib[worstSlot] = contrib;
+            }
+        }
+    }
+
+    vec3 accum = vec3(0.0);
+    int top0 = -1;
+    int top1 = -1;
+    for(int i = 0; i < 4; ++i)
+    {
+        if(bestScore[i] <= 1.0e-5)
+        {
+            continue;
+        }
+        if(top0 < 0 || bestScore[i] > bestScore[top0])
+        {
+            top1 = top0;
+            top0 = i;
+        }
+        else if(top1 < 0 || bestScore[i] > bestScore[top1])
+        {
+            top1 = i;
+        }
+    }
+
+    for(int i = 0; i < 4; ++i)
+    {
+        if(bestScore[i] <= 1.0e-5)
+        {
+            continue;
+        }
+        const vec3 toLight = bestPos[i] - worldPos;
+        const float d = length(toLight);
+        if((i == top0 || i == top1) && d < 32.0)
+        {
+            float vis = 1.0;
+            if(d > 0.75)
+            {
+                vis = fogTraceVisibility(worldPos, toLight / d, d - 0.65);
+            }
+            accum += bestContrib[i] * vis;
+        }
+        else
+        {
+            accum += bestContrib[i] * 0.65;
+        }
+    }
+
+    return accum * (scatterCoeff * localStrength * 2.2);
+}
+
+void main()
+{
+    const ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    const ivec3 size = imageSize(fogLightOut);
+    const int layers = max(int(pc.params.x + 0.5), 2);
+    const int segmentCount = layers - 1;
+    const float maxDistance = max(pc.params.y > 1.0 ? pc.params.y : cam.cloudParams8.w, 16.0);
+
+    // Per-(x,y) column depth range across in-cell 4x4 taps.
+    // barrier() runs unconditionally before any thread returns.
+    if(gl_LocalInvocationID.z == 0u)
+    {
+        float cellMax = maxDistance;
+        float cellMin = maxDistance;
+        vec2 farUv = vec2(0.5);
+        const ivec2 depthSize = textureSize(sceneDepth, 0);
+        if(coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
+        {
+            const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+            const vec2 tileStep = 1.0 / vec2(size.xy);
+            farUv = centerUv;
+            float minRawDepth = 1.0;
+            float maxRawDepth = 0.0;
+            vec2 minDepthUv = centerUv;
+            vec2 maxDepthUv = centerUv;
+            bool hasSky = false;
+            float bestSkyDist2 = 1.0e9;
+
+            for(int ty = 0; ty < 4; ++ty)
+            {
+                for(int tx = 0; tx < 4; ++tx)
+                {
+                    const vec2 offset = (vec2(float(tx), float(ty)) * (1.0 / 3.0) - 0.5) * 0.90 * tileStep;
+                    const vec2 sampleUv = clamp(centerUv + offset, vec2(0.0005), vec2(0.9995));
+                    const ivec2 dCoord = clamp(ivec2(sampleUv * vec2(depthSize)), ivec2(0), depthSize - ivec2(1));
+                    const float d = texelFetch(sceneDepth, dCoord, 0).r;
+                    if(d <= 1.0e-5)
+                    {
+                        hasSky = true;
+                        const vec2 delta = sampleUv - centerUv;
+                        const float dist2 = dot(delta, delta);
+                        if(dist2 < bestSkyDist2)
+                        {
+                            bestSkyDist2 = dist2;
+                            farUv = sampleUv;
+                        }
+                    }
+                    else
+                    {
+                        if(d < minRawDepth)
+                        {
+                            minRawDepth = d;
+                            minDepthUv = sampleUv;
+                        }
+                        if(d > maxRawDepth)
+                        {
+                            maxRawDepth = d;
+                            maxDepthUv = sampleUv;
+                        }
+                    }
+                }
+            }
+
+            if(!hasSky)
+            {
+                cellMax = min(maxDistance, fogSceneDistanceForDepth(minDepthUv, minRawDepth, cam.projInverse));
+                farUv = minDepthUv;
+            }
+            if(maxRawDepth > 1.0e-5)
+            {
+                cellMin = min(cellMax, fogSceneDistanceForDepth(maxDepthUv, maxRawDepth, cam.projInverse));
+            }
+            else
+            {
+                cellMin = cellMax;
+            }
+        }
+        sCellMinDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = cellMin;
+        sCellMaxDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = cellMax;
+        sCellFarUv[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = farUv;
+    }
+    barrier();
+
+    if(any(greaterThanEqual(coord, size)))
+    {
+        return;
+    }
+
+    if(cam.cloudParams7.x < 0.5 || cam.waterSimState.w != 0u || coord.z >= segmentCount)
+    {
+        imageStore(fogLightOut, coord, vec4(0.0));
+        return;
+    }
+
+    const vec4 medium = imageLoad(fogDensityRead, coord);
+    if(medium.a <= 1.0e-4)
+    {
+        imageStore(fogLightOut, coord, vec4(0.0));
+        return;
+    }
+    const float hazeSigmaT = max(medium.r, 0.0);
+    const float shaftSigmaS = max(medium.g, 0.0);
+    const float skyOpenness = clamp(medium.b, 0.0, 1.0);
+
+    const float hazeSigmaS = hazeSigmaT * FOG_HAZE_ALBEDO;
+    const float totalSigmaT = hazeSigmaT + shaftSigmaS * FOG_SHAFT_EXTINCTION_FRAC;
+    const float totalScatter = hazeSigmaS + shaftSigmaS;
+
+    const float d0 = fogSliceBoundaryDistance(coord.z, layers, maxDistance);
+    const float d1 = fogSliceBoundaryDistance(coord.z + 1, layers, maxDistance);
+    const float cellMinDist = sCellMinDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+    const float cellMaxDist = sCellMaxDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+    const vec2  cellFarUv   = sCellFarUv[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+
+    if(d0 >= cellMaxDist)
+    {
+        imageStore(fogLightOut, coord, vec4(0.0));
+        return;
+    }
+
+    const bool useJitter = cam.fogExtrasParams.w > 0.001;
+    const vec3 jitter = useJitter
+        ? fogTemporalJitter3D(coord, cam.frameCount)
+        : vec3(0.5);
+
+    const vec2 xyOffset = mix(vec2(0.5), jitter.xy, useJitter ? 0.85 : 0.0);
+    const float zOffset = mix(0.5, jitter.z, useJitter ? 0.90 : 0.0);
+
+    vec2 uv = (vec2(coord.xy) + xyOffset) / vec2(size.xy);
+    float segEnd = d1;
+    if(d0 < cellMinDist)
+    {
+        segEnd = min(d1, max(d0, cellMinDist - 0.18));
+    }
+    else
+    {
+        uv = cellFarUv;
+        segEnd = min(d1, max(d0, cellMaxDist - 0.18));
+    }
+
+    const vec3 worldDir = fogWorldRayDirection(uv, cam.projInverse, cam.viewInverse);
+    const vec3 cameraPos = cam.viewInverse[3].xyz;
+    const float dist = mix(d0, segEnd, zOffset);
+    const vec3 fogPos = cameraPos + worldDir * dist;
+
+    float rayDistAtUv = maxDistance;
+    {
+        const ivec2 depthSize = textureSize(sceneDepth, 0);
+        if(depthSize.x > 1 && depthSize.y > 1)
+        {
+            const ivec2 dCoord = clamp(ivec2(uv * vec2(depthSize)), ivec2(0), depthSize - ivec2(1));
+            const float rawDepthUv = texelFetch(sceneDepth, dCoord, 0).r;
+            if(rawDepthUv > 1.0e-5)
+            {
+                rayDistAtUv = fogSceneDistanceForDepth(uv, rawDepthUv, cam.projInverse);
+            }
+        }
+    }
+    const bool sampleBehindDepth = (dist > rayDistAtUv - 0.05);
+
+    vec3 inScatter = vec3(0.0);
+    const bool isOverworld = abs(cam.weatherParams.z - 1.0) < 0.25;
+    float geomVis = isOverworld ? 0.0 : 1.0;
+
+    if(totalScatter > 1.0e-6)
+    {
+        const bool isNether = abs(cam.weatherParams.z - 2.0) < 0.25;
+        const bool isEnd    = abs(cam.weatherParams.z - 3.0) < 0.25;
+
+        const float ambientStrength = max(cam.cloudParams8.z, 0.0);
+        const float sunStrength = max(cam.cloudParams8.y, 0.0);
+        const float anisotropyG = clamp(cam.cloudParams8.x, 0.0, 0.92);
+        const float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
+
+        if(isOverworld)
+        {
+            const vec3 sunDir0 = sunDirection();
+            const float sunElevation = sunDir0.y;
+            const vec3 moonDir0 = moonEclipticDirectionAt(
+                moonDecalPhase01(cam.historyParams.w, cam.sssParams.z));
+
+            const float sunDirectAmt = skyDirectSunAmount(sunElevation);
+            const float moonDirectAmt = skyDirectMoonAmount(sunElevation);
+            const bool isSun = skyDirectIsSun(sunElevation);
+            const vec3 lightDir = normalize(isSun ? sunDir0 : moonDir0);
+
+            const vec3 directColor = isSun
+                ? skyModelSunColorContinuous(sunDir0, 0.85)
+                : skyModelMoonColor(-moonDir0.y);
+
+            const float moonElev01 = clamp(moonDir0.y / 0.81915204429, 0.0, 1.0);
+            const float moonPhaseDim = skyModelMoonPhaseDim(cam.sssParams.z, 0.35);
+            const float directEnergy = isSun
+                ? (2.4 * sunDirectAmt * mix(1.0, 0.25, rain))
+                : (2.4 * (0.055 / 1.22077458876) * moonElev01 * moonDirectAmt * moonPhaseDim);
+
+            float sunVis = 0.0;
+            const float goldenWeight = isSun ? skySunGoldenHourWeight(sunElevation) : 0.0;
+
+            // 1) Direct Sun / Moon volumetric lighting with exact view LOS + sun RT occlusion.
+            if(directEnergy > 1.0e-5 && lightDir.y > 0.01)
+            {
+                const float viewVis = sampleBehindDepth
+                    ? 0.0
+                    : fogTraceViewLineOfSight(cameraPos, worldDir, 0.05, dist);
+                if(viewVis > 0.5)
+                {
+                    const float sunRayMax = clamp(
+                        fogPos.y < 280.0 ? (280.0 - max(fogPos.y, -64.0)) / max(lightDir.y, 0.14) : 128.0,
+                        96.0, FOG_SUN_RAY_MAX_DIST);
+                    geomVis = fogTraceVisibility(fogPos, lightDir, sunRayMax);
+                    const float cloudVis = fogSampleCloudShadow(fogPos, cameraPos, lightDir);
+                    sunVis = geomVis * cloudVis;
+
+                    // Physically-correct Beer-Lambert sun self-shadow transmittance (spectral at golden hour).
+                    const float sunTau = totalSigmaT * 36.0 / max(lightDir.y, 0.08);
+                    const vec3 spectralExt = mix(vec3(1.0), vec3(0.78, 0.96, 1.26), goldenWeight * 0.85);
+                    const vec3 sunSelfTrans1 = exp(-sunTau * spectralExt);
+                    const vec3 sunSelfTrans2 = exp(-sunTau * 0.42 * spectralExt);
+
+                    const float cosTheta = dot(worldDir, lightDir);
+                    const float hazeDirectCoeff = hazeSigmaS * sunStrength * fogPhaseHaze(cosTheta, anisotropyG);
+                    const float shaftDirectCoeff = shaftSigmaS * fogPhaseShaft(cosTheta, anisotropyG) * 2.35;
+                    const float wrapCoeff = (hazeSigmaS * sunStrength * 0.30 + shaftSigmaS * 0.55) *
+                        fogPhaseShaftBroad(cosTheta, anisotropyG);
+
+                    inScatter += directColor * directEnergy * sunVis *
+                        (sunSelfTrans1 * (hazeDirectCoeff + shaftDirectCoeff) + sunSelfTrans2 * wrapCoeff);
+                }
+            }
+
+            // 2) Sky Ambient In-Scattering: isotropic when occluded so forward Mie sun lobe never leaks through walls.
+            const float dayAmt = smoothstep(-0.08, 0.22, sunElevation);
+            const vec3 baseSkyAmbient = mix(vec3(0.035, 0.050, 0.105), vec3(0.36, 0.48, 0.70), dayAmt);
+            const float skyAmbientMix = clamp(cam.fogExtrasParams.z * 0.72, 0.0, 0.72) *
+                skyOpenness * mix(0.35, 1.0, geomVis);
+            vec3 skyAmbient = baseSkyAmbient;
+            if(skyAmbientMix > 0.001)
+            {
+                const float elevMag = clamp(abs(sunElevation) / 0.81915204429, 0.0, 1.0);
+                const float skyScale = mix(0.08, 1.0, dayAmt) * elevMag;
+                const float weatherFactor = mix(1.0, 0.25, rain);
+                const vec3 zenithInscatter = clearSkyInscatter(
+                    vec3(0.0, 1.0, 0.0), sunElevation, lightDir, directColor, skyScale,
+                    weatherFactor, vec3(1.0));
+                const vec2 orthoXZ = dot(lightDir.xz, lightDir.xz) > 1.0e-6
+                    ? normalize(vec2(-lightDir.z, lightDir.x))
+                    : vec2(1.0, 0.0);
+                const vec3 orthoDir = normalize(vec3(orthoXZ.x, 0.28, orthoXZ.y));
+                const vec3 orthoInscatter = clearSkyInscatter(
+                    orthoDir, sunElevation, lightDir, directColor, skyScale,
+                    weatherFactor, vec3(1.0));
+                const vec3 isoSkyInscatter = mix(orthoInscatter, zenithInscatter, 0.45);
+                vec3 atmInscatter = isoSkyInscatter;
+                if(sunVis > 0.001)
+                {
+                    const vec3 horizonDir = normalize(vec3(worldDir.x, max(worldDir.y, 0.12), worldDir.z));
+                    const vec3 dirSkyInscatter = clearSkyInscatter(
+                        horizonDir, sunElevation, lightDir, directColor, skyScale,
+                        weatherFactor, vec3(1.0));
+                    atmInscatter = mix(isoSkyInscatter, dirSkyInscatter, sunVis);
+                }
+                skyAmbient = mix(baseSkyAmbient, min(atmInscatter * 0.28, vec3(1.2)), skyAmbientMix);
+            }
+            // Rain shifts ambient toward cool overcast grey.
+            const float ambLuma = dot(skyAmbient, vec3(0.2126, 0.7152, 0.0722));
+            skyAmbient = mix(skyAmbient, vec3(ambLuma) * vec3(0.86, 0.90, 0.95), rain * 0.65);
+
+            // Cave attenuation: outdoors = 1.0, deep underground = 0.10.
+            const float effectiveOpenness = max(skyOpenness, geomVis * 0.25);
+            const float caveAmbientGate = mix(0.10, 1.0, effectiveOpenness);
+            inScatter += skyAmbient * (ambientStrength * 0.48 * caveAmbientGate * hazeSigmaS);
+        }
+        else if(isNether)
+        {
+            const vec3 netherAmbient = vec3(0.30, 0.10, 0.06);
+            inScatter += netherAmbient * (ambientStrength * 0.65 * hazeSigmaS);
+        }
+        else if(isEnd)
+        {
+            const vec3 endAmbient = vec3(0.10, 0.07, 0.18);
+            inScatter += endAmbient * (ambientStrength * 0.65 * hazeSigmaS);
+        }
+
+        // 3) Local Lights (torches, lanterns, lava) within near/mid range when VolReSTIR is off.
+        const float localScatter = hazeSigmaS + shaftSigmaS * 0.20;
+        if(!sampleBehindDepth && dist < FOG_LOCAL_LIGHT_MAX_DIST && localScatter > 1.0e-5)
+        {
+            inScatter += fogEvaluateLocalLights(fogPos, worldDir, localScatter);
+        }
+
+        // 4) Optional wavelength tint (fogOpticsParams.yzw).
+        vec3 fogTint = cam.fogOpticsParams.yzw;
+        if(dot(fogTint, fogTint) < 0.01)
+        {
+            fogTint = vec3(1.0);
+        }
+        else
+        {
+            fogTint = clamp(fogTint, vec3(0.5), vec3(1.5));
+        }
+        inScatter *= fogTint;
+    }
+
+    if(!(inScatter.r == inScatter.r) || !(inScatter.g == inScatter.g) || !(inScatter.b == inScatter.b))
+    {
+        inScatter = vec3(0.0);
+    }
+    inScatter = clamp(inScatter, vec3(0.0), vec3(FOG_RADIANCE_CLAMP));
+    vec4 currentVal = vec4(inScatter, totalSigmaT);
+
+    // 5) 3D Temporal Reprojection & Accumulation (rejects silhouette discontinuities & tightens shadow clamp).
+    const bool silhouetteSlice = (d0 >= cellMinDist - 0.05) && ((cellMaxDist - cellMinDist) > 1.0);
+    if(!silhouetteSlice && pc.params.z > 0.5 && cam.historyValid != 0u && useJitter)
+    {
+        // Reproject the UNJITTERED depth-clamped froxel center for exact temporal alignment.
+        const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+        const vec3 centerDir = fogWorldRayDirection(centerUv, cam.projInverse, cam.viewInverse);
+        const float centerSegEnd = min(d1, max(d0, cellMinDist - 0.18));
+        const float centerDist = mix(d0, centerSegEnd, 0.5);
+        const vec3 centerWorldPos = cameraPos + centerDir * centerDist;
+
+        const vec4 prevClip = cam.prevViewProj * vec4(centerWorldPos, 1.0);
+        if(prevClip.w > 1.0e-4)
+        {
+            const vec2 prevNdc = prevClip.xy / prevClip.w;
+            const vec2 prevUv = vec2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
+            const float prevDist = length(centerWorldPos - cam.prevViewInverse[3].xyz);
+            const float prevW = fogDistanceToLightHistoryW(prevDist, maxDistance, layers);
+
+            if(prevUv.x > 0.002 && prevUv.x < 0.998 &&
+               prevUv.y > 0.002 && prevUv.y < 0.998 &&
+               prevW > 0.001 && prevW < (float(segmentCount) / float(layers) - 0.001))
+            {
+                const vec4 hist = textureLod(fogLightHistory, vec3(prevUv, prevW), 0.0);
+                if(all(equal(hist, hist)))
+                {
+                    const float speed = cam.playerVelocityAndSpeed.w;
+                    const float cosRot = clamp(
+                        dot(normalize(cam.viewInverse[2].xyz), normalize(cam.prevViewInverse[2].xyz)),
+                        -1.0, 1.0);
+                    const float turnMotion = smoothstep(0.9995, 0.985, cosRot);
+                    const float motion = clamp(max(smoothstep(1.2, 14.0, speed), turnMotion), 0.0, 1.0);
+                    float histWeight = mix(0.90, 0.56, motion);
+                    // Reduce history weight if extinction jumped sharply (e.g. slider/weather change).
+                    const float sigmaDelta = abs(hist.a - currentVal.a) / max(currentVal.a + hist.a, 0.005);
+                    histWeight *= mix(1.0, 0.35, smoothstep(0.35, 1.2, sigmaDelta));
+                    histWeight *= mix(0.25, 1.0, geomVis);
+                    const float edgeDist = min(min(prevUv.x, 1.0 - prevUv.x), min(prevUv.y, 1.0 - prevUv.y));
+                    histWeight *= smoothstep(0.002, 0.035, edgeDist);
+                    histWeight *= clamp(cam.fogExtrasParams.w, 0.0, 1.0);
+
+                    const float lumCur = dot(currentVal.rgb, vec3(0.2126, 0.7152, 0.0722));
+                    const vec3 histRgb = max(hist.rgb, vec3(0.0));
+                    const float lumHist = dot(histRgb, vec3(0.2126, 0.7152, 0.0722));
+                    const float maxAllowedLum = (geomVis < 0.5)
+                        ? (lumCur * 1.35 + 0.004)
+                        : max(lumCur * 3.5 + 0.04, 0.08);
+                    vec3 clampedHistRgb = histRgb;
+                    if(lumHist > maxAllowedLum && lumHist > 1.0e-6)
+                    {
+                        clampedHistRgb *= (maxAllowedLum / lumHist);
+                    }
+                    currentVal = mix(currentVal, vec4(clampedHistRgb, max(hist.a, 0.0)), histWeight);
+                }
+            }
+        }
+    }
+
+    imageStore(fogLightOut, coord, currentVal);
+}

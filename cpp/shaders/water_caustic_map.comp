@@ -2,57 +2,75 @@
 #extension GL_GOOGLE_include_directive : require
 
 // ============================================================================
-// 水面焦散图（2026-11-01 重构：顶点拉伸光栅 -> 逐 texel compute）
+// 水面焦散图 —— 光子泼溅（2026-11-20 重构）
 //
-// 旧实现的账（PERF L10 GPU 实测）：
-//   · water_caustic_map.vert 是 256² quad × 6 顶点 × 3×3 实例 = 3,538,944 顶点；
-//   · 层 0 还按 3 档 IOR 各 draw 一次（C++ 的 for channel 0..2），加反射层
-//     共 4 次 draw ⇒ **每帧 14,155,776 顶点**；
-//   · 输出 1024² × 2 层 × 11 级 mip，每帧重建（默认不节流）；
-//   · 结果：稳态 4~6ms，日出第一个 sunY>0 的帧 **441ms**（GPU 从夜间低频冷
-//     状态直接吃一个千万顶点的 pass）。
+// ── 为什么换掉"逐纹素雅可比" ──────────────────────────────────────────────
+// 旧实现（2026-11-01 起）对每个纹素点算 dq/dp 的行列式，密度 = 1/|det|。
+// 数学没错，但它把"点密度"直接当成"光强"：
+//   · det 在焦散线（caustic cusp）上穿过 0，1/|det| 是一条 1/x 的尖峰，
+//     离散采样下必然变成逐纹素的针状尖刺；
+//   · 水面斜率场在 tile=128/512² 下的 RMS 斜率实测 ≈1.1（45°+），
+//     1 格参考深度下每个波峰折叠 3~5 次 ⇒ 焦散线密度远高于图的分辨率，
+//     整张图退化成椒盐噪声（离线复刻 2026-11-20 的 PNG 可复现）。
+// 结果就是"水底碎玻璃/静电"，随波浪逐帧闪。
 //
-// 新实现：不发射任何顶点，对 512² 每个 texel 求一次面密度（雅可比行列式倒数）。
-// 数学与 GPU Gems 2 Ch.2 / 旧 frag 的 dFdx 面积比完全同源，只是把"渲染时让
-// 光栅器去算导数"换成"自己用 5 点有限差分算"：
+// ── 现在（照抄 HPWater 的 HPWaterCausticCompute.compute）───────────────────
+// HPWater 的焦散不是算密度，而是 **光子泼溅**：水面每一点把折射后的光
+// 打到接收面上，落在哪个像素就给哪个像素 +1（InterlockedAdd），再做 à-trous
+// 模糊。本质上是同一份雅可比，但被"按桶累加"积分掉了：
+//   · 焦散线变成一条有宽度（≈ 图纹素）的亮线，而不是 1/x 尖峰；
+//   · 亮度的动态范围天然由"落进来的光子数"给出 —— 平水恒等于 1，
+//     聚焦处 3~40，散焦处 0，能量守恒，不需要 1/|det| 的 clamp 修补；
+//   · 折叠再多也只是把光子堆到同一桶里，不会产生采样噪声。
 //
-//     接收点 q(p) = p.xz + d.xz * (refHeight / |d.y|),  d = refract/reflect
-//     J = [dq/dx, dq/dz]（中心差分，步长 = 一个 texel）
-//     density = 1 / |det J|      —— 面积压缩 = 光聚集
+// 与 HPWater 的差异（本机没有光栅管线、也没有屏幕空间深度图）：
+//   · 他们是**屏幕空间**泼溅（源 = 屏幕像素，桶 = 屏幕像素，落到真实场景深度）；
+//   · 我们是**世界空间**泼溅（源 = 水面上 1024² 的规则网格，桶 = 参考接收面
+//     1024² 的规则网格）。平水时源格与桶一一对应 ⇒ 每个桶恰好 1 个光子，
+//     "1 = 未扰动"的旧口径逐字保留，消费端不需要换约定。
+//   · 只有一张单通道累加图（R32_UINT），RGB 色散移到消费端做（见
+//     rgen_water_caustics.glsl 的 3 次偏移采样，等同 HPWater 的非 RGB 路径）。
 //
-// 平坦水面 det J == 1 ⇒ density == 1，与旧图的"平水 = 1"口径逐字一致，
-// 所以消费端（binding 69/70）不需要任何改动。
-//
-// 色散：三个波长（1.3315/1.3335/1.3365）各算一遍雅可比，焦散图案逐通道
-// 位移 —— 恢复消费端注释里"逐通道累加"的物理口径，替换掉 2026-11-01 的
-// 固定 RGB 偏移近似（那个只调亮度不位移图案，观感是假彩虹镶边）。
-// 密度上限：硬 clamp(0.20, 6.0) 改为软膝压缩（knee 2.0，渐近 6.0）。
-// 硬 clamp 把所有 area < 1/6 的强聚焦 texel 压成同一亮度，焦散细线退化
-// 成平顶大亮块；软膝在 knee 以上单调且 C1 连续，极端聚焦仍保留亮度梯度。
-// 下限 0.20 保留（反射层的减光口径不变）。
+// 会话链：[本文件] 泼溅 → water_caustic_resolve.comp（模糊 + 归一 + 软膝压缩）
+// → 宿主 mip 链 → 消费端采样。
 // ============================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D waterFftSlope;
-layout(rgba16f, set = 0, binding = 1) uniform writeonly image2DArray causticOutput;
+// 落到接收面后按桶累加：每格一个光子，计数用整数原子加。
+layout(r32ui, set = 0, binding = 1) uniform uimage2DArray causticAccum;
 
 layout(push_constant) uniform WaterCausticMapPush
 {
     vec4 sunDirection;   // xyz = 指向太阳（单位向量，y > 0）；w 保留
-    vec4 params;         // x = tile 周期（格）；y = 折射参考深度；z = 反射参考高度；w = 色散强度
+    vec4 params;         // x = tile 周期（格）；y = 折射参考深度；z = 反射参考高度；w 保留
 } pc;
 
-// 与 VulkanCore.cpp 的 WATER_CAUSTIC_MAP_RESOLUTION 逐字对应（宿主有 static_assert）。
-// 2026-11-15：512 -> 1024（宿主同步改），纹素 = tile 周期 / 1024。
+// 与 VulkanCore / OrionInternal.h 的 WATER_CAUSTIC_MAP_RESOLUTION 逐字对应。
 const uint CAUSTIC_RESOLUTION = 1024u;
 const float CAUSTIC_RESOLUTION_F = 1024.0f;
 
-const float DETAIL_TILE = 32.0;
+const float DETAIL_TILE = 32.0f;
 
-// 三档 IOR 逐通道雅可比（与消费端 rgen_water_caustics.glsl 的 waterParams.y
-// 色散插值口径一致；反射层是镜面不分色，IOR 用不到，取 g 档占位）。
-const vec3 CAUSTIC_IOR_RGB = vec3(1.3315, 1.3335, 1.3365);
+// 细节层（.ba，32 格域）参与焦散的权重。
+// 它的波长细到 0.32 格，而本图一个桶 = 0.125 格 —— 原样参与会在桶一级
+// 欠采样，泼溅出来是"每桶一跳"的颗粒。0.35 + LOD 1.5 让它在焦散里只做
+// 低频调制（表面法线仍然吃全量细节，见 water_wave_field.glsl）。
+#ifndef WATER_CAUSTIC_SPLAT_DETAIL_WEIGHT
+#define WATER_CAUSTIC_SPLAT_DETAIL_WEIGHT 35   // 百分之一：35 = 0.35
+#endif
+#ifndef WATER_CAUSTIC_SPLAT_DETAIL_LOD
+#define WATER_CAUSTIC_SPLAT_DETAIL_LOD 15      // 百分之一：15 = 1.5
+#endif
+
+const float kDetailWeight = float(WATER_CAUSTIC_SPLAT_DETAIL_WEIGHT) / 100.0;
+const float kDetailLod = float(WATER_CAUSTIC_SPLAT_DETAIL_LOD) / 100.0;
+
+// 折射/反射光线"能送光到接收面"的最小竖直分量。0.05 ⇒ 最远 20 格。
+#ifndef WATER_CAUSTIC_MIN_VERTICAL
+#define WATER_CAUSTIC_MIN_VERTICAL 0.050f
+#endif
 
 // 与旧 vert 的两段斜率叠加同一口径（base = .rg，detail = .ba，detail 以
 // DETAIL_TILE 为周期重采一次）。
@@ -62,74 +80,47 @@ vec2 slopeAt(vec2 uv)
     const vec2 detailSlope = textureLod(
         waterFftSlope,
         uv * (pc.params.x / DETAIL_TILE),
-        0.0
+        kDetailLod
     ).ba;
-    return baseSlope + detailSlope;
+    return baseSlope + detailSlope * kDetailWeight;
 }
 
-// 水面点 -> 参考接收面上的落点。refHeight 由调用方按层给（折射 1 格、反射 16 格）。
-// reflectLayer = true 时走镜面反射（layer 1），否则走折射（layer 0，按 ior 折射）。
-vec2 projectToReceiver(vec2 sourceXZ, vec2 slope, float refHeight, bool reflectLayer, float ior)
+// 水面点 -> 参考接收面上的落点。valid = false 表示这一格的水面法线太陡，
+// 折射光几乎水平或干脆朝上 —— 它没有能力把光送到接收面，直接丢弃光子
+// （HPWater 同一处也是 continue）。丢弃而不是"钳到上限"，因为钳制会把所有
+// 无效面元堆到同一条半径 20 格的圆上，糊出一个假的光环。
+vec2 projectToReceiver(
+    vec2 sourceXZ,
+    vec2 slope,
+    float refHeight,
+    bool reflectLayer,
+    float ior,
+    out bool valid)
 {
+    valid = true;
     const vec3 normal = normalize(vec3(-slope.x, 1.0, -slope.y));
     const vec3 incoming = -normalize(pc.sunDirection.xyz);
 
     if(reflectLayer)
     {
         const vec3 outgoing = normalize(reflect(incoming, normal));
-        const float up = max(outgoing.y, 1.0e-3);
-        return sourceXZ + outgoing.xz * (refHeight / up);
+        if(outgoing.y < WATER_CAUSTIC_MIN_VERTICAL)
+        {
+            valid = false;
+            return sourceXZ;
+        }
+        return sourceXZ + outgoing.xz * (refHeight / outgoing.y);
     }
 
     const vec3 refracted = refract(incoming, normal, 1.0 / ior);
-    const float down = min(refracted.y, -1.0e-3);
-    return sourceXZ + refracted.xz * (refHeight / -down);
-}
-
-// 单档 IOR 的波前面积密度：中心差分雅可比的行列式倒数。
-// 下界 0.10 与旧 frag 的 `min(area * params.w, 40)` 同源：限制极端聚焦的
-// 亮度爆炸。
-float jacobianDensity(
-    vec2 uv, vec2 sourceXZ, float cell, float refHeight, float ior)
-{
-    const vec2 texelStep = vec2(1.0 / CAUSTIC_RESOLUTION_F, 0.0);
-
-    const vec2 qXP = projectToReceiver(
-        sourceXZ + vec2(cell, 0.0),
-        slopeAt(uv + texelStep.xy),
-        refHeight, false, ior);
-    const vec2 qXM = projectToReceiver(
-        sourceXZ - vec2(cell, 0.0),
-        slopeAt(uv - texelStep.xy),
-        refHeight, false, ior);
-    const vec2 qZP = projectToReceiver(
-        sourceXZ + vec2(0.0, cell),
-        slopeAt(uv + texelStep.yx),
-        refHeight, false, ior);
-    const vec2 qZM = projectToReceiver(
-        sourceXZ - vec2(0.0, cell),
-        slopeAt(uv - texelStep.yx),
-        refHeight, false, ior);
-
-    const vec2 dqdx = (qXP - qXM) / (2.0 * cell);
-    const vec2 dqdz = (qZP - qZM) / (2.0 * cell);
-    const float area = abs(dqdx.x * dqdz.y - dqdx.y * dqdz.x);
-    return 1.0 / max(area, 0.10);
-}
-
-// 软膝压缩：knee 以下线性（斜率 1），knee 以上单调、C1 连续、向 ceiling
-// 渐近。替代旧 `clamp(…, 0.20, 6.0)` 的硬上限 —— 硬 clamp 会把整个强聚焦
-// 区压成同一亮度（平顶亮块）；软膝保留聚焦强度的亮度梯度。
-float compressDensity(float raw)
-{
-    const float KNEE = 2.0;
-    const float CEILING = 6.0;
-    if(raw <= KNEE)
+    // 掠射阈值：|y| 小于它时落点在 20 格开外，已经不属于同一块水面
+    // （而且跨图丢光子）。真实世界里这些面元走全反射/白沫，不往水底送光。
+    if(-refracted.y < WATER_CAUSTIC_MIN_VERTICAL)
     {
-        return raw;
+        valid = false;
+        return sourceXZ;
     }
-    return KNEE + (CEILING - KNEE) *
-        (1.0 - exp(-(raw - KNEE) / (CEILING - KNEE)));
+    return sourceXZ + refracted.xz * (refHeight / -refracted.y);
 }
 
 void main()
@@ -145,40 +136,27 @@ void main()
     }
 
     const float tilePeriod = max(pc.params.x, 1.0e-3);
-    // 层 0（折射）用 params.y，层 1（反射）用 params.z —— 一次 dispatch 出两层，
-    // 省掉第二次 bind/push。
     const bool reflectLayer = (layer == 1);
     const float refHeight = max(reflectLayer ? pc.params.z : pc.params.y, 0.0);
-    const float cell = tilePeriod / CAUSTIC_RESOLUTION_F;
 
     const vec2 uv = (vec2(texel) + 0.5) / CAUSTIC_RESOLUTION_F;
     const vec2 sourceXZ = uv * tilePeriod;
+    const vec2 slope = slopeAt(uv);
 
-    vec3 rgb;
-    if(reflectLayer)
+    bool valid = false;
+
+    const vec2 receiverXZ = projectToReceiver(
+        sourceXZ, slope, refHeight, reflectLayer, 1.3335, valid);
+
+    if(!valid || any(isnan(receiverXZ)) || any(isinf(receiverXZ)))
     {
-        // 反射层是镜面，不分色 ⇒ 逐字 vec3(density)，与旧口径一致。
-        const float density = max(
-            compressDensity(
-                jacobianDensity(uv, sourceXZ, cell, refHeight, CAUSTIC_IOR_RGB.g)),
-            0.20);
-        rgb = vec3(density);
-    }
-    else
-    {
-        // 物理色散：三个波长各用各的 IOR 折射，焦散图案逐通道位移；
-        // 消费端 waterParams.y 在「亮度化」与「物理 RGB」之间插值。
-        rgb = vec3(
-            max(compressDensity(jacobianDensity(
-                uv, sourceXZ, cell, refHeight, CAUSTIC_IOR_RGB.r)), 0.20),
-            max(compressDensity(jacobianDensity(
-                uv, sourceXZ, cell, refHeight, CAUSTIC_IOR_RGB.g)), 0.20),
-            max(compressDensity(jacobianDensity(
-                uv, sourceXZ, cell, refHeight, CAUSTIC_IOR_RGB.b)), 0.20));
+        return;
     }
 
-    imageStore(
-        causticOutput,
-        ivec3(texel, layer),
-        vec4(max(rgb, vec3(0.05)), 1.0));
+    // 回卷到 tile：平水时 q == p，桶号与源格一一对应 ⇒ 每桶恰好 1 个光子。
+    vec2 wrapped = receiverXZ / tilePeriod;
+    wrapped -= floor(wrapped);
+    const ivec2 bin = ivec2(wrapped * CAUSTIC_RESOLUTION_F);
+
+    imageAtomicAdd(causticAccum, ivec3(bin, layer), 1u);
 }
