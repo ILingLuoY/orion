@@ -68,10 +68,13 @@ public class VulkanCameraMixin {
     private double waterPlayerStampZ = Double.NaN;
 
     // 2026-11-21 水体掩码：玩家周围 48×48 块在水面 Y 平面逐块查流体
-    //（水 = 255），≥100ms 或玩家块/水面变动才重扫上传。
+    // 2026-11-22 Round 2：升级为 48×48 RGBA8（RGB = BiomeColors.getAverageWaterColor，
+    // A = 水体掩码 255/0），静止 ≥250ms 或玩家块/水面变动才重扫上传。
     private static final int WATER_SIM_MASK_EXTENT = 48;
     private final byte[] waterSimMaskData =
-            new byte[WATER_SIM_MASK_EXTENT * WATER_SIM_MASK_EXTENT];
+            new byte[WATER_SIM_MASK_EXTENT * WATER_SIM_MASK_EXTENT * 4];
+    private final BlockPos.MutableBlockPos waterSimMaskCursor =
+            new BlockPos.MutableBlockPos();
     private long lastWaterSimMaskUploadNanos = 0L;
     private int lastWaterSimMaskPlayerX = Integer.MIN_VALUE;
     private int lastWaterSimMaskPlayerZ = Integer.MIN_VALUE;
@@ -649,39 +652,11 @@ public class VulkanCameraMixin {
                 final int base = boatCount * 5;
                 waterBoatData[base] = (float) entity.getX();
                 waterBoatData[base + 1] = (float) entity.getZ();
-                waterBoatData[base + 2] = (float) entity.getDeltaMovement().x;
-                waterBoatData[base + 3] = (float) entity.getDeltaMovement().z;
+                // 2026-11-22 Round 2 (Item C): velocity in blocks/sec for continuous dipole wake
+                waterBoatData[base + 2] = (float) (entity.getDeltaMovement().x * WATER_TRAIL_TICKS_TO_SECONDS);
+                waterBoatData[base + 3] = (float) (entity.getDeltaMovement().z * WATER_TRAIL_TICKS_TO_SECONDS);
                 waterBoatData[base + 4] = 1.5f;
                 boatCount++;
-
-                // 2026-11-21 尾迹 stamp：位移 ≥0.75 格才入队（低配雨+船共用
-                // 64 深脉冲队列，双子步每步消费至多 16 条，按距不按帧控制节奏）。
-                final net.minecraft.world.phys.Vec3 delta =
-                        entity.getDeltaMovement();
-                final double boatSpeedPS = Math.sqrt(
-                        delta.x * delta.x + delta.z * delta.z)
-                        * WATER_TRAIL_TICKS_TO_SECONDS;
-                if (boatSpeedPS > WATER_TRAIL_MIN_SPEED_PS) {
-                    final double[] lastStamp = waterTrailLastStamp.get(entityId);
-                    final double ddx = entity.getX() - (lastStamp == null
-                            ? Double.NaN : lastStamp[0]);
-                    final double ddz = entity.getZ() - (lastStamp == null
-                            ? Double.NaN : lastStamp[1]);
-                    if (lastStamp == null
-                            || ddx * ddx + ddz * ddz
-                                    >= WATER_TRAIL_STAMP_INTERVAL_SQR) {
-                        NativeVulkan.queueWaterImpulse(
-                                (float) entity.getX(),
-                                (float) entity.getZ(),
-                                (float) (0.10 + 0.06 * Math.min(boatSpeedPS, 6.0)),
-                                0.60f
-                        );
-                        waterTrailLastStamp.put(
-                                entityId,
-                                new double[]{entity.getX(), entity.getZ()}
-                        );
-                    }
-                }
             }
         }
 
@@ -746,15 +721,13 @@ public class VulkanCameraMixin {
         if (Float.isNaN(waterSurfaceY) || waterSurfaceY < -500.0f) {
             return;
         }
-        if (this.minecraft == null || this.minecraft.level == null ||
+        if (this.minecraft == null ||
+                !(this.minecraft.level instanceof net.minecraft.client.multiplayer.ClientLevel clientLevel) ||
                 this.minecraft.player == null) {
             return;
         }
         final var player = this.minecraft.player;
-        final boolean playerInWater = player.isInWater();
-        final boolean surfaceStable = !Float.isNaN(lastWaterSimMaskSurfaceY) &&
-                Math.abs(waterSurfaceY - lastWaterSimMaskSurfaceY) <= 0.01f;
-        if (!playerInWater && !surfaceStable) {
+        if (!player.isInWater() && Math.abs(player.getY() - waterSurfaceY) > 32.0) {
             return;
         }
 
@@ -766,7 +739,7 @@ public class VulkanCameraMixin {
                 Math.abs(waterSurfaceY - lastWaterSimMaskSurfaceY) > 0.01f;
         final long now = System.nanoTime();
         final boolean due =
-                now - lastWaterSimMaskUploadNanos >= 100_000_000L;
+                now - lastWaterSimMaskUploadNanos >= 250_000_000L;
         if (!due && !moved && !surfaceChanged) {
             return;
         }
@@ -781,9 +754,16 @@ public class VulkanCameraMixin {
         for (int dz = 0; dz < WATER_SIM_MASK_EXTENT; ++dz) {
             final int rowBase = dz * WATER_SIM_MASK_EXTENT;
             for (int dx = 0; dx < WATER_SIM_MASK_EXTENT; ++dx) {
-                final FluidState state = this.minecraft.level.getFluidState(
-                        new BlockPos(originX + dx, probeY, originZ + dz));
-                waterSimMaskData[rowBase + dx] =
+                waterSimMaskCursor.set(originX + dx, probeY, originZ + dz);
+                final FluidState state = clientLevel.getFluidState(waterSimMaskCursor);
+                final int tintRgb = net.minecraft.client.renderer.BiomeColors.getAverageWaterColor(
+                        clientLevel,
+                        waterSimMaskCursor);
+                final int offset = (rowBase + dx) * 4;
+                waterSimMaskData[offset] = (byte) ((tintRgb >> 16) & 0xFF);
+                waterSimMaskData[offset + 1] = (byte) ((tintRgb >> 8) & 0xFF);
+                waterSimMaskData[offset + 2] = (byte) (tintRgb & 0xFF);
+                waterSimMaskData[offset + 3] =
                         state.is(FluidTags.WATER) ? (byte) 0xFF : (byte) 0x00;
             }
         }

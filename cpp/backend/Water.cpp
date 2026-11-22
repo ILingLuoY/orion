@@ -14,18 +14,58 @@ void updateWaterSimulationRayDescriptor()
         return;
     }
 
-    VkDescriptorImageInfo info{};
-    info.sampler = g_waterSimSampler;
-    info.imageView = g_waterSimView;
-    info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo infos[2]{};
+    infos[0].sampler = g_waterSimSampler;
+    infos[0].imageView = g_waterSimView;
+    infos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[2]{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = g_rayTracingDescriptorSet;
+    writes[0].dstBinding = 33;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = &infos[0];
+
+    uint32_t writeCount = 1u;
+    if(g_waterSimMaskView != VK_NULL_HANDLE)
+    {
+        infos[1].sampler = g_waterSimSampler;
+        infos[1].imageView = g_waterSimMaskView;
+        infos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = g_rayTracingDescriptorSet;
+        writes[1].dstBinding = 70;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].pImageInfo = &infos[1];
+        writeCount = 2u;
+    }
+
+    vkUpdateDescriptorSets(g_device, writeCount, writes, 0, nullptr);
+}
+void updateWaterSimFftDescriptor()
+{
+    if(g_waterSimDescriptorSet == VK_NULL_HANDLE ||
+       g_waterFftSlopeView == VK_NULL_HANDLE ||
+       g_waterFftSlopeSampler == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorImageInfo fftInfo{};
+    fftInfo.sampler = g_waterFftSlopeSampler;
+    fftInfo.imageView = g_waterFftSlopeView;
+    fftInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = g_rayTracingDescriptorSet;
-    write.dstBinding = 33;
-    write.descriptorCount = 1;
+    write.dstSet = g_waterSimDescriptorSet;
+    write.dstBinding = 5u;
+    write.descriptorCount = 1u;
     write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &info;
-    vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+    write.pImageInfo = &fftInfo;
+    vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
 }
 void updateWaterCausticRayDescriptor()
 {
@@ -711,6 +751,7 @@ void createWaterFftResources()
         vkDestroyShaderModule(g_device, shaderModule, nullptr);
 
         g_waterFftAvailable.store(true);
+        updateWaterSimFftDescriptor();
         RTLog("[WATER FFT] Phillips spectrum pipeline created ("
             + std::to_string(WATER_FFT_RESOLUTION) + "x" + std::to_string(WATER_FFT_RESOLUTION)
             + ", 41 dispatches/update, " + std::to_string(g_waterFftRateHz.load()) + " Hz,"
@@ -736,6 +777,25 @@ void recordWaterFftUpdate(VkCommandBuffer cmd)
         return;
     }
     if(g_waterFftPipeline == VK_NULL_HANDLE || g_waterFftDescriptorSet == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 2026-11-22 (Batch 2): Skip 41-dispatch FFT update when TLAS has 0 water sections
+    // and player is not in water (after initial layout transition + first initialization).
+    // Rollback: set kWATER_FFT_SKIP_WHEN_NO_WATER = false.
+    static constexpr bool kWATER_FFT_SKIP_WHEN_NO_WATER = true;
+    const CameraUBO* waterFftUbo =
+        g_cameraUboMapped != nullptr
+            ? static_cast<const CameraUBO*>(g_cameraUboMapped)
+            : nullptr;
+    const bool playerInWaterNow =
+        waterFftUbo != nullptr && waterFftUbo->playerInWater > 0.5f;
+    if(kWATER_FFT_SKIP_WHEN_NO_WATER &&
+       g_waterFftLayoutReady &&
+       g_tlasWaterSectionCountValid.load(std::memory_order_relaxed) &&
+       g_tlasWaterSectionCount.load(std::memory_order_relaxed) == 0u &&
+       !playerInWaterNow)
     {
         return;
     }
@@ -831,7 +891,8 @@ void recordWaterFftUpdate(VkCommandBuffer cmd)
         slopeBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         vkCmdPipelineBarrier(
             cmd,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0u,
             0u, nullptr,
@@ -881,6 +942,7 @@ void recordWaterFftUpdate(VkCommandBuffer cmd)
     const float detailVisualScale =
         g_waterFftAmplitude.load() * kWATER_FFT_DETAIL_BOOST *
         g_waterFftDetail.load();
+    int32_t finalDetailLayer = 2;
     if(detailVisualScale > 0.0f)
     {
         auto detailDispatch = [&](int32_t src, int32_t dst, int32_t stage, int32_t mode, int32_t axis)
@@ -908,16 +970,20 @@ void recordWaterFftUpdate(VkCommandBuffer cmd)
             detailDispatch(detailLayer ^ 1, detailLayer, length, 1, 1);
             detailLayer ^= 1;
         }
+        finalDetailLayer = detailLayer ^ 1;
     }
 
+    // 2026-11-22 Round 2 (Item G): butterfly loops flip `layer ^= 1` after the
+    // final stage write, so completed 512x512 IFFT resides in `layer ^ 1` (and `detailLayer ^ 1`).
+    const int32_t finalBaseLayer = layer ^ 1;
     waterFftDispatch(
-        cmd, layer, -1, 0, 3, 0,
-        2, // detailLayer：detailVisualScale <= 0 时 finalize 不读它，占位即可
+        cmd, finalBaseLayer, -1, 0, 3, 0,
+        finalDetailLayer,
         -1.0f,
         detailTexel,
         detailVisualScale,
         0.0f);
-    g_waterFftWorkingLayer = layer;
+    g_waterFftWorkingLayer = finalBaseLayer;
 
     VkImageMemoryBarrier preMip{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     preMip.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1004,7 +1070,8 @@ void recordWaterFftUpdate(VkCommandBuffer cmd)
     vkCmdPipelineBarrier(
         cmd,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0u,
         0u, nullptr,
         0u, nullptr,
@@ -1029,37 +1096,30 @@ void destroyWaterFftResources()
     if(g_waterFftStateImage){vkDestroyImage(g_device,g_waterFftStateImage,nullptr);g_waterFftStateImage=VK_NULL_HANDLE;}
     if(g_waterFftStateMemory){vkFreeMemory(g_device,g_waterFftStateMemory,nullptr);g_waterFftStateMemory=VK_NULL_HANDLE;}
 }
-// 把焦散图绑到 RT set 的 binding 69（折射）/ 70（反射）。创建成功后调用一次。
+// 把焦散图绑到 RT set 的 binding 69（折射）。binding 70 已转交给 waterBiomeMaskMap。
 void updateWaterCausticMapRayDescriptor()
 {
     if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
        g_waterCausticMapView == VK_NULL_HANDLE ||
-       g_waterCausticMapReflectView == VK_NULL_HANDLE ||
        g_waterCausticMapSampler == VK_NULL_HANDLE)
     {
         return;
     }
 
-    VkDescriptorImageInfo info[2]{};
-    info[0].sampler = g_waterCausticMapSampler;
-    info[0].imageView = g_waterCausticMapView;
-    info[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    info[1].sampler = g_waterCausticMapSampler;
-    info[1].imageView = g_waterCausticMapReflectView;
-    info[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo info{};
+    info.sampler = g_waterCausticMapSampler;
+    info.imageView = g_waterCausticMapView;
+    info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkWriteDescriptorSet writes[2]{};
-    for(uint32_t i = 0u; i < 2u; ++i)
-    {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = g_rayTracingDescriptorSet;
-        writes[i].dstBinding = 69u + i;
-        writes[i].descriptorCount = 1u;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[i].pImageInfo = &info[i];
-    }
-    vkUpdateDescriptorSets(g_device, 2u, writes, 0u, nullptr);
-    RTLog("[WATER CAUSTIC MAP] bound to RT bindings 69 (refract) / 70 (reflect)");
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = g_rayTracingDescriptorSet;
+    write.dstBinding = 69u;
+    write.descriptorCount = 1u;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &info;
+    vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+    RTLog("[WATER CAUSTIC MAP] bound to RT binding 69 (refract; binding 70 owned by waterBiomeMaskMap)");
 }
 void destroyWaterCausticMapResources()
 {
@@ -3042,7 +3102,7 @@ void createWaterSimulationResources()
         "water simulation create sampler failed"
     );
 
-    VkDescriptorSetLayoutBinding bindings[5]{};
+    VkDescriptorSetLayoutBinding bindings[6]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[0].descriptorCount = 1;
@@ -3059,15 +3119,20 @@ void createWaterSimulationResources()
     bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    // 2026-11-21 binding 4：水体掩码（R8 48×48，Java 扫描上传）。
+    // 2026-11-22 Round 2 binding 4: RGBA8 48x48 biome tint (RGB) + water mask (A).
     bindings[4].binding = 4;
     bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[4].descriptorCount = 1;
     bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    // 2026-11-22 Round 2 (Item E): waterFftSlope for shoreline wave reflection.
+    bindings[5].binding = 5;
+    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[5].descriptorCount = 1;
+    bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo layoutInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
     };
-    layoutInfo.bindingCount = 5u;
+    layoutInfo.bindingCount = 6u;
     layoutInfo.pBindings = bindings;
     check(
         vkCreateDescriptorSetLayout(
@@ -3079,8 +3144,8 @@ void createWaterSimulationResources()
         "water simulation create descriptor layout failed"
     );
 
-    VkDescriptorPoolSize poolSizes[4] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u },
+    VkDescriptorPoolSize poolSizes[3] = {
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3u },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2u }
     };
@@ -3088,7 +3153,7 @@ void createWaterSimulationResources()
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
     };
     poolInfo.maxSets = 1u;
-    poolInfo.poolSizeCount = 4u;
+    poolInfo.poolSizeCount = 3u;
     poolInfo.pPoolSizes = poolSizes;
     check(
         vkCreateDescriptorPool(
@@ -3175,14 +3240,13 @@ void createWaterSimulationResources()
         std::memset(g_waterSimEntityMapped, 0, sizeof(WaterSimEntityUBO));
     }
 
-    // 2026-11-21 水体掩码：48×48 R8（1 字节/块，0=陆地 255=水），
-    // Java 扫描写入持久映射缓冲，recordWaterSimulation 里拷进图像。
+    // 2026-11-22 Round 2: 48x48 RGBA8 (RGB = biome water tint, A = water mask).
     {
         VkImageCreateInfo maskImageInfo{
             VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
         };
         maskImageInfo.imageType = VK_IMAGE_TYPE_2D;
-        maskImageInfo.format = VK_FORMAT_R8_UNORM;
+        maskImageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
         maskImageInfo.extent = {
             WATER_SIM_MASK_EXTENT, WATER_SIM_MASK_EXTENT, 1u
         };
@@ -3236,7 +3300,7 @@ void createWaterSimulationResources()
         };
         maskViewInfo.image = g_waterSimMaskImage;
         maskViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        maskViewInfo.format = VK_FORMAT_R8_UNORM;
+        maskViewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
         maskViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         maskViewInfo.subresourceRange.levelCount = 1u;
         maskViewInfo.subresourceRange.layerCount = 1u;
@@ -3250,8 +3314,9 @@ void createWaterSimulationResources()
             "water simulation create mask view failed"
         );
 
-        const VkDeviceSize maskBufferSize =
+        const uint32_t maskTexelCount =
             WATER_SIM_MASK_EXTENT * WATER_SIM_MASK_EXTENT;
+        const VkDeviceSize maskBufferSize = maskTexelCount * 4u;
         VkBufferCreateInfo maskBufferInfo{
             VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
         };
@@ -3312,7 +3377,14 @@ void createWaterSimulationResources()
             ),
             "water simulation map mask buffer failed"
         );
-        std::memset(g_waterSimMaskMapped, 0xFF, maskBufferSize);
+        uint8_t* initBytes = static_cast<uint8_t*>(g_waterSimMaskMapped);
+        for(uint32_t i = 0u; i < maskTexelCount; ++i)
+        {
+            initBytes[i * 4u + 0u] = 63u;
+            initBytes[i * 4u + 1u] = 118u;
+            initBytes[i * 4u + 2u] = 228u;
+            initBytes[i * 4u + 3u] = 255u;
+        }
     }
 
     VkDescriptorImageInfo sampledInfo{};
@@ -3333,7 +3405,7 @@ void createWaterSimulationResources()
     maskInfo.imageView = g_waterSimMaskView;
     maskInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkWriteDescriptorSet writes[5]{};
+    VkWriteDescriptorSet writes[6]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = g_waterSimDescriptorSet;
     writes[0].dstBinding = 0u;
@@ -3364,7 +3436,13 @@ void createWaterSimulationResources()
     writes[4].descriptorCount = 1u;
     writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[4].pImageInfo = &maskInfo;
-    vkUpdateDescriptorSets(g_device, 5u, writes, 0u, nullptr);
+    writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[5].dstSet = g_waterSimDescriptorSet;
+    writes[5].dstBinding = 5u;
+    writes[5].descriptorCount = 1u;
+    writes[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[5].pImageInfo = &maskInfo;
+    vkUpdateDescriptorSets(g_device, 6u, writes, 0u, nullptr);
 
 
     g_waterSimLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -3452,11 +3530,128 @@ void recordWaterSimulation(VkCommandBuffer cmd)
         return;
     }
 
+    // Upload biome+mask RGBA8 before any idle or rate-throttle early return so RT binding 70
+    // is always in GENERAL layout and stays immediately fresh for shoreline wetness & biome tint.
+    bool maskValidSnapshot = false;
+    float maskOriginXSnapshot = 0.0f;
+    float maskOriginZSnapshot = 0.0f;
+    if(g_waterSimMaskImage != VK_NULL_HANDLE)
+    {
+        bool wasLayoutReady = g_waterSimMaskLayoutReady;
+        bool maskDirty = false;
+        {
+            std::lock_guard<std::mutex> guard(g_waterSimMaskMutex);
+            maskDirty = g_waterSimMaskDirty;
+            g_waterSimMaskDirty = false;
+            maskValidSnapshot = g_waterSimMaskValid;
+            maskOriginXSnapshot = g_waterSimMaskOriginX;
+            maskOriginZSnapshot = g_waterSimMaskOriginZ;
+        }
+        if(!wasLayoutReady)
+        {
+            VkImageMemoryBarrier maskBarrier{
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+            };
+            maskBarrier.image = g_waterSimMaskImage;
+            maskBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            maskBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            maskBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            maskBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            maskBarrier.srcAccessMask = 0u;
+            maskBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
+                                        VK_ACCESS_SHADER_READ_BIT;
+            maskBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            maskBarrier.subresourceRange.levelCount = 1u;
+            maskBarrier.subresourceRange.layerCount = 1u;
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT |
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0u,
+                0u, nullptr, 0u, nullptr, 1u, &maskBarrier
+            );
+            g_waterSimMaskLayoutReady = true;
+            maskDirty = true;
+        }
+        else if(maskDirty && g_waterSimMaskMapped != nullptr)
+        {
+            VkImageMemoryBarrier preCopyBarrier{
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+            };
+            preCopyBarrier.image = g_waterSimMaskImage;
+            preCopyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            preCopyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            preCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            preCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            preCopyBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            preCopyBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            preCopyBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            preCopyBarrier.subresourceRange.levelCount = 1u;
+            preCopyBarrier.subresourceRange.layerCount = 1u;
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u,
+                0u, nullptr, 0u, nullptr, 1u, &preCopyBarrier
+            );
+        }
+        if(maskDirty && g_waterSimMaskMapped != nullptr)
+        {
+            VkBufferImageCopy maskRegion{};
+            maskRegion.bufferOffset = 0u;
+            maskRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            maskRegion.imageSubresource.layerCount = 1u;
+            maskRegion.imageExtent = {
+                WATER_SIM_MASK_EXTENT, WATER_SIM_MASK_EXTENT, 1u
+            };
+            vkCmdCopyBufferToImage(
+                cmd,
+                g_waterSimMaskBuffer,
+                g_waterSimMaskImage,
+                VK_IMAGE_LAYOUT_GENERAL,
+                1u,
+                &maskRegion
+            );
+            VkImageMemoryBarrier maskReadBarrier{
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+            };
+            maskReadBarrier.image = g_waterSimMaskImage;
+            maskReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            maskReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            maskReadBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            maskReadBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            maskReadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            maskReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                            VK_ACCESS_TRANSFER_WRITE_BIT;
+            maskReadBarrier.subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            maskReadBarrier.subresourceRange.levelCount = 1u;
+            maskReadBarrier.subresourceRange.layerCount = 1u;
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u,
+                0u, nullptr, 0u, nullptr, 1u, &maskReadBarrier
+            );
+        }
+    }
+
     CameraUBO* ubo = static_cast<CameraUBO*>(g_cameraUboMapped);
     const bool playerInWater = ubo->playerInWater > 0.5f;
     const bool windKeepsSimAlive = waterWindStrength() > 0.0f;
-    if(!windKeepsSimAlive && !playerInWater && !g_waterSimPendingImpulse &&
-       g_waterSimKeepAliveSeconds <= 0.0f)
+    const bool nearbyWaterActive =
+        maskValidSnapshot &&
+        g_waterNearbySurfaceY > -500.0f &&
+        std::fabs(ubo->playerY - g_waterNearbySurfaceY) <= 32.0f;
+    if(!windKeepsSimAlive && !playerInWater && !nearbyWaterActive &&
+       !g_waterSimPendingImpulse && g_waterSimKeepAliveSeconds <= 0.0f)
     {
         if(!g_waterSimLoggedAwaitingWater)
         {
@@ -3530,7 +3725,7 @@ void recordWaterSimulation(VkCommandBuffer cmd)
     ubo->waterSimTexelWorldSize = WATER_SIM_TEXEL_WORLD_SIZE;
     ubo->waterSimReadLayer = g_waterSimReadLayer;
     ubo->waterSimEnabled =
-        (playerInWater || g_waterSimPendingImpulse ||
+        (playerInWater || nearbyWaterActive || g_waterSimPendingImpulse ||
          g_waterSimKeepAliveSeconds > 0.0f ||
          waterWindStrength() > 0.0f) ? 1u : 0u;
 
@@ -3618,94 +3813,18 @@ void recordWaterSimulation(VkCommandBuffer cmd)
     push.waveGaussianSource = g_waterSimGaussianSource.load();
     push.waveDampingScale = g_waterSimDampingScale.load();
     push.waveSpeed = g_waterSimPropagationSpeed.load();
-    // 2026-11-21 交互波升级：雨涟漪强度 / 水体掩码窗口 / 涟漪倍率。
-    // 2026-11-21 顾问轮1：雨滴涟漪倍率统一到降雨页「雨波纹明显度」
-    //（g_rainRippleStrength，与解析细雨环层同一个旋钮），独立旋钮已删。
     push.rainStrength = g_waterWeatherRain.load();
     push.rainRippleScale = g_rainRippleStrength.load();
     push.invMaskExtent = 1.0f / static_cast<float>(WATER_SIM_MASK_EXTENT);
-    {
-        std::lock_guard<std::mutex> guard(g_waterSimMaskMutex);
-        push.maskOriginX = g_waterSimMaskOriginX;
-        push.maskOriginZ = g_waterSimMaskOriginZ;
-        push.maskEnabled = g_waterSimMaskValid ? 1u : 0u;
-    }
-
-    // 水体掩码上传：首帧布局 UNDEFINED→GENERAL，之后 dirty 才拷贝。
-    if(g_waterSimMaskImage != VK_NULL_HANDLE)
-    {
-        if(!g_waterSimMaskLayoutReady)
-        {
-            VkImageMemoryBarrier maskBarrier{
-                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
-            };
-            maskBarrier.image = g_waterSimMaskImage;
-            maskBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            maskBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            maskBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            maskBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            maskBarrier.srcAccessMask = 0u;
-            maskBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
-                                        VK_ACCESS_SHADER_READ_BIT;
-            maskBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            maskBarrier.subresourceRange.levelCount = 1u;
-            maskBarrier.subresourceRange.layerCount = 1u;
-            vkCmdPipelineBarrier(
-                cmd,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0u,
-                0u, nullptr, 0u, nullptr, 1u, &maskBarrier
-            );
-            g_waterSimMaskLayoutReady = true;
-        }
-        bool maskDirty = false;
-        {
-            std::lock_guard<std::mutex> guard(g_waterSimMaskMutex);
-            maskDirty = g_waterSimMaskDirty;
-            g_waterSimMaskDirty = false;
-        }
-        if(maskDirty && g_waterSimMaskMapped != nullptr)
-        {
-            VkBufferImageCopy maskRegion{};
-            maskRegion.bufferOffset = 0u;
-            maskRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            maskRegion.imageSubresource.layerCount = 1u;
-            maskRegion.imageExtent = {
-                WATER_SIM_MASK_EXTENT, WATER_SIM_MASK_EXTENT, 1u
-            };
-            vkCmdCopyBufferToImage(
-                cmd,
-                g_waterSimMaskBuffer,
-                g_waterSimMaskImage,
-                VK_IMAGE_LAYOUT_GENERAL,
-                1u,
-                &maskRegion
-            );
-            VkImageMemoryBarrier maskReadBarrier{
-                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
-            };
-            maskReadBarrier.image = g_waterSimMaskImage;
-            maskReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            maskReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            maskReadBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            maskReadBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            maskReadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            maskReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
-                                            VK_ACCESS_TRANSFER_WRITE_BIT;
-            maskReadBarrier.subresourceRange.aspectMask =
-                VK_IMAGE_ASPECT_COLOR_BIT;
-            maskReadBarrier.subresourceRange.levelCount = 1u;
-            maskReadBarrier.subresourceRange.layerCount = 1u;
-            vkCmdPipelineBarrier(
-                cmd,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0u,
-                0u, nullptr, 0u, nullptr, 1u, &maskReadBarrier
-            );
-        }
-    }
+    push.maskOriginX = maskOriginXSnapshot;
+    push.maskOriginZ = maskOriginZSnapshot;
+    const bool fftReady =
+        g_waterFftLayoutReady &&
+        g_waterFftAvailable.load() &&
+        g_waterFftEnabled.load();
+    push.maskEnabled =
+        (maskValidSnapshot ? 1u : 0u) |
+        (fftReady ? 2u : 0u);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterSimPipeline);
     vkCmdBindDescriptorSets(
@@ -4195,19 +4314,37 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateWaterSimMask(
     {
         return;
     }
-    const jsize expected =
+    const jsize texelCount =
         static_cast<jsize>(WATER_SIM_MASK_EXTENT * WATER_SIM_MASK_EXTENT);
-    if(env->GetArrayLength(mask) < expected)
+    const jsize rgbaSize = texelCount * 4;
+    const jsize arrLen = env->GetArrayLength(mask);
+    if(arrLen < texelCount)
     {
         return;
     }
     std::lock_guard<std::mutex> guard(g_waterSimMaskMutex);
-    env->GetByteArrayRegion(
-        mask,
-        0,
-        expected,
-        static_cast<jbyte*>(g_waterSimMaskMapped)
-    );
+    if(arrLen >= rgbaSize)
+    {
+        env->GetByteArrayRegion(
+            mask,
+            0,
+            rgbaSize,
+            static_cast<jbyte*>(g_waterSimMaskMapped)
+        );
+    }
+    else
+    {
+        std::vector<jbyte> r8(static_cast<size_t>(texelCount));
+        env->GetByteArrayRegion(mask, 0, texelCount, r8.data());
+        uint8_t* dst = static_cast<uint8_t*>(g_waterSimMaskMapped);
+        for(jsize i = 0; i < texelCount; ++i)
+        {
+            dst[i * 4 + 0] = 63u;
+            dst[i * 4 + 1] = 118u;
+            dst[i * 4 + 2] = 228u;
+            dst[i * 4 + 3] = static_cast<uint8_t>(r8[static_cast<size_t>(i)]);
+        }
+    }
     g_waterSimMaskOriginX = originX;
     g_waterSimMaskOriginZ = originZ;
     g_waterSimMaskValid = true;

@@ -5097,25 +5097,32 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
         g_volumetricCloudHistoryDepthLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
-    VkImageMemoryBarrier sceneBarriers[2]{};
-    for(uint32_t i = 0u; i < 2u; ++i)
+    // 2026-11-22 (Batch 2): preVolBarriers at lines 4945-4984 already synchronized
+    // ALL_COMMANDS -> COMPUTE_SHADER on g_rtOutputImage & g_dlssDepthImage with zero
+    // RT commands issued since. Rollback: set kCLOUD_SKIP_REDUNDANT_RT_BARRIER = false.
+    static constexpr bool kCLOUD_SKIP_REDUNDANT_RT_BARRIER = true;
+    if(!kCLOUD_SKIP_REDUNDANT_RT_BARRIER)
     {
-        sceneBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        sceneBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        sceneBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        sceneBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        sceneBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        sceneBarriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        sceneBarriers[i].dstAccessMask = i == 0u
-            ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-            : VK_ACCESS_SHADER_READ_BIT;
-        sceneBarriers[i].image = i == 0u ? g_rtOutputImage : g_dlssDepthImage;
-        sceneBarriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        sceneBarriers[i].subresourceRange.levelCount = 1u;
-        sceneBarriers[i].subresourceRange.layerCount = 1u;
+        VkImageMemoryBarrier sceneBarriers[2]{};
+        for(uint32_t i = 0u; i < 2u; ++i)
+        {
+            sceneBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            sceneBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            sceneBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            sceneBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            sceneBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            sceneBarriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            sceneBarriers[i].dstAccessMask = i == 0u
+                ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                : VK_ACCESS_SHADER_READ_BIT;
+            sceneBarriers[i].image = i == 0u ? g_rtOutputImage : g_dlssDepthImage;
+            sceneBarriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            sceneBarriers[i].subresourceRange.levelCount = 1u;
+            sceneBarriers[i].subresourceRange.layerCount = 1u;
+        }
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, sceneBarriers);
     }
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, sceneBarriers);
 
     const VkPipeline cloudRenderPipeline = g_volumetricCloudRenderPipelineV3;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cloudRenderPipeline);
@@ -5282,7 +5289,7 @@ after_clouds:
     // Air god rays are handled by the unified froxel pipeline above; skip this entire block
     // when neither VolReSTIR nor underwater god rays are active (avoids idle full-screen passes).
     const bool underwaterGodRayActive =
-        (volRestirEnabled() == 0u && g_cameraInWater.load() != 0u && g_godRayEnabled.load());
+        (g_cameraInWater.load() != 0u && g_godRayEnabled.load());
     const bool volRestirCompositeActive =
         (volRestirEnabled() != 0u &&
          g_volRestirCompositePipeline != VK_NULL_HANDLE &&
@@ -5309,15 +5316,21 @@ after_clouds:
             barrier.subresourceRange.layerCount = 1u;
         }
         godRayBarriers[0].srcAccessMask =
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-        godRayBarriers[0].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            VK_ACCESS_SHADER_READ_BIT |
+            VK_ACCESS_SHADER_WRITE_BIT |
+            VK_ACCESS_TRANSFER_READ_BIT;
+        godRayBarriers[0].dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT |
+            VK_ACCESS_SHADER_WRITE_BIT |
+            VK_ACCESS_TRANSFER_WRITE_BIT;
         godRayBarriers[0].image = g_godRayTargetImage;
         godRayBarriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         godRayBarriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         godRayBarriers[1].image = g_godRayHistoryImage;
         vkCmdPipelineBarrier(cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 0u, nullptr, 2u,
             godRayBarriers);
 
         if(g_godRayHistoryNeedsClear.exchange(false) &&
@@ -5627,7 +5640,7 @@ after_clouds:
         static bool s_godRayDispatchLogged = false;
         const bool godRayWillDispatch =
             godRayHazePassEnabled() &&
-            volRestirEnabled() == 0u &&
+            underwaterGodRayActive &&
             g_volumetricLightPipeline != VK_NULL_HANDLE &&
             g_volumetricLightSet != VK_NULL_HANDLE;
         if(!s_godRayDispatchLogged)
@@ -5645,6 +5658,31 @@ after_clouds:
 
         if(godRayWillDispatch)
         {
+            if(volRestirEnabled() == 0u)
+            {
+                VkImageSubresourceRange clearRange{};
+                clearRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                clearRange.levelCount = 1u;
+                clearRange.layerCount = 1u;
+                const VkClearColorValue neutralColor{{0.0f, 0.0f, 0.0f, 1.0f}};
+                vkCmdClearColorImage(cmd, g_godRayTargetImage,
+                    VK_IMAGE_LAYOUT_GENERAL, &neutralColor, 1u, &clearRange);
+                VkImageMemoryBarrier clearToCompute{};
+                clearToCompute.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                clearToCompute.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                clearToCompute.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                clearToCompute.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                clearToCompute.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                clearToCompute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                clearToCompute.dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                clearToCompute.image = g_godRayTargetImage;
+                clearToCompute.subresourceRange = clearRange;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+                    1u, &clearToCompute);
+            }
+
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volumetricLightPipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                 g_volumetricLightPipelineLayout, 0u, 1u, &g_volumetricLightSet, 0u, nullptr);

@@ -762,7 +762,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     );
 
     const bool nowInWater = ubo->playerInWater > 0.5f;
-    if(nowInWater || !g_waterSimPlayerStateValid)
+    const bool nearbyWaterSurfaceOk =
+        waterSurfaceY > -500.0 &&
+        std::fabs(ubo->playerY - static_cast<float>(waterSurfaceY)) <= 32.0f;
+    if(nowInWater || !g_waterSimPlayerStateValid || nearbyWaterSurfaceOk)
     {
         g_waterSimLastSurfaceY = static_cast<float>(waterSurfaceY);
     }
@@ -791,6 +794,17 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     g_waterSimPlayerStateValid = true;
     g_waterSimPlayerWasInWater = nowInWater;
 
+    bool maskValidSnapshot = false;
+    float maskOriginXSnapshot = 0.0f;
+    float maskOriginZSnapshot = 0.0f;
+    {
+        std::lock_guard<std::mutex> guard(g_waterSimMaskMutex);
+        maskValidSnapshot = g_waterSimMaskValid;
+        maskOriginXSnapshot = g_waterSimMaskOriginX;
+        maskOriginZSnapshot = g_waterSimMaskOriginZ;
+    }
+    const bool nearbyWaterActive = maskValidSnapshot && nearbyWaterSurfaceOk;
+
     ubo->waterSurfaceY = g_waterSimLastSurfaceY;
     ubo->waterSimOriginX = g_waterSimOriginX;
     ubo->waterSimOriginZ = g_waterSimOriginZ;
@@ -798,11 +812,18 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->waterSimReadLayer = g_waterSimReadLayer;
     ubo->waterSimEnabled =
         (g_waterSimOriginValid &&
-         (nowInWater || g_waterSimPendingImpulse ||
+         (nowInWater || nearbyWaterActive || g_waterSimPendingImpulse ||
           g_waterSimKeepAliveSeconds > 0.0f ||
           waterWindStrength() > 0.0f)) ? 1u : 0u;
     ubo->waterSimImpulsePending =
         g_waterSimPendingImpulse ? 1u : 0u;
+    // 2026-11-22 Round 2: publish 48x48 water biome+mask window via dead glassCausticParams lane.
+    ubo->glassCausticParams[0] = maskOriginXSnapshot;
+    ubo->glassCausticParams[1] = maskOriginZSnapshot;
+    ubo->glassCausticParams[2] =
+        1.0f / static_cast<float>(WATER_SIM_MASK_EXTENT);
+    ubo->glassCausticParams[3] =
+        (maskValidSnapshot && (nowInWater || nearbyWaterSurfaceOk)) ? 1.0f : 0.0f;
     ubo->cameraInWater =
         cameraInWater > 0.5f ? 1u : 0u;
     g_cameraInWater.store(ubo->cameraInWater, std::memory_order_relaxed);

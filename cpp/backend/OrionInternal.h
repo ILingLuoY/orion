@@ -3672,6 +3672,7 @@ void createVLIComputePipeline();
 void destroyVLIResources();
 void updateRTOutputDescriptor();
 void updateWaterSimulationRayDescriptor();
+void updateWaterSimFftDescriptor();
 void updateWaterCausticRayDescriptor();
 void createEntityPbrFallbackResources();
 void destroyEntityPbrFallbackResources();
@@ -4257,6 +4258,9 @@ extern float g_waterSimLastSurfaceY;
 // 每帧都更新；与 g_waterSimLastSurfaceY（只在下水时更新、离开水后冻结）
 // 分开，专供焦散图两处近水判据使用。不经 UBO，避免动 shader 布局。
 extern float g_waterNearbySurfaceY;
+// 2026-11-22 (Batch 2): Active SECTION_AS_CLASS_WATER instance count from TLAS assembly.
+extern std::atomic<uint32_t> g_tlasWaterSectionCount;
+extern std::atomic<bool> g_tlasWaterSectionCountValid;
 extern bool g_waterSimOriginValid;
 extern float g_waterSimOriginX;
 extern float g_waterSimOriginZ;

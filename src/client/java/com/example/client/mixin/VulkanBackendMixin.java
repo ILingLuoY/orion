@@ -598,29 +598,74 @@ public class VulkanBackendMixin {
                 )
         );
 
-        // 2026-11-10：动态下标访问 sampler2D 数组（不是完整的 descriptor indexing）。
-        //
-        // ⚠ 已**默认关闭**。实测：加上这一位后，四台 RTPSO 里 main 那条冷编
-        // 11.3 分钟后返回 result=-3（VK_ERROR_INITIALIZATION_FAILED），且
-        // createDevice 日志里 "[Mixin] Injected Vulkan features" 打印了 3 次
-        // （设备创建重试）⇒ 该特性很可能没有被真正接受，而使用动态下标的
-        // SPIR-V 需要它，于是 RTPSO 创建失败、客户端 0xC0000409 退出。
-        // 现状：shader 侧 ORION_ATLAS_DYNAMIC_INDEX=0，走原来的 64 路 switch。
-        // 若要重新验证：ORION_ATLAS_DYNINDEX=1 + 重编 SPV（-DORION_ATLAS_DYNAMIC_INDEX=1）。
-        final boolean wantDynamicAtlasIndex =
-                "1".equals(System.getenv("ORION_ATLAS_DYNINDEX"));
-        if (wantDynamicAtlasIndex) {
-            vulkanFeatures.add(
-                    new VulkanFeature(
-                            VK10_FEATURES_STRUCT,
-                            "shaderSampledImageArrayDynamicIndexing"
-                    )
-            );
+        // 2026-11-22 (Batch 2): Probe & enable Core 1.0 dynamic sampler array indexing +
+        // Vulkan 1.2 non-uniform sampler2D[] indexing together so rchit/rahit/K2-rgen
+        // can use entityAtlases[nonuniformEXT(slot - 1u)] cleanly without UB or -3 errors.
+        // Rollback: set enableNonUniformAtlasIndex = false and -DORION_ATLAS_DYNAMIC_INDEX=0.
+        final boolean enableNonUniformAtlasIndex = true;
+        if (enableNonUniformAtlasIndex) {
+            boolean dynamicSupported = false;
+            boolean nonUniformSupported = false;
+            boolean descIdxSupported = false;
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkPhysicalDeviceFeatures2 available =
+                        VkPhysicalDeviceFeatures2.calloc(stack).sType$Default();
+                VK12_FEATURES_STRUCT.findOrCreateStructInPNextChain(available, stack);
+                VK12.vkGetPhysicalDeviceFeatures2(
+                        physicalDevice.vkPhysicalDevice(),
+                        available
+                );
+                dynamicSupported =
+                        available.features().shaderSampledImageArrayDynamicIndexing();
+                nonUniformSupported = new VulkanFeature(
+                        VK12_FEATURES_STRUCT,
+                        "shaderSampledImageArrayNonUniformIndexing",
+                        VkPhysicalDeviceVulkan12Features.SHADERSAMPLEDIMAGEARRAYNONUNIFORMINDEXING
+                ).get(available);
+                descIdxSupported = new VulkanFeature(
+                        VK12_FEATURES_STRUCT,
+                        "descriptorIndexing",
+                        VkPhysicalDeviceVulkan12Features.DESCRIPTORINDEXING
+                ).get(available);
+            } catch (RuntimeException error) {
+                System.err.println("[ATLAS-NONUNIFORM] feature probe failed: " + error);
+            }
 
-            System.err.println(
-                    "[ATLAS-DYNINDEX] requested shaderSampledImageArrayDynamicIndexing=1"
-                            + " (sampler2D[64] dynamic indexing for entity atlases)"
-            );
+            if (dynamicSupported && nonUniformSupported) {
+                if (descIdxSupported && !fgRequiresDescriptorIndexing) {
+                    vulkanFeatures.add(
+                            new VulkanFeature(
+                                    VK12_FEATURES_STRUCT,
+                                    "descriptorIndexing",
+                                    VkPhysicalDeviceVulkan12Features.DESCRIPTORINDEXING
+                            )
+                    );
+                }
+                vulkanFeatures.add(
+                        new VulkanFeature(
+                                VK10_FEATURES_STRUCT,
+                                "shaderSampledImageArrayDynamicIndexing"
+                        )
+                );
+                vulkanFeatures.add(
+                        new VulkanFeature(
+                                VK12_FEATURES_STRUCT,
+                                "shaderSampledImageArrayNonUniformIndexing",
+                                VkPhysicalDeviceVulkan12Features.SHADERSAMPLEDIMAGEARRAYNONUNIFORMINDEXING
+                        )
+                );
+                System.err.println(
+                        "[ATLAS-NONUNIFORM] enabled=1 dynamic=1 nonUniform=1 descIdx="
+                                + (descIdxSupported ? 1 : 0)
+                );
+            } else {
+                System.err.println(
+                        "[ATLAS-NONUNIFORM] unsupported dynamic="
+                                + (dynamicSupported ? 1 : 0)
+                                + " nonUniform="
+                                + (nonUniformSupported ? 1 : 0)
+                );
+            }
         }
 
 

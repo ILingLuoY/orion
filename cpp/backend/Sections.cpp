@@ -3232,7 +3232,14 @@ void recordSectionBLASBuild(
     geometry.geometryType =
         VK_GEOMETRY_TYPE_TRIANGLES_KHR;
 
-    geometry.flags = 0;
+    // 2026-11-22 (Batch 2): Preserve VK_GEOMETRY_OPAQUE_BIT_KHR on actual build
+    // (prepareSectionBLAS already requests it, previously zeroed here).
+    // Rollback: set kSECTION_BLAS_OPAQUE_FLAG_FIX = false.
+    static constexpr bool kSECTION_BLAS_OPAQUE_FLAG_FIX = true;
+    geometry.flags =
+        (kSECTION_BLAS_OPAQUE_FLAG_FIX && section.opaqueGeometry)
+            ? VK_GEOMETRY_OPAQUE_BIT_KHR
+            : 0;
 
     geometry.geometry.triangles =
         triangles;

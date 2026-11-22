@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -238,6 +239,10 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     #include "camera_ubo.glsl"
 } cam;
 
+// 2026-11-22 批3：植物 UV 摇摆（与 material_resolve 的着色侧同一函数同一输入
+// ⇒ alpha 剪影与着色逐位一致）。cam 已在上方声明。
+#include "wind_common.glsl"
+
 layout(binding = 3, set = 0) uniform sampler2D blockAtlas;
 // 2026-10-06：实体纹理槽 16 → 32（与 rt_test.rchit / VulkanCore 的
 // ENTITY_RT_TEXTURE_SLOT_COUNT 必须一致）。any-hit 的 alpha 测试也要能看到
@@ -248,8 +253,19 @@ layout(binding = 36, set = 0) uniform sampler2D entityAtlases[128];
 layout(binding = 37, set = 0) uniform sampler2D particleAtlases[3];
 layout(binding = 40, set = 0) uniform sampler2D rainStreakAtlas;
 
+#ifndef ORION_ATLAS_DYNAMIC_INDEX
+#define ORION_ATLAS_DYNAMIC_INDEX 1
+#endif
+
 vec4 sampleEntityAlphaAtlas(uint textureSlot, vec2 uv)
 {
+#if ORION_ATLAS_DYNAMIC_INDEX
+    if(textureSlot == 0u || textureSlot > 128u)
+    {
+        return vec4(1.0);
+    }
+    return textureLod(entityAtlases[nonuniformEXT(textureSlot - 1u)], uv, 0.0);
+#else
     switch(textureSlot)
     {
         case 1u: return textureLod(entityAtlases[0], uv, 0.0);
@@ -382,6 +398,7 @@ vec4 sampleEntityAlphaAtlas(uint textureSlot, vec2 uv)
         case 128u: return textureLod(entityAtlases[127], uv, 0.0);
         default: return vec4(1.0);
     }
+#endif
 }
 
 vec4 sampleParticleAlphaAtlas(uint textureSlot, vec2 uv)
@@ -739,6 +756,27 @@ void main() {
     // The alpha test defines the visible cutout silhouette.  It must
     // use the same unfiltered base-atlas texel as closest-hit, otherwise
     // linear filtering turns foliage and grass into semi-transparent blur.
+    // =====================================================
+    // 2026-11-22 批3：植物 UV 摇摆（叶道 materialId 0.25）。与 material_resolve
+    // 的着色侧用 windFoliageUvSway 同一函数同一输入（插值顶点位置 + 顶点 UV 三元
+    // 组）⇒ alpha 剪影与着色逐位一致地随风摆。实体/粒子/雨/voxy 的 materialId
+    // 编码与叶道撞区间 ⇒ 全部排除。
+    // =====================================================
+    if(materialId > 0.2 && materialId < 0.45 &&
+       entityTextureSlot == 0u && particleTextureSlot == 0u &&
+       !isVoxyAnyHit && !isRtWeatherRain)
+    {
+        const vec2 swayUv0 = vec2(v0.u, v0.v);
+        const vec2 swayUv1 = vec2(v1.u, v1.v);
+        const vec2 swayUv2 = vec2(v2.u, v2.v);
+        const ivec2 swayAtlasSize = textureSize(blockAtlas, 0);
+        texCoord = windFoliageUvSway(
+            texCoord,
+            swayUv0, swayUv1, swayUv2,
+            hitWorldPosition,
+            1.0 / vec2(swayAtlasSize));
+    }
+
     vec4 atlasSample;
     if(isVoxyAnyHit)
     {

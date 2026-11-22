@@ -74,12 +74,16 @@ const float OCCLUSION_MAX_OPTICAL_DEPTH = 6.0;
 
 const float WATER_GODRAY_MAX_DISTANCE = 48.0;
 const float WATER_GODRAY_SCATTER_SCALE = 0.35;
+const float WATER_GODRAY_SCATTER_SCALE_V2 = 0.24;
 const float WATER_GODRAY_SHIMMER = 8.0;
 const float WATER_GODRAY_WAVE_AMPLITUDE = 0.25;
 const float WATER_SURFACE_F0 = 0.020;
 
 #ifndef WATER_VOLUMETRIC_BIOME_SYNC
 #define WATER_VOLUMETRIC_BIOME_SYNC 1
+#endif
+#ifndef WATER_UNDERWATER_GODRAYS_FIX
+#define WATER_UNDERWATER_GODRAYS_FIX 1
 #endif
 
 // 水色三件套 —— 与 rt_test.rgen 的同名函数逐字同步（真源在 rgen，本 pass
@@ -188,7 +192,13 @@ float waterGodRayShimmer(vec2 worldXZ, vec3 lightDirection)
     float slope = dot(
         waterNaturalWaveGradientCapped(worldXZ, shimmerCameraDistance, 2, 1.0, 0.0),
         lightAzimuth);
+#if WATER_UNDERWATER_GODRAYS_FIX
+    float rawShimmer = 1.0 + 11.0 * slope;
+    float shimmer = clamp(rawShimmer, 0.18, 2.35);
+    return shimmer * shimmer * 0.55 + shimmer * 0.35;
+#else
     return clamp(1.0 + WATER_GODRAY_SHIMMER * slope, 0.35, 1.75);
+#endif
 }
 
 float saturate(float value)
@@ -443,8 +453,13 @@ vec3 marchUnderwaterGodRays(
     float surfaceY = cam.waterSimSurfaceAndOrigin.x;
 
     vec3 sigmaAbsorption = waterAbsorptionColor();
+#if WATER_UNDERWATER_GODRAYS_FIX
+    vec3 sigmaScatter = waterScatterColor() * waterScatteringAmount() *
+        WATER_GODRAY_SCATTER_SCALE_V2;
+#else
     vec3 sigmaScatter = waterScatterColor() * waterScatteringAmount() *
         WATER_GODRAY_SCATTER_SCALE;
+#endif
     vec3 sigmaExtinction = sigmaAbsorption + sigmaScatter;
 
     float cosIncidence = clamp(lightDirection.y, 0.0, 1.0);
@@ -462,6 +477,15 @@ vec3 marchUnderwaterGodRays(
     vec3 underwaterLightDir = dot(refractedLightIn, refractedLightIn) > 1.0e-6
         ? normalize(-refractedLightIn)
         : lightDirection;
+#endif
+#if WATER_UNDERWATER_GODRAYS_FIX && WATER_VOLUMETRIC_BIOME_SYNC
+    float cosWater = dot(worldDirection, underwaterLightDir);
+    float waterPhase = mix(
+        rayleighPhase(cosWater),
+        min(henyeyGreenstein(cosWater, 0.62), 1.35) * 0.65 + 0.08,
+        0.75);
+#else
+    float waterPhase = phase;
 #endif
 
     for(int step = 0; step < MAX_LIGHT_RAY_STEPS; ++step)
@@ -483,14 +507,18 @@ vec3 marchUnderwaterGodRays(
             vec3 lightPathTransmittance = exp(-sigmaAbsorption * slantDepth);
             if(step % VL_SHADOW_RAY_STEP_STRIDE == 0)
             {
+#if WATER_UNDERWATER_GODRAYS_FIX && WATER_VOLUMETRIC_BIOME_SYNC
+                terrainVisibility = sunVisibilityRayQuery(position, underwaterLightDir);
+#else
                 terrainVisibility = sunVisibilityRayQuery(position, lightDirection);
+#endif
             }
             float visibility = surfaceTransmittance *
                 waterGodRayShimmer(surfaceCrossing.xz, lightDirection) *
                 cloudSunTransmittance(surfaceCrossing, lightDirection) *
                 terrainVisibility;
             radiance += transmittance * lightColor * lightPathTransmittance *
-                lightEnergy * visibility * phase * sigmaScatter * strength *
+                lightEnergy * visibility * waterPhase * sigmaScatter * strength *
                 stepLength;
         }
         transmittance *= exp(-sigmaExtinction * stepLength);
@@ -510,7 +538,14 @@ void main()
 
     if(cam.godRayParams0.x < 0.5 || abs(cam.weatherParams.z - 1.0) >= 0.25)
     {
+#if WATER_UNDERWATER_GODRAYS_FIX
+        if(cam.waterSimState.w == 0u)
+        {
+            storeGodRayNeutral(pixel);
+        }
+#else
         storeGodRayNeutral(pixel);
+#endif
         return;
     }
 
@@ -535,7 +570,14 @@ void main()
 
     if(abs(lightDirection.y) <= 1.0e-4)
     {
+#if WATER_UNDERWATER_GODRAYS_FIX
+        if(cam.waterSimState.w == 0u)
+        {
+            storeGodRayNeutral(pixel);
+        }
+#else
         storeGodRayNeutral(pixel);
+#endif
         return;
     }
     float dayAmount = smoothstep(-0.03, 0.03, sunElevation);
@@ -584,7 +626,14 @@ void main()
     float marchEnd = min(GODRAY_MAX_DISTANCE, sceneDistance);
     if(marchEnd <= 0.5)
     {
+#if WATER_UNDERWATER_GODRAYS_FIX
+        if(cam.waterSimState.w == 0u)
+        {
+            storeGodRayNeutral(pixel);
+        }
+#else
         storeGodRayNeutral(pixel);
+#endif
         return;
     }
 
@@ -620,7 +669,12 @@ void main()
             rayleighPhase(dot(worldDirection, lightDirection)),
             jitter,
             steps);
+#if WATER_UNDERWATER_GODRAYS_FIX
+        vec4 existing = imageLoad(godRayTarget, pixel);
+        storeGodRay(pixel, max(existing.rgb, vec3(0.0)) + waterRadiance, existing.a);
+#else
         storeGodRay(pixel, waterRadiance, 1.0);
+#endif
         return;
     }
 

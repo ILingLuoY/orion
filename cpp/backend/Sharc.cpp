@@ -2773,10 +2773,12 @@ void createK2DirectImage(uint32_t width, uint32_t height)
         s_k2DirectBoundSet = VK_NULL_HANDLE;
     }
 
+    // 2026-11-22 (Batch 2): RGBA32F -> RGBA16F halves binding 89 bandwidth (6 full-screen ops/frame).
+    // Rollback: restore VK_FORMAT_R32G32B32A32_SFLOAT + rgba32f in rt_test.rgen:320.
     createRRGuideImage(
         width,
         height,
-        VK_FORMAT_R32G32B32A32_SFLOAT,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
         g_k2DirectImage,
         g_k2DirectMemory,
         g_k2DirectView,
@@ -3762,6 +3764,9 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
             // K2-SUNA 写 binding 89（水=完整水色 / 不透明 rgb=0 占位、a=rtao），
             // K2-SUNB **load-add** 叠加阴影+GGX+植被SSS 的直射，K2-LOC 照旧
             // load-add 局部光，K2-I 照旧整图载入。四级交接同过全局 barrier。
+            // 时戳：B_K2SUN 在四腿档恒 ≈0 占位（三腿的"整直射腿"不存在），
+            // 不写会让时窗完整性检查丢整窗（2026-11-22 实测 missing index=13）。
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2SUN);
             if(g_k2sunAPipeline == VK_NULL_HANDLE ||
                g_k2sunBPipeline == VK_NULL_HANDLE ||
                g_k2locPipeline == VK_NULL_HANDLE ||

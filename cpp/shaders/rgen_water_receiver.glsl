@@ -100,8 +100,8 @@ vec3 tracePrimaryWaterReceiverIndirectReworked(
 #endif
     int waterInterfaceSteps = 0;
 
-    const vec3 WATER_ABSORPTION = waterAbsorptionColor();
-    const vec3 WATER_SCATTER_COLOR = waterScatterColor();
+    const vec3 WATER_ABSORPTION = waterAbsorptionColorAt(receiverPos.xz);
+    const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(receiverPos.xz);
 
 const float WATER_EXTINCTION_DISTANCE =
     16.0;
@@ -424,7 +424,7 @@ vec3 tracePrimaryTransparentRadiance(
 
 
 const vec3 WATER_ABSORPTION =
-    waterAbsorptionColor();
+    waterAbsorptionColorAt(startOrigin.xz);
 
 // 已确认：0~3 格保持高通透。
 const float WATER_SHALLOW_DISTANCE =
@@ -439,7 +439,7 @@ const float WATER_EXTINCTION_DISTANCE =
 const float WATER_SCATTERING =
     waterScatteringAmount();
 
-const vec3 WATER_SCATTER_COLOR = waterScatterColor();
+const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
 
 
     const float WATER_F0 =
@@ -835,7 +835,7 @@ if(insideWater)
 #else
     if(cam.waterSimState.w == 0u)
     {
-        vec3 volumeExtinction = waterAbsorptionColor() + waterScatterColor();
+        vec3 volumeExtinction = WATER_ABSORPTION + WATER_SCATTER_COLOR;
         float scatterCos = dot(currentDirection, getTimeDrivenSkyLightDirection());
         vec3 volumePhase;
         if(cam.waterParams.w > 0.5)
@@ -855,7 +855,7 @@ if(insideWater)
         float waterEntryFresnel = WATER_F0 +
             (1.0 - WATER_F0) * pow(1.0 - waterEntryCos, 5.0);
         accumulatedWaterScattering +=
-            waterScatterColor() * waterScatteringAmount() *
+            WATER_SCATTER_COLOR * WATER_SCATTERING *
             getTimeDrivenSkyLightColor() * getTimeDrivenSkyLightRadianceScale() *
             volumePhase * stepInScatter * throughput *
             (1.0 - waterEntryFresnel) *
@@ -1271,7 +1271,14 @@ if(hitMaterialId >= 2.5)
                         // 循环体里判（TerminateOnFirstHit 命中即终止 ⇒ 循环体可能一次
                         // 都不进 ⇒ 恒判未命中 ⇒ 水体恒判能见到太阳）。
                         while(rayQueryProceedEXT(receiverSunVisQuery) &&
-                              ++receiverSunVisGuard < 32) {}
+                              ++receiverSunVisGuard < 32)
+                        {
+                            if(rayQueryGetIntersectionTypeEXT(receiverSunVisQuery, false) ==
+                               gl_RayQueryCandidateIntersectionTriangleEXT)
+                            {
+                                rayQueryConfirmIntersectionEXT(receiverSunVisQuery);
+                            }
+                        }
                         if(rayQueryGetIntersectionTypeEXT(receiverSunVisQuery, true) !=
                             gl_RayQueryCommittedIntersectionNoneEXT)
                         {

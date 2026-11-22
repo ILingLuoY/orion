@@ -1411,6 +1411,14 @@ void main()
     rtCntHitAccepted();
     #endif
 
+    // 2026-11-22 (Batch 2): Fast visibility/AO distance exit before material resolution.
+    const uint rtFastVisPurpose = payload.state & 0x7u;
+    if(rtFastVisPurpose == 5u || rtFastVisPurpose == 3u)
+    {
+        payload.hitDistance = gl_HitTEXT;
+        return;
+    }
+
     // 2026-10-21 根因修复（同 rt_test.rchit 的说明）：生产模式必须先把命中身份与
     // hitT 播种进 ray payload，否则 resolveHitMaterialGlass() 会拿陈旧身份索引
     // sectionVertexAddressBuffer（无边界检查）⇒ 垃圾指针 ⇒ GPU 挂死。

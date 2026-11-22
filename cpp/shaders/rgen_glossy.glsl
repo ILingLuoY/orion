@@ -47,9 +47,13 @@ bool orionGlossyRrEnabled()
     return cam.giRayParams.w > 0.5f;
 }
 
+#ifndef GLOSSY_STEP_LOD_DEFAULT_ON
+#define GLOSSY_STEP_LOD_DEFAULT_ON 1
+#endif
+
 bool orionGlossyStepLodEnabled()
 {
-    return cam.pomSecondaryParams.y > 0.5f;
+    return (GLOSSY_STEP_LOD_DEFAULT_ON != 0) || (cam.pomSecondaryParams.y > 0.5f);
 }
 
 vec3 tracePrimaryGlossyReflectionRadiance(
@@ -1254,7 +1258,14 @@ float traceWaterReflectedSun(
         // 2026-11-16 修正：committed 交点必须在查询终止后读，不能在循环体里判
         // （TerminateOnFirstHit 命中即终止，循环体可能一次都不进 ⇒ 恒判未命中 ⇒
         // 水面永远被当成晒着太阳）。
-        while(rayQueryProceedEXT(glossSunVisQuery) && ++glossSunVisGuard < 32) {}
+        while(rayQueryProceedEXT(glossSunVisQuery) && ++glossSunVisGuard < 32)
+        {
+            if(rayQueryGetIntersectionTypeEXT(glossSunVisQuery, false) ==
+               gl_RayQueryCandidateIntersectionTriangleEXT)
+            {
+                rayQueryConfirmIntersectionEXT(glossSunVisQuery);
+            }
+        }
         if(rayQueryGetIntersectionTypeEXT(glossSunVisQuery, true) !=
             gl_RayQueryCommittedIntersectionNoneEXT)
         {
@@ -1331,11 +1342,12 @@ float traceWaterReflectedSun(
     // CalcSpecularReflectionSample 没有任何 caustic 输入）。这里原来的
     // 1 + (d-1)*4（clamp 到 6）在掠射 F≈1 时会把波纹打成过曝白斑，
     // 且新泼溅图的 floor=0.20 会让平坦水面落进"负增益"档（黑洞）。
-    // 置 false = 纯 Fresnel 镜面太阳；改 true 回旧档做 A/B。
-    const bool WATER_REFLECT_CAUSTIC_ENABLED = false;
+#ifndef WATER_REFLECT_CAUSTIC_ENABLED
+#define WATER_REFLECT_CAUSTIC_ENABLED 0
+#endif
     float reflectedCausticGain = 1.0;
-    if(WATER_REFLECT_CAUSTIC_ENABLED &&
-       cam.waterFftParams.y > 0.0 && cam.waterFftParams2.w > 0.5)
+#if WATER_REFLECT_CAUSTIC_ENABLED
+    if(cam.waterFftParams.y > 0.0 && cam.waterFftParams2.w > 0.5)
     {
         float projScale = float(rtLaunchSize().y) /
             (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
@@ -1343,11 +1355,6 @@ float traceWaterReflectedSun(
             receiverPos,
             length(receiverPos - cam.viewInverse[3].xyz),
             projScale);
-        // 2026-11-01：宿主改成 compute 生产，反射参考面从 +4 格抬到 +16 格
-        // （覆盖到水面以上 32 格）。
-        // 2026-11-20 泼溅重构：图的键从"源水面点"换成"接收面"（落在 16 格
-        // 参考面上的位置）。所以采样点 = 接收面沿**平坦反射方向**退到 16 格
-        // 面的那一点：receiver - out.xz * ((16 - h) / out.y)，out = (-sun.xz, sun.y)。
         const float reflectHeight = max(
             waterHitPos.y - cam.waterSimSurfaceAndOrigin.x, 0.0);
         const float mapReflectHeight = 16.0;
@@ -1361,13 +1368,6 @@ float traceWaterReflectedSun(
             causticLod).r;
         if(causticDensity > 1.0e-4)
         {
-            // 2026-10-20：反射层改用自己的旋钮（waterWaveParams.w，GUI
-            // 「反射焦散强度」），不再蹭折射那份「焦散亮度」。两者照的面完全不
-            // 同（折射 = 水下地板，反射 = 朝水的天花板），要能分别调才有意义。
-            // 本 lane 出厂 4.0，而拆杆之前借的是折射那根的 1.3（随包快照）/ 1.1
-            //（用户实机）⇒ 本版默认更亮，就是"不明显"的修法；拖回 1.3 = 旧观感。
-            // 配旧 DLL（本 lane 仍写 0）时增益恒为 1 ⇒ 优雅降级成纯镜面太阳光，
-            // 不崩不脏值。
             float causticStrength =
                 clamp(cam.waterWaveParams.w, 0.0, 8.0);
             reflectedCausticGain = clamp(
@@ -1376,6 +1376,7 @@ float traceWaterReflectedSun(
                 6.0);
         }
     }
+#endif
 
 
     // =================================================

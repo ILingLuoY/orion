@@ -1868,6 +1868,29 @@ public class SectionCompilerMixin {
                 || state.is(net.minecraft.tags.BlockTags.FLOWERS);
     }
 
+    // 2026-11-22 批3：打标覆盖面扩展——原只有 LEAVES/FLOWERS 标签；草/作物/
+    // 藤/甘蔗/树苗/浆果丛按类判定补上（摇摆的主视觉是大片草与作物）。
+    // Block 级缓存：方块种类有限，computeIfAbsent 每块只算一次。
+    private static final java.util.concurrent.ConcurrentHashMap<Block, Boolean>
+            FOLIAGE_BLOCK_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static boolean isFoliageOwnerState(
+            net.minecraft.world.level.block.state.BlockState state) {
+        return FOLIAGE_BLOCK_CACHE.computeIfAbsent(state.getBlock(), block -> {
+            if (state.is(net.minecraft.tags.BlockTags.LEAVES) ||
+                    state.is(net.minecraft.tags.BlockTags.FLOWERS) ||
+                    state.is(net.minecraft.tags.BlockTags.SAPLINGS) ||
+                    state.is(net.minecraft.tags.BlockTags.CROPS)) {
+                return true;
+            }
+            return block instanceof net.minecraft.world.level.block.BushBlock
+                    || block instanceof net.minecraft.world.level.block.CropBlock
+                    || block instanceof net.minecraft.world.level.block.SaplingBlock
+                    || block instanceof net.minecraft.world.level.block.VineBlock
+                    || block instanceof net.minecraft.world.level.block.SugarCaneBlock;
+        });
+    }
+
     private static void accumulateVptAlbedoAndTagRainPuddles(
             SectionPos sectionPos,
             net.minecraft.client.renderer.chunk.RenderSectionRegion region,
@@ -1998,19 +2021,15 @@ public class SectionCompilerMixin {
                     );
                     net.minecraft.world.level.block.state.BlockState ownerState =
                             region.getBlockState(position);
-                    if (ownerState.is(net.minecraft.tags.BlockTags.LEAVES) ||
-                            ownerState.is(net.minecraft.tags.BlockTags.FLOWERS)) {
-                        foliageOwner = true;
-                    } else {
+                    foliageOwner = isFoliageOwnerState(ownerState);
+                    if (!foliageOwner) {
                         position.set(
                                 minX + (int) Math.floor(centerX),
                                 minY + (int) Math.floor(centerY),
                                 minZ + (int) Math.floor(centerZ)
                         );
                         ownerState = region.getBlockState(position);
-                        foliageOwner =
-                                ownerState.is(net.minecraft.tags.BlockTags.LEAVES) ||
-                                ownerState.is(net.minecraft.tags.BlockTags.FLOWERS);
+                        foliageOwner = isFoliageOwnerState(ownerState);
                     }
                     if (foliageOwner) {
                         for (int v = 0; v < 4; ++v) {
@@ -2019,7 +2038,6 @@ public class SectionCompilerMixin {
                     }
                 }
             }
-
             final float spanX = quadSpan(x0, x1, x2, x3);
             final float spanY = quadSpan(y0, y1, y2, y3);
             final float spanZ = quadSpan(z0, z1, z2, z3);

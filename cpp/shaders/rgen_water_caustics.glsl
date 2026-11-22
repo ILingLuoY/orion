@@ -103,6 +103,9 @@ const float WATER_CAUSTIC_GRAZING_LOD_BOOST = 2.0;
 #ifndef WATER_CAUSTIC_DRIFT_AND_DEPTH_SYNC
 #define WATER_CAUSTIC_DRIFT_AND_DEPTH_SYNC 1
 #endif
+#ifndef WATER_CAUSTIC_DEPTH_FOCUS
+#define WATER_CAUSTIC_DEPTH_FOCUS 1
+#endif
 
 // per-invocation 入口光照缓存：rgen_main_body 算一次入口太阳透射与云影，
 // 供 rgen_water_receiver（水下入散射）与 rgen_water_caustics（云影）复用并立即清零。
@@ -269,7 +272,8 @@ vec3 evaluateWaterCrestBacklit(
     // Physical wave-crest forward transmission cone (~18-25° half-angle): active at low sun
     // when viewing waves toward the sun azimuth, tinted by biome water scatter color.
     float phaseBacklit = pow(clamp(cosViewSun, 0.0, 1.0), 12.0);
-    vec3 transmitted = waterScatterColor() * exp(-waterAbsorptionColor() * thickness * 1.5);
+    vec3 transmitted = waterScatterColorAt(waterSurfacePos.xz) *
+        exp(-waterAbsorptionColorAt(waterSurfacePos.xz) * thickness * 1.5);
     vec3 sunRadiance =
         getTimeDrivenSkyLightColor() *
         getTimeDrivenSkyLightRadianceScale();
@@ -279,7 +283,7 @@ vec3 evaluateWaterCrestBacklit(
 #else
     float phaseBacklit = pow(clamp(cosViewSun, 0.0, 1.0), 700.0);
 
-    vec3 transmitted = exp(-waterAbsorptionColor() * thickness * 1.5);
+    vec3 transmitted = exp(-waterAbsorptionColorAt(waterSurfacePos.xz) * thickness * 1.5);
     vec3 sunRadiance =
         getTimeDrivenSkyLightColor() *
         getTimeDrivenSkyLightRadianceScale();
@@ -316,6 +320,7 @@ vec3 evaluateWaterCrestBacklit(
     // 「波峰透光」强度（0..2），再考虑这两个常数。
     // ===========================================================================
     vec3 evaluateWaterThinLayerSSS(
+    vec3 waterSurfacePos,
     vec3 surfaceNormal,
     vec3 rayDirection,
     vec3 sunDirectionLit,
@@ -366,8 +371,8 @@ vec3 evaluateWaterCrestBacklit(
     const float kSssPhaseG = clamp(cam.waterSssParams.z, 0.0, 0.95);
     const float kSssStrength = clamp(cam.waterSssParams.w, 0.0, 2.0);
 
-    const vec3 scatter = waterScatterColor();
-    const vec3 extinction = waterAbsorptionColor() + scatter;
+    const vec3 scatter = waterScatterColorAt(waterSurfacePos.xz);
+    const vec3 extinction = waterAbsorptionColorAt(waterSurfacePos.xz) + scatter;
     const vec3 singleScatteringAlbedo = scatter / max(extinction, vec3(1.0e-5));
 
     // Fo/Fi：水面 F0 的 Schlick（不含 TIR；从上方看水面不会 TIR）。
@@ -461,7 +466,7 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
 )
 {
     const float WATER_IOR = 1.33;
-    const vec3 WATER_ABSORPTION = waterAbsorptionColor();
+    const vec3 WATER_ABSORPTION = waterAbsorptionColorAt(waterSurfacePosition.xz);
     const vec3 WATER_GLASS_TINT = vec3(0.20, 0.75, 0.78);
     const float WATER_CAUSTIC_STRENGTH = waterStyleCausticStrength();
 
@@ -514,7 +519,8 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
     {
 #if WATER_VOLUME_INSCATTER_V2
         const vec3 causticColumnExtinction =
-            WATER_ABSORPTION * 1.35 + waterScatterColor() * waterScatteringAmount() * 0.35;
+            WATER_ABSORPTION * 1.35 +
+            waterScatterColorAt(waterSurfacePosition.xz) * waterScatteringAmount() * 0.35;
         cameraWaterTransmittance = exp(-causticColumnExtinction * receiver.waterPathLength);
 #else
         float cameraWaterFade = clamp(receiver.waterPathLength / 16.0, 0.0, 1.0);
@@ -578,6 +584,11 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
     causticMapLod = min(
         causticMapLod + WATER_CAUSTIC_GRAZING_LOD_BOOST * grazingBlend,
         8.0);
+#endif
+#if WATER_CAUSTIC_DEPTH_FOCUS
+    // Deep water broadens caustic focus bands smoothly via mip chain; shallow-to-mid stays crisp.
+    float depthFocusLodBoost = smoothstep(2.2, 10.5, waterDepth) * 2.2;
+    causticMapLod = min(causticMapLod + depthFocusLodBoost, 8.0);
 #endif
 
     // 地图不可用（模块软失败 / FFT 关闭）时退回 1.0 = 未扰动波前，与旧
@@ -739,15 +750,15 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
     float depthDiffusion = clamp(cam.waterParams.z, 0.0, 1.0);
     if(depthDiffusion > 0.001)
     {
+#if WATER_CAUSTIC_DEPTH_FOCUS
+        naturalDensity3 = mix(naturalDensity3, vec3(1.0),
+            depthDiffusion * (1.0 - exp(-waterDepth * 0.26)));
+#else
         naturalDensity3 = mix(naturalDensity3, vec3(1.0),
             depthDiffusion * (1.0 - exp(-waterDepth * 0.45)));
+#endif
     }
 
-    // ── 批次3-P2（waterParams.y，0=关）：焦散 RGB 色散 ──
-    // 色散本体在地图里（water_caustic_map.comp 按 1.3315/1.3335/1.3365 三个
-    // IOR 各算一遍雅可比，逐通道写入 —— 2026-11-14 从固定 RGB 偏移近似改回
-    // 物理口径）。本旋钮在「单色（旧观感）」与「参考物理 RGB」之间插值：
-    // 0 = 关 = 亮度化，1 = 完整三通道。
     float causticDispersion = clamp(cam.waterParams.y, 0.0, 1.0);
     if(causticDispersion < 0.999)
     {
@@ -760,31 +771,19 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
             causticDispersion);
     }
 
-    // Density 1 is the unperturbed wavefront and therefore contributes no
-    // extra lighting; only physically concentrated area adds caustic energy.
-    // A mild contrast curve favours the bright cellular peaks over the dim
-    // web so the pattern reads clearly on sunlit floors.
-    // 2026-11-14：地图端已把密度软膝压缩到渐近 6（不再有硬平顶），这里
-    // 去掉旧的二次硬 clamp（min(…,4.5)）—— 它会在软膝上方再切一刀，把
-    // 软膝留出的聚焦亮度梯度重新压成平顶。峰值能量与旧口径一致
-    // （5 × (0.88+0.24×5) ≈ 10.4 倍太阳辐射）。
     vec3 causticFocus = max(naturalDensity3 - 1.0, vec3(0.0));
     causticFocus *= 0.88 + 0.24 * causticFocus;
 
-    // =====================================================
-    // 2026-11-16（用户反馈「焦散还是怪怪的，要线线分明」）：焦点能量对比度
-    // 整形。密度剖面里只有窄带超过 1，γ>1 的幂曲线提峰收肩 —— 峰顶抬高、
-    // 两肩压回去，读作更细更亮的线；暗网（focus≈0）逐位不变。放在
-    // 0.88+0.24×f 扩展之后 ⇒ 峰值能量比旧档高（γ=1.35 时峰约 ×2），要压
-    // 回去动 GUI 的焦散强度旋钮，不动这里的曲线形状。
-    // 单位是百分之一（预处理器不吃浮点比较）：135 = 1.35。
-    // 100 = 逐位旧档（回退 = 改回 100）。线仍偏粗就升（150/175），
-    // 线上出现闪烁/碎块就收。
-    // =====================================================
 #ifndef WATER_CAUSTIC_LINE_SHARPEN_HP
 #define WATER_CAUSTIC_LINE_SHARPEN_HP 135
 #endif
-#if WATER_CAUSTIC_LINE_SHARPEN_HP > 100
+#if WATER_CAUSTIC_DEPTH_FOCUS
+    float shallowRamp = smoothstep(0.06, 0.38, waterDepth);
+    float focusSweetSpot =
+        smoothstep(0.45, 1.4, waterDepth) * (1.0 - smoothstep(3.5, 8.0, waterDepth));
+    float focusGamma = mix(1.12, 1.45, focusSweetSpot);
+    causticFocus = pow(causticFocus, vec3(focusGamma)) * shallowRamp;
+#elif WATER_CAUSTIC_LINE_SHARPEN_HP > 100
     causticFocus =
         pow(causticFocus, vec3(WATER_CAUSTIC_LINE_SHARPEN_HP / 100.0));
 #endif

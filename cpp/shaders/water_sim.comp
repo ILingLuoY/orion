@@ -12,6 +12,8 @@ layout(set = 0, binding = 2) uniform CameraProperties
     #include "camera_ubo.glsl"
 } cam;
 
+#include "wind_common.glsl"
+
 layout(set = 0, binding = 3) uniform WaterSimEntities
 {
     ivec4 entityCounts;
@@ -20,9 +22,10 @@ layout(set = 0, binding = 3) uniform WaterSimEntities
     vec4 entityBoatParams[8];
 } simEntities;
 
-// 2026-11-21 水体掩码（48×48 R8，块分辨率，1 = 水 / 0 = 陆地）。
-// 宿主按块扫描玩家周围 48×48 窗口上传；origin 随上传一起走 push。
+// 2026-11-22 Round 2: 48x48 RGBA8 (RGB = biome water tint, A = water mask 1/0).
 layout(set = 0, binding = 4) uniform sampler2D waterSimMask;
+// 2026-11-22 Round 2 (Item E): FFT ocean slope map for inhomogeneous Neumann shore bounce.
+layout(set = 0, binding = 5) uniform sampler2D waterFftSlope;
 
 layout(push_constant) uniform WaterSimulationPush
 {
@@ -55,6 +58,12 @@ layout(push_constant) uniform WaterSimulationPush
 #ifndef WATER_SIM_ISOTROPIC_LAPLACIAN
 #define WATER_SIM_ISOTROPIC_LAPLACIAN 1
 #endif
+#ifndef WATER_SIM_SHORE_WAVE_BOUNCE
+#define WATER_SIM_SHORE_WAVE_BOUNCE 1
+#endif
+#ifndef WATER_SIM_BOAT_DIPOLE_WAKE
+#define WATER_SIM_BOAT_DIPOLE_WAKE 1
+#endif
 
 // 雨点涟漪（sim 大滴点缀）：每子步确定性撒点预算（rain²·BUDGET，≤ 16）。
 // 2026-11-21 顾问轮1 路线定档：细密雨环由消费端解析层
@@ -85,17 +94,42 @@ float rainMexicanHat(vec2 delta, float radius)
     return (1.0 - u2) * exp(-u2) * window;
 }
 
-// 2026-11-21 顾问轮1（F3）：单点水体掩码（1 = 水）。0.45/0.55 陡肩保留
-// LINEAR 对方块直角的微倒角、去掉旧 0.35/0.65 的 3 texel 吸波软肩。
+// 2026-11-21 顾问轮1（F3）：单点水体掩码（1 = 水）。2026-11-22 Round 2 升级为 RGBA8 .a。
 float sampleWaterMask(vec2 worldPos)
 {
-    if(pushData.maskEnabled == 0u) return 1.0;
+    if((pushData.maskEnabled & 1u) == 0u) return 1.0;
     vec2 uv = (worldPos - vec2(pushData.maskOriginX, pushData.maskOriginZ)) *
         pushData.invMaskExtent;
     if(any(lessThanEqual(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0))))
         return 1.0;
-    return smoothstep(0.45, 0.55, texture(waterSimMask, uv).r);
+    return smoothstep(0.45, 0.55, texture(waterSimMask, uv).a);
 }
+
+#if WATER_SIM_SHORE_WAVE_BOUNCE
+vec2 sampleFftSlopeForShore(vec2 worldXZ)
+{
+    const float tilePeriod = max(cam.waterFftParams.x, 1.0e-3);
+    const float waveTime = uintBitsToFloat(cam.padding) *
+        clamp(cam.waterFftParams.w, 0.0, 4.0);
+    const vec2 drift = -windDirXZ() * 0.0629 * waveTime;
+
+    const vec2 uvSwell = fract(worldXZ / tilePeriod + drift);
+    const vec2 swellSlope = textureLod(waterFftSlope, uvSwell, 0.0).rg;
+
+    const vec2 detailUv = fract(worldXZ / 32.0 + drift * 1.7);
+    const vec2 detailSlope = textureLod(waterFftSlope, detailUv, 1.5).ba;
+
+    float swellWeight = cam.waterFftParams2.z > 0.0 ? cam.waterFftParams2.z : 0.45;
+    float detailWeight = cam.waterFftParams2.x > 0.0 ? cam.waterFftParams2.x : 0.90;
+    vec2 slope = (swellSlope * swellWeight + detailSlope * detailWeight) * 0.62;
+    float mag = length(slope);
+    if(mag > 0.9)
+    {
+        slope *= (0.9 / mag);
+    }
+    return slope;
+}
+#endif
 
 const ivec2 RESOLUTION = ivec2(512);
 
@@ -465,16 +499,35 @@ void main()
     float maskUL = sampleWaterMask(worldPosition + vec2(-1.0, 1.0) * texelWorld);
     float maskUR = sampleWaterMask(worldPosition + vec2( 1.0, 1.0) * texelWorld);
     float centerMask = sampleWaterMask(worldPosition);
+    float edgeMask = (maskL + maskR + maskD + maskU +
+                      maskDL + maskDR + maskUL + maskUR) * 0.125;
 
-    // 陆地邻居回读中心高度（零通量）；水邻居保持原值。
-    left      = mix(height, left,      maskL);
-    right     = mix(height, right,     maskR);
-    down      = mix(height, down,      maskD);
-    up        = mix(height, up,        maskU);
-    downLeft  = mix(height, downLeft,  maskDL);
-    downRight = mix(height, downRight, maskDR);
-    upLeft    = mix(height, upLeft,    maskUL);
-    upRight   = mix(height, upRight,   maskUR);
+    // 2026-11-22 Round 2 (Item E): inhomogeneous Neumann shore reflection from FFT ocean slope.
+    // d(h_fft + h_sim)/dn = 0 => h_ghost = h_center - k * dx * dot(fftSlope, offset).
+    vec2 shoreGrad = vec2(0.0);
+#if WATER_SIM_SHORE_WAVE_BOUNCE
+    const bool shoreBounceFftReady = (pushData.maskEnabled & 2u) != 0u;
+    if(shoreBounceFftReady && centerMask > 0.5 && edgeMask < 0.999 &&
+       cam.waterFftParams.y > 0.0)
+    {
+        float calibration = clamp(cam.waterWaveParams.x, 0.0, 1.0);
+        float simStrength = clamp(cam.waterWaveParams.y, 0.0, 2.0);
+        float twoInteractionScale = max(2.0 * mix(0.19, 0.5, calibration) * simStrength, 0.30);
+        float kShoreBounce = clamp(0.75 / twoInteractionScale, 0.35, 2.2) *
+            smoothstep(0.0, 0.15, simStrength);
+        shoreGrad = sampleFftSlopeForShore(worldPosition) * (kShoreBounce * texelWorld);
+    }
+#endif
+
+    // 陆地邻居施加非齐次 Neumann 虚单元边界条件；水邻居保持原值。
+    left      = mix(height + shoreGrad.x,               left,      maskL);
+    right     = mix(height - shoreGrad.x,               right,     maskR);
+    down      = mix(height + shoreGrad.y,               down,      maskD);
+    up        = mix(height - shoreGrad.y,               up,        maskU);
+    downLeft  = mix(height + shoreGrad.x + shoreGrad.y, downLeft,  maskDL);
+    downRight = mix(height - shoreGrad.x + shoreGrad.y, downRight, maskDR);
+    upLeft    = mix(height + shoreGrad.x - shoreGrad.y, upLeft,    maskUL);
+    upRight   = mix(height - shoreGrad.x - shoreGrad.y, upRight,   maskUR);
 
     float stepScale = clamp(pushData.updateAndImpulse.x * 30.0, 0.25, 1.5);
 #if WATER_SIM_ISOTROPIC_LAPLACIAN
@@ -503,8 +556,6 @@ void main()
 
     // 岸线微阻尼：贴岸水体格（8 邻掩码均值 < 1）按比例吃掉部分反射能量，
     // 防小水洼永动驻波；开阔水 edgeMask = 1 ⇒ 无操作。
-    float edgeMask = (maskL + maskR + maskD + maskU +
-                      maskDL + maskDR + maskUL + maskUR) * 0.125;
     velocity *= mix(0.88, 1.0, edgeMask);
 
     float neighborMean = 0.25 * (left + right + down + up);
@@ -624,16 +675,43 @@ void main()
         const float speed = length(velocityXZ);
         const vec2 relative = worldPosition - boat.xy;
 
+#if WATER_SIM_BOAT_DIPOLE_WAKE
+        // 2026-11-22 Round 2 (Item C): velocityXZ is in blocks/sec.
+        // Continuous bow-push / stern-suction pressure dipole excites physical Kelvin V-wakes.
+        if(speed > 0.15)
+        {
+            const vec2 forward = velocityXZ / speed;
+            const vec2 rightVec = vec2(-forward.y, forward.x);
+            const float along = dot(relative, forward);
+            const float across = dot(relative, rightVec);
+            if(abs(along) < 2.2 && abs(across) < 1.6)
+            {
+                const float dBowAlong = along - 0.58;
+                const float dSternAlong = along + 0.58;
+                const float acrossSq = across * across;
+                const float bowLobe = exp(-(dBowAlong * dBowAlong / 0.3528 + acrossSq / 0.3528));
+                const float sternLobe = exp(-(dSternAlong * dSternAlong / 0.50 + acrossSq / 0.4608));
+                const float speedFactor =
+                    smoothstep(0.15, 1.2, speed) * clamp(speed * 0.22, 0.0, 1.35);
+                velocity += boatScale * speedFactor *
+                    (0.075 * bowLobe - 0.058 * sternLobe) *
+                    centerMask * spongeRetention;
+            }
+        }
+        else if(speed > 0.03)
+        {
+            height += boatScale * 0.025 * smoothstep(0.03, 0.15, speed) *
+                gaussianWaveSource(relative, 1.30) * centerMask * spongeRetention;
+        }
+#else
         float boatRipples = (sourceMode > 0.5)
             ? gaussianWaveSource(relative, 1.60)
             : concentricRipples(relative, 1.60, 3.0);
-        // 2026-11-21：底噪随速度淡入（静止船不再持续泵能量）；解析尾迹
-        // 图案整体删除 —— 尾迹改由 Java 沿路径 stamp（queueWaterImpulse
-        // 带 .w 半径），stamp 进场后随波方程传播、船停后自然存留衰减。
         height += boatScale *
             (0.121 * smoothstep(0.03, 0.30, speed) +
              0.088 * clamp(speed, 0.0, 2.5)) *
             boatRipples * centerMask * spongeRetention;
+#endif
     }
 
     if(pushData.layersAndFlags.w != 0u)

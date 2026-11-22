@@ -286,6 +286,10 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float waterFftSwellWeight;
     private float waterFftDetailWeight;
     private float waterFftWindSpeed;
+    // 2026-11-22 统一风场（「风场」折叠组，CameraUBO.windParams）
+    private float windAngleDeg;
+    private float windStrength;
+    private float windGust;
     private int postTonemapMode;
     private float postExposureStrength;
     private float postContrast;
@@ -412,6 +416,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     // 界面级状态，不写存档；默认收起。
     private static boolean showUpscalerAdvanced;
     private static boolean showSkyAdvanced;
+    private static boolean showWindAdvanced;
     private static boolean showCloudAdvanced;
     private static boolean showFogAdvanced;
     private static boolean showWaterAdvanced;
@@ -558,6 +563,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.loadWaterWaveAflSettings(RTXSettingsConfig.getWaterWaveAflSettings());
         this.loadWaterSssSettings(RTXSettingsConfig.getWaterSssSettings());
         this.loadWaterFftSettings(RTXSettingsConfig.getWaterFftSettings());
+        this.loadWindSettings(RTXSettingsConfig.getWindSettings());
         this.loadPostProcessingSettings(RTXSettingsConfig.getPostProcessingSettings());
 
         RTXSettingsConfig.CloudSettings clouds =
@@ -1172,6 +1178,20 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                     pendingMoonLightFloor, "%.2f", value -> pendingMoonLightFloor = (float) value));
             this.addOptionRow(cloudSlider("白天月亮亮度", 0.0, 1.0, 0.05,
                     pendingMoonDaylightDim, "%.2f", value -> pendingMoonDaylightDim = (float) value));
+            this.flushOptionRow();
+        }
+
+        // 2026-11-22 统一风场（折叠组，默认收起）：一条风向喂云/雾/水波
+        //（批1），植物摇摆（批3）复用同一车道。出厂 30.5° = HP 云原方向，
+        // 出厂时云/雾逐位不变、水波从 45° 转到与云同向。
+        this.addOptionRow(this.windAdvancedToggle());
+        if(showWindAdvanced) {
+            this.addOptionRow(cloudSlider("风向（0°=+X 顺时针）", 0.0, 360.0, 0.5,
+                    windAngleDeg, "%.1f°", value -> windAngleDeg = (float) value));
+            this.addOptionRow(cloudSlider("风强（植物摇摆倍率）", 0.0, 2.0, 0.05,
+                    windStrength, "%.2f", value -> windStrength = (float) value));
+            this.addOptionRow(cloudSlider("阵风强度（0 = 恒定风）", 0.0, 1.0, 0.05,
+                    windGust, "%.2f", value -> windGust = (float) value));
             this.flushOptionRow();
         }
         this.section = PAGE_CLOUD;
@@ -2979,6 +2999,14 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         } else {
             allApplied = false;
         }
+        RTXSettingsConfig.WindSettings updatedWind =
+                new RTXSettingsConfig.WindSettings(
+                        windAngleDeg, windStrength, windGust);
+        if(!NativeVulkan.isLoaded() || NativeVulkan.setWindParams(updatedWind.toParamArray())) {
+            RTXSettingsConfig.setWindSettings(updatedWind);
+        } else {
+            allApplied = false;
+        }
         int effectiveTlasCull = postTlasCullDistance;
         if(effectiveTlasCull == 0 && this.minecraft != null) {
             effectiveTlasCull = Math.min(512, Math.max(64,
@@ -4107,6 +4135,13 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.waterFftWindSpeed = fft.windSpeed();
     }
 
+    // 2026-11-22 统一风场：读配置进界面字段（「风场」折叠组）。
+    private void loadWindSettings(RTXSettingsConfig.WindSettings wind) {
+        this.windAngleDeg = wind.angleDeg();
+        this.windStrength = wind.strength();
+        this.windGust = wind.gust();
+    }
+
     private static final int PRESET_NEUTRAL = 0;
     private static final int PRESET_ICELAND = 1;
     private static final int PRESET_GREENLAND = 2;
@@ -4931,6 +4966,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private AbstractWidget skyAdvancedToggle() {
         return foldToggleButton("高级选项（月光 / 天气压暗 / 日冕 / 云内月光）", showSkyAdvanced,
                 () -> showSkyAdvanced = !showSkyAdvanced);
+    }
+
+    // 2026-11-22 统一风场折叠组（风向 / 风强 / 阵风 → 云雾水波植物）
+    private AbstractWidget windAdvancedToggle() {
+        return foldToggleButton("风场（风向 / 风强 / 阵风 → 云雾水波）", showWindAdvanced,
+                () -> showWindAdvanced = !showWindAdvanced);
     }
 
     private AbstractWidget cloudAdvancedToggle() {

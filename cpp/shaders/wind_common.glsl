@@ -92,4 +92,65 @@ float windGustField(vec2 worldXZ, float timeSeconds)
     return clamp(g * global, 0.0, 1.0);
 }
 
+// ===========================================================================
+// ⑤ 批3：植物 UV 摇摆（BSL/Crysis 混合模型，适配 RT 着色空间）
+//
+// 路径追踪不重建 BLAS ⇒ 三角形轮廓不动；可见摇晃来自 **alpha 剪影的纹理图样
+// 随风位移**：resolve（着色）与 any-hit（alpha test）用同一函数同一输入 ⇒
+// 镂空轮廓在两类射线间逐位一致地摆（官方 MC RTX 的植物动画同为此路线）。
+//
+// 模型（BSL 多向行进波 + Crysis 阵风门控混合）：
+//   · 主摆：沿风传播的正弦（位置相位 ⇒ 阵风跨树冠行进，波长 ~11 格）
+//   · 侧摆：垂直风向的拍频（×0.45，叶丛的横向摆动）
+//   · 叶颤：高频小幅度微颤（位置哈希相位，叶与叶不同步）
+//   · 阵风门控：windGustField（55 格行进噪声）调幅，风强滑条整体乘
+//   · 位移以 **世界格** 为单位（资源包分辨率无关），经 spriteSpan 换算成 UV
+//   · Sprite 矩形钳制（半纹素内缩，与 material_resolve 的 safe 口径一致）：
+//     图样贴边时不会串进相邻 sprite
+//
+// 调用方（material_resolve 与 rt_test.rahit）必须给同一 worldPos（插值顶点
+// 位置）与同一 baseUv/顶点 UV 三元组 ⇒ 剪影逐位一致。
+// ===========================================================================
+vec2 windFoliageUvSway(
+    vec2 baseUv,
+    vec2 uv0, vec2 uv1, vec2 uv2,
+    vec3 worldPos,
+    vec2 atlasTexel)
+{
+    vec2 wdir = windDirXZ();
+    vec2 wperp = vec2(-wdir.y, wdir.x);
+    float t = uintBitsToFloat(cam.padding);
+
+    // 位置相位：波沿风跨树冠行进
+    float travel = dot(worldPos.xz, wdir);
+    float side = dot(worldPos.xz, wperp);
+
+    // 阵风门控（0.45 基线 = 无阵风时也有微风）+ 三分量波形
+    float gustGate = 0.45 + 0.55 * windGustField(worldPos.xz, t);
+    float mainWave = sin(t * 1.9 + travel * 0.55);
+    float sideWave = sin(t * 3.1 + side * 0.62);
+    float flutter = sin(
+        t * 5.3 + worldPos.x * 2.1 + worldPos.y * 1.3 + worldPos.z * 1.7);
+
+    // 位移（格）：闲置 ~0.020，阵风峰值 ~0.095；风强滑条 0..2 整体乘
+    float disp = (0.020 + 0.075 * gustGate) * windStrength();
+
+    // sprite 矩形（顶点 UV 包围盒）—— 位移换算成 UV 的世界尺度基准
+    vec2 spriteMin = min(min(uv0, uv1), uv2);
+    vec2 spriteMax = max(max(uv0, uv1), uv2);
+    vec2 spriteSpan = max(spriteMax - spriteMin, atlasTexel);
+
+    vec2 uvJitter =
+        (wdir * mainWave + wperp * (sideWave * 0.45)) * (disp * spriteSpan)
+        + vec2(0.0, flutter * 0.30) * (disp * spriteSpan.y);
+
+    // Sprite 内钳制（半纹素内缩，防 bilinear 串相邻 sprite）
+    vec2 sMin = spriteMin + atlasTexel * 0.5;
+    vec2 sMax = spriteMax - atlasTexel * 0.5;
+    vec2 sCenter = (sMin + sMax) * 0.5;
+    sMin = min(sMin, sCenter);
+    sMax = max(sMax, sCenter);
+    return clamp(baseUv + uvJitter, sMin, sMax);
+}
+
 #endif

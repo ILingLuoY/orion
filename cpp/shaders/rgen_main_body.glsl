@@ -1457,6 +1457,20 @@ if (primaryHitDistance < 0.0) {
             vec3 albedo = unpackAlbedoUnorm(payload.albedoPacked);
             vec3 normal = payload.normal;
             float matId = getLegacyMaterialId(payload.state);
+            // 2026-11-22 批3：叶道回填（0.25 = Java LEAVES/FLOWERS/草/作物打标）。
+            // getLegacyMaterialId 对不透明恒回 0 ⇒ 顶点 materialId 只能经
+            // material_resolve 的 g_hitVertexMaterialId 导出（resolveHitMaterial
+            // 已在本 fork 中执行过，全局已就绪）。这一行点亮既有但一直死着的
+            // 叶子背光/SSS 分支（:4703 一带的 matId 0.2~0.45 判据）。
+            // 门控：全局只在 K2 内联材质路径（ORION_K2_MATERIAL_INLINE →
+            // material_resolve）存在；K1/单发 K2/callable 路径不 include
+            // material_resolve ⇒ 不引用。四腿/三腿/两腿档全是内联路径。
+#ifdef ORION_K2_MATERIAL_INLINE
+            if(g_hitVertexMaterialId > 0.2 && g_hitVertexMaterialId < 0.45)
+            {
+                matId = 0.25;
+            }
+#endif
 
 // The geometric face normal, captured before POM, normal maps or rain
 // displacement touch `normal`.  Rain surface classification must key off the
@@ -1496,6 +1510,16 @@ if (matId > 0.5 && matId < 2.5) {
 #ifndef ORION_K1_PRIMARY
 // ④ K1 死分支摘除：K1 的主命中组（地形/水/实体/粒子）全部在切点落 landing 后
 // continue，水像素永远走不到水分支体（水面着色整体延期给 K2）⇒ K1 编译期摘除。
+#ifndef WATER_K2_GUIDE_PROBE_DEDUP
+#define WATER_K2_GUIDE_PROBE_DEDUP 1
+#endif
+#if WATER_K2_GUIDE_PROBE_DEDUP && \
+    (defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_B))
+                // 2026-11-22 非时域性能优化 #2：K2-LOC / K2-SUNB 对水像素无直射
+                // 附加输出、也不写 RR guide，原路径仍跑完 BRDF 与整条
+                // RT_PURPOSE_DISTANCE_ONLY 射线后在尾部 continue 丢弃 ⇒ 直接早退。
+                continue;
+#endif
                 vec3 viewDir = -worldDir.xyz;
                 float cosTheta = clamp(dot(normal, viewDir), 0.0, 1.0);
                 float R0 = 0.02;
@@ -1506,6 +1530,10 @@ if (matId > 0.5 && matId < 2.5) {
                 // =====================================================
                 // RR-6.2 - Primary water guides
                 // =====================================================
+#if !WATER_K2_GUIDE_PROBE_DEDUP || \
+    (!defined(ORION_K2_DIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) && \
+     !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B) && \
+     !defined(ORION_K2_DIRECT_LOCAL_STAGE))
                 if(s == 0)
                 {
                     const float waterGuideRoughness =
@@ -1679,6 +1707,7 @@ if (matId > 0.5 && matId < 2.5) {
                             65504.0;
                     }
                 }
+#endif
 
 #if defined(ORION_K2_INDIRECT_STAGE)
                 // ③ K2-I：水像素的完整着色（反射/折射/太阳瓣/吸收）已由 K2-D
@@ -1977,6 +2006,7 @@ else
                     // G_sss = 1−NdotL）。与 P1 同为透射侧，同样乘出射菲涅尔。
                     sampleColor +=
                         evaluateWaterThinLayerSSS(
+                            hitPos,
                             normal,
                             worldDir.xyz,
                             sunDir,
@@ -1998,8 +2028,9 @@ else
 #else
                         const float kWaterMultiScatterScale = 2.0;
 #endif
+                        vec3 waterHitScatter = waterScatterColorAt(hitPos.xz);
                         vec3 waterMultiExtinction =
-                            waterAbsorptionColor() + waterScatterColor();
+                            waterAbsorptionColorAt(hitPos.xz) + waterHitScatter;
                         float waterMultiPath = clamp(
                             transmittedTransmissionInfo.waterPathLength, 0.05, 60.0);
                         vec3 waterMultiShare = vec3(1.0) -
@@ -2009,7 +2040,7 @@ else
                                 transmittedTransmissionInfo.receiverSelfEmissionRadiance,
                             vec3(0.0));
                         sampleColor += waterMultiSource *
-                            waterScatterColor() * waterScatteringAmount() *
+                            waterHitScatter * waterScatteringAmount() *
                             waterMultiShare *
                             (kWaterMultiScatterScale * (1.0 - fresnel));
                     }
@@ -2869,7 +2900,14 @@ for(
         // 2026-11-16 修正：committed 交点只有在查询终止后才可读，不能在 Proceed 循环
         // 体里判——TerminateOnFirstHit 下一旦命中就终止，循环体可能一次都不进，那样
         // 永远读不到 committed，AO 会恒判"无遮挡"。必须在循环结束后统一读。
-        while(rayQueryProceedEXT(aoVisQuery) && ++aoVisProceedGuard < 32) {}
+        while(rayQueryProceedEXT(aoVisQuery) && ++aoVisProceedGuard < 32)
+        {
+            if(rayQueryGetIntersectionTypeEXT(aoVisQuery, false) ==
+               gl_RayQueryCandidateIntersectionTriangleEXT)
+            {
+                rayQueryConfirmIntersectionEXT(aoVisQuery);
+            }
+        }
         if(rayQueryGetIntersectionTypeEXT(aoVisQuery, true) !=
             gl_RayQueryCommittedIntersectionNoneEXT)
         {
@@ -2904,8 +2942,7 @@ for(
         traceRayEXT(
             topLevelAS,
 
-            gl_RayFlagsTerminateOnFirstHitEXT |
-            gl_RayFlagsSkipClosestHitShaderEXT,
+            gl_RayFlagsTerminateOnFirstHitEXT,
 
             0xff,
             0,
@@ -3217,12 +3254,13 @@ shadowSamples = SUN_SHADOW_FORCE_SAMPLES;
 #endif
 
 // 高档 tap 数（用户「太阳阴影采样」= 高，即 CameraUBO.perfPrimary.w = 2）。
-// 低档 = 上一版的高档成本（8/4），作为"同观感但便宜一半"的回退臂。
+// 2026-11-22 非时域性能优化 #3：半影已走逐帧随机方向 + DLSS-RR 时域收敛，
+// 不再需要确定性 16/8-tap 去量化台阶 ⇒ 与时空蓝噪声配对降到近场 2/1、远场 1/1。
 #ifndef SUN_SHADOW_SOFT_TAPS
-#define SUN_SHADOW_SOFT_TAPS 16
+#define SUN_SHADOW_SOFT_TAPS 2
 #endif
 #ifndef SUN_SHADOW_SOFT_TAPS_LOW
-#define SUN_SHADOW_SOFT_TAPS_LOW 8
+#define SUN_SHADOW_SOFT_TAPS_LOW 1
 #endif
 
 // 已停用（方向 tap 取代起点平移）。保留宏名只为外部 -D 不报未定义。
@@ -3243,12 +3281,11 @@ shadowSamples = SUN_SHADOW_FORCE_SAMPLES;
 #endif
 
 #ifndef SUN_SHADOW_SOFT_TAPS_FAR
-// 2026-11-10：远端 tap 数。半影宽现在是"孔径 × 遮挡距离"，32 格外照样看得见
-// （遮挡物越远带越宽），所以远端也要够密的级数。高档 8、低档 4。
-#define SUN_SHADOW_SOFT_TAPS_FAR 8
+// 2026-11-22：远场（>= 32m）统一 1 tap，交由时空蓝噪声 + DLSS-RR 收敛。
+#define SUN_SHADOW_SOFT_TAPS_FAR 1
 #endif
 #ifndef SUN_SHADOW_SOFT_TAPS_FAR_LOW
-#define SUN_SHADOW_SOFT_TAPS_FAR_LOW 4
+#define SUN_SHADOW_SOFT_TAPS_FAR_LOW 1
 #endif
 #ifndef SUN_SHADOW_SOFT_TAPS_FAR_DISTANCE
 #define SUN_SHADOW_SOFT_TAPS_FAR_DISTANCE 32.0
@@ -3571,10 +3608,24 @@ for (int si = 0;
                 ? cam.sssParams.y
                 : SUN_SHADOW_SOFT_APERTURE;
 
+#ifndef SUN_SHADOW_BLUE_NOISE
+#define SUN_SHADOW_BLUE_NOISE 1
+#endif
+#if SUN_SHADOW_BLUE_NOISE
+        float sunDiskRand0 = glassBlueNoiseSample(
+            uvec2(gl_LaunchIDEXT.xy), cam.frameCount, 71u + uint(si) * 2u);
+        float sunDiskRand1 = glassBlueNoiseSample(
+            uvec2(gl_LaunchIDEXT.xy), cam.frameCount, 72u + uint(si) * 2u);
+        // shadowSamples > 1 时按扇区等分角空间（2-tap 落在太阳盘相对两半，免费降方差）
+        float sunDiskAngle = 6.2831853 *
+            ((float(si) + sunDiskRand0) / float(max(shadowSamples, 1)));
+        float sunDiskRadius = sqrt(sunDiskRand1) * sunDiskAperture;
+#else
         float sunDiskRand0 = rand(shadowSeed);
         float sunDiskRand1 = rand(shadowSeed);
         float sunDiskAngle = 6.2831853 * sunDiskRand0;
         float sunDiskRadius = sqrt(sunDiskRand1) * sunDiskAperture;
+#endif
 
         shadowDir = normalize(
             diskAxisN +
@@ -3695,12 +3746,16 @@ for (int si = 0;
 #ifndef SUN_SHADOW_VOXEL_GATE_RANGE
 #define SUN_SHADOW_VOXEL_GATE_RANGE 3.0
 #endif
+#ifndef SUN_SHADOW_VOXEL_GATE_MAX_DIST
+#define SUN_SHADOW_VOXEL_GATE_MAX_DIST 48.0
+#endif
 // 注意：#if 只能算整数，所以开关用单独的 int 宏。
 #ifndef SUN_SHADOW_VOXEL_GATE
 #define SUN_SHADOW_VOXEL_GATE 1
 #endif
 #if SUN_SHADOW_VOXEL_GATE
     if(hit.hitDistance < 0.0 &&
+       rtLodDistance < SUN_SHADOW_VOXEL_GATE_MAX_DIST &&
        cam.perfAblationStage.x != 33u &&
        vptVoxelPathBlocked(
            hitPos,
@@ -4429,6 +4484,79 @@ if(rainWallWetness > 0.0)
         f0MetalCode
     );
 }
+
+// =====================================================
+// 2026-11-22 Round 2 (Item A): zero-ray shoreline wetness band.
+// Darkens and smooths exterior solid faces touching water within capillary height.
+// =====================================================
+#ifndef WATER_SHORELINE_WETNESS
+#define WATER_SHORELINE_WETNESS 1
+#endif
+#if WATER_SHORELINE_WETNESS
+if(rainSolidSurfaceCandidate &&
+   cam.glassCausticParams.w > 0.5 &&
+   cam.waterSimState.w == 0u &&
+   rtLodDistance < 48.0)
+{
+    const float waterY = cam.waterSimSurfaceAndOrigin.x;
+    const float hAboveWater = hitPos.y - waterY;
+    if(hAboveWater > -0.35 && hAboveWater < 1.40)
+    {
+        const vec2 maskUv =
+            (hitPos.xz - cam.glassCausticParams.xy) * cam.glassCausticParams.z;
+        if(all(greaterThan(maskUv, vec2(0.02))) && all(lessThan(maskUv, vec2(0.98))))
+        {
+            float waterProx = 0.0;
+            if(primaryGeometricNormal.y > 0.5)
+            {
+                const float stepUv = cam.glassCausticParams.z * 0.90;
+                float mC = textureLod(waterBiomeMaskMap, maskUv, 0.0).a;
+                float mE = textureLod(waterBiomeMaskMap, maskUv + vec2(stepUv, 0.0), 0.0).a;
+                float mW = textureLod(waterBiomeMaskMap, maskUv - vec2(stepUv, 0.0), 0.0).a;
+                float mN = textureLod(waterBiomeMaskMap, maskUv + vec2(0.0, stepUv), 0.0).a;
+                float mS = textureLod(waterBiomeMaskMap, maskUv - vec2(0.0, stepUv), 0.0).a;
+                waterProx = max(mC, max(max(mE, mW), max(mN, mS)));
+            }
+            else if(abs(primaryGeometricNormal.y) < 0.5)
+            {
+                const vec2 outUv =
+                    maskUv + primaryGeometricNormal.xz * (cam.glassCausticParams.z * 0.55);
+                waterProx = textureLod(waterBiomeMaskMap, outUv, 0.0).a;
+            }
+
+            if(waterProx > 0.12)
+            {
+                float shoreNoise = evaluateContinuousRainWetnessNoise(hitPos.xz * 1.35);
+                float maxWetHeight =
+                    (primaryGeometricNormal.y > 0.5 ? 0.65 : 0.95) + 0.35 * shoreNoise;
+                float heightMask = (1.0 - smoothstep(0.05, maxWetHeight, hAboveWater)) *
+                    smoothstep(-0.35, -0.05, hAboveWater);
+                float distFade = 1.0 - smoothstep(32.0, 48.0, rtLodDistance);
+                float shoreWetness = clamp(
+                    smoothstep(0.12, 0.72, waterProx) * heightMask * distFade,
+                    0.0,
+                    1.0);
+                if(shoreWetness > 0.005)
+                {
+                    float existingRainWet = max(rainGroundWetness, rainWallWetness);
+                    float extraShoreWet = max(shoreWetness - existingRainWet, 0.0);
+                    albedo *= 1.0 - extraShoreWet * 0.42;
+                    roughness = min(roughness, mix(roughness, 0.075, shoreWetness * 0.88));
+                    if(primaryGeometricNormal.y > 0.5)
+                    {
+                        normal = normalize(
+                            mix(normal, primaryGeometricNormal, shoreWetness * 0.35));
+                        NdotL = max(0.0, dot(normal, sunDir));
+                    }
+                    pbr2ReflectionStrength = evaluatePBR2ReflectionStrength(
+                        roughness,
+                        f0MetalCode);
+                }
+            }
+        }
+    }
+}
+#endif
 
 // =====================================================
 // A1 - GGX Direct Sun Lighting

@@ -43,6 +43,10 @@ layout(binding = 60, set = 0) uniform sampler2D endSkyAtlas;
 // volumetric-cloud compute composite already covers those pixels.
 const uint RT_PURPOSE_PRIMARY_SKY = 7u;
 
+#ifndef RMISS_VISIBILITY_EARLYOUT
+#define RMISS_VISIBILITY_EARLYOUT 1
+#endif
+
 // =====================================================
 // 2026-10-22 MIS-A：GI 射线标记（bit 14）—— 与 rt_test.rgen 的
 // RT_STATE_NO_SUN_DISK_BIT **必须同值**（rmiss 是独立 TU，宏/常量不跨文件）。
@@ -1077,6 +1081,29 @@ float iceSunDog(vec3 rayDir, vec3 lightDir)
 void main() {
     payload.hitDistance = -1.0;
     payload.normal = vec3(0.0);
+
+#if RMISS_VISIBILITY_EARLYOUT
+    // 2026-11-22 非时域性能优化 #1：可见性/距离探针（GLASS_VISIBILITY=5 /
+    // VISIBILITY_ONLY=3 / DISTANCE_ONLY=2）不消费天空/云辐亮度。原路径在
+    // 1888 行因 purpose != PRIMARY_SKY 跑满 24 步 Tyndall 3D 云行军 +
+    // 完整大气/日月/冰晕，然后在 1902 行将 finalColor 丢弃。
+    // 早退保留 hitDistance=-1、normal=0 与 rahit 累积的 albedoPacked（玻璃透射色），
+    // 其余尾部字段清零与原尾部逐位一致。回退：-DRMISS_VISIBILITY_EARLYOUT=0。
+    {
+        const uint missPurpose = payload.state & 0x7u;
+        if(missPurpose == 5u || missPurpose == 3u || missPurpose == 2u)
+        {
+            payload.roughness = 1.0;
+            payload.f0Metal = 0.0;
+#ifndef ORION_RMISS_SLIM
+            payload.emission = vec3(0.0);
+#endif
+            payload.parallaxRayTravel = 0.0;
+            payload.pomSelfShadow = 1.0;
+            return;
+        }
+    }
+#endif
 
     vec3 rayDir = gl_WorldRayDirectionEXT;
 

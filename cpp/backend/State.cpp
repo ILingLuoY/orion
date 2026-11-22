@@ -187,6 +187,9 @@ float g_waterSimPendingImpulseStrength = 0.0f;
 float g_waterSimLastSurfaceY = 0.0f;
 // 2026-11-16：焦散近水门的"玩家附近水面 Y"（见 OrionInternal.h 注释）。
 float g_waterNearbySurfaceY = 0.0f;
+// 2026-11-22 (Batch 2): Active SECTION_AS_CLASS_WATER instance count from TLAS assembly.
+std::atomic<uint32_t> g_tlasWaterSectionCount{0u};
+std::atomic<bool> g_tlasWaterSectionCountValid{false};
 bool g_waterSimOriginValid = false;
 float g_waterSimOriginX = 0.0f;
 float g_waterSimOriginZ = 0.0f;

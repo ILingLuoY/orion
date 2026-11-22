@@ -5,6 +5,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
 // 2026-11-16：purpose==3 可见性点位的 inline ray query 可选臂（rgen_main_body /
 // rgen_glossy / rgen_water_receiver）需要 ray query 类型与内建；运行时由
 // cam.visQueryAb 闸门决定走 query 臂还是既有 traceRayEXT 臂，默认全关。
@@ -317,7 +318,7 @@ uniform image2D giHalfImage;
 #if defined(ORION_K2_DIRECT_STAGE) || defined(ORION_K2_INDIRECT_STAGE) \
     || defined(ORION_K2_DIRECT_SUN_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) \
     || defined(ORION_K2_DIRECT_SUN_STAGE_A) || defined(ORION_K2_DIRECT_SUN_STAGE_B)
-layout(binding = 89, set = 0, rgba32f)
+layout(binding = 89, set = 0, rgba16f)
 uniform image2D k2DirectImage;
 #endif
 
@@ -1321,18 +1322,9 @@ layout(binding = 58, set = 0) uniform sampler2D sunShadowMapFar;
 // =====================================================
 layout(binding = 69, set = 0) uniform sampler2D waterCausticMap;
 
-// =====================================================
-// 2026-10-19 反射焦散图（天花板/悬垂上的"波光"）—— binding 70
-//
-// 与 binding 69 同一张 1024²×11 mip 图的**数组层 1**：宿主用同一套 256² 网格
-// ×3×3 实例，把 reflect(-sun, n) 投到水面之上 +4 格的参考接收面，片元仍用
-// 源面积比写 R 通道（镜面反射无 IOR 色散）。
-//
-// 消费端：traceWaterReflectedSun 在"水面可见太阳"判定之后用本图调制原有的
-// 反射辐照度 —— 平水 = 1（不改亮度），聚焦 = >1，散焦 = <1。
-// 安全阀同 binding 69：waterFftParams2.w > 0.5 才采样。
-// =====================================================
-layout(binding = 70, set = 0) uniform sampler2D waterReflectCausticMap;
+// 2026-11-22 Round 2: binding 70 repurposed from unused reflect caustic map
+// to 48x48 RGBA8 water biome tint (RGB) + water mask (A).
+layout(binding = 70, set = 0) uniform sampler2D waterBiomeMaskMap;
 
 // 正交基 / 投影 / 查询与生产者共用同一份，所以"写进去的位置"与"查出来的位置"
 // 结构上不可能对不上。消费者半边 + 远场转发档（sunShadowFarVisibility）。
@@ -5024,6 +5016,9 @@ const vec3 WATER_BIOME_TINT_OCEAN_LIN = vec3(0.0462, 0.1835, 0.7816);
 #ifndef WATER_BIOME_TINT_STRENGTH
 #define WATER_BIOME_TINT_STRENGTH 1.0
 #endif
+#ifndef WATER_PER_HIT_BIOME_TINT
+#define WATER_PER_HIT_BIOME_TINT 1
+#endif
 
 vec3 waterBiomeTint()
 {
@@ -5034,11 +5029,34 @@ vec3 waterBiomeTint()
     return clamp(cam.waterBiomeTint.xyz, vec3(0.0), vec3(1.0));
 }
 
-vec3 waterAbsorptionColor()
+vec3 waterBiomeTintAt(vec2 worldXZ)
+{
+    vec3 fallbackTint = waterBiomeTint();
+#if !WATER_PER_HIT_BIOME_TINT
+    return fallbackTint;
+#else
+    if(cam.glassCausticParams.w < 0.5)
+    {
+        return fallbackTint;
+    }
+    vec2 uv = (worldXZ - cam.glassCausticParams.xy) * cam.glassCausticParams.z;
+    if(any(lessThanEqual(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0))))
+    {
+        return fallbackTint;
+    }
+    vec2 border = smoothstep(vec2(0.0), vec2(0.0625), uv) *
+        (1.0 - smoothstep(vec2(0.9375), vec2(1.0), uv));
+    float blendWeight = border.x * border.y;
+    vec3 sampledTint = clamp(textureLod(waterBiomeMaskMap, uv, 0.0).rgb, vec3(0.0), vec3(1.0));
+    return mix(fallbackTint, sampledTint, blendWeight);
+#endif
+}
+
+vec3 waterAbsorptionColorForTint(vec3 rawTint)
 {
     vec3 tint = mix(
         WATER_BIOME_TINT_OCEAN,
-        waterBiomeTint(),
+        rawTint,
         clamp(WATER_BIOME_TINT_STRENGTH, 0.0, 1.0)
     );
     vec3 tintLin = pow(max(tint, vec3(0.02)), vec3(2.2));
@@ -5054,11 +5072,11 @@ vec3 waterAbsorptionColor()
     ) * clamp(cam.waterStyleParams0.z, 0.25, 4.0) * biomeModulate;
 }
 
-vec3 waterScatterColor()
+vec3 waterScatterColorForTint(vec3 rawTint)
 {
     vec3 tint = mix(
         WATER_BIOME_TINT_OCEAN,
-        waterBiomeTint(),
+        rawTint,
         clamp(WATER_BIOME_TINT_STRENGTH, 0.0, 1.0)
     );
     vec3 tintLin = pow(max(tint, vec3(0.02)), vec3(2.2));
@@ -5073,6 +5091,26 @@ vec3 waterScatterColor()
         vec3(0.05, 0.34, 0.30),
         clamp(cam.waterStyleParams0.y, 0.0, 1.0)
     ) * biomeModulate;
+}
+
+vec3 waterAbsorptionColor()
+{
+    return waterAbsorptionColorForTint(waterBiomeTint());
+}
+
+vec3 waterScatterColor()
+{
+    return waterScatterColorForTint(waterBiomeTint());
+}
+
+vec3 waterAbsorptionColorAt(vec2 worldXZ)
+{
+    return waterAbsorptionColorForTint(waterBiomeTintAt(worldXZ));
+}
+
+vec3 waterScatterColorAt(vec2 worldXZ)
+{
+    return waterScatterColorForTint(waterBiomeTintAt(worldXZ));
 }
 
 float waterScatteringAmount()

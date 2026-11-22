@@ -2836,7 +2836,7 @@ bool rebuildWorldGeometry(
     // 原本每帧 malloc/free 一次。
     static std::vector<VkAccelerationStructureInstanceKHR> instances;
     instances.clear();
-
+    uint32_t activeWaterSectionCount = 0u;
 
     if(orderedSections.empty())
     {
@@ -3274,6 +3274,7 @@ bool rebuildWorldGeometry(
             {
                 instance.instanceShaderBindingTableRecordOffset =
                     SBT_RECORD_WATER;
+                ++activeWaterSectionCount;
             }
             else if(geometryClass == SECTION_AS_CLASS_ENTITY)
             {
@@ -3307,14 +3308,21 @@ bool rebuildWorldGeometry(
 
             const bool ommGeometry = section.hasOpacityMicromap;
 
+            // 2026-11-22 (Batch 2): Voxy/DH LOD sections use SECTION_AS_CLASS_OPAQUE
+            // but MUST enter rahit for lodHitIsRedundant(); force non-opaque on LOD only.
+            static constexpr bool kTLAS_LOD_FORCE_NO_OPAQUE = true;
+            const bool forceNoOpaque =
+                (!opaqueGeometry && !ommGeometry) ||
+                (kTLAS_LOD_FORCE_NO_OPAQUE && lodSpatialKey);
+
             instance.flags =
                 (geometryClass == SECTION_AS_CLASS_OMM
                     ? 0u
                     : VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR) |
                 (
-                    (opaqueGeometry || ommGeometry)
-                        ? 0u
-                        : VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
+                    forceNoOpaque
+                        ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
+                        : 0u
                 );
 
             instance.accelerationStructureReference =
@@ -3392,6 +3400,9 @@ bool rebuildWorldGeometry(
         instances.push_back(inactive);
         RTLogFlushed("[TLAS CULL] all instances culled; inactive placeholder in use");
     }
+
+    g_tlasWaterSectionCount.store(activeWaterSectionCount, std::memory_order_relaxed);
+    g_tlasWaterSectionCountValid.store(true, std::memory_order_relaxed);
 
     rtxPreCmdAfterInstances = std::chrono::steady_clock::now();
 

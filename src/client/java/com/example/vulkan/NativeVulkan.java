@@ -769,6 +769,13 @@ public final class NativeVulkan {
     public static native boolean setWaterFftParams(float[] params);
 
     /**
+     * 2026-11-22 统一风场（CameraUBO.windParams）：[0]=风向角（度），
+     * [1]=风强倍率（0..2），[2]=阵风强度（0..1）。见 RTXSettingsConfig.WindSettings。
+     * 旧数组语义（少于 3 项）按缺位落默认处理。
+     */
+    public static native boolean setWindParams(float[] params);
+
+    /**
      * 2026-10-03 后处理（新「后处理」设置页）：色彩映射模式（0=Uchimura/GT
      * 1=AgX 2=PBR中性 3=ACES 4=Uncharted2 5=Reinhard 6=ACES 2.0）+ 自动曝光参与度 +
      * 对比 + 饱和 + gamma。见 RTXSettingsConfig.PostProcessingSettings。
@@ -2094,6 +2101,11 @@ public final class NativeVulkan {
                 RTXSettingsConfig.getWaterFftSettings().toParamArray()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore water FFT params");
+        }
+        if(!setWindParams(
+                RTXSettingsConfig.getWindSettings().toParamArray()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore wind params");
         }
         if(!setWaterWaveAflParams(
                 RTXSettingsConfig.getWaterWaveAflSettings().toParamArray()

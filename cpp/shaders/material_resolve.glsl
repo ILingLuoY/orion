@@ -30,6 +30,11 @@
 #ifndef MATERIAL_RESOLVE_GLSL
 #define MATERIAL_RESOLVE_GLSL
 
+// 2026-11-22 批3：风场 helper（植物 UV 摇摆/法线倾斜）。本文件的全部宿主 TU
+//（rt_test.rchit / rt_test_material.rcall / rgen_k2_material_inline ← rgen）
+// 都在 include 本文件之前声明了 cam。
+#include "wind_common.glsl"
+
 // 2026-11-21 P0-1：rchit 算出的主命中世界位移，经 per-pixel 旁路图（binding 98）
 // 回传 rgen。这里**只暴露全局量**：image 声明与 imageStore 放在引用该槽的 rchit main
 // 里（rt_test.rchit），本头文件不引用该图 —— 否则 rcall TU（rt_test_material.rcall）
@@ -37,6 +42,11 @@
 // 而它们的描述符写法不在本轮范围内（蓝图 §3.3 风险 3）。
 vec3 g_hitWorldOffset = vec3(0.0);
 bool g_hitOffsetValid = false;
+
+// 2026-11-22 批3：顶点 materialId 原值导出（0.25 = 叶道，Java LEAVES/FLOWERS
+// 打标）。getLegacyMaterialId 对不透明恒回 0 ⇒ rgen 侧叶子 SSS/摇摆分支只能
+// 从这里读叶道（照 g_hitWorldOffset 的全局导出先例，payload 零改动）。
+float g_hitVertexMaterialId = 0.0;
 
 void resolveHitMaterial(vec3 rayOrigin, vec3 rayDirection)
 {
@@ -233,6 +243,10 @@ float materialId =
     v1.materialId * barycentrics.y +
     v2.materialId * barycentrics.z;
 
+// 2026-11-22 批3：顶点 materialId 导出（0.25 = 叶道）。rgen 的叶子 SSS/
+// 摇摆分支从这里读（getLegacyMaterialId 对不透明恒 0，见全局声明处注释）。
+g_hitVertexMaterialId = materialId;
+
 // Negative pad1 is reserved by the native Voxy LOD decoder. Its colour is
 // already texture- and biome-resolved, so it must never sample blockAtlas at
 // the placeholder UV (0, 0). -2 additionally marks the coarse lava/light
@@ -352,6 +366,20 @@ bool isRtWeatherRain =
     vec3 pos2 = vec3(v2.x, v2.y, v2.z);
 
     vec3 geoNormal = normalize(cross(pos1 - pos0, pos2 - pos0));
+
+    // 2026-11-22 批3：叶面法线顺风小倾角（阵风调制，≤~0.12 rad）——光照响应级
+    // 摇摆。仅叶道（顶点 materialId 0.25）；水/玻璃/实体/粒子不受影响。
+    if(materialId > 0.2 && materialId < 0.45 &&
+       !isEntityMaterial && !isParticleMaterial)
+    {
+        const vec3 wdir3 = vec3(windDirXZ().x, 0.0, windDirXZ().y);
+        const float tiltPhase = dot(pos0 + pos1 + pos2, wdir3) * 0.55;
+        const float tilt =
+            (sin(uintBitsToFloat(cam.padding) * 1.9 + tiltPhase) *
+                (0.55 + 0.45 * windGustField(pos0.xz, uintBitsToFloat(cam.padding)))) *
+            0.12 * windStrength();
+        geoNormal = normalize(geoNormal + wdir3 * tilt);
+    }
 
     // =====================================================
     // DISTANCE_ONLY FAST PATH
@@ -1218,6 +1246,29 @@ safeMax =
         safeMax,
         spriteCenter
     );
+
+
+// =====================================================
+// 2026-11-22 批3：植物 UV 摇摆（叶道 materialId 0.25）
+//
+// texCoord 在此处（sprite 矩形已定、POM/图集采样之前）加摆——后续 POM 从
+// 摆动后的基准 UV 出发，剪影与着色一致。rt_test.rahit 的 alpha test 用
+// wind_common 的同一函数同一输入 ⇒ 镂空轮廓逐位一致地摆。
+// 排除实体/粒子（它们的 materialId 编码与叶道撞区间）。
+// =====================================================
+if(materialId > 0.2 && materialId < 0.45 &&
+   !isEntityMaterial && !isParticleMaterial)
+{
+    const vec3 swayWorldPos =
+        pos0 * barycentrics.x +
+        pos1 * barycentrics.y +
+        pos2 * barycentrics.z;
+    texCoord = windFoliageUvSway(
+        texCoord,
+        uv0, uv1, uv2,
+        swayWorldPos,
+        atlasTexel);
+}
 
 
 // =====================================================

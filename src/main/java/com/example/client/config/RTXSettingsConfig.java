@@ -1461,6 +1461,33 @@ public final class RTXSettingsConfig {
         markDirty();
     }
 
+    // 2026-11-22 统一风场（CameraUBO.windParams，消费方 wind_common.glsl）：
+    //   angleDeg  风向角（世界 XZ 平面，度；dir=(cos,sin)；出厂 30.5 = HP 云原方向）
+    //   strength  风强倍率（植物摇摆/阵风幅度乘数；0..2）
+    //   gust      阵风强度（0 = 恒定风）
+    // 三者经 JNI setWindParams 落同一车道；云/雾/水波方向也统一读它（批1）。
+    public record WindSettings(
+            float angleDeg,
+            float strength,
+            float gust) {
+        public WindSettings {
+            if(!Float.isFinite(angleDeg) || angleDeg < 0 || angleDeg > 360 ||
+               !Float.isFinite(strength) || strength < 0 || strength > 2 ||
+               !Float.isFinite(gust) || gust < 0 || gust > 1)
+                throw new IllegalArgumentException("Invalid wind settings");
+        }
+
+        public float[] toParamArray() {
+            return new float[] { angleDeg, strength, gust };
+        }
+    }
+    private static WindSettings windSettings = new WindSettings(30.5f, 1.0f, 0.4f);
+    public static synchronized WindSettings getWindSettings() { return windSettings; }
+    public static synchronized void setWindSettings(WindSettings settings) {
+        windSettings = java.util.Objects.requireNonNull(settings);
+        markDirty();
+    }
+
     // 2026-10-03 后处理（新「后处理」设置页）：色彩映射 + 曝光/对比/饱和/gamma。
     //   tonemapMode       0=Uchimura/GT 1=AgX 2=Khronos PBR Neutral 3=ACES 4=Uncharted2
     //                     5=Reinhard 6=ACES 2.0（2026-10-23，官方 CTL 逐函数移植）
@@ -3781,6 +3808,10 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.waterFftSwellWeight, 0.45f, 0.02f, 2.0f, 0.05f),
                         validCloudSetting(data.waterFftDetailWeight, 0.90f, 0.02f, 3.0f, 0.05f),
                         validCloudSetting(data.waterFftWindSpeed, 3.5f, 0.5f, 14.0f, 0.5f));
+                windSettings = new WindSettings(
+                        validCloudSetting(data.windAngleDeg, 30.5f, 0f, 360f, 0.5f),
+                        validCloudSetting(data.windStrength, 1.0f, 0f, 2f, 0.05f),
+                        validCloudSetting(data.windGust, 0.4f, 0f, 1f, 0.05f));
                 postProcessingSettings = new PostProcessingSettings(
                         data.postTonemapMode == null ? 0
                             : Math.max(0, Math.min(6, data.postTonemapMode)),
@@ -4431,6 +4462,9 @@ public final class RTXSettingsConfig {
             data.waterFftSwellWeight = waterFftSettings.swellWeight();
             data.waterFftDetailWeight = waterFftSettings.detailWeight();
             data.waterFftWindSpeed = waterFftSettings.windSpeed();
+            data.windAngleDeg = windSettings.angleDeg();
+            data.windStrength = windSettings.strength();
+            data.windGust = windSettings.gust();
             data.postTonemapMode = postProcessingSettings.tonemapMode();
             data.postExposureStrength = postProcessingSettings.exposureStrength();
             data.postContrast = postProcessingSettings.contrast();
@@ -4839,6 +4873,11 @@ public final class RTXSettingsConfig {
         Float waterFftSwellWeight;
         Float waterFftDetailWeight;
         Float waterFftWindSpeed;
+
+        // 2026-11-22 统一风场（JSON 键 windAngleDeg / windStrength / windGust）
+        Float windAngleDeg;
+        Float windStrength;
+        Float windGust;
         Integer postTonemapMode;
         Float postExposureStrength;
         Float postContrast;

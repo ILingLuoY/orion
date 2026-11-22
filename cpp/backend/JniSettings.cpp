@@ -7,6 +7,31 @@
 
 
 extern "C"
+// 2026-11-22 统一风场（CameraUBO.windParams，消费方 wind_common.glsl）：
+//   [0]=风向角（度，0..360） [1]=风强倍率（0..2） [2]=阵风强度（0..1）。
+// 与 populateWindParams 同一钳制口径；缺位/非法落默认（30.5/1.0/0.4）。
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setWindParams(
+    JNIEnv* env, jclass, jfloatArray params)
+{
+    if(params == nullptr || env->GetArrayLength(params) < 1) return JNI_FALSE;
+    const jsize count = std::min<jsize>(env->GetArrayLength(params), 3);
+    jfloat values[3] = {30.5f, 1.0f, 0.4f};
+    env->GetFloatArrayRegion(params, 0, count, values);
+    for(int i = 0; i < count; ++i)
+    {
+        if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
+    }
+    g_windAngle.store(
+        std::min(std::max(static_cast<float>(values[0]), 0.0f), 360.0f));
+    g_windStrength.store(
+        std::min(std::max(static_cast<float>(values[1]), 0.0f), 2.0f));
+    g_windGust.store(
+        std::min(std::max(static_cast<float>(values[2]), 0.0f), 1.0f));
+    return JNI_TRUE;
+}
+
+// 2026-11-22: Restore extern "C" linkage (line 9's extern "C" applies only to setWindParams).
+extern "C"
 JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setColorGradeParams(
     JNIEnv* env, jclass, jfloatArray params)
 {

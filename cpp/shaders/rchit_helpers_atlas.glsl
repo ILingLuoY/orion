@@ -1,21 +1,17 @@
 #ifndef ORION_ATLAS_DYNAMIC_INDEX
-#define ORION_ATLAS_DYNAMIC_INDEX 0
+#define ORION_ATLAS_DYNAMIC_INDEX 1
 #endif
 // 2026-11-05 B①：从 rt_test.rchit 474-1038 行原样切出的图集解码/采样 helper 段。
 // rchit 在原位置 include 回来；K2 的 rgen（ORION_K2_TRANSPORT）也 include 它。
 vec4 sampleEntityAtlas(uint textureSlot, vec2 uv)
 {
 #if ORION_ATLAS_DYNAMIC_INDEX
-    if(textureSlot == 0u || textureSlot > 64u)
+    if(textureSlot == 0u || textureSlot > 128u)
     {
         return vec4(1.0);
     }
-    return textureLod(entityAtlases[textureSlot - 1u], uv, 0.0);
-#endif
-
-    // Keep every sampler operand statically indexed.  The current device is
-    // created by Java without descriptor-indexing feature negotiation, while
-    // closest-hit invocations naturally select different entity textures.
+    return textureLod(entityAtlases[nonuniformEXT(textureSlot - 1u)], uv, 0.0);
+#else
     switch(textureSlot)
     {
         case 1u: return textureLod(entityAtlases[0], uv, 0.0);
@@ -148,6 +144,7 @@ vec4 sampleEntityAtlas(uint textureSlot, vec2 uv)
         case 128u: return textureLod(entityAtlases[127], uv, 0.0);
         default: return vec4(1.0);
     }
+#endif
 }
 
 // 2026-10-09：实体 LabPBR 一次取两图（`_n` + `_s`）。与 sampleEntityAtlas 同样
@@ -167,11 +164,11 @@ void sampleEntityPbr(
         specularTexel = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
-    normalTexel = textureLod(entityNormalAtlases[textureSlot - 1u], uv, 0.0);
-    specularTexel = textureLod(entitySpecularAtlases[textureSlot - 1u], uv, 0.0);
+    const uint entityPbrIdx = nonuniformEXT(textureSlot - 1u);
+    normalTexel = textureLod(entityNormalAtlases[entityPbrIdx], uv, 0.0);
+    specularTexel = textureLod(entitySpecularAtlases[entityPbrIdx], uv, 0.0);
     return;
-#endif
-
+#else
     switch(textureSlot)
     {
         case 1u: normalTexel = textureLod(entityNormalAtlases[0], uv, 0.0); specularTexel = textureLod(entitySpecularAtlases[0], uv, 0.0); return;
@@ -243,6 +240,7 @@ void sampleEntityPbr(
             specularTexel = vec4(0.0, 0.0, 0.0, 1.0);
             return;
     }
+#endif
 }
 
 vec4 sampleRTAlbedo(uint textureSlot, vec2 uv)

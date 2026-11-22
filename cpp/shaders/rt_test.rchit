@@ -1,6 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -325,7 +326,8 @@ void main()
     // **不进材质解析**。它替代了原来"整条射线都 SkipClosestHitShader"的做法
     // （那样 any-hit 拿不到任何 t）。purpose 5 = RT_PURPOSE_GLASS_VISIBILITY，
     // 与 rt_test.rahit 的同名常量一致。
-    if((payload.state & 0x7u) == 5u)
+    const uint rtFastVisPurpose = payload.state & 0x7u;
+    if(rtFastVisPurpose == 5u || rtFastVisPurpose == 3u)
     {
         payload.hitDistance = gl_HitTEXT;
         return;
