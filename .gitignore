@@ -124,6 +124,30 @@ cpp/external/**/.git
 /rust/**/dist/
 /rust/.toolchains/
 
+# 2026-11-23 仓库整理：根目录只应放构建入口与少量工具脚本。
+# 历史上这里堆过 196 个 shader/SPV 副本（91 个与 cpp/shaders 逐字节相同、85 个是
+# 同名旧版）、25 个日志、56 张截图、52MB 的 rtx_backend.dll.bak_*、38MB 的
+# voxy jar 与两个 15MB 的 zip。以下规则防止再次堆积；真正的 shader 源在
+# cpp/shaders，运行时副本在 run/shaders。
+/*.spv
+/*.glsl
+/*.comp
+/*.vert
+/*.frag
+/*.log
+/*.png
+/*.ppm
+/*.zip
+/voxy-*.jar
+/_tmp_*
+/_launch_*
+/_mc_cmdline.txt
+/vkdiag.txt
+/rtx_backend.dll.bak_*
+/nvngx_*.dll.bak_*
+/HANDOFF-*.md
+/CRASH_HANDOFF.md
+
 # 开发期临时脚本与验证目录（_deploy_*/_perf_l10 等仍保留）
 /.build_scratch/
 /_tmp_*
