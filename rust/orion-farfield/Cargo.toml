@@ -1,0 +1,16 @@
+[package]
+name = "orion-farfield"
+version = "0.1.0"
+edition = "2021"
+# Orion 远场（DH LOD）加速试点 — 见 HANDOFF-2026-11-17-DH-OPT-AND-RUST.md §5
+# M0 前置：安装 rustup-msvc（winget install Rustlang.Rustup），然后 cargo check
+
+[lib]
+name = "orion_farfield"
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+# 注意：不设 panic="abort"——导出函数统一 catch_unwind 返回错误码，
+# 避免 panic 直接打死整个 Minecraft 进程。

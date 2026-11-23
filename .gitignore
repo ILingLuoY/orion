@@ -116,6 +116,14 @@ cpp/external/**/.git
 /vulkan-rtx-java-current.zip
 *.spvasm
 
+# Rust（orion-farfield）
+# 2026-11-23：rust/ 此前从未被 git 跟踪（远端仓库里看不到源码），只有一份旧
+# orion_farfield.dll，且缺 off_convert_sections 导出 ⇒ Java 侧 RustBridge 初始化
+# 直接失败、远景被裁成空洞。现在源码与构建脚本进仓库；cargo 产物与中间缓存不进。
+/rust/**/target/
+/rust/**/dist/
+/rust/.toolchains/
+
 # 开发期临时脚本与验证目录（_deploy_*/_perf_l10 等仍保留）
 /.build_scratch/
 /_tmp_*
