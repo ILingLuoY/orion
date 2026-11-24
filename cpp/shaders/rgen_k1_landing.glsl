@@ -59,6 +59,7 @@ uint ptLandingRecordIndex(uint pixelLinear, int s)
 void ptLandingInvalidate(uint index)
 {
     ptLandingRecords[index].a.x = 0.0;
+    ptLandingRecords[index].c.w = 0u;
 }
 
 // 切点身份快照。payload 此刻 = K1 精简 rchit 播种的身份五元组：
@@ -126,6 +127,51 @@ void ptLandingLoadGlossyExtra(uint index, out vec3 glossyRaw, out float specHitD
 {
     glossyRaw = ptLandingRecords[index].d.xyz;
     specHitDist = ptLandingRecords[index].d.w;
+}
+
+vec2 ptOctEncode(vec3 n)
+{
+    float l1 = abs(n.x) + abs(n.y) + abs(n.z);
+    vec3 u = l1 > 1.0e-8 ? (n / l1) : vec3(0.0, 1.0, 0.0);
+    if(u.z < 0.0)
+    {
+        vec2 sgn = vec2(u.x >= 0.0 ? 1.0 : -1.0, u.y >= 0.0 ? 1.0 : -1.0);
+        u.xy = (1.0 - abs(u.yx)) * sgn;
+    }
+    return clamp(u.xy, vec2(-1.0), vec2(1.0));
+}
+
+uint ptEncodeAxisFace(vec3 face)
+{
+    if(dot(face, face) <= 0.25) return 7u;
+    vec3 af = abs(face);
+    if(af.x >= af.y && af.x >= af.z) return face.x >= 0.0 ? 0u : 1u;
+    if(af.y >= af.z) return face.y >= 0.0 ? 2u : 3u;
+    return face.z >= 0.0 ? 4u : 5u;
+}
+
+void ptLandingStoreSpatialMaterial(
+    uint index,
+    vec3 albedo,
+    float roughness,
+    vec3 f0,
+    float metallic,
+    vec3 shadingNormal,
+    vec3 geomFace,
+    bool pixelActive
+)
+{
+    uint faceCode = ptEncodeAxisFace(geomFace);
+    bool hasPbr = f0.x >= 0.0;
+    vec3 safeN = dot(shadingNormal, shadingNormal) > 1.0e-8
+        ? normalize(shadingNormal)
+        : vec3(0.0, 1.0, 0.0);
+    uvec4 packedC;
+    packedC.x = packUnorm4x8(vec4(clamp(albedo, 0.0, 1.0), clamp(roughness, 0.0, 1.0)));
+    packedC.y = packUnorm4x8(vec4(clamp(max(f0, vec3(0.0)), 0.0, 1.0), clamp(metallic, 0.0, 1.0)));
+    packedC.z = packSnorm2x16(ptOctEncode(safeN));
+    packedC.w = faceCode | (hasPbr ? 8u : 0u) | (pixelActive ? 16u : 0u) | (0x5au << 24u);
+    ptLandingRecords[index].c = packedC;
 }
 
 #endif // ORION_K1_PRIMARY || ORION_K2_TRANSPORT

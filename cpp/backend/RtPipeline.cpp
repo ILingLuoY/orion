@@ -202,7 +202,7 @@ PERF_L10_TIME_STALL("tlasQueueIdle", check(
 << "[RT INIT] TLAS BUILD COMPLETE\n";
 }
 VkDescriptorSetLayout createRTDescriptorSetLayout(){
-    VkDescriptorSetLayoutBinding b[99]{};
+    VkDescriptorSetLayoutBinding b[101]{};
 
     b[0].binding=0; b[0].descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; b[0].descriptorCount=1; b[0].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     b[1].binding=1; b[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; b[1].descriptorCount=1; b[1].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_COMPUTE_BIT;
@@ -379,12 +379,12 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[29].binding = 31;
     b[29].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[29].descriptorCount = 1;
-    b[29].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    b[29].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     b[30].binding = 32;
     b[30].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[30].descriptorCount = 1;
-    b[30].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    b[30].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     b[31].binding = 33;
     b[31].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -615,7 +615,8 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[70].binding = 70;
     b[70].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     b[70].descriptorCount = 1;
-    b[70].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    b[70].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                       VK_SHADER_STAGE_COMPUTE_BIT;
 
     b[71].binding = 71;
     b[71].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -747,14 +748,14 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[88].binding = 88;
     b[88].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[88].descriptorCount = 1;
-    b[88].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    b[88].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // ③ K2-D/K2-I 直射级交接图（rgba32f）。仅拆分变体的 spv 声明它；K1/主变体
     // 不访问，但共享 pipeline layout 必须声明（描述符未绑定时拆分管线不会用它）。
     b[89].binding = 89;
     b[89].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[89].descriptorCount = 1;
-    b[89].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    b[89].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // 2026-11-11 太阳可见度屏幕空间滤波（软影 A 方案，形态 1）：
     //   90 = sunVisRaw（全分辨率 rgba16f，raygen 写 / 滤波 comp 读）
@@ -775,13 +776,12 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
         VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // 2026-11-14 曾用：稀疏反射的时域历史（binding 92）。
-    // 2026-11-16 撤销：观感影响大，反射改为**不参与稀疏**（VPT_SPARSE_GLOSSY=0），
-    // 着色器不再声明本槽位，也没有任何图像绑定它。槽位本身保留不删 ——
-    // 删了会牵连后面 b[93]（RT 阶段计数器）的编号。
+    // 2026-11-24：复用于 K2-I 稀疏紧凑间接调度的 GI 暂存输出图（rgba16f）。
     b[92].binding = 92;
     b[92].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[92].descriptorCount = 1;
-    b[92].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    b[92].stageFlags =
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // 2026-11-16：RT 阶段三计数器（rays / hits / material evals）storage buffer。
     // 仅总闸 ORION_RT_STAGE_COUNTERS=1 时 ensureRtStageCounters() 才写描述；关闭时
@@ -835,16 +835,28 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[98].descriptorCount = 1;
     b[98].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 
+    // 2026-11-23 M3: GPU 8x8x8 ReGIR Light Grid (binding 99).
+    b[99].binding = 99;
+    b[99].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[99].descriptorCount = 1;
+    b[99].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+
+    // 2026-11-24: K2-I 稀疏活跃像素紧凑间接调度缓冲（binding 100）。
+    b[100].binding = 100;
+    b[100].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[100].descriptorCount = 1;
+    b[100].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+
     // D1：材质 callable 也读这套描述符（landing 槽位回传）。stageFlags 不参与
     // 管线布局兼容性判定，全量放行不影响既有管线（spv 无 callable 阶段照常工作）。
     for(auto& entry : b)
     {
-        entry.stageFlags |= VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+        entry.stageFlags |= VK_SHADER_STAGE_CALLABLE_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
     }
 
     VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     static_assert(
-        sizeof(b) / sizeof(b[0]) == 99u,
+        sizeof(b) / sizeof(b[0]) == 101u,
         "RT descriptor set layout: update this assert together with b[]"
     );
     ci.bindingCount = static_cast<uint32_t>(sizeof(b) / sizeof(b[0]));

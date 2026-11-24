@@ -756,27 +756,6 @@ void main() {
     // The alpha test defines the visible cutout silhouette.  It must
     // use the same unfiltered base-atlas texel as closest-hit, otherwise
     // linear filtering turns foliage and grass into semi-transparent blur.
-    // =====================================================
-    // 2026-11-22 批3：植物 UV 摇摆（叶道 materialId 0.25）。与 material_resolve
-    // 的着色侧用 windFoliageUvSway 同一函数同一输入（插值顶点位置 + 顶点 UV 三元
-    // 组）⇒ alpha 剪影与着色逐位一致地随风摆。实体/粒子/雨/voxy 的 materialId
-    // 编码与叶道撞区间 ⇒ 全部排除。
-    // =====================================================
-    if(materialId > 0.2 && materialId < 0.45 &&
-       entityTextureSlot == 0u && particleTextureSlot == 0u &&
-       !isVoxyAnyHit && !isRtWeatherRain)
-    {
-        const vec2 swayUv0 = vec2(v0.u, v0.v);
-        const vec2 swayUv1 = vec2(v1.u, v1.v);
-        const vec2 swayUv2 = vec2(v2.u, v2.v);
-        const ivec2 swayAtlasSize = textureSize(blockAtlas, 0);
-        texCoord = windFoliageUvSway(
-            texCoord,
-            swayUv0, swayUv1, swayUv2,
-            hitWorldPosition,
-            1.0 / vec2(swayAtlasSize));
-    }
-
     vec4 atlasSample;
     if(isVoxyAnyHit)
     {

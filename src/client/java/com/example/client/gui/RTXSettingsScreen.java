@@ -1025,7 +1025,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                                 ),
                                 this.pendingGiBounces
                         )
-                        .withValues(0, 1, 2, 3, 4)
+                        .withValues(0, 1, 2, 3, 4, 6, 8)
                         .create(
                                 Component.literal("GI 跳数"),
                                 (button, value) -> this.pendingGiBounces = value

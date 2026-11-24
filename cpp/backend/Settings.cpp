@@ -57,7 +57,11 @@ bool hdrOutputActive()
 {
     return
         g_hdrRequested.load() &&
-        g_hdrSurfaceSupported.load();
+        g_hdrSurfaceSupported.load() &&
+        // 2026-11-23：再加一道系统侧门控 —— Windows「使用 HDR」没开时驱动仍会
+        // 报告 ST2084 支持，若照样输出 HDR10/PQ，系统只能按 SDR 桌面合成 ⇒
+        // 画面发灰。查询失败时 windowsHdrAllowsHdrOutput() 返回 true（保持旧行为）。
+        windowsHdrAllowsHdrOutput();
 }
 bool glassAlphaBlendEnvFlag(const char* name)
 {
@@ -317,7 +321,11 @@ bool giNoPomEnabled()
     static const bool cached = []()
     {
         const char* raw = std::getenv("ORION_GI_NO_POM");
-        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return true;
+        }
+        return raw[0] != '0';
     }();
 
     return cached;
@@ -417,7 +425,7 @@ int rtxdiReuseInactiveEnabled()
         const char* raw = std::getenv("ORION_RTDI_REUSE_INACTIVE");
         if(raw == nullptr || raw[0] == '\0')
         {
-            return 0;
+            return 1;
         }
         return raw[0] != '0' ? 1 : 0;
     }();

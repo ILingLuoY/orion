@@ -3,9 +3,88 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+// ============================================================================
+// 2026-11-23：HDR 显示路径补高光肩部压缩 + 打通统一曝光参数
+//
+// 旧实现的两个问题（"开 HDR 整体过曝"的根因）：
+//   1) 这里只有 exposure → 硬 clamp(10000/203) → PQ，**没有任何 tone mapping**；
+//      而 SDR 路径（rr_sdr_post.comp）有 uchimura 曲线把 >1 的部分压回显示域。
+//      场景的线性白通常不是 1.0（地形白 ≈1、云 5~20、太阳更高），HDR 下这些
+//      像素直接落到 1000~10000 nits，看起来就是整屏爆白。
+//   2) 曝光强度写死 0.6；UI 的"曝光强度"、CG 曝光（manualEV）、色彩增益
+//      （gainR/G/B）在 HDR 下全部无效 —— 用户没有任何旋钮可以压暗。
+//
+// 现在：
+//   · 曝光参数改读 push_constant（与 SDR 同一套 128 字节布局，仍然由
+//     display 派发统一推送）。默认值不变：exposureStrength=0.6、manualEV=0、
+//     gain=1，所以不开肩部时与旧版逐位一致。
+//   · 转 Rec2020 / PQ 之前加 soft shoulder：knee 以下（默认 = 1.0 参考白 =
+//     203 nits）完全线性，knee 以上平滑渐近到 HDR_PEAK_NITS（1000 nits，与
+//     applyHdrStaticMetadata() 上报的 maxLuminance 一致）。中间调不变，只压高光。
+//   · -DHDR_SHOULDER_ENABLED=0 可回退旧版行为（编译期 A/B）。
+//   · HDR_REFERENCE_WHITE_NITS 默认 203（BT.2408 的 SDR 白）。若整屏仍偏亮，
+//     改成 120~150 可整体降档（峰值不变，动态范围更大）。
+// ============================================================================
+
+#ifndef HDR_REFERENCE_WHITE_NITS
+#define HDR_REFERENCE_WHITE_NITS 203.0
+#endif
+
+#ifndef HDR_PEAK_NITS
+#define HDR_PEAK_NITS 1000.0
+#endif
+
+#ifndef HDR_SHOULDER_ENABLED
+#define HDR_SHOULDER_ENABLED 1
+#endif
+
+// 相对参考白的肩部起点：1.0 = 超过"SDR 白点"才开始压缩。
+#ifndef HDR_SHOULDER_KNEE_REL
+#define HDR_SHOULDER_KNEE_REL 1.0
+#endif
+
 #ifndef RR_STABLE_GLASS_RADIANCE
 #define RR_STABLE_GLASS_RADIANCE 0
 #endif
+
+// 与 rr_sdr_post.comp / OrionInternal.h 的 PostProcessingPush 逐字节一致。
+// display 派发对 HDR / SDR 是同一份 push 数据，这里只读其中几个 lane。
+layout(push_constant) uniform PostPush
+{
+    int tonemapMode;
+    float exposureStrength;
+    float contrast;
+    float saturation;
+    float gamma;
+    float gainR;
+    float gainG;
+    float gainB;
+
+    float manualEV;
+    float blackPoint;
+    float whitePoint;
+    float gradeContrast;
+    float gradePivot;
+    float liftR;
+    float liftG;
+    float liftB;
+    float gradeGammaR;
+    float gradeGammaG;
+    float gradeGammaB;
+    float gradeGainR;
+    float gradeGainG;
+    float gradeGainB;
+    float shadowHue;
+    float shadowStrength;
+    float highlightHue;
+    float highlightStrength;
+    float vibrance;
+    float fade;
+    float vignette;
+    float vignetteRadius;
+    float hueRotate;
+    float tintGreen;
+} postPush;
 
 layout(binding = 0, set = 0, rgba16f)
 uniform image2D rrOutputImage;
@@ -27,15 +106,12 @@ buffer AeState
     float cloudWhite;
 };
 
-const float AE_EXPOSURE_STRENGTH = 0.6;
-
 const float PQ_M1 = 0.1593017578125;
 const float PQ_M2 = 78.84375;
 const float PQ_C1 = 0.8359375;
 const float PQ_C2 = 18.8515625;
 const float PQ_C3 = 18.6875;
 const float PQ_PEAK_NITS = 10000.0;
-const float PQ_REFERENCE_WHITE_NITS = 203.0;
 
 const mat3 REC709_TO_REC2020 = mat3(
     0.6274040, 0.0690970, 0.0163916,
@@ -62,6 +138,16 @@ vec3 encodePQ(vec3 linearNits)
     );
 }
 
+// 软膝肩部：x <= knee 时输出 x（一阶连续、斜率 1）；
+// x → ∞ 时渐近 peak。用来把"场景线性白 > 1"的部分收进显示域。
+vec3 hdrShoulder(vec3 x, float knee, float peak)
+{
+    float span = max(peak - knee, 1.0e-3);
+    vec3 over = max(x - vec3(knee), vec3(0.0));
+
+    return min(x, vec3(knee)) + span * over / (over + vec3(span));
+}
+
 void main()
 {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -79,6 +165,9 @@ void main()
             mix(color.rgb, vec3(0.0), isnan(color.rgb)),
             vec3(0.0)
         );
+
+    linear =
+        mix(linear, vec3(0.0), isinf(linear));
 
 #if RR_STABLE_GLASS_RADIANCE
 #ifndef POST_SKIP_STABLE
@@ -105,13 +194,33 @@ void main()
 #endif
 #endif
 
+    // 曝光与 SDR 同口径，只是强度由 UI/宿主推送（默认 0.6，与旧常量一致）。
     linear *=
-        exp2(currentEV * AE_EXPOSURE_STRENGTH);
+        exp2(currentEV * postPush.exposureStrength);
+
+    linear *=
+        vec3(postPush.gainR, postPush.gainG, postPush.gainB);
+
+    linear *=
+        exp2(postPush.manualEV);
+
+#if HDR_SHOULDER_ENABLED
+    {
+        const float peakRel =
+            HDR_PEAK_NITS / HDR_REFERENCE_WHITE_NITS;
+
+        linear =
+            hdrShoulder(
+                linear,
+                HDR_SHOULDER_KNEE_REL,
+                peakRel);
+    }
+#endif
 
     linear =
         min(
             linear,
-            vec3(PQ_PEAK_NITS / PQ_REFERENCE_WHITE_NITS)
+            vec3(PQ_PEAK_NITS / HDR_REFERENCE_WHITE_NITS)
         );
 
     vec3 rec2020 =
@@ -119,7 +228,7 @@ void main()
 
     vec3 encoded =
         encodePQ(
-            rec2020 * PQ_REFERENCE_WHITE_NITS
+            rec2020 * HDR_REFERENCE_WHITE_NITS
         );
 
     imageStore(

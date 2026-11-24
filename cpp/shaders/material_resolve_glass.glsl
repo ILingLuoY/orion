@@ -127,6 +127,8 @@ void resolveHitMaterialGlass(vec3 rayOrigin, vec3 rayDirection, vec3 barycentric
             }
         }
 
+        g_hitWorldOffset = hitWorldOffset;
+        g_hitOffsetValid = true;
     }
 
 float interpU =

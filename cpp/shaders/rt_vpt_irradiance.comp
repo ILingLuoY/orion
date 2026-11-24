@@ -15,8 +15,8 @@ const uint SOURCE_WORDS = 4096u;
 const uint PROBE_EDGE = 9u;
 const uint PROBE_WORDS = 729u;
 const uint DIRECTION_COUNT = 6u;
-const uint DIRECTIONAL_CACHE_WORDS = DIRECTION_COUNT * PROBE_WORDS;
-const uint PAGE_WORDS = SOURCE_WORDS + DIRECTIONAL_CACHE_WORDS;
+const uint DIRECTIONAL_CACHE_WORDS = 0u;
+const uint PAGE_WORDS = SOURCE_WORDS;
 const uint SURFACE_FACE_WORDS = SOURCE_WORDS * DIRECTION_COUNT;
 const uint CANDIDATES_PER_PAGE = 8u;
 const float MAX_LIGHT_DISTANCE = 30.0;
@@ -569,6 +569,7 @@ bool resolveWorkPage(uint invocation, uint entriesPerPage, out uint page, out iv
 
 void solveDirectProbe(uint invocation)
 {
+    return;
     uint page;
     ivec3 section;
     uint probe;
@@ -684,6 +685,7 @@ void solveSurfaceFace(uint invocation)
 
 void solveSecondaryLobe(uint invocation)
 {
+    return;
     uint page;
     ivec3 section;
     uint probeDirection;

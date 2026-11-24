@@ -34,6 +34,10 @@ layout(push_constant) uniform FogFroxelPush
 #define TERRAIN_HEIGHT_CONSUMER 1
 #include "terrain_height.glsl"
 
+#ifndef FOG_SILHOUETTE_FIX
+#define FOG_SILHOUETTE_FIX 1
+#endif
+
 // Calibrated so UI density 1.0 = subtle depth haze, 2.5 = rich mist, 5+ = thick fog.
 const float FOG_HAZE_EXTINCTION_UNIT = 0.0028;
 const float FOG_SHAFT_AEROSOL_UNIT   = 0.0080;
@@ -42,6 +46,9 @@ const float FOG_SIGMA_CLAMP          = 0.25;
 
 shared float sTileMaxDist[4][4];
 shared float sTileMinDist[4][4];
+#if FOG_SILHOUETTE_FIX
+shared vec2  sTileFarUv[4][4];
+#endif
 
 // Wide 9-tap hemisphere openness & smoothed ground elevation from terrainHeightMap.
 // Eliminates artificial vertical light pillars under small ceiling/canopy gaps and smooths
@@ -134,35 +141,61 @@ void main()
     {
         float tileMax = maxDistance;
         float tileMin = maxDistance;
+#if FOG_SILHOUETTE_FIX
+        vec2 farUv = vec2(0.5);
+#endif
         const ivec2 depthSize = textureSize(sceneDepth, 0);
         if(coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
         {
             const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
             const vec2 tileStep = 1.0 / vec2(size.xy);
+#if FOG_SILHOUETTE_FIX
+            farUv = centerUv;
+#endif
             float minRawDepth = 1.0;
             float maxRawDepth = 0.0;
             vec2 minDepthUv = centerUv;
             vec2 maxDepthUv = centerUv;
             bool hasSky = false;
+#if FOG_SILHOUETTE_FIX
+            uint skyMask = 0u;
+            vec2 tapCenterUvs[16];
+#endif
 
             for(int ty = 0; ty < 4; ++ty)
             {
                 for(int tx = 0; tx < 4; ++tx)
                 {
+#if FOG_SILHOUETTE_FIX
+                    const vec2 offset = (vec2(float(tx), float(ty)) * (1.0 / 3.0) - 0.5) * 0.94 * tileStep;
+#else
                     const vec2 offset = (vec2(float(tx), float(ty)) * (1.0 / 3.0) - 0.5) * 0.90 * tileStep;
+#endif
                     const vec2 sampleUv = clamp(centerUv + offset, vec2(0.0005), vec2(0.9995));
                     const ivec2 dCoord = clamp(ivec2(sampleUv * vec2(depthSize)), ivec2(0), depthSize - ivec2(1));
+#if FOG_SILHOUETTE_FIX
+                    const vec2 snappedUv = (vec2(dCoord) + 0.5) / vec2(depthSize);
+                    const int tapIdx = ty * 4 + tx;
+                    tapCenterUvs[tapIdx] = snappedUv;
+#endif
                     const float d = texelFetch(sceneDepth, dCoord, 0).r;
                     if(d <= 1.0e-5)
                     {
                         hasSky = true;
+#if FOG_SILHOUETTE_FIX
+                        skyMask |= (1u << uint(tapIdx));
+#endif
                     }
                     else
                     {
                         if(d < minRawDepth)
                         {
                             minRawDepth = d;
+#if FOG_SILHOUETTE_FIX
+                            minDepthUv = snappedUv;
+#else
                             minDepthUv = sampleUv;
+#endif
                         }
                         if(d > maxRawDepth)
                         {
@@ -173,10 +206,65 @@ void main()
                 }
             }
 
+#if FOG_SILHOUETTE_FIX
+            if(hasSky)
+            {
+                if(skyMask == 0xFFFFu)
+                {
+                    farUv = centerUv;
+                }
+                else
+                {
+                    int bestIdx = -1;
+                    int bestSolidDist2 = -1;
+                    float bestCenterDist2 = 1.0e9;
+                    for(int i = 0; i < 16; ++i)
+                    {
+                        if((skyMask & (1u << uint(i))) == 0u)
+                        {
+                            continue;
+                        }
+                        const int ix = i & 3;
+                        const int iy = i >> 2;
+                        int minSolidDist2 = 1000;
+                        for(int j = 0; j < 16; ++j)
+                        {
+                            if((skyMask & (1u << uint(j))) != 0u)
+                            {
+                                continue;
+                            }
+                            const int dx = ix - (j & 3);
+                            const int dy = iy - (j >> 2);
+                            minSolidDist2 = min(minSolidDist2, dx * dx + dy * dy);
+                        }
+                        const vec2 delta = tapCenterUvs[i] - centerUv;
+                        const float centerDist2 = dot(delta, delta);
+                        if(bestIdx < 0 ||
+                           minSolidDist2 > bestSolidDist2 ||
+                           (minSolidDist2 == bestSolidDist2 && centerDist2 < bestCenterDist2))
+                        {
+                            bestIdx = i;
+                            bestSolidDist2 = minSolidDist2;
+                            bestCenterDist2 = centerDist2;
+                        }
+                    }
+                    if(bestIdx >= 0)
+                    {
+                        farUv = tapCenterUvs[bestIdx];
+                    }
+                }
+            }
+            else
+            {
+                tileMax = min(maxDistance, fogSceneDistanceForDepth(minDepthUv, minRawDepth, cam.projInverse));
+                farUv = minDepthUv;
+            }
+#else
             if(!hasSky)
             {
                 tileMax = min(maxDistance, fogSceneDistanceForDepth(minDepthUv, minRawDepth, cam.projInverse));
             }
+#endif
             if(maxRawDepth > 1.0e-5)
             {
                 tileMin = min(tileMax, fogSceneDistanceForDepth(maxDepthUv, maxRawDepth, cam.projInverse));
@@ -188,6 +276,9 @@ void main()
         }
         sTileMaxDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = tileMax;
         sTileMinDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = tileMin;
+#if FOG_SILHOUETTE_FIX
+        sTileFarUv[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = farUv;
+#endif
     }
     barrier();
 
@@ -197,11 +288,35 @@ void main()
     }
 
     // Last Z slice (layers - 1) is not a segment; Pass 3 stores [0..layers-1] boundaries.
+#if FOG_SILHOUETTE_FIX
+    if(coord.z == segmentCount)
+    {
+        if(cam.cloudParams7.x >= 0.5 && cam.waterSimState.w == 0u)
+        {
+            imageStore(fogFroxelDensity, coord, vec4(
+                sTileMinDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y],
+                sTileMaxDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y],
+                0.0,
+                1.0));
+        }
+        else
+        {
+            imageStore(fogFroxelDensity, coord, vec4(0.0, maxDistance, 0.0, 0.0));
+        }
+        return;
+    }
+    if(cam.cloudParams7.x < 0.5 || cam.waterSimState.w != 0u || coord.z > segmentCount)
+    {
+        imageStore(fogFroxelDensity, coord, vec4(0.0));
+        return;
+    }
+#else
     if(cam.cloudParams7.x < 0.5 || cam.waterSimState.w != 0u || coord.z >= segmentCount)
     {
         imageStore(fogFroxelDensity, coord, vec4(0.0));
         return;
     }
+#endif
 
     const float d0 = fogSliceBoundaryDistance(coord.z, layers, maxDistance);
     const float d1 = fogSliceBoundaryDistance(coord.z + 1, layers, maxDistance);
@@ -222,7 +337,13 @@ void main()
     const vec2 xyOffset = mix(vec2(0.5), jitter.xy, useJitter ? 0.85 : 0.0);
     const float zOffset = mix(0.5, jitter.z, useJitter ? 0.90 : 0.0);
 
-    const vec2 uv = (vec2(coord.xy) + xyOffset) / vec2(size.xy);
+    vec2 uv = (vec2(coord.xy) + xyOffset) / vec2(size.xy);
+#if FOG_SILHOUETTE_FIX
+    if(d0 >= tileMinDist)
+    {
+        uv = sTileFarUv[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+    }
+#endif
     const vec3 worldDir = fogWorldRayDirection(uv, cam.projInverse, cam.viewInverse);
     const vec3 cameraPos = cam.viewInverse[3].xyz;
     const float boundDist = (d0 < tileMinDist) ? tileMinDist : tileMaxDist;

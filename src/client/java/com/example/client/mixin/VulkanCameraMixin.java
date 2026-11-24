@@ -156,14 +156,71 @@ public class VulkanCameraMixin {
      * 玩家在水里时不走这里（走 findPlayerWaterSurfaceY，门判据也短路）。
      * 回退 = 把调用处改回 findPlayerWaterSurfaceY(playerPosition)。
      */
+    private static final boolean NEAREST_WATER_SURFACE_PROBE = true;
+    private static final int NEARBY_WATER_RING_HALF_EXTENT = 24;
+    private static final int NEARBY_WATER_RING_STEP = 2;
+    private static final int NEARBY_WATER_RING_UP_BLOCKS = 6;
+    private static final int NEARBY_WATER_RING_DOWN_BLOCKS = 16;
     private static final int NEARBY_WATER_PROBE_HALF_EXTENT = 96;
     private static final int NEARBY_WATER_PROBE_STEP = 8;
     private static final int NEARBY_WATER_PROBE_UP_BLOCKS = 8;
     private static final int NEARBY_WATER_PROBE_DOWN_BLOCKS = 32;
-    private static final long NEARBY_WATER_PROBE_INTERVAL_NANOS = 500_000_000L;
+    private static final long NEARBY_WATER_PROBE_INTERVAL_NANOS = 250_000_000L;
     private long lastNearbyWaterProbeNanos = 0L;
     private float cachedNearbyWaterSurfaceY = 0.0f;
     private boolean cachedNearbyWaterValid = false;
+    private final BlockPos.MutableBlockPos nearbyWaterProbeCursor =
+            new BlockPos.MutableBlockPos();
+    private final BlockPos.MutableBlockPos nearbyWaterClimbCursor =
+            new BlockPos.MutableBlockPos();
+
+    private boolean lastProbedWaterIsSource = false;
+
+    private float probeColumnWaterSurfaceY(
+            Level level, int x, int z, int yTop, int yBottom, int dyStep, float playerY) {
+        for (int y = yTop; y >= yBottom; y -= dyStep) {
+            nearbyWaterProbeCursor.set(x, y, z);
+            FluidState state = level.getFluidState(nearbyWaterProbeCursor);
+            if (!state.is(FluidTags.WATER)) {
+                continue;
+            }
+            int topY = y;
+            FluidState topState = state;
+            for (int climb = 0; climb < 64; ++climb) {
+                nearbyWaterClimbCursor.set(x, topY + 1, z);
+                FluidState above = level.getFluidState(nearbyWaterClimbCursor);
+                if (!above.is(FluidTags.WATER)) {
+                    break;
+                }
+                ++topY;
+                topState = above;
+            }
+            nearbyWaterClimbCursor.set(x, topY, z);
+            float surfaceY = topY + topState.getHeight(level, nearbyWaterClimbCursor);
+            if (Math.abs(surfaceY - playerY) <= 32.0f) {
+                lastProbedWaterIsSource = topState.isSource();
+                return surfaceY;
+            }
+            // Water column surface is too far vertically from player; stop climbing this column.
+            break;
+        }
+        lastProbedWaterIsSource = false;
+        return Float.NaN;
+    }
+
+    private double waterCandidateScore(
+            int dx, int dz, float surfaceY, float playerY, boolean isSource) {
+        double dySurf = surfaceY - playerY;
+        double score = dx * (double) dx + dz * (double) dz + dySurf * dySurf;
+        if (!isSource) {
+            score += 16.0;
+        }
+        if (!Float.isNaN(lastWaterSimMaskSurfaceY)
+                && Math.abs(surfaceY - lastWaterSimMaskSurfaceY) <= 0.25f) {
+            score -= 64.0;
+        }
+        return score;
+    }
 
     private float findNearbyWaterSurfaceY(Vec3 playerPosition) {
         long now = System.nanoTime();
@@ -185,43 +242,134 @@ public class VulkanCameraMixin {
         int py = playerBlock.getY();
         int pz = playerBlock.getZ();
 
-        for (int dz = -NEARBY_WATER_PROBE_HALF_EXTENT;
-                dz <= NEARBY_WATER_PROBE_HALF_EXTENT;
-                dz += NEARBY_WATER_PROBE_STEP) {
-            for (int dx = -NEARBY_WATER_PROBE_HALF_EXTENT;
-                    dx <= NEARBY_WATER_PROBE_HALF_EXTENT;
-                    dx += NEARBY_WATER_PROBE_STEP) {
-                for (int dy = NEARBY_WATER_PROBE_UP_BLOCKS;
-                        dy >= -NEARBY_WATER_PROBE_DOWN_BLOCKS;
-                        dy -= 2) {
-                    BlockPos probe = new BlockPos(px + dx, py + dy, pz + dz);
-                    FluidState state = this.minecraft.level.getFluidState(probe);
-                    if (!state.is(FluidTags.WATER)) {
-                        continue;
-                    }
-                    BlockPos topBlock = probe;
-                    FluidState topState = state;
-                    for (int climb = 0; climb < 64; ++climb) {
-                        FluidState above =
-                                this.minecraft.level.getFluidState(topBlock.above());
-                        if (!above.is(FluidTags.WATER)) {
-                            break;
-                        }
-                        topBlock = topBlock.above();
-                        topState = above;
-                    }
-                    float surfaceY = topBlock.getY() +
-                            topState.getHeight(this.minecraft.level, topBlock);
-                    if (Math.abs(surfaceY - (float) playerPosition.y) <= 32.0f) {
-                        cachedNearbyWaterSurfaceY = surfaceY;
+        if (NEAREST_WATER_SURFACE_PROBE) {
+            final float playerY = (float) playerPosition.y;
+            final Level level = this.minecraft.level;
+            final int yRingTop = py + NEARBY_WATER_RING_UP_BLOCKS;
+            final int yRingBottom = py - NEARBY_WATER_RING_DOWN_BLOCKS;
+
+            for (int r = 0; r <= NEARBY_WATER_RING_HALF_EXTENT;
+                    r += (r < 8 ? 1 : NEARBY_WATER_RING_STEP)) {
+                final int step = (r <= 8) ? 1 : NEARBY_WATER_RING_STEP;
+                boolean foundInRing = false;
+                double bestScore = Double.MAX_VALUE;
+                float bestSurfaceY = 0.0f;
+
+                if (r == 0) {
+                    float s = probeColumnWaterSurfaceY(level, px, pz, yRingTop, yRingBottom, 1, playerY);
+                    if (!Float.isNaN(s)) {
+                        cachedNearbyWaterSurfaceY = s;
                         return cachedNearbyWaterSurfaceY;
                     }
-                    // 该水柱顶面离玩家太远（悬崖俯瞰等），这一柱不再向上爬
-                    break;
+                    continue;
+                }
+
+                for (int dx = -r; dx <= r; dx += step) {
+                    for (int edge = -1; edge <= 1; edge += 2) {
+                        int dz = edge * r;
+                        float s = probeColumnWaterSurfaceY(
+                                level, px + dx, pz + dz, yRingTop, yRingBottom, 1, playerY);
+                        if (!Float.isNaN(s)) {
+                            double score = waterCandidateScore(
+                                    dx, dz, s, playerY, lastProbedWaterIsSource);
+                            if (score < bestScore) {
+                                bestScore = score;
+                                bestSurfaceY = s;
+                                foundInRing = true;
+                            }
+                        }
+                    }
+                }
+                for (int dz = -r + step; dz <= r - step; dz += step) {
+                    for (int edge = -1; edge <= 1; edge += 2) {
+                        int dx = edge * r;
+                        float s = probeColumnWaterSurfaceY(
+                                level, px + dx, pz + dz, yRingTop, yRingBottom, 1, playerY);
+                        if (!Float.isNaN(s)) {
+                            double score = waterCandidateScore(
+                                    dx, dz, s, playerY, lastProbedWaterIsSource);
+                            if (score < bestScore) {
+                                bestScore = score;
+                                bestSurfaceY = s;
+                                foundInRing = true;
+                            }
+                        }
+                    }
+                }
+
+                if (foundInRing) {
+                    cachedNearbyWaterSurfaceY = bestSurfaceY;
+                    return cachedNearbyWaterSurfaceY;
                 }
             }
+
+            final int yFarTop = py + NEARBY_WATER_PROBE_UP_BLOCKS;
+            final int yFarBottom = py - NEARBY_WATER_PROBE_DOWN_BLOCKS;
+            boolean foundFar = false;
+            double bestFarScore = Double.MAX_VALUE;
+            float bestFarSurfaceY = 0.0f;
+            for (int dz = -NEARBY_WATER_PROBE_HALF_EXTENT;
+                    dz <= NEARBY_WATER_PROBE_HALF_EXTENT;
+                    dz += NEARBY_WATER_PROBE_STEP) {
+                for (int dx = -NEARBY_WATER_PROBE_HALF_EXTENT;
+                        dx <= NEARBY_WATER_PROBE_HALF_EXTENT;
+                        dx += NEARBY_WATER_PROBE_STEP) {
+                    float s = probeColumnWaterSurfaceY(
+                            level, px + dx, pz + dz, yFarTop, yFarBottom, 2, playerY);
+                    if (!Float.isNaN(s)) {
+                        double score = waterCandidateScore(
+                                dx, dz, s, playerY, lastProbedWaterIsSource);
+                        if (score < bestFarScore) {
+                            bestFarScore = score;
+                            bestFarSurfaceY = s;
+                            foundFar = true;
+                        }
+                    }
+                }
+            }
+            if (foundFar) {
+                cachedNearbyWaterSurfaceY = bestFarSurfaceY;
+            }
+            return cachedNearbyWaterSurfaceY;
+        } else {
+            for (int dz = -NEARBY_WATER_PROBE_HALF_EXTENT;
+                    dz <= NEARBY_WATER_PROBE_HALF_EXTENT;
+                    dz += NEARBY_WATER_PROBE_STEP) {
+                for (int dx = -NEARBY_WATER_PROBE_HALF_EXTENT;
+                        dx <= NEARBY_WATER_PROBE_HALF_EXTENT;
+                        dx += NEARBY_WATER_PROBE_STEP) {
+                    for (int dy = NEARBY_WATER_PROBE_UP_BLOCKS;
+                            dy >= -NEARBY_WATER_PROBE_DOWN_BLOCKS;
+                            dy -= 2) {
+                        BlockPos probe = new BlockPos(px + dx, py + dy, pz + dz);
+                        FluidState state = this.minecraft.level.getFluidState(probe);
+                        if (!state.is(FluidTags.WATER)) {
+                            continue;
+                        }
+                        BlockPos topBlock = probe;
+                        FluidState topState = state;
+                        for (int climb = 0; climb < 64; ++climb) {
+                            FluidState above =
+                                    this.minecraft.level.getFluidState(topBlock.above());
+                            if (!above.is(FluidTags.WATER)) {
+                                break;
+                            }
+                            topBlock = topBlock.above();
+                            topState = above;
+                        }
+                        float surfaceY = topBlock.getY() +
+                                topState.getHeight(this.minecraft.level, topBlock);
+                        if (Math.abs(surfaceY - (float) playerPosition.y) <= 32.0f) {
+                            cachedNearbyWaterSurfaceY = surfaceY;
+                            return cachedNearbyWaterSurfaceY;
+                        }
+                        // 该水柱顶面离玩家太远（悬崖俯瞰等），这一柱不再向上爬
+                        break;
+                    }
+                }
+            }
+            return cachedNearbyWaterSurfaceY;
         }
-        return cachedNearbyWaterSurfaceY;
     }
 
     /**
@@ -522,7 +670,15 @@ public class VulkanCameraMixin {
                 playerInWater > 0.5f
                         ? findPlayerWaterSurfaceY(playerPosition)
                         : findNearbyWaterSurfaceY(playerPosition);
+        if (playerInWater > 0.5f) {
+            cachedNearbyWaterSurfaceY = waterSurfaceY;
+            cachedNearbyWaterValid = true;
+            lastNearbyWaterProbeNanos = System.nanoTime();
+        }
         float cameraInWater = isRenderCameraInWater(pos) ? 1.0f : 0.0f;
+
+        // 2026-11-24: update mask before updateCamera so CameraUBO receives matching origin same frame.
+        updateWaterSimMask(waterSurfaceY);
 
         NativeVulkan.updateCamera(
                 viewInvArray,
@@ -667,7 +823,6 @@ public class VulkanCameraMixin {
         NativeVulkan.updateWaterBoats(waterBoatData, boatCount);
 
         stampPlayerWaterTrail();
-        updateWaterSimMask(waterSurfaceY);
     }
 
     /**
@@ -739,7 +894,7 @@ public class VulkanCameraMixin {
                 Math.abs(waterSurfaceY - lastWaterSimMaskSurfaceY) > 0.01f;
         final long now = System.nanoTime();
         final boolean due =
-                now - lastWaterSimMaskUploadNanos >= 250_000_000L;
+                now - lastWaterSimMaskUploadNanos >= 1_000_000_000L;
         if (!due && !moved && !surfaceChanged) {
             return;
         }

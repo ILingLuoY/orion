@@ -167,7 +167,7 @@ int tlasCullMode()
 
         if(raw == nullptr || raw[0] == '\0')
         {
-            return -1;
+            return 4;
         }
 
         return std::min(std::max(std::atoi(raw), 0), 5);
@@ -194,7 +194,7 @@ bool tlasKeepBoxEnabled()
 
         if(raw == nullptr || raw[0] == '\0')
         {
-            return true;
+            return false;
         }
 
         return raw[0] != '0';
@@ -204,8 +204,7 @@ bool tlasKeepBoxEnabled()
 }
 
 // 近场保底半径（格）：半径内的 Section 永不剔除。
-// 默认 24 —— 覆盖水面模拟的 ±24（48 格见方）与焦散/近场 GI 的最小需求；
-// 反射要更远的话把它调大，或者用 ORION_TLAS_CULL 的边距 lane 外扩视锥。
+// 默认 64 —— 安全覆盖 48 格水面模拟、30 格局部光、室内与近场 GI/反射。
 float tlasNearGuardBlocks()
 {
     static const float s_blocks = []() -> float
@@ -214,12 +213,12 @@ float tlasNearGuardBlocks()
 
         if(raw == nullptr)
         {
-            return 24.0f;
+            return 64.0f;
         }
 
         const float parsed = static_cast<float>(std::atof(raw));
 
-        return parsed >= 0.0f ? parsed : 24.0f;
+        return parsed >= 0.0f ? parsed : 64.0f;
     }();
 
     return s_blocks;
@@ -1152,6 +1151,53 @@ bool acquireSectionMemory(
 
 // 归还一个 chunk（调用点已证明 GPU 不再读它：退役环的 fence 已信号，见
 // releaseRetirementSlot）。整块 slab 空掉时按保留策略决定留用还是真释放。
+// 2026-11-23 CPU批②：slab 是否落在主机内存堆（非 device-local）。
+// 内存属性按物理设备缓存一次；开关关闭时恒返回 false ⇒ 所有 slab 归设备类，逐位旧行为。
+static bool sectionSlabIsHostHeap(uint32_t memoryTypeIndex)
+{
+    if constexpr(!CPUPERF_HOST_SLAB_KEEP)
+    {
+        return false;
+    }
+
+    static VkPhysicalDevice s_cachedPhysicalDevice = VK_NULL_HANDLE;
+    static VkPhysicalDeviceMemoryProperties s_cachedProperties{};
+
+    if(g_physicalDevice == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    if(s_cachedPhysicalDevice != g_physicalDevice)
+    {
+        vkGetPhysicalDeviceMemoryProperties(
+            g_physicalDevice, &s_cachedProperties);
+        s_cachedPhysicalDevice = g_physicalDevice;
+    }
+
+    if(memoryTypeIndex >= s_cachedProperties.memoryTypeCount)
+    {
+        return false;
+    }
+
+    const uint32_t heapIndex =
+        s_cachedProperties.memoryTypes[memoryTypeIndex].heapIndex;
+
+    return (s_cachedProperties.memoryHeaps[heapIndex].flags &
+            VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0u;
+}
+static size_t sectionSlabClassKeepSlabs(bool hostClass)
+{
+    return hostClass
+        ? SECTION_MEMORY_POOL_HOST_KEEP_SLABS
+        : sectionMemoryPoolEffectiveKeepSlabs();
+}
+static VkDeviceSize sectionSlabClassKeepBytes(bool hostClass)
+{
+    return hostClass
+        ? SECTION_MEMORY_POOL_HOST_KEEP_BYTES
+        : sectionMemoryPoolEffectiveKeepBytes();
+}
 void releaseSectionMemory(
     uint32_t slabIndex,
     uint32_t chunkIndex)
@@ -1183,22 +1229,32 @@ void releaseSectionMemory(
 
     if(SECTION_MEMORY_POOL_ENABLED)
     {
+        // 2026-11-23 CPU批②：按「主机堆 / 设备堆」分类计数，各用各的上限。
+        // 开关关闭时 hostClass 恒 false、类内计数 = 全体计数 ⇒ 与旧判据逐位一致。
+        const bool hostClass = sectionSlabIsHostHeap(slab.memoryTypeIndex);
+
         VkDeviceSize keptBytes = 0u;
-        size_t keptSlabs = 0u;
+        VkDeviceSize classKeptBytes = 0u;
+        size_t classKeptSlabs = 0u;
 
         for(const SectionMemorySlab& other : g_sectionMemorySlabs)
         {
             if(other.memory != VK_NULL_HANDLE && other.liveChunks == 0u)
             {
                 keptBytes += other.capacity;
-                ++keptSlabs;
+
+                if(sectionSlabIsHostHeap(other.memoryTypeIndex) == hostClass)
+                {
+                    classKeptBytes += other.capacity;
+                    ++classKeptSlabs;
+                }
             }
         }
 
         g_sectionMemoryPoolKeptBytes = keptBytes;
 
-        if(keptSlabs <= sectionMemoryPoolEffectiveKeepSlabs() &&
-           keptBytes <= sectionMemoryPoolEffectiveKeepBytes())
+        if(classKeptSlabs <= sectionSlabClassKeepSlabs(hostClass) &&
+           classKeptBytes <= sectionSlabClassKeepBytes(hostClass))
         {
             return;
         }
@@ -1241,24 +1297,32 @@ double trimSectionMemoryPool()
         return 0.0;
     }
 
-    const VkDeviceSize maxKeepBytes =
-        sectionMemoryPoolEffectiveKeepBytes();
-    const size_t maxKeepSlabs =
-        sectionMemoryPoolEffectiveKeepSlabs();
-
+    // 2026-11-23 CPU批②：两类（0=设备堆，1=主机堆）各自对照各自的上限。
+    // 开关关闭时全部 slab 归 0 类、上限即旧的有效上限 ⇒ 行为与旧版一致。
     VkDeviceSize keptBytes = 0u;
-    size_t keptSlabs = 0u;
+    VkDeviceSize classKeptBytes[2] = {0u, 0u};
+    size_t classKeptSlabs[2] = {0u, 0u};
 
     for(const SectionMemorySlab& slab : g_sectionMemorySlabs)
     {
         if(slab.memory != VK_NULL_HANDLE && slab.liveChunks == 0u)
         {
+            const size_t cls =
+                sectionSlabIsHostHeap(slab.memoryTypeIndex) ? 1u : 0u;
+
             keptBytes += slab.capacity;
-            ++keptSlabs;
+            classKeptBytes[cls] += slab.capacity;
+            ++classKeptSlabs[cls];
         }
     }
 
-    if(keptSlabs <= maxKeepSlabs && keptBytes <= maxKeepBytes)
+    const auto classUnderCap = [&](size_t cls)
+    {
+        return classKeptSlabs[cls] <= sectionSlabClassKeepSlabs(cls == 1u) &&
+               classKeptBytes[cls] <= sectionSlabClassKeepBytes(cls == 1u);
+    };
+
+    if(classUnderCap(0u) && classUnderCap(1u))
     {
         g_sectionMemoryPoolKeptBytes = keptBytes;
         return 0.0;
@@ -1268,12 +1332,20 @@ double trimSectionMemoryPool()
 
     for(SectionMemorySlab& slab : g_sectionMemorySlabs)
     {
-        if(keptSlabs <= maxKeepSlabs && keptBytes <= maxKeepBytes)
+        if(classUnderCap(0u) && classUnderCap(1u))
         {
             break;
         }
 
         if(slab.memory == VK_NULL_HANDLE || slab.liveChunks != 0u)
+        {
+            continue;
+        }
+
+        const size_t cls =
+            sectionSlabIsHostHeap(slab.memoryTypeIndex) ? 1u : 0u;
+
+        if(classUnderCap(cls))
         {
             continue;
         }
@@ -1288,7 +1360,8 @@ double trimSectionMemoryPool()
         );
 
         keptBytes -= slab.capacity;
-        --keptSlabs;
+        classKeptBytes[cls] -= slab.capacity;
+        --classKeptSlabs[cls];
 
         slab.memory = VK_NULL_HANDLE;
         slab.chunkBytes = 0u;
@@ -1389,10 +1462,19 @@ void updateVramGovernor()
 
     g_vramGovernor.freedTotalMb += trimSectionMemoryPool();
 
-    if(g_vramGovernor.over)
+    // 2026-11-23 ⑨：开关打开时只在 over 的进入沿裁一次，且不裁主机内存的顶点 staging。
+    static bool s_governorWasOver = false;
+    const bool governorOverEdge =
+        g_vramGovernor.over && !s_governorWasOver;
+    s_governorWasOver = g_vramGovernor.over;
+
+    if(g_vramGovernor.over &&
+       (!CPUPERF_GOV_TRIM_ON_ENTER_ONLY || governorOverEdge))
     {
         const VkDeviceSize stagingFreed =
-            g_vertexStagingPool.trimIdleKeepingLargest() +
+            (CPUPERF_GOV_TRIM_ON_ENTER_ONLY
+                ? static_cast<VkDeviceSize>(0u)
+                : g_vertexStagingPool.trimIdleKeepingLargest()) +
             g_blasScratchPool.trimIdleKeepingLargest();
 
         g_vramGovernor.freedTotalMb +=

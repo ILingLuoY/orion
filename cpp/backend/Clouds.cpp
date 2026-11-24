@@ -5252,14 +5252,14 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
         compositePush.whiteScale =
             (hdrOutputActive() ? AE_HDR_CLOUD_WHITE_SCALE : 1.0f) *
             g_cloudShoulderScale;
-        // 与下游曝光强度同口径：SDR 走 UI 的"自动曝光强度"，
-        // HDR 走 rr_hdr_encode.comp 里的 AE_EXPOSURE_STRENGTH = 0.6。
-        // ORION_CLOUD_SHOULDER_STRENGTH 可强制成旧口径（1.0）做 A/B。
+        // 与下游曝光强度同口径。2026-11-23 起 rr_hdr_encode.comp 也改读
+        // PostPush.exposureStrength（不再用编译期常量 0.6），所以 SDR/HDR
+        // 统一走 UI 的"自动曝光强度"。ORION_CLOUD_SHOULDER_STRENGTH 仍可
+        // 强制成旧口径（1.0）做 A/B。
         compositePush.exposureStrength =
             g_cloudShoulderStrength >= 0.0f
                 ? g_cloudShoulderStrength
-                : (hdrOutputActive() ? AE_HDR_EXPOSURE_STRENGTH
-                                     : g_postExposureStrength.load());
+                : g_postExposureStrength.load();
         vkCmdPushConstants(cmd, g_volumetricCloudCompositePipelineLayout,
             VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(compositePush), &compositePush);
         vkCmdDispatch(cmd, (g_rtOutputWidth + 7u) / 8u,
@@ -5879,11 +5879,11 @@ void recordCloudFarBandComposite(VkCommandBuffer cmd)
     push.whiteScale =
         (hdrOutputActive() ? AE_HDR_CLOUD_WHITE_SCALE : 1.0f) *
         g_cloudShoulderScale;
+    // 同 compositePush 分支：HDR/SDR 都用 UI 的自动曝光强度（2026-11-23）。
     push.exposureStrength =
         g_cloudShoulderStrength >= 0.0f
             ? g_cloudShoulderStrength
-            : (hdrOutputActive() ? AE_HDR_EXPOSURE_STRENGTH
-                                 : g_postExposureStrength.load());
+            : g_postExposureStrength.load();
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
         g_volumetricCloudCompositePipeline);

@@ -743,6 +743,12 @@ currentMapDepth =
 #ifndef POM_SELF_SHADOW_FULL_TEXELS
 #define POM_SELF_SHADOW_FULL_TEXELS 0.25
 #endif
+#ifndef POM_RES_ADAPTIVE_SHADOW
+#define POM_RES_ADAPTIVE_SHADOW 1
+#endif
+#ifndef POM_SELF_SHADOW_MIN_DEPTH_FRAC
+#define POM_SELF_SHADOW_MIN_DEPTH_FRAC 0.32
+#endif
 
 float tracePOMSelfShadow(
     vec2 hitUV,
@@ -836,6 +842,21 @@ float tracePOMSelfShadow(
     // 见上面 grazingBoost 的取证）。24 与 4 倍密度上限配对，成本只在低太阳角发生。
     const int VL_POM_SELF_SHADOW_MAX_SAMPLES = 24;
 
+    const vec2 selfShadowAtlasSizeF =
+        labPBRAtlasSizeF();
+
+    const float selfShadowSpriteRes =
+        max(spriteSpan.x * selfShadowAtlasSizeF.x, 1.0);
+
+#if POM_RES_ADAPTIVE_SHADOW
+    const float resLog2 =
+        clamp(log2(max(selfShadowSpriteRes / 16.0, 1.0)), 0.0, 5.0);
+
+    const float resSampleBoost =
+        clamp(1.0 + 0.35 * resLog2, 1.0, 2.2);
+#else
+    const float resSampleBoost = 1.0;
+#endif
 
     int sampleCount =
         int(
@@ -845,7 +866,8 @@ float tracePOMSelfShadow(
                     4.0,
                     facing
                 ) *
-                grazingBoost
+                grazingBoost *
+                resSampleBoost
             )
         );
 
@@ -885,14 +907,34 @@ float tracePOMSelfShadow(
     //   回退见文件顶部 POM_SELF_SHADOW_FULL_TEXELS 的三档。
     // =====================================================
     float selfShadowTexelWorld =
-        1.0 / max(spriteSpan.x * labPBRAtlasSizeF().x, 1.0);
+        1.0 / selfShadowSpriteRes;
 
+#if POM_RES_ADAPTIVE_SHADOW
+    float selfShadowFullDepthWorld =
+        max(
+            max(
+                selfShadowTexelWorld *
+                    POM_SELF_SHADOW_FULL_TEXELS,
+                pomDepthScale *
+                    POM_SELF_SHADOW_MIN_DEPTH_FRAC
+            ),
+            1.0e-6
+        );
+
+    float selfShadowBias01 =
+        !pomSmoothSampling()
+            ? mix(0.008, 0.024, clamp(resLog2 * 0.25, 0.0, 1.0))
+            : 0.004;
+#else
     float selfShadowFullDepthWorld =
         max(
             selfShadowTexelWorld *
                 POM_SELF_SHADOW_FULL_TEXELS,
             1.0e-6
         );
+
+    const float selfShadowBias01 = 0.004;
+#endif
 
 
     float maxBlockDepthWorld =
@@ -921,9 +963,6 @@ float tracePOMSelfShadow(
 
     // 2026-10-29：atlasSizeF 与纹素边界在整个 hit 内不变 ⇒ 循环外算一次。
     // 循环体每步只做 wrap + 采样，不再重复 textureSize / floor / ceil。
-    const vec2 selfShadowAtlasSizeF =
-        labPBRAtlasSizeF();
-
     ivec2 selfShadowLo;
     ivec2 selfShadowHi;
 
@@ -1010,7 +1049,7 @@ float tracePOMSelfShadow(
             (
                 rayDepth -
                 blockerDepth -
-                0.004
+                selfShadowBias01
             ) *
             pomDepthScale;
 

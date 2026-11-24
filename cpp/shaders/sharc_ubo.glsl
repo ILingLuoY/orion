@@ -53,7 +53,14 @@ uint sharcMode()
         }
     }
 
-    return min(cam.sharcCacheParams.w, 4u);
+    return min(cam.sharcCacheParams.w & 0xFFu, 4u);
+}
+
+// 解码宿主编码进 sharcCacheParams.w[15:8] 的自适应 update 分块大小（默认 5）。
+uint sharcUpdateBlockSize()
+{
+    const uint encoded = (cam.sharcCacheParams.w >> 8u) & 0xFFu;
+    return clamp(encoded == 0u ? 5u : encoded, 2u, 8u);
 }
 
 // update 是否生效（模式 3 / 4）。
@@ -108,9 +115,9 @@ SharcResolveParameters sharcBuildResolveParameters()
 {
     SharcResolveParameters resolveParameters;
     resolveParameters.cameraPositionPrev = cam.prevViewInverse[3].xyz;
-    resolveParameters.accumulationFrameNum = 10u;
-    resolveParameters.responsiveFrameNum = 10u;
-    resolveParameters.staleFrameNumMax = 64u;
+    resolveParameters.accumulationFrameNum = 32u;
+    resolveParameters.responsiveFrameNum = 16u;
+    resolveParameters.staleFrameNumMax = 256u;
     resolveParameters.frameIndex = cam.frameCount;
     return resolveParameters;
 }

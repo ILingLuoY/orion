@@ -42,6 +42,8 @@
 #extension GL_EXT_control_flow_attributes : require
 
 #define SHARC_ENABLE_GLSL 1
+#define SHARC_MATERIAL_DEMODULATION 1
+#define SHARC_SEPARATE_EMISSIVE 1
 
 #ifndef SHARC_UPDATE
 #define SHARC_UPDATE 0

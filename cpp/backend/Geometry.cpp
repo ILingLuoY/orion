@@ -3,6 +3,8 @@
 // 函数体保持逐字不变；共享声明见 OrionInternal.h。
 
 #include "OrionInternal.h"
+#include <atomic>
+#include <thread>
 #include "TrackingHooks.h"
 
 
@@ -656,6 +658,93 @@ bool sameVertexPayload(
                 a.size() * sizeof(Vertex)
             ) == 0
         );
+}
+// 2026-11-23 CPU批①：实体层判等。语义与「哈希相等 + size 相等」一致（逐位比较，
+// 与 FNV 一样把 -0.0/+0.0、NaN 位型差异当作变化），但：
+//   · size 不等直接返回，不再先算完整层哈希；
+//   · 动画中的层通常首段就不等 ⇒ 首 256KB 探测即退出；
+//   · 静止大层 4 路并行 memcmp（每路 1MB 步进检查停止标志），单路吞吐远高于 FNV。
+bool sameVertexPayloadParallel(
+    const std::vector<Vertex>& a,
+    const std::vector<Vertex>& b
+)
+{
+    if(a.size() != b.size())
+    {
+        return false;
+    }
+
+    if(a.empty())
+    {
+        return true;
+    }
+
+    const uint8_t* const pa = reinterpret_cast<const uint8_t*>(a.data());
+    const uint8_t* const pb = reinterpret_cast<const uint8_t*>(b.data());
+    const size_t totalBytes = a.size() * sizeof(Vertex);
+
+    constexpr size_t kSerialLimit = 4u << 20;
+    if(totalBytes < kSerialLimit)
+    {
+        return std::memcmp(pa, pb, totalBytes) == 0;
+    }
+
+    constexpr size_t kProbeBytes = 256u << 10;
+    if(std::memcmp(pa, pb, kProbeBytes) != 0)
+    {
+        return false;
+    }
+
+    constexpr size_t kParts = 4u;
+    const size_t remaining = totalBytes - kProbeBytes;
+    const size_t chunkBytes =
+        ((remaining / kParts) + 63u) & ~static_cast<size_t>(63u);
+
+    std::atomic<bool> differs{false};
+
+    const auto compareRange = [pa, pb, &differs](size_t begin, size_t end)
+    {
+        constexpr size_t kStepBytes = 1u << 20;
+
+        for(size_t offset = begin; offset < end; offset += kStepBytes)
+        {
+            if(differs.load(std::memory_order_relaxed))
+            {
+                return;
+            }
+
+            const size_t length = std::min(kStepBytes, end - offset);
+
+            if(std::memcmp(pa + offset, pb + offset, length) != 0)
+            {
+                differs.store(true, std::memory_order_relaxed);
+                return;
+            }
+        }
+    };
+
+    std::thread workers[kParts - 1u];
+
+    for(size_t partIndex = 0u; partIndex + 1u < kParts; ++partIndex)
+    {
+        const size_t partBegin =
+            std::min(kProbeBytes + partIndex * chunkBytes, totalBytes);
+        const size_t partEnd =
+            std::min(partBegin + chunkBytes, totalBytes);
+
+        workers[partIndex] = std::thread(compareRange, partBegin, partEnd);
+    }
+
+    compareRange(
+        std::min(kProbeBytes + (kParts - 1u) * chunkBytes, totalBytes),
+        totalBytes);
+
+    for(std::thread& worker : workers)
+    {
+        worker.join();
+    }
+
+    return !differs.load(std::memory_order_relaxed);
 }
 int32_t rtSignExtendBits(uint64_t raw, uint32_t bits)
 {
@@ -1812,6 +1901,8 @@ void geometryCaptureWorkerLoop()
         uint64_t slowestCaptureCycles = 0ull;
         const auto captureWaitStart = std::chrono::steady_clock::now();
         {
+            // 2026-11-23 锁竞争批⑦：声明在 lock_guard 之前 ⇒ 解锁之后才恢复优先级。
+            const ScopedLockHolderPriorityBoost captureLockBoost;
             std::lock_guard<std::timed_mutex> chunkLock(g_chunkMutex);
             // 2026-11-07c：必须在 lock_guard 之后声明，析构顺序保证它先于解锁。
             const ChunkMutexHoldProbe chunkHoldProbe("capture");
@@ -2546,6 +2637,10 @@ void chunkStoreUploadDigestLocked(
     digest.meshVertices = static_cast<uint64_t>(meshVertices);
 }
 
+static constexpr bool kWATER_DEDUP_BACKWARD_QUADS = true;
+static std::atomic<uint64_t> g_waterBackwardQuadsDropped{0ull};
+static std::atomic<uint64_t> g_waterBackwardQuadsLogged{0ull};
+
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
         JNIEnv* env,
@@ -2701,6 +2796,18 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
     std::vector<Vertex> repackedVertices(triVertexCount);
     uint32_t rainPuddleCandidateQuads = 0u;
     uint32_t rainPuddleMalformedQuads = 0u;
+
+    const auto sameVertexPos = [](const Vertex& a, const Vertex& b) -> bool
+    {
+        return std::fabs(a.x - b.x) <= 1.0e-5f &&
+               std::fabs(a.y - b.y) <= 1.0e-5f &&
+               std::fabs(a.z - b.z) <= 1.0e-5f;
+    };
+
+    size_t writeQuad = 0u;
+    bool hasPrevWaterQuad = false;
+    Vertex prevWaterQuad[4]{};
+    uint64_t droppedWaterQuadsInChunk = 0ull;
 
     for (int q = 0; q < quadCount; ++q) {
         Vertex quadVerts[4];
@@ -2905,6 +3012,45 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
             }
         }
 
+        const bool isWaterQuad =
+            !indexedSolidQuads &&
+            (layerId == 3 ||
+             (quadVerts[0].materialId == 1.0f &&
+              quadVerts[1].materialId == 1.0f &&
+              quadVerts[2].materialId == 1.0f &&
+              quadVerts[3].materialId == 1.0f));
+
+        if(kWATER_DEDUP_BACKWARD_QUADS && isWaterQuad)
+        {
+            const bool isReversedDuplicate =
+                hasPrevWaterQuad &&
+                ((sameVertexPos(quadVerts[0], prevWaterQuad[0]) &&
+                  sameVertexPos(quadVerts[1], prevWaterQuad[3]) &&
+                  sameVertexPos(quadVerts[2], prevWaterQuad[2]) &&
+                  sameVertexPos(quadVerts[3], prevWaterQuad[1])) ||
+                 (sameVertexPos(quadVerts[0], prevWaterQuad[3]) &&
+                  sameVertexPos(quadVerts[1], prevWaterQuad[2]) &&
+                  sameVertexPos(quadVerts[2], prevWaterQuad[1]) &&
+                  sameVertexPos(quadVerts[3], prevWaterQuad[0])));
+
+            if(isReversedDuplicate)
+            {
+                ++droppedWaterQuadsInChunk;
+                hasPrevWaterQuad = false;
+                continue;
+            }
+
+            for(int v = 0; v < 4; ++v)
+            {
+                prevWaterQuad[v] = quadVerts[v];
+            }
+            hasPrevWaterQuad = true;
+        }
+        else
+        {
+            hasPrevWaterQuad = false;
+        }
+
         if(indexedSolidQuads)
         {
             repackedVertices[q * 4 + 0] = quadVerts[0];
@@ -2914,12 +3060,44 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
         }
         else
         {
-            repackedVertices[q * 6 + 0] = quadVerts[0];
-            repackedVertices[q * 6 + 1] = quadVerts[1];
-            repackedVertices[q * 6 + 2] = quadVerts[2];
-            repackedVertices[q * 6 + 3] = quadVerts[0];
-            repackedVertices[q * 6 + 4] = quadVerts[2];
-            repackedVertices[q * 6 + 5] = quadVerts[3];
+            repackedVertices[writeQuad * 6u + 0u] = quadVerts[0];
+            repackedVertices[writeQuad * 6u + 1u] = quadVerts[1];
+            repackedVertices[writeQuad * 6u + 2u] = quadVerts[2];
+            repackedVertices[writeQuad * 6u + 3u] = quadVerts[0];
+            repackedVertices[writeQuad * 6u + 4u] = quadVerts[2];
+            repackedVertices[writeQuad * 6u + 5u] = quadVerts[3];
+            ++writeQuad;
+        }
+    }
+
+    if(!indexedSolidQuads && writeQuad != static_cast<size_t>(quadCount))
+    {
+        repackedVertices.resize(writeQuad * 6u);
+    }
+
+    if(droppedWaterQuadsInChunk > 0ull)
+    {
+        const uint64_t totalDropped =
+            g_waterBackwardQuadsDropped.fetch_add(
+                droppedWaterQuadsInChunk,
+                std::memory_order_relaxed
+            ) + droppedWaterQuadsInChunk;
+        uint64_t prevLogged =
+            g_waterBackwardQuadsLogged.load(std::memory_order_relaxed);
+        if(prevLogged == 0ull || totalDropped - prevLogged >= 65536ull)
+        {
+            if(g_waterBackwardQuadsLogged.compare_exchange_strong(
+                   prevLogged,
+                   totalDropped,
+                   std::memory_order_relaxed))
+            {
+                RTLog(
+                    "[WATER DEDUP] dropped coplanar backward water quads total=" +
+                    std::to_string(totalDropped) +
+                    " (lastChunk=" +
+                    std::to_string(droppedWaterQuadsInChunk) +
+                    ")");
+            }
         }
     }
 

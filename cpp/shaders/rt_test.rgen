@@ -4,8 +4,14 @@
 // 条件编译与兜底 #define 一并不存在了。
 #extension GL_GOOGLE_include_directive : require
 
-#extension GL_EXT_ray_tracing : require
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#ifdef ORION_K2I_COMPOSE_COMPUTE
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#define gl_LaunchIDEXT gl_GlobalInvocationID
+#define gl_LaunchSizeEXT uvec3(imageSize(image), 1u)
+#else
+#extension GL_EXT_ray_tracing : require
 // 2026-11-16：purpose==3 可见性点位的 inline ray query 可选臂（rgen_main_body /
 // rgen_glossy / rgen_water_receiver）需要 ray query 类型与内建；运行时由
 // cam.visQueryAb 闸门决定走 query 臂还是既有 traceRayEXT 臂，默认全关。
@@ -13,9 +19,9 @@
 // 2026-10-30 方案 A：次级辐射射线要用 gl_RayFlagsForceOpacityMicromap2StateEXT，
 // glslang 要求显式请求该扩展（否则报 "required extension not requested"）。
 #extension GL_EXT_opacity_micromap : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #ifdef RT_ENABLE_SER
 #extension GL_EXT_shader_invocation_reorder : require
+#endif
 #endif
 
 // ============================================================================
@@ -145,7 +151,9 @@ const bool LL_P3_ENABLE_G2B_LOCAL_GUIDE =
 #define RR_STABLE_GLASS_RADIANCE 0
 #endif
 
+#ifndef ORION_K2I_COMPOSE_COMPUTE
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+#endif
 layout(binding = 1, set = 0, rgba16f) uniform image2D image;
 
 layout(binding = 6, set = 0, rgba32f)
@@ -183,7 +191,7 @@ uniform image2D dlssMotionImage;
 // 本文件每像素清槽；主射线返回后 imageLoad 读回 xyz（a<0.5 = 无写入，按 0 处理）。
 // rchit 写槽端见 rt_test.rchit；半分辨率 GI 变体不参与本信道（见 rgen_main_body 守卫）。
 layout(binding = 98, set = 0, rgba16f)
-uniform image2D hitOffsetImage;
+coherent uniform image2D hitOffsetImage;
 
 // 2026-10-22：MV 改为 **UV 单位**（宿主 mvecScale=(1,1)，官方 §6.0 的
 // "values in [-1,1] ⇒ scale {1,1}"）。此宏仅保留历史兼容，新代码不再分支。
@@ -320,6 +328,23 @@ uniform image2D giHalfImage;
     || defined(ORION_K2_DIRECT_SUN_STAGE_A) || defined(ORION_K2_DIRECT_SUN_STAGE_B)
 layout(binding = 89, set = 0, rgba16f)
 uniform image2D k2DirectImage;
+#endif
+
+#if defined(ORION_K2_INDIRECT_STAGE) && !SHARC_UPDATE
+layout(binding = 92, set = 0, rgba16f)
+uniform image2D k2GiTraceImage;
+#endif
+
+#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE
+layout(std430, binding = 100, set = 0) readonly buffer K2iSparseCompactSSBO
+{
+    uint width;
+    uint height;
+    uint depth;
+    uint mode;
+    uint activeCount;
+    uint activeCoords[];
+} k2iSparseCompact;
 #endif
 
 // ============================================================================
@@ -755,10 +780,10 @@ vec3 sharcClampUpdateRadiance(
     return radiance;
 }
 
-ivec2 sharcUpdateBlockOffset(const ivec2 sharcBlock)
+ivec2 sharcUpdateBlockOffset(const ivec2 sharcBlock, const uint blockSize)
 {
     const uint sharcBlockArea =
-        uint(SHARC_UPDATE_BLOCK) * uint(SHARC_UPDATE_BLOCK);
+        blockSize * blockSize;
 
     uint sharcHash = uint(sharcBlock.x) * 73856093u ^
         uint(sharcBlock.y) * 19349663u ^
@@ -770,15 +795,15 @@ ivec2 sharcUpdateBlockOffset(const ivec2 sharcBlock)
     const uint sharcIndex = sharcHash % sharcBlockArea;
 
     return ivec2(
-        int(sharcIndex % uint(SHARC_UPDATE_BLOCK)),
-        int(sharcIndex / uint(SHARC_UPDATE_BLOCK)));
+        int(sharcIndex % blockSize),
+        int(sharcIndex / blockSize));
 }
 
 // 真实渲染尺寸。SHARC_UPDATE 的 dispatch 是块级（远小于屏幕），
 // 所以 update 变体里不能拿 gl_LaunchSizeEXT 做屏幕归一化。
 ivec2 rtLaunchSize()
 {
-#if SHARC_UPDATE
+#if SHARC_UPDATE || defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)
     return imageSize(image);
 #else
     return ivec2(gl_LaunchSizeEXT.xy);
@@ -1014,7 +1039,7 @@ int perfL10GiBounceCap()
         return 0;
     }
 
-    return min(perfGiFromUbo, 4);
+    return min(perfGiFromUbo, 8);
 }
 
 // Stage 9: cap near-field RTAO at two rays instead of four.
@@ -1205,6 +1230,7 @@ float perfGiTraceMaxDistance(float baseMax)
 // 《Creating Optimal Meshes for Ray Tracing》：成本 ∝ 光线穿过的 alpha 层数）。
 //
 // 回退：删掉第三项即回到 4 态。
+#ifndef ORION_K2I_COMPOSE_COMPUTE
 const uint SECONDARY_TRAVERSE_FLAGS_4STATE =
     gl_RayFlagsNoneEXT |
     gl_RayFlagsCullBackFacingTrianglesEXT;
@@ -1213,18 +1239,11 @@ const uint SECONDARY_TRAVERSE_FLAGS_2STATE =
     SECONDARY_TRAVERSE_FLAGS_4STATE |
     gl_RayFlagsForceOpacityMicromap2StateEXT;
 
-// 2026-10-30 方案 A/B：**默认 4 态**（= 改动前行为）。
-//
-// 曾经默认 2 态（NVIDIA Indiana Jones 间接光做法），但同局 A/B 实测收益 **0.00**
-// （base 15.09 vs 4 态 15.09，56 窗口），而它对次级射线的 alpha 判定有实际影响：
-// 把 2 态与次级 mip 一起关掉后室内明显变暗，说明它会改变 GI/反射的透光量。
-// 零收益 + 有副作用 ⇒ 默认回退到 4 态。
-//
-// 保留两个常量与函数壳，因为档 31 仍是“强制 4 态”的对照臂，将来换硬件/驱动可复测。
 uint secondaryTraverseFlags()
 {
     return SECONDARY_TRAVERSE_FLAGS_4STATE;
 }
+#endif
 
 // Binding 34 (the old 256x256 wavefront-area caustic map) is deliberately no
 // longer declared here.  Water caustics are analytic now; see
@@ -1537,6 +1556,14 @@ layout(std430, binding = 80, set = 0) buffer VPTBestLightBuffer
     uint tiles[];
 } vptBestLightBuffer;
 
+layout(std430, binding = 99, set = 0) readonly buffer VPTLightGridBuffer
+{
+    uvec4 header;
+    uvec4 cellMeta[9216];
+    uint aliasWords[9216 * 32];
+    uvec4 slots[9216 * 32];
+} vptLightGridBuffer;
+
 const float VPT_SCREEN_POSITION_EPSILON = 0.35;
 const float VPT_SCREEN_NORMAL_COSINE = 0.92;
 const float VPT_SCREEN_MAX_HISTORY = 8.0;
@@ -1546,8 +1573,8 @@ const uint VLI_SOURCE_WORDS = 4096u;
 const uint VLI_PROBE_EDGE = 9u;
 const uint VLI_PROBE_WORDS = VLI_PROBE_EDGE * VLI_PROBE_EDGE * VLI_PROBE_EDGE;
 const uint VPT_DIRECTION_COUNT = 6u;
-const uint VPT_DIRECTIONAL_CACHE_WORDS = VPT_DIRECTION_COUNT * VLI_PROBE_WORDS; // 4374 uint
-const uint VLI_PAGE_WORDS = VLI_SOURCE_WORDS + VPT_DIRECTIONAL_CACHE_WORDS;
+const uint VPT_DIRECTIONAL_CACHE_WORDS = 0u;
+const uint VLI_PAGE_WORDS = VLI_SOURCE_WORDS;
 const uint VPT_SURFACE_FACE_WORDS = VLI_SOURCE_WORDS * VPT_DIRECTION_COUNT;
 const uint VPT_RELATED_EMITTERS_PER_SECTION = 8u;
 const uint VPT_EMITTER_HEADER_WORDS = 4u;
@@ -2059,6 +2086,9 @@ vec3 vliDecodeEmitterColor(uint typeCode)
 }
 
 vec3 sampleHemisphereCosine(vec3 normal, inout uint state);
+vec3 sampleHemisphereCosine2D(vec3 normal, vec2 u);
+vec3 sampleGGXVNDF(vec3 normal, vec3 viewDir, float roughness, vec2 u);
+float ggxVNDFMaskingG1(float NdotV, float roughness);
 vec3 vptDominantBlockFaceNormal(vec3 normal);
 
 // Defined next to the glass optical model; needed by the local-light direct
@@ -2415,15 +2445,10 @@ vec3 evaluateVPTExactFaceDirectLighting(
     // that is not exposed).  Samples that are missing (unloaded Section) or not
     // solid are dropped and the weights renormalised, so a Section border or a
     // doorway cannot draw a seam or go black.
-    vec3 axes[3] = vec3[3](
-        vec3(1.0, 0.0, 0.0),
-        vec3(0.0, 1.0, 0.0),
-        vec3(0.0, 0.0, 1.0)
-    );
     int faceAxis = blockFaceNormal.x != 0.0 ? 0 :
         (blockFaceNormal.y != 0.0 ? 1 : 2);
-    vec3 unitU = axes[faceAxis == 0 ? 1 : 0];
-    vec3 unitV = axes[faceAxis == 2 ? 1 : 2];
+    vec3 unitU = (faceAxis == 0) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 unitV = (faceAxis == 2) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
     ivec3 stepU = ivec3(unitU);
     ivec3 stepV = ivec3(unitV);
 
@@ -3199,18 +3224,347 @@ uint vptRisProposalCount()
 #endif
 }
 
-// 2026-10-26 RTXDI 式直接光 reservoir 的合并/可见性尾段。定义在
+#ifndef VPT_LOCAL_PBR_BRDF
+#define VPT_LOCAL_PBR_BRDF 1
+#endif
+#ifndef VPT_LOCAL_SHAPE_SAMPLING
+#define VPT_LOCAL_SHAPE_SAMPLING 1
+#endif
+#ifndef VPT_LOCAL_LIGHT_GRID
+#define VPT_LOCAL_LIGHT_GRID 1
+#endif
+#ifndef VPT_DIRECT_SPATIAL_PASS
+#define VPT_DIRECT_SPATIAL_PASS 1
+#endif
+
+vec3 dynamicLightBRDF(
+    vec3 N,
+    vec3 V,
+    vec3 L,
+    vec3 albedo,
+    vec3 f0,
+    float metallic,
+    float roughness
+);
+
+// Visible-face projected weights for +X,+Y,+Z (posW) and -X,-Y,-Z (negW) from hitPos.
+void vptEmitterVisibleFaceWeights(
+    ivec3 emitterBlock,
+    vec3 hitPos,
+    out vec3 posW,
+    out vec3 negW,
+    out float totalW
+)
+{
+    const vec3 bMin = vec3(emitterBlock);
+    const vec3 bMax = bMin + vec3(1.0);
+    const vec3 bCenter = bMin + vec3(0.5);
+    posW = vec3(0.0);
+    negW = vec3(0.0);
+    for(int a = 0; a < 3; ++a)
+    {
+        if(hitPos[a] > bMax[a] + 1.0e-4)
+        {
+            vec3 fc = bCenter;
+            fc[a] = bMax[a];
+            vec3 d = hitPos - fc;
+            float len = max(length(d), 1.0e-5);
+            posW[a] = max(d[a] / len, 1.0e-4);
+        }
+        else if(hitPos[a] < bMin[a] - 1.0e-4)
+        {
+            vec3 fc = bCenter;
+            fc[a] = bMin[a];
+            vec3 d = fc - hitPos;
+            float len = max(length(d), 1.0e-5);
+            negW[a] = max(d[a] / len, 1.0e-4);
+        }
+    }
+    totalW = dot(posW, vec3(1.0)) + dot(negW, vec3(1.0));
+}
+
+vec3 vptSampleLocalEmitterPoint(
+    ivec3 emitterBlock,
+    uint typeCode,
+    vec3 hitPos,
+    inout uint rngState
+)
+{
+    const vec3 bMin = vec3(emitterBlock);
+    if(localLightProfilePointLike(typeCode))
+    {
+        float cosTheta = 1.0 - 2.0 * rand(rngState);
+        float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+        float phi = 6.2831853 * rand(rngState);
+        float radius = 0.18 * pow(rand(rngState), 1.0 / 3.0);
+        vec3 offset = vec3(
+            sinTheta * cos(phi),
+            cosTheta,
+            sinTheta * sin(phi)
+        ) * radius;
+        return bMin + vec3(0.5) + offset;
+    }
+
+    vec3 posW;
+    vec3 negW;
+    float totalW;
+    vptEmitterVisibleFaceWeights(emitterBlock, hitPos, posW, negW, totalW);
+    if(totalW <= 1.0e-6)
+    {
+        float cosTheta = 1.0 - 2.0 * rand(rngState);
+        float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+        float phi = 6.2831853 * rand(rngState);
+        return clamp(
+            bMin + vec3(0.5) + vec3(
+                sinTheta * cos(phi),
+                cosTheta,
+                sinTheta * sin(phi)
+            ) * 0.18,
+            bMin + vec3(0.001),
+            bMin + vec3(0.999)
+        );
+    }
+
+    float pick = rand(rngState) * totalW;
+    int selectedAxis = 0;
+    float selectedSign = 1.0;
+    float accum = 0.0;
+    bool found = false;
+    for(int a = 0; a < 3 && !found; ++a)
+    {
+        if(posW[a] > 0.0)
+        {
+            accum += posW[a];
+            if(pick <= accum)
+            {
+                selectedAxis = a;
+                selectedSign = 1.0;
+                found = true;
+            }
+        }
+        if(!found && negW[a] > 0.0)
+        {
+            accum += negW[a];
+            if(pick <= accum)
+            {
+                selectedAxis = a;
+                selectedSign = -1.0;
+                found = true;
+            }
+        }
+    }
+    if(!found)
+    {
+        for(int a = 2; a >= 0; --a)
+        {
+            if(posW[a] > 0.0) { selectedAxis = a; selectedSign = 1.0; break; }
+            if(negW[a] > 0.0) { selectedAxis = a; selectedSign = -1.0; break; }
+        }
+    }
+
+    vec2 uv = vec2(rand(rngState), rand(rngState)) * 0.990 + vec2(0.005);
+    vec3 localPos = vec3(0.0);
+    if(selectedAxis == 0)
+    {
+        localPos = vec3(selectedSign > 0.0 ? 0.999 : 0.001, uv.x, uv.y);
+    }
+    else if(selectedAxis == 1)
+    {
+        localPos = vec3(uv.x, selectedSign > 0.0 ? 0.999 : 0.001, uv.y);
+    }
+    else
+    {
+        localPos = vec3(uv.x, uv.y, selectedSign > 0.0 ? 0.999 : 0.001);
+    }
+    return bMin + localPos;
+}
+
+float vptLocalEmitterAngularWeight(
+    ivec3 emitterBlock,
+    uint typeCode,
+    vec3 hitPos,
+    vec3 lightSample,
+    vec3 lightDirToEmitter
+)
+{
+    if(localLightProfilePointLike(typeCode))
+    {
+        return 1.0;
+    }
+
+    vec3 posW;
+    vec3 negW;
+    float totalW;
+    vptEmitterVisibleFaceWeights(emitterBlock, hitPos, posW, negW, totalW);
+    if(totalW <= 1.0e-6)
+    {
+        return 1.0;
+    }
+
+    vec3 rel = lightSample - (vec3(emitterBlock) + vec3(0.5));
+    vec3 absRel = abs(rel);
+    vec3 emitterFaceNormal = vec3(0.0);
+    float faceW = 0.0;
+    if(absRel.x >= absRel.y && absRel.x >= absRel.z)
+    {
+        bool isPos = rel.x >= 0.0;
+        emitterFaceNormal.x = isPos ? 1.0 : -1.0;
+        faceW = isPos ? posW.x : negW.x;
+    }
+    else if(absRel.y >= absRel.z)
+    {
+        bool isPos = rel.y >= 0.0;
+        emitterFaceNormal.y = isPos ? 1.0 : -1.0;
+        faceW = isPos ? posW.y : negW.y;
+    }
+    else
+    {
+        bool isPos = rel.z >= 0.0;
+        emitterFaceNormal.z = isPos ? 1.0 : -1.0;
+        faceW = isPos ? posW.z : negW.z;
+    }
+
+    if(faceW <= 1.0e-6)
+    {
+        return 0.0;
+    }
+    float emitterFacing = max(dot(emitterFaceNormal, -lightDirToEmitter), 0.0);
+    float faceProb = faceW / totalW;
+    return min(emitterFacing / max(faceProb, 1.0e-5), 2.0);
+}
+
+bool vptValidateCachedEmitterVoxel(
+    vec3 candidateSample,
+    uint cachedEmission,
+    uint cachedTypeCode
+)
+{
+    if(cachedEmission == 0u)
+    {
+        return false;
+    }
+    ivec3 emitterBlock = ivec3(floor(candidateSample));
+    uint sourceWord = 0u;
+    if(!vptReadSourceVoxel(emitterBlock, sourceWord))
+    {
+        return false;
+    }
+    uint liveEmission = (sourceWord >> 2u) & 15u;
+    uint liveTypeCode = (sourceWord >> 6u) & 31u;
+    return liveEmission == cachedEmission && liveTypeCode == cachedTypeCode;
+}
+
+float vptLocalEmitterProxyTarget(
+    vec3 hitPos,
+    vec3 N,
+    vec3 viewDir,
+    float albedoLuma,
+    float specProxyGain,
+    bool waterColumnReceiver,
+    bool geometricFaceKnown,
+    vec3 geometricFaceRecovered,
+    vec3 emitterCenter,
+    uint emission,
+    uint typeCode
+)
+{
+    if(emission == 0u)
+    {
+        return 0.0;
+    }
+    vec3 toLight = emitterCenter - hitPos;
+    float distSq = dot(toLight, toLight);
+    if(distSq <= 1.0e-6)
+    {
+        return 0.0;
+    }
+    float distanceToLight = sqrt(distSq);
+    float emissionLevel = float(emission);
+    if(distanceToLight > vptLocalLightRange(typeCode, emissionLevel))
+    {
+        return 0.0;
+    }
+
+    vec3 lightDir = toLight / distanceToLight;
+    float clampedCos = waterColumnReceiver ? 1.0 : max(dot(N, lightDir), 0.0);
+#if VPT_LOCAL_GEOMETRIC_COSINE_BOUND
+    if(!waterColumnReceiver)
+    {
+        clampedCos = min(
+            clampedCos,
+            vptLocalFaceSetCosineBound(
+                geometricFaceKnown,
+                geometricFaceRecovered,
+                hitPos,
+                lightDir
+            )
+        );
+    }
+#endif
+    if(clampedCos <= 0.0 && distanceToLight > 1.5)
+    {
+        return 0.0;
+    }
+    float effCos = waterColumnReceiver ? 1.0 : max(clampedCos, 0.05);
+
+    float brdfProxy = albedoLuma * 0.92 * effCos;
+    if(specProxyGain > 0.0)
+    {
+        vec3 halfVec = viewDir + lightDir;
+        float halfLen = length(halfVec);
+        if(halfLen > 1.0e-6)
+        {
+            vec3 H = halfVec / halfLen;
+            float ndoth = max(dot(N, H), 0.0);
+            float nh2 = ndoth * ndoth;
+            float nh4 = nh2 * nh2;
+            float nh16 = nh4 * nh4 * nh4 * nh4;
+            brdfProxy += specProxyGain * nh16 * effCos;
+        }
+    }
+
+    float scale = 3.2 * LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
+        localLightProfileBrightness(typeCode, emissionLevel) *
+        vptLocalLightDistanceAttenuation(distanceToLight) *
+        vptLocalLightRangeFade(distanceToLight, typeCode, emissionLevel);
+    vec3 lightColor = vliDecodeEmitterColor(typeCode);
+    float lightLuma = max(dot(lightColor, vec3(0.2126, 0.7152, 0.0722)), 1.0e-4);
+    return lightLuma * scale * brdfProxy;
+}
+
+bool vptLocalEmitterContributionAt(
+    vec3 hitPos,
+    vec3 N,
+    vec3 viewDir,
+    vec3 hitAlbedo,
+    vec3 f0,
+    float metallic,
+    float roughness,
+    bool waterColumnReceiver,
+    bool geometricFaceKnown,
+    vec3 geometricFaceRecovered,
+    vec3 samplePosition,
+    uint emission,
+    uint typeCode,
+    out vec3 contribution
+);
+
+// 2026-10-26 RTXDI 式直接光 reservoir 的合并/可见性尾段（Scheme B）。定义在
 // evaluateVPTCandidateDirectTemporal 之后（重投影与抖动补偿helper 都在那里），
 // 这里先给原型 —— 与文件里 getDLSSFrameJitter 的前向声明同一手法。
 vec3 evaluateVPTDirectLightReservoirTail(
     vec3 hitPos,
     vec3 N,
+    vec3 viewDir,
     vec3 hitAlbedo,
+    vec3 f0,
+    float metallic,
+    float roughness,
     bool waterColumnReceiver,
     bool geometricFaceKnown,
     vec3 geometricFaceRecovered,
-    float currentWeightSum,
-    vec3 currentContribution,
+    float initialW,
+    float initialProxyTarget,
     vec3 currentSample,
     uint currentEmission,
     uint currentTypeCode,
@@ -3276,6 +3630,19 @@ void neeVisCacheKey(
     keyHi = h1;
 }
 
+uvec2 rtLogicalPixelCoord()
+{
+#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
+    if(k2iSparseCompact.mode != 0u)
+    {
+        const uint compactIdx = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+        const uint packedCoord = k2iSparseCompact.activeCoords[compactIdx];
+        return uvec2(packedCoord & 0xFFFFu, packedCoord >> 16u);
+    }
+#endif
+    return gl_LaunchIDEXT.xy;
+}
+
 vec3 traceVptLocalLightVisibilityCached(
     vec3 origin,
     vec3 target,
@@ -3302,8 +3669,9 @@ vec3 traceVptLocalLightVisibilityCached(
     neeVisCacheKey(
         origin, target, targetVoxelEntryDistance, cullMask, keyLo, keyHi);
 
+    const uvec2 neeP = rtLogicalPixelCoord();
     const uint pixelLinear =
-        gl_LaunchIDEXT.y * uint(gl_LaunchSizeEXT.x) + gl_LaunchIDEXT.x;
+        neeP.y * uint(imageSize(image).x) + neeP.x;
     const uint base =
         (pixelLinear * uint(VPT_NEE_VIS_SLOTS) + callIndex) * 8u;
     const uint frameTag = cam.matReuseAb.w;
@@ -3332,18 +3700,74 @@ vec3 traceVptLocalLightVisibilityCached(
     return transmittance;
 }
 
+#ifndef VPT_LIGHT_GRID_EXHAUSTIVE_MAX
+#define VPT_LIGHT_GRID_EXHAUSTIVE_MAX 8u
+#endif
+#ifndef VPT_LIGHT_GRID_PROPOSAL_CAP
+#define VPT_LIGHT_GRID_PROPOSAL_CAP 12u
+#endif
+#ifndef VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP
+#define VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP 8u
+#endif
+#ifndef VPT_LOCAL_BLUE_NOISE_RIS
+#define VPT_LOCAL_BLUE_NOISE_RIS 1
+#endif
+#ifndef VPT_LOCAL_SKIP_BOUNCE_VOXEL_OCC
+#define VPT_LOCAL_SKIP_BOUNCE_VOXEL_OCC 1
+#endif
+
+// Dithered 128x128x64 blue noise in [0, 1) using shared binding-76 table.
+// Adding rand/256 removes 8-bit quantization bias while keeping blue-noise spectrum.
+float vptLocalBlueNoise01(uvec2 pixelIdx, uint temporalIdx, uint seedIndex, inout uint rngState)
+{
+    const uvec2 seedOffset = uvec2(glassBlueNoiseR2(seedIndex) * vec2(128.0));
+    const uint x = (pixelIdx.x + seedOffset.x) & 127u;
+    const uint y = (pixelIdx.y + seedOffset.y) & 127u;
+    const uint layer = temporalIdx & 63u;
+    const uint byteIndex = 16384u * layer + 128u * y + x;
+    const uint word = glassBlueNoise.words[byteIndex >> 2u];
+    const uint raw = (word >> ((byteIndex & 3u) * 8u)) & 0xFFu;
+    return clamp((float(raw) + rand(rngState)) * (1.0 / 256.0), 0.0, 0.9999999);
+}
+
 vec3 evaluateVPTRISDirectLightingSingle(
     vec3 hitPos,
     vec3 hitNormal,
+    vec3 viewDir,
     vec3 hitAlbedo,
     vec3 geometricFaceNormal,
+    vec3 f0,
+    float metallic,
+    float roughness,
     bool useTemporalReservoir,
     bool shadingActive,
     inout uint rngState
 )
 {
+    // =====================================================================
+    // 2026-11-23【必须得看】k2loc 性能审查结论（逐条对照源码核实过，别再凭印象改）
+    //
+    // 1) 硬件可见性射线之后再跑 vptVoxelPathBlocked（VPT_LOCAL_CONSERVATIVE_
+    //    VOXEL_OCCLUSION=1）——【不能去掉】。2026-10-02 为修“封闭立方体内部每条棱
+    //    漏亮线”专门加的：相邻方块四边形在棱上不水密，硬件射线会从棱缝滑过去把
+    //    屋外的灯漏进密闭房间。实际开销小：局部光射程 ≤30 格，真实步数多为 5~15，
+    //    且用增量游标；上文记载的实测 DDA 合计约 0.28 ms，不是 k2loc 主头。
+    //    VPT_VOXEL_PATH_MAX_STEPS=256 只是上限，不是常态。
+    // 2) “RIS 默认 16 候选、每候选 4~5 次分散读取”只适用于旧 VLI 回退路径。
+    //    现行主路径是 Light Grid：格内 ≤4 盏 = 1 次读 slots（连 alias 都不查）；
+    //    5~32 盏 = 2 次读（aliasWords + slots）；仅 >32 盏溢出/出网格才回退旧路径。
+    //    Mode 1（temporalMode）候选数已截断为 min(vptRisProposalCount(), 8u)。
+    // 3) 2026-11-23 路线 C 已将像素内隔墙 0.12 软 DDA 撤除，改由 Light Grid 建格期
+    //    在 4×4×4 格上做保守墙体预剔除 + 脏检测缓存，避免 8.3×~15× 萤火虫并省 k2loc。
+    // 4) Mode 1 对齐 RTX Remix DLSS-RR：M=4 历史 + 4×4 XOR 置换采样 + 2 样本宽半径
+    //    空间复用 + 关闭 70% 非活跃像素邻居克隆 + finalW<=20 钳制。
+    // 5) NEE 可见性缓存（traceVptLocalLightVisibilityCached / binding 95）默认【关闭】：
+    //    cam.matReuseAb.z==0（需 ORION_LOCAL_NEE_CACHE=1）时函数首行短路返回原射线，
+    //    不算哈希、不写那 7 个字。要不要保留，须先在开启态统计命中率再定。
+    // =====================================================================
     // ===== DBG_LADDER_C: 单个本地光 RIS 可达 → 纯黄 =====
     if(DBG_LADDER_C) { return vec3(1.0, 1.0, 0.0); }
+    const bool temporalMode = useTemporalReservoir && cam.sparseParams.x >= 0.5;
 
     // =====================================================
     // 2026-10-03 **消灭明暗分界线（1/3）：目录查找抖动**。
@@ -3358,92 +3782,125 @@ vec3 evaluateVPTRISDirectLightingSingle(
     // 一律不动，只有"去哪个目录取候选"被随机化，而提案 pdf 始终按**实际使用的
     // 那个目录**计算（下面 sourceDirectoryEntry.selectionProbability）⇒ RIS 仍无偏。
     // =====================================================
-    const vec3 directoryJitter = vec3(
-        rand(rngState), rand(rngState), rand(rngState)) - vec3(0.5);
-    ivec3 receiverSection = ivec3(floor((hitPos + directoryJitter * 16.0) / 16.0));
-    uint receiverPage;
-    // Section whose source directory we actually read.  It is normally the
-    // receiver's own Section; see the miss path below.
-    ivec3 directorySection = receiverSection;
-    // 2026-10-03 借目录混合（消除明暗分界线的候选修复 #2）：接收点自有页缺失
-    // 时，旧实现按 +x→−x→+y→… 的**固定顺序**取第一个有页邻居当唯一捐助者 ⇒
-    // 接收点跨 Section 边界时捐助者可能在两个邻居间翻转 ⇒ 提案权重离散跳变
-    // ⇒ 可见的明暗分界。新实现取**距离最近的两个**有页邻居，按距离连续混合
-    //（等距时 0.5/0.5），pdf 乘对应混合权重保持无偏。自有页存在时混合不生效，
-    // 行为与旧版逐位一致。
+    bool useLightGrid = false;
+    bool gridEmptyZero = false;
+    uint gridCellIdx = 0u;
+    uint gridCellCount = 0u;
+    float gridCellSumP = 0.0;
+#if VPT_LOCAL_LIGHT_GRID
+    if(!(temporalMode && !shadingActive))
+    {
+        ivec3 gridOrigin = ivec3(
+            int(vptLightGridBuffer.header.x),
+            int(vptLightGridBuffer.header.y),
+            int(vptLightGridBuffer.header.z)
+        );
+        if(vptLightGridBuffer.header.w != 0u)
+        {
+            vec3 gridLookupN = dot(geometricFaceNormal, geometricFaceNormal) > 0.25
+                ? normalize(geometricFaceNormal)
+                : (dot(hitNormal, hitNormal) > 1.0e-8 ? normalize(hitNormal) : vec3(0.0));
+            vec3 cellJitter = (vec3(
+                rand(rngState), rand(rngState), rand(rngState)
+            ) - vec3(0.5)) * 0.25;
+            cellJitter -= gridLookupN * dot(cellJitter, gridLookupN);
+            vec3 gridLookupPos = hitPos + gridLookupN * 0.20 + cellJitter;
+            ivec3 relCell = ivec3(floor(gridLookupPos / 4.0)) - gridOrigin;
+            if(all(greaterThanEqual(relCell, ivec3(0))) &&
+               all(lessThan(relCell, ivec3(24, 16, 24))))
+            {
+                gridCellIdx = uint(relCell.y) * 576u +
+                    uint(relCell.z) * 24u + uint(relCell.x);
+                uvec4 meta = vptLightGridBuffer.cellMeta[gridCellIdx];
+                gridCellCount = meta.x;
+                gridCellSumP = uintBitsToFloat(meta.y);
+                if(gridCellCount == 0u)
+                {
+                    gridEmptyZero = true;
+                }
+                else if(gridCellCount <= 32u)
+                {
+                    useLightGrid = true;
+                }
+            }
+        }
+    }
+#endif
+
+    bool hasDirectory = !useLightGrid && !gridEmptyZero && !(temporalMode && !shadingActive);
+    ivec3 receiverSection = ivec3(0);
+    uint receiverPage = 0u;
+    ivec3 directorySection = ivec3(0);
     float borrowDonorWeightA = 1.0;
     bool borrowDonorBValid = false;
     ivec3 borrowDonorBSection = ivec3(0);
     uint borrowDonorBPage = 0u;
     float borrowDonorBDistanceSquared = 1.0e30;
-    if(!vliLookupSectionPage(receiverSection, receiverPage))
+    if(hasDirectory)
     {
-        // A Section missing from the VPT page table is *unknown*, not black.
-        // Returning zero here removed the complete local-light term over whole
-        // 16-block Sections, which is what painted the hard, un-jittered
-        // terminators along the Section grid on otherwise uniformly lit walls.
-        //
-        // Borrow the first resident axis neighbour instead.  Directory offsets
-        // are stored relative to the Section that owns the directory, so every
-        // emitter is still reconstructed at its true absolute position by
-        // offsetting from `directorySection` rather than `receiverSection`.
-        // Only the Section-level proposal weights become the donor's, which is
-        // a bounded approximation versus a hard black band.
-        bool borrowedDirectory = false;
-        ivec3 donorASection = ivec3(0);
-        uint donorAPage = 0u;
-        float donorADistanceSquared = 1.0e30;
-        for(uint neighbourIndex = 0u; neighbourIndex < 6u; ++neighbourIndex)
+        const vec3 directoryJitter = vec3(
+            rand(rngState), rand(rngState), rand(rngState)) - vec3(0.5);
+        receiverSection = ivec3(floor((hitPos + directoryJitter * 16.0) / 16.0));
+        directorySection = receiverSection;
+        if(!vliLookupSectionPage(receiverSection, receiverPage))
         {
-            ivec3 neighbour = receiverSection + (
-                neighbourIndex == 0u ? ivec3( 1,  0,  0) :
-                neighbourIndex == 1u ? ivec3(-1,  0,  0) :
-                neighbourIndex == 2u ? ivec3( 0,  1,  0) :
-                neighbourIndex == 3u ? ivec3( 0, -1,  0) :
-                neighbourIndex == 4u ? ivec3( 0,  0,  1) :
-                                       ivec3( 0,  0, -1)
-            );
-            uint neighbourPage;
-            if(vliLookupSectionPage(neighbour, neighbourPage))
+            bool borrowedDirectory = false;
+            ivec3 donorASection = ivec3(0);
+            uint donorAPage = 0u;
+            float donorADistanceSquared = 1.0e30;
+            for(uint neighbourIndex = 0u; neighbourIndex < 6u; ++neighbourIndex)
             {
-                borrowedDirectory = true;
-                const vec3 neighbourCenter =
-                    vec3(neighbour) * 16.0 + vec3(8.0);
-                const vec3 toNeighbour = hitPos - neighbourCenter;
-                const float neighbourDistanceSquared =
-                    dot(toNeighbour, toNeighbour);
-                if(neighbourDistanceSquared < donorADistanceSquared)
+                ivec3 neighbour = receiverSection + (
+                    neighbourIndex == 0u ? ivec3( 1,  0,  0) :
+                    neighbourIndex == 1u ? ivec3(-1,  0,  0) :
+                    neighbourIndex == 2u ? ivec3( 0,  1,  0) :
+                    neighbourIndex == 3u ? ivec3( 0, -1,  0) :
+                    neighbourIndex == 4u ? ivec3( 0,  0,  1) :
+                                           ivec3( 0,  0, -1)
+                );
+                uint neighbourPage;
+                if(vliLookupSectionPage(neighbour, neighbourPage))
                 {
-                    borrowDonorBSection = donorASection;
-                    borrowDonorBPage = donorAPage;
-                    borrowDonorBDistanceSquared = donorADistanceSquared;
-                    donorASection = neighbour;
-                    donorAPage = neighbourPage;
-                    donorADistanceSquared = neighbourDistanceSquared;
-                }
-                else if(neighbourDistanceSquared < borrowDonorBDistanceSquared)
-                {
-                    borrowDonorBSection = neighbour;
-                    borrowDonorBPage = neighbourPage;
-                    borrowDonorBDistanceSquared = neighbourDistanceSquared;
+                    borrowedDirectory = true;
+                    const vec3 neighbourCenter =
+                        vec3(neighbour) * 16.0 + vec3(8.0);
+                    const vec3 toNeighbour = hitPos - neighbourCenter;
+                    const float neighbourDistanceSquared =
+                        dot(toNeighbour, toNeighbour);
+                    if(neighbourDistanceSquared < donorADistanceSquared)
+                    {
+                        borrowDonorBSection = donorASection;
+                        borrowDonorBPage = donorAPage;
+                        borrowDonorBDistanceSquared = donorADistanceSquared;
+                        donorASection = neighbour;
+                        donorAPage = neighbourPage;
+                        donorADistanceSquared = neighbourDistanceSquared;
+                    }
+                    else if(neighbourDistanceSquared < borrowDonorBDistanceSquared)
+                    {
+                        borrowDonorBSection = neighbour;
+                        borrowDonorBPage = neighbourPage;
+                        borrowDonorBDistanceSquared = neighbourDistanceSquared;
+                    }
                 }
             }
-        }
-        if(!borrowedDirectory)
-        {
-            return vec3(0.0);
-        }
-        directorySection = donorASection;
-        receiverPage = donorAPage;
-        // 混合权重：越近的捐助者权重越大（w_A = d_B/(d_A+d_B)，等距 0.5/0.5）。
-        // 只有一个有页邻居时 w_A = 1（退化为旧行为）。
-        borrowDonorBValid = borrowDonorBDistanceSquared < 1.0e29;
-        if(borrowDonorBValid)
-        {
-            const float donorADistance = sqrt(donorADistanceSquared);
-            const float donorBDistance = sqrt(borrowDonorBDistanceSquared);
-            borrowDonorWeightA =
-                donorBDistance / max(donorADistance + donorBDistance, 1.0e-6);
+            if(!borrowedDirectory)
+            {
+                hasDirectory = false;
+            }
+            else
+            {
+                directorySection = donorASection;
+                receiverPage = donorAPage;
+                borrowDonorBValid = borrowDonorBDistanceSquared < 1.0e29;
+                if(borrowDonorBValid)
+                {
+                    const float donorADistance = sqrt(donorADistanceSquared);
+                    const float donorBDistance = sqrt(borrowDonorBDistanceSquared);
+                    borrowDonorWeightA =
+                        donorBDistance / max(donorADistance + donorBDistance, 1.0e-6);
+                }
+            }
         }
     }
 
@@ -3578,264 +4035,294 @@ vec3 evaluateVPTRISDirectLightingSingle(
     uint selectedEmission = 0u;
     uint selectedTypeCode = 0u;
     float weightSum = 0.0;
-    uint directoryBase = receiverPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
-    uint sourceSectionCount = min(
-        vptSourceDirectoryPagesBuffer.entries[directoryBase].pageIndex,
-        VPT_SOURCE_DIRECTORY_MAX_SECTIONS
-    );
-    if(sourceSectionCount == 0u)
+    uint directoryBase = 0u;
+    uint sourceSectionCount = 0u;
+    if(hasDirectory)
     {
-        // =====================================================
-        // 2026-10-03 **消灭明暗分界线（2/3）：空目录向外借**。
-        //
-        // 旧实现：所选 Section 的目录为空（它 ±2 圈内没有发射体）⇒ 整项归零。
-        // 接收点跨过 16 格平面时，一侧目录非空、另一侧为空 ⇒ 一侧有光、另一侧
-        // 全黑 —— 又是一条笔直的分界线（与"页缺失"同类，只是发生在目录层面）。
-        //
-        // 这里向外借**邻居的目录**（不只是页）：取第一个非空的。发射体的绝对位置
-        // 按 donor 的 Section 重建（偏移本就是相对目录拥有者存的），提案权重用
-        // donor 目录自己的 selectionProbability ⇒ RIS 仍无偏，最坏的代价只是
-        // "Section 级提案权重变成 donor 的"，绝不会归零。
-        // =====================================================
-        bool borrowedDirectoryEntries = false;
-        for(uint neighbourIndex = 0u; neighbourIndex < 6u; ++neighbourIndex)
+        directoryBase = receiverPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
+        sourceSectionCount = min(
+            vptSourceDirectoryPagesBuffer.entries[directoryBase].pageIndex,
+            VPT_SOURCE_DIRECTORY_MAX_SECTIONS
+        );
+        if(sourceSectionCount == 0u)
         {
-            ivec3 neighbour = directorySection + (
-                neighbourIndex == 0u ? ivec3( 1,  0,  0) :
-                neighbourIndex == 1u ? ivec3(-1,  0,  0) :
-                neighbourIndex == 2u ? ivec3( 0,  1,  0) :
-                neighbourIndex == 3u ? ivec3( 0, -1,  0) :
-                neighbourIndex == 4u ? ivec3( 0,  0,  1) :
-                                       ivec3( 0,  0, -1)
-            );
-            uint neighbourPage;
-            if(!vliLookupSectionPage(neighbour, neighbourPage))
+            bool borrowedDirectoryEntries = false;
+            for(uint neighbourIndex = 0u; neighbourIndex < 6u; ++neighbourIndex)
             {
-                continue;
+                ivec3 neighbour = directorySection + (
+                    neighbourIndex == 0u ? ivec3( 1,  0,  0) :
+                    neighbourIndex == 1u ? ivec3(-1,  0,  0) :
+                    neighbourIndex == 2u ? ivec3( 0,  1,  0) :
+                    neighbourIndex == 3u ? ivec3( 0, -1,  0) :
+                    neighbourIndex == 4u ? ivec3( 0,  0,  1) :
+                                           ivec3( 0,  0, -1)
+                );
+                uint neighbourPage;
+                if(!vliLookupSectionPage(neighbour, neighbourPage))
+                {
+                    continue;
+                }
+                const uint neighbourBase =
+                    neighbourPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
+                const uint neighbourCount = min(
+                    vptSourceDirectoryPagesBuffer.entries[neighbourBase].pageIndex,
+                    VPT_SOURCE_DIRECTORY_MAX_SECTIONS
+                );
+                if(neighbourCount == 0u)
+                {
+                    continue;
+                }
+                directorySection = neighbour;
+                receiverPage = neighbourPage;
+                directoryBase = neighbourBase;
+                sourceSectionCount = neighbourCount;
+                borrowedDirectoryEntries = true;
+                break;
             }
-            const uint neighbourBase =
-                neighbourPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
-            const uint neighbourCount = min(
-                vptSourceDirectoryPagesBuffer.entries[neighbourBase].pageIndex,
-                VPT_SOURCE_DIRECTORY_MAX_SECTIONS
-            );
-            if(neighbourCount == 0u)
+            if(!borrowedDirectoryEntries)
             {
-                continue;
+                hasDirectory = false;
             }
-            directorySection = neighbour;
-            receiverPage = neighbourPage;
-            directoryBase = neighbourBase;
-            sourceSectionCount = neighbourCount;
-            borrowedDirectoryEntries = true;
-            break;
-        }
-        if(!borrowedDirectoryEntries)
-        {
-            return vec3(0.0);
         }
     }
 
-    for(uint proposalIndex = 0u;
-        proposalIndex < vptRisProposalCount();
-        ++proposalIndex)
+    const bool bounceCaller = (!temporalMode && f0.x < 0.0);
+    uint proposalBudget = temporalMode
+        ? min(vptRisProposalCount(), 6u)
+        : vptRisProposalCount();
+    if(useLightGrid && !temporalMode)
     {
-        // 2026-10-03 借目录混合：本次提案按权重挑捐助者目录（自有页存在时
-        // borrowDonorBValid = false，恒用 A，行为与旧版一致）。
-        ivec3 proposalDirectorySection = directorySection;
-        uint proposalDirectoryBase = directoryBase;
-        uint proposalSectionCount = sourceSectionCount;
-        float proposalDonorWeight = borrowDonorWeightA;
-        if(borrowDonorBValid && rand(rngState) >= borrowDonorWeightA)
-        {
-            proposalDirectorySection = borrowDonorBSection;
-            proposalDirectoryBase =
-                borrowDonorBPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
-            proposalSectionCount = min(
-                vptSourceDirectoryPagesBuffer.entries[proposalDirectoryBase].pageIndex,
-                VPT_SOURCE_DIRECTORY_MAX_SECTIONS
-            );
-            proposalDonorWeight = 1.0 - borrowDonorWeightA;
-        }
-        if(proposalSectionCount == 0u || proposalDonorWeight <= 0.0)
-        {
-            continue;
-        }
-        uint sourceDirectoryBucket = min(
-            uint(rand(rngState) * float(proposalSectionCount)),
-            proposalSectionCount - 1u
-        );
-        VPTSourceDirectoryEntry sourceDirectoryBucketEntry =
-            vptSourceDirectoryPagesBuffer.entries[
-            proposalDirectoryBase + 1u + sourceDirectoryBucket
-        ];
-        uint sourceDirectoryIndex = rand(rngState) <=
-            float(sourceDirectoryBucketEntry.aliasThresholdQ16) / 65535.0
-            ? sourceDirectoryBucket
-            : min(sourceDirectoryBucketEntry.aliasIndex, proposalSectionCount - 1u);
-        VPTSourceDirectoryEntry sourceDirectoryEntry =
-            vptSourceDirectoryPagesBuffer.entries[
-                proposalDirectoryBase + 1u + sourceDirectoryIndex
-            ];
-        uint sourcePage = sourceDirectoryEntry.pageIndex;
-        uint sourceMetadata = sourceDirectoryEntry.emitterCountAndOffset;
-        uint emitterCount = sourceMetadata & 0x1fffu;
-        if(emitterCount == 0u)
-        {
-            continue;
-        }
+        const uint gridCap = bounceCaller
+            ? uint(VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP)
+            : uint(VPT_LIGHT_GRID_PROPOSAL_CAP);
+        proposalBudget = min(proposalBudget, min(gridCellCount, gridCap));
+    }
+    const bool gridExhaustive = useLightGrid &&
+        gridCellCount <= uint(VPT_LIGHT_GRID_EXHAUSTIVE_MAX);
+    const uint loopCount = gridExhaustive ? gridCellCount : proposalBudget;
+    const float effectiveProposalCount = gridExhaustive
+        ? 1.0
+        : max(float(loopCount), 1.0);
 
-        uint emitterBucket = min(
-            uint(rand(rngState) * float(emitterCount)),
-            emitterCount - 1u
-        );
-        uint emitterAliasWord = vptEmitterAliasPagesBuffer.words[
-            sourcePage * VPT_EMITTER_PAGE_WORDS +
-            VPT_EMITTER_HEADER_WORDS + emitterBucket
-        ];
-        uint emitterIndex = rand(rngState) <=
-            float(emitterAliasWord & 0xffffu) / 65535.0
-            ? emitterBucket
-            : min(emitterAliasWord >> 16u, emitterCount - 1u);
-        uint packedEmitter = vptEmitterIndexPagesBuffer.words[
-            sourcePage * VPT_EMITTER_PAGE_WORDS +
-            VPT_EMITTER_HEADER_WORDS + emitterIndex
-        ];
-        uint emission = (packedEmitter >> 12u) & 15u;
-        if(emission == 0u) continue;
+    const bool useBlueNoiseBucket =
+        (VPT_LOCAL_BLUE_NOISE_RIS != 0) && useLightGrid && !gridExhaustive && !temporalMode;
+    float bnBucketPhase = useBlueNoiseBucket
+        ? vptLocalBlueNoise01(rtLogicalPixelCoord(), cam.frameCount, 29u, rngState)
+        : 0.0;
 
-        ivec3 sourceSection = proposalDirectorySection + ivec3(
-            int((sourceMetadata >> 13u) & 7u) - 2,
-            int((sourceMetadata >> 16u) & 7u) - 2,
-            int((sourceMetadata >> 19u) & 7u) - 2
-        );
-        ivec3 emitterBlock = sourceSection * 16 + ivec3(
-            int(packedEmitter & 15u),
-            int((packedEmitter >> 4u) & 15u),
-            int((packedEmitter >> 8u) & 15u)
-        );
+    const vec3 lumaWeights = vec3(0.2126, 0.7152, 0.0722);
+    const float albedoLuma = max(dot(max(hitAlbedo, vec3(0.0)), lumaWeights), 0.04);
+    const float specProxyGain = (f0.x >= 0.0 && !waterColumnReceiver)
+        ? (max(max(f0.r, max(f0.g, f0.b)), 0.04) *
+           (1.0 - clamp(roughness, 0.0, 1.0)) * 0.5)
+        : 0.0;
+    float selectedProxyTarget = 0.0;
 
-        vec3 emitterCenter = vec3(emitterBlock) + vec3(0.5);
-        vec3 toLight = emitterCenter - hitPos;
-        float distanceSquared = dot(toLight, toLight);
-        if(distanceSquared <= 1.0e-6)
+    if(useLightGrid || hasDirectory)
+    {
+        for(uint proposalIndex = 0u;
+            proposalIndex < loopCount;
+            ++proposalIndex)
         {
-            continue;
-        }
-        float distanceToLight = sqrt(distanceSquared);
-        float emissionLevel = float(emission);
-        // 2026-10-31：档案 id 扩到 5 bit，距离/亮度都按档案走 ⇒ 先取 id。
-        uint typeCode = (packedEmitter >> 16u) & 31u;
-        if(distanceToLight > vptLocalLightRange(typeCode, emissionLevel))
-        {
-            continue;
-        }
+            ivec3 emitterBlock = ivec3(0);
+            uint emission = 0u;
+            uint typeCode = 0u;
+            float invSourcePdf = 1.0;
 
-        float receiverCosine = waterColumnReceiver
-            ? 1.0
-            : max(dot(N, toLight / distanceToLight), 0.0);
-#if VPT_LOCAL_GEOMETRIC_COSINE_BOUND
-        // 浮雕只能衰减：几何面本身背对这颗灯时直接判不可达，旧行为会在浮雕
-        // 越过地平线的那些纹素上放行。
-        receiverCosine = min(
-            receiverCosine,
-            max(dot(localGeometricN, toLight / distanceToLight), 0.0)
-        );
-#endif
-        if(receiverCosine <= 0.0)
-        {
-            continue;
-        }
+            if(useLightGrid)
+            {
+                uint chosenIdx = proposalIndex;
+                if(!gridExhaustive)
+                {
+                    float uBucket = useBlueNoiseBucket
+                        ? fract(bnBucketPhase + (float(proposalIndex) + 0.5) / float(loopCount))
+                        : rand(rngState);
+                    uint bucket = min(
+                        uint(uBucket * float(gridCellCount)),
+                        gridCellCount - 1u
+                    );
+                    uint aw = vptLightGridBuffer.aliasWords[gridCellIdx * 32u + bucket];
+                    chosenIdx = rand(rngState) <= float(aw & 0xffffu) / 65535.0
+                        ? bucket
+                        : min(aw >> 16u, gridCellCount - 1u);
+                }
+                uvec4 slotData = vptLightGridBuffer.slots[gridCellIdx * 32u + chosenIdx];
+                float pCell = uintBitsToFloat(slotData.w);
+                uint packedYMeta = slotData.y;
+                uint identity = packedYMeta >> 16u;
+                emission = (identity >> 5u) & 15u;
+                typeCode = identity & 31u;
+                if(emission == 0u || pCell <= 0.0) continue;
+                emitterBlock = ivec3(
+                    int(slotData.x),
+                    int(packedYMeta & 0xffffu) - 32768,
+                    int(slotData.z)
+                );
+                invSourcePdf = gridExhaustive
+                    ? 1.0
+                    : (max(gridCellSumP, pCell) / max(pCell, 1.0e-6));
+            }
+            else
+            {
+                ivec3 proposalDirectorySection = directorySection;
+                uint proposalDirectoryBase = directoryBase;
+                uint proposalSectionCount = sourceSectionCount;
+                float proposalDonorWeight = borrowDonorWeightA;
+                if(borrowDonorBValid && rand(rngState) >= borrowDonorWeightA)
+                {
+                    proposalDirectorySection = borrowDonorBSection;
+                    proposalDirectoryBase =
+                        borrowDonorBPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
+                    proposalSectionCount = min(
+                        vptSourceDirectoryPagesBuffer.entries[proposalDirectoryBase].pageIndex,
+                        VPT_SOURCE_DIRECTORY_MAX_SECTIONS
+                    );
+                    proposalDonorWeight = 1.0 - borrowDonorWeightA;
+                }
+                if(proposalSectionCount == 0u || proposalDonorWeight <= 0.0)
+                {
+                    continue;
+                }
+                uint sourceDirectoryBucket = min(
+                    uint(rand(rngState) * float(proposalSectionCount)),
+                    proposalSectionCount - 1u
+                );
+                VPTSourceDirectoryEntry sourceDirectoryBucketEntry =
+                    vptSourceDirectoryPagesBuffer.entries[
+                    proposalDirectoryBase + 1u + sourceDirectoryBucket
+                ];
+                uint sourceDirectoryIndex = rand(rngState) <=
+                    float(sourceDirectoryBucketEntry.aliasThresholdQ16) / 65535.0
+                    ? sourceDirectoryBucket
+                    : min(sourceDirectoryBucketEntry.aliasIndex, proposalSectionCount - 1u);
+                VPTSourceDirectoryEntry sourceDirectoryEntry =
+                    vptSourceDirectoryPagesBuffer.entries[
+                        proposalDirectoryBase + 1u + sourceDirectoryIndex
+                    ];
+                uint sourcePage = sourceDirectoryEntry.pageIndex;
+                uint sourceMetadata = sourceDirectoryEntry.emitterCountAndOffset;
+                uint emitterCount = sourceMetadata & 0x1fffu;
+                if(emitterCount == 0u)
+                {
+                    continue;
+                }
 
-        vec3 centreDirection = toLight / distanceToLight;
-        vec3 referenceAxis = abs(centreDirection.y) < 0.95
-            ? vec3(0.0, 1.0, 0.0)
-            : vec3(1.0, 0.0, 0.0);
-        vec3 tangent = normalize(cross(referenceAxis, centreDirection));
-        vec3 bitangent = normalize(cross(centreDirection, tangent));
+                uint emitterBucket = min(
+                    uint(rand(rngState) * float(emitterCount)),
+                    emitterCount - 1u
+                );
+                uint emitterAliasWord = vptEmitterAliasPagesBuffer.words[
+                    sourcePage * VPT_EMITTER_PAGE_WORDS +
+                    VPT_EMITTER_HEADER_WORDS + emitterBucket
+                ];
+                uint emitterIndex = rand(rngState) <=
+                    float(emitterAliasWord & 0xffffu) / 65535.0
+                    ? emitterBucket
+                    : min(emitterAliasWord >> 16u, emitterCount - 1u);
+                uint packedEmitter = vptEmitterIndexPagesBuffer.words[
+                    sourcePage * VPT_EMITTER_PAGE_WORDS +
+                    VPT_EMITTER_HEADER_WORDS + emitterIndex
+                ];
+                emission = (packedEmitter >> 12u) & 15u;
+                if(emission == 0u) continue;
+                typeCode = (packedEmitter >> 16u) & 31u;
 
-        vec2 sampleUv = vec2(rand(rngState), rand(rngState)) - vec2(0.5);
-        vec3 emitterSample = emitterCenter +
-            (tangent * sampleUv.x + bitangent * sampleUv.y) *
-            VPT_LOCAL_LIGHT_AREA_SIZE;
-        // 2026-09-30: 夹回发射体体素。下面的入面缩短与玻璃染色都建立在
-        // 「采样点仍在这个发光方块内」这一前提上（sampledPointInsideEmitterVoxel
-        // 就是它的判据）；斜向射线的切向基斜跨 XZ 时，面积/2 的偏移能越出方块
-        // 约 0.2 格，夹回后该前提对所有方向都成立。夹回只收紧散布，scale 里没有
-        // 面积因子，因此本地光能量不变。
-        emitterSample = clamp(
-            emitterSample,
-            vec3(emitterBlock) + vec3(0.001),
-            vec3(emitterBlock) + vec3(0.999)
-        );
-        vec3 sampledToLight = emitterSample - hitPos;
-        float sampledDistance = length(sampledToLight);
-        if(sampledDistance <= 1.0e-6) continue;
-        vec3 lightDirection = sampledToLight / sampledDistance;
-        float sampledCosine = max(dot(N, lightDirection), 0.0);
-#if VPT_LOCAL_GEOMETRIC_COSINE_BOUND
-        sampledCosine = min(
-            sampledCosine,
-            vptLocalFaceSetCosineBound(
+                ivec3 sourceSection = proposalDirectorySection + ivec3(
+                    int((sourceMetadata >> 13u) & 7u) - 2,
+                    int((sourceMetadata >> 16u) & 7u) - 2,
+                    int((sourceMetadata >> 19u) & 7u) - 2
+                );
+                emitterBlock = sourceSection * 16 + ivec3(
+                    int(packedEmitter & 15u),
+                    int((packedEmitter >> 4u) & 15u),
+                    int((packedEmitter >> 8u) & 15u)
+                );
+
+                uint totalEmitterPower = vptEmitterIndexPagesBuffer.words[
+                    sourcePage * VPT_EMITTER_PAGE_WORDS + 2u
+                ];
+                float proposalPdf = max(
+                    proposalDonorWeight *
+                    sourceDirectoryEntry.selectionProbability *
+                    (float(emission) / float(max(totalEmitterPower, 1u))),
+                    1.0e-8
+                );
+                invSourcePdf = 1.0 / proposalPdf;
+            }
+
+            vec3 emitterCenter = vec3(emitterBlock) + vec3(0.5);
+            float proxyTarget = vptLocalEmitterProxyTarget(
+                hitPos,
+                N,
+                viewDir,
+                albedoLuma,
+                specProxyGain,
+                waterColumnReceiver,
                 geometricFaceKnown,
                 geometricFaceRecovered,
-                hitPos,
-                lightDirection
-            )
-        );
-#endif
-        if(sampledCosine <= 0.0) continue;
-        float scale = 3.2 * LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
-            localLightProfileBrightness(typeCode, emissionLevel) *
-            vptLocalLightDistanceAttenuation(sampledDistance) *
-            vptLocalLightRangeFade(sampledDistance, typeCode, emissionLevel);
-        vec3 contribution = vliDecodeEmitterColor(typeCode) * scale * sampledCosine;
-        // The section Alias table already includes power and distance; the
-        // emitter Alias table uses exact emission power.  Keep the real PDF
-        // explicit so RIS remains unbiased after hierarchical importance
-        // sampling instead of retaining the old uniform reciprocal.
-        float target = max(dot(contribution, vec3(0.2126, 0.7152, 0.0722)), 0.0);
-        uint totalEmitterPower = vptEmitterIndexPagesBuffer.words[
-            sourcePage * VPT_EMITTER_PAGE_WORDS + 2u
-        ];
-        float proposalPdf = max(
-            // 混合提案的 pdf：w_D × p_D(x)（x 不在捐助者 D 目录里时 p_D = 0，
-            // 与采样规则一致，RIS 保持无偏）。
-            proposalDonorWeight *
-            sourceDirectoryEntry.selectionProbability *
-            (float(emission) / float(max(totalEmitterPower, 1u))),
-            1.0e-8
-        );
-        float weight = target / proposalPdf;
-        if(weight <= 0.0) continue;
-        weightSum += weight;
-        if(rand(rngState) * weightSum < weight)
-        {
-            selectedContribution = contribution;
-            selectedSample = emitterSample;
-            selectedBlock = emitterBlock;
-            selectedEmission = emission;
-            selectedTypeCode = typeCode;
+                emitterCenter,
+                emission,
+                typeCode
+            );
+            if(proxyTarget <= 0.0) continue;
+
+            float weight = proxyTarget * invSourcePdf;
+            if(weight <= 0.0) continue;
+            weightSum += weight;
+            if(rand(rngState) * weightSum < weight)
+            {
+                selectedBlock = emitterBlock;
+                selectedEmission = emission;
+                selectedTypeCode = typeCode;
+                selectedProxyTarget = proxyTarget;
+            }
         }
     }
 
-    // =====================================================
-    // 2026-10-26 RTXDI 式时域 reservoir（设置项：直接光模式 = 1）。
-    //
-    // 放在 weightSum <= 0 的早退**之前**：本帧提案全部落空时，上一帧的
-    // reservoir 仍要参与合并（官方 RTXDI 也是先合并、后判可见性）。
-    // =====================================================
-    if(useTemporalReservoir && cam.sparseParams.x >= 0.5)
+    float initialW = 0.0;
+    if(weightSum > 0.0 && selectedEmission > 0u && selectedProxyTarget > 0.0)
+    {
+        initialW = weightSum /
+            max(effectiveProposalCount * selectedProxyTarget, 1.0e-6);
+#if VPT_LOCAL_SHAPE_SAMPLING
+        selectedSample = vptSampleLocalEmitterPoint(
+            selectedBlock, selectedTypeCode, hitPos, rngState
+        );
+#else
+        vec3 selCenter = vec3(selectedBlock) + vec3(0.5);
+        vec3 toSel = selCenter - hitPos;
+        float selDist = max(length(toSel), 1.0e-5);
+        vec3 centreDir = toSel / selDist;
+        vec3 refAxis = abs(centreDir.y) < 0.95
+            ? vec3(0.0, 1.0, 0.0)
+            : vec3(1.0, 0.0, 0.0);
+        vec3 tangent = normalize(cross(refAxis, centreDir));
+        vec3 bitangent = normalize(cross(centreDir, tangent));
+        vec2 sampleUv = vec2(rand(rngState), rand(rngState)) - vec2(0.5);
+        selectedSample = clamp(
+            selCenter + (tangent * sampleUv.x + bitangent * sampleUv.y) *
+                VPT_LOCAL_LIGHT_AREA_SIZE,
+            vec3(selectedBlock) + vec3(0.001),
+            vec3(selectedBlock) + vec3(0.999)
+        );
+#endif
+    }
+
+    if(temporalMode)
     {
         return evaluateVPTDirectLightReservoirTail(
             hitPos,
             N,
+            viewDir,
             hitAlbedo,
+            f0,
+            metallic,
+            roughness,
             waterColumnReceiver,
             geometricFaceKnown,
             geometricFaceRecovered,
-            weightSum,
-            selectedContribution,
+            initialW,
+            selectedProxyTarget,
             selectedSample,
             selectedEmission,
             selectedTypeCode,
@@ -3843,7 +4330,15 @@ vec3 evaluateVPTRISDirectLightingSingle(
             rngState
         );
     }
-    if(weightSum <= 0.0)
+    if(initialW <= 0.0)
+    {
+        return vec3(0.0);
+    }
+    if(!vptLocalEmitterContributionAt(
+        hitPos, N, viewDir, hitAlbedo, f0, metallic, roughness,
+        waterColumnReceiver, geometricFaceKnown, geometricFaceRecovered,
+        selectedSample, selectedEmission, selectedTypeCode,
+        selectedContribution))
     {
         return vec3(0.0);
     }
@@ -3919,7 +4414,9 @@ vec3 evaluateVPTRISDirectLightingSingle(
 #if VPT_LOCAL_CONSERVATIVE_VOXEL_OCCLUSION
     // 见 vptVoxelPathBlocked：补齐"硬件射线从两块相接的棱缝里滑过去"这条漏光路径
     // （用户报的"方块角落的亮线"正好沿棱出现）。
-    if(!perfL10DisableLocalVoxelOcclusion() && vptVoxelPathBlocked(
+    if(!perfL10DisableLocalVoxelOcclusion() &&
+       !(VPT_LOCAL_SKIP_BOUNCE_VOXEL_OCC != 0 && bounceCaller) &&
+       vptVoxelPathBlocked(
         receiverOrigin,
         selectedSample,
         selectedBlock,
@@ -3933,13 +4430,31 @@ vec3 evaluateVPTRISDirectLightingSingle(
     // Local emitters are the only light this path handles, so the coloured
     // transmission - and the exposure guard that keeps its hue from being
     // clipped to white - are applied here and nowhere else.
-    float selectedWeight = max(dot(selectedContribution,
-        vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
     return applyLocalGlassTint(
-        selectedContribution * (weightSum /
-            (float(vptRisProposalCount()) * selectedWeight)) *
-            max(hitAlbedo, vec3(0.0)) * 0.92,
+        selectedContribution * initialW,
         transmittance
+    );
+}
+
+// 7-parameter wrapper for callers without PBR roughness/metallic/f0
+vec3 evaluateVPTRISDirectLightingSingle(
+    vec3 hitPos,
+    vec3 hitNormal,
+    vec3 hitAlbedo,
+    vec3 geometricFaceNormal,
+    bool useTemporalReservoir,
+    bool shadingActive,
+    inout uint rngState
+)
+{
+    vec3 cameraPosition =
+        (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    vec3 toCam = cameraPosition - hitPos;
+    float camLen = length(toCam);
+    vec3 viewDir = camLen > 1.0e-6 ? (toCam / camLen) : vec3(0.0, 1.0, 0.0);
+    return evaluateVPTRISDirectLightingSingle(
+        hitPos, hitNormal, viewDir, hitAlbedo, geometricFaceNormal,
+        vec3(-1.0), -1.0, 1.0, useTemporalReservoir, shadingActive, rngState
     );
 }
 
@@ -4021,15 +4536,6 @@ float vptLocalLightKeepProbability(float cameraDistance)
 // 纯 Lambert（kD 恒 0.92，与改动前完全等价）。
 // =====================================================
 
-vec3 dynamicLightBRDF(
-    vec3 N,
-    vec3 V,
-    vec3 L,
-    vec3 albedo,
-    vec3 f0,
-    float metallic,
-    float roughness
-);
 // 为什么长这样：
 //   · **独立光源集 + 均匀提案**：动态光源与方块发射体是不相交的两个集合，所以自己
 //     跑一次均匀提案 RIS（pdf = 1/条数，不需要 alias 表）就已经无偏，最后与体素那套
@@ -4283,8 +4789,12 @@ vec3 evaluateVPTRISDirectLighting(
     // 明暗分界线与"prob"观感的来源。现在本地光恢复为每像素必算、不丢弃、不加权
     // —— 与旧版 Orion 的行为一致。代价：>56 格的像素也要跑候选搜索 + 1 条可视
     // 性射线；如果帧时间不可接受，再谈别的限距方案（不用概率）。
+    vec3 toCam = cameraPosition - hitPos;
+    float camLen = length(toCam);
+    vec3 viewDir = camLen > 1.0e-6 ? (toCam / camLen) : vec3(0.0, 1.0, 0.0);
     vec3 voxelDirect = evaluateVPTRISDirectLightingSingle(
-        hitPos, hitNormal, hitAlbedo, geometricFaceNormal, false, true, rngState);
+        hitPos, hitNormal, viewDir, hitAlbedo, geometricFaceNormal,
+        f0, metallic, roughness, false, true, rngState);
 
     // 2026-10-07 动态光源（移动光源）：**相加**，不并进上面那次 RIS —— 理由见函数上方
     // 那段说明。条数为 0 时这里立刻返回 0，整条链逐位回到改动前。
@@ -4311,10 +4821,13 @@ vec3 evaluateVPTRISDirectLightingPrimary(
     vec3 cameraPosition =
         (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
     float receiverCameraDistance = length(hitPos - cameraPosition);
+    vec3 toCam = cameraPosition - hitPos;
+    float camLen = length(toCam);
+    vec3 viewDir = camLen > 1.0e-6 ? (toCam / camLen) : vec3(0.0, 1.0, 0.0);
 
     vec3 voxelDirect = evaluateVPTRISDirectLightingSingle(
-        hitPos, hitNormal, hitAlbedo, geometricFaceNormal,
-        temporalReservoir, shadingActive, rngState);
+        hitPos, hitNormal, viewDir, hitAlbedo, geometricFaceNormal,
+        f0, metallic, roughness, temporalReservoir, shadingActive, rngState);
 
     // 2026-10-26 稀疏渲染：动态光源没有可老化的 reservoir，非活跃像素
     // 直接跳过（与本地光的 enableRtxdiReuseForInactivePixels 语义对齐 ——
@@ -7041,65 +7554,45 @@ vec3 evaluateVPTCandidateDirectTemporal(
 // M 是候选数，每帧只 +1 ⇒ 4 就是 4 帧历史。我们此前每帧按提案数（16）计入 M，
 // 又没有在钳位时缩放 weightSum ⇒ W 逐帧上涨、画面被降噪器钳成萤火虫。
 #ifndef VPT_DIRECT_WRS_HISTORY_LENGTH
-// RTXDI 的 rtx.di.maxHistoryLength 默认值。
 #define VPT_DIRECT_WRS_HISTORY_LENGTH 4.0
 #endif
 #ifndef VPT_DIRECT_WRS_NORMAL_COSINE
-// rtxdi_temporal_reuse.comp.slang:123 tparams.normalThreshold = 0.8
-#define VPT_DIRECT_WRS_NORMAL_COSINE 0.8
+#define VPT_DIRECT_WRS_NORMAL_COSINE 0.80
 #endif
-// 空间复用（rtxdi_spatial_reuse.comp.slang:118-131 + rtx_rtxdi_rayquery.h:71-75）
 #ifndef VPT_DIRECT_WRS_SPATIAL_SAMPLES
-#define VPT_DIRECT_WRS_SPATIAL_SAMPLES 2
+#define VPT_DIRECT_WRS_SPATIAL_SAMPLES 0
 #endif
 #ifndef VPT_DIRECT_WRS_SPATIAL_SAMPLES_DISOC
-#define VPT_DIRECT_WRS_SPATIAL_SAMPLES_DISOC 4
+#define VPT_DIRECT_WRS_SPATIAL_SAMPLES_DISOC 0
 #endif
 #ifndef VPT_DIRECT_WRS_SPATIAL_RADIUS
-// sparams.samplingRadius = 30（像素）
-#define VPT_DIRECT_WRS_SPATIAL_RADIUS 30
+#define VPT_DIRECT_WRS_SPATIAL_RADIUS 12
 #endif
 #ifndef VPT_DIRECT_WRS_SPATIAL_NORMAL
-// sparams.normalThreshold = 0.5（比时域的 0.8 松，Remix 原值）
-#define VPT_DIRECT_WRS_SPATIAL_NORMAL 0.5
+#define VPT_DIRECT_WRS_SPATIAL_NORMAL 0.90
 #endif
 #ifndef VPT_DIRECT_WRS_SPATIAL_DEPTH
-// sparams.depthThreshold = 0.1（按相机距离的相对量）
-#define VPT_DIRECT_WRS_SPATIAL_DEPTH 0.1
+#define VPT_DIRECT_WRS_SPATIAL_DEPTH 0.05
 #endif
 #ifndef VPT_DIRECT_WRS_DISOCLUSION_FRAMES
-// rtx.di.disocclusionFrames = 8
 #define VPT_DIRECT_WRS_DISOCLUSION_FRAMES 8
 #endif
-// 时域重投影的探测次数（RTXDI_TemporalResampling :432-467 固定 9 次）。
-// 1 = 旧行为（只试运动矢量像素）。
 #ifndef VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS
-#define VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS 9
+#define VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS 3
 #endif
-// best-light sampling（Remix 的 RtxdiBestLights，见 initial_sampling.comp:102-105）。
-// 0 = 关。⚠ 我们用的是"格锚点像素的上一帧 reservoir"，不是 argmax(照度)，
-// 原因见 tail 里的长注释（没有 per-tile SSBO / 没有 G-buffer）。
 #ifndef VPT_DIRECT_WRS_BEST_LIGHT
-#define VPT_DIRECT_WRS_BEST_LIGHT 1
+#define VPT_DIRECT_WRS_BEST_LIGHT 0
 #endif
-// 2026-11-02 稀疏瘦身：非活跃像素（不写颜色）跳过空间复用与 best-light，
-// 只保留 temporal + history 落盘。0 = 回到"非活跃像素也跑全套"的旧行为（A/B 用）。
 #ifndef VPT_SPARSE_INACTIVE_THIN
 #define VPT_SPARSE_INACTIVE_THIN 1
 #endif
 #ifndef VPT_DIRECT_WRS_BEST_LIGHT_TILE
-// Remix 的 RTXDI_GRAD_FACTOR 是 8 的整数倍口径；这里用 8×8。
 #define VPT_DIRECT_WRS_BEST_LIGHT_TILE 8
 #endif
-// RAY_TRACED bias correction（Remix 的 rtx.di.enableRayTracedBiasCorrection 默认 true）：
-// 选中的历史样本要重验一次可见性，不可见则把它的 p̂ 置 0。
 #ifndef VPT_DIRECT_WRS_RAY_TRACED_BC
-#define VPT_DIRECT_WRS_RAY_TRACED_BC 1
+#define VPT_DIRECT_WRS_RAY_TRACED_BC 0
 #endif
 #ifndef VPT_DIRECT_WRS_CONFIDENCE_LENGTH
-// rtxdi_temporal_reuse.comp.slang:144 的 kReprojectionConfidenceHistoryLength。
-// ⚠ 参考仓库里只有这个符号的**用法**（预编译 shader 内联），没有定义 ⇒ 取 8，
-// 与 disocclusionFrames 同值：语义是"连续重投影成功 8 帧视为收敛"。
 #define VPT_DIRECT_WRS_CONFIDENCE_LENGTH 8.0
 #endif
 
@@ -7169,10 +7662,38 @@ void vptBestLightInsert(ivec2 pixelCoord, float luma)
     atomicMax(vptBestLightBuffer.tiles[writeHalf * halfOffset + tileIndex], key);
 }
 
-// 按当前接收面重算一个灯样本的无阴影贡献（与 RIS 提案循环的 scale 逐项一致）。
+// Pack RGB transmittance into IEEE-754 mantissa of [1.0, 2.0) (8/8/7 bits) so zero/denorm flush never alters it.
+float vptPackTransmittance24(vec3 transmittance)
+{
+    vec3 clamped = clamp(transmittance, vec3(0.0), vec3(1.0));
+    uint r = min(uint(round(clamped.r * 255.0)), 255u);
+    uint g = min(uint(round(clamped.g * 255.0)), 255u);
+    uint b = min(uint(round(clamped.b * 127.0)), 127u);
+    return uintBitsToFloat(0x3f800000u | r | (g << 8u) | (b << 16u));
+}
+
+vec3 vptUnpackTransmittance24(float packed)
+{
+    uint bits = floatBitsToUint(packed);
+    if((bits & 0xff800000u) != 0x3f800000u)
+    {
+        return vec3(1.0);
+    }
+    float r = float(bits & 255u) / 255.0;
+    float g = float((bits >> 8u) & 255u) / 255.0;
+    float b = float((bits >> 16u) & 127u) / 127.0;
+    return vec3(r, g, b);
+}
+
+// 按当前接收面重算一个灯样本的无阴影贡献（与 RIS 提案循环的 BRDF + 形状 + 衰减逐项一致）。
 bool vptLocalEmitterContributionAt(
     vec3 hitPos,
     vec3 N,
+    vec3 viewDir,
+    vec3 hitAlbedo,
+    vec3 f0,
+    float metallic,
+    float roughness,
     bool waterColumnReceiver,
     bool geometricFaceKnown,
     vec3 geometricFaceRecovered,
@@ -7195,20 +7716,20 @@ bool vptLocalEmitterContributionAt(
     }
     float distanceToLight = sqrt(distanceSquared);
     float emissionLevel = float(emission);
-    // 距离闸与提案循环同口径（那里量的是**发射体中心**到接收点，不是采样点），
-    // 否则 max range 边缘那一圈采样的 target 会被本函数判 0，合并出一个偏置。
-    vec3 emitterCenter = floor(samplePosition) + vec3(0.5);
+    ivec3 emitterBlock = ivec3(floor(samplePosition));
+    vec3 emitterCenter = vec3(emitterBlock) + vec3(0.5);
     if(length(emitterCenter - hitPos) > vptLocalLightRange(typeCode, emissionLevel))
     {
         return false;
     }
     vec3 lightDirection = toLight / distanceToLight;
-    float cosine = waterColumnReceiver
+    float shadingNdotL = waterColumnReceiver
         ? 1.0
         : max(dot(N, lightDirection), 0.0);
+    float clampedNdotL = shadingNdotL;
 #if VPT_LOCAL_GEOMETRIC_COSINE_BOUND
-    cosine = min(
-        cosine,
+    clampedNdotL = min(
+        clampedNdotL,
         vptLocalFaceSetCosineBound(
             geometricFaceKnown,
             geometricFaceRecovered,
@@ -7217,16 +7738,53 @@ bool vptLocalEmitterContributionAt(
         )
     );
 #endif
-    if(cosine <= 0.0)
+    if(clampedNdotL <= 0.0)
     {
         return false;
     }
+
+    vec3 brdfTerm = vec3(0.0);
+    if(waterColumnReceiver)
+    {
+        brdfTerm = max(hitAlbedo, vec3(0.0)) * 0.92;
+    }
+    else
+    {
+#if VPT_LOCAL_PBR_BRDF
+        float horizonScale = (shadingNdotL > 1.0e-6)
+            ? clamp(clampedNdotL / shadingNdotL, 0.0, 1.0)
+            : 0.0;
+        brdfTerm = dynamicLightBRDF(
+            N, viewDir, lightDirection,
+            max(hitAlbedo, vec3(0.0)), f0, metallic, roughness
+        ) * horizonScale;
+#else
+        brdfTerm = max(hitAlbedo, vec3(0.0)) * 0.92 * clampedNdotL;
+#endif
+    }
+    if(max(brdfTerm.r, max(brdfTerm.g, brdfTerm.b)) <= 0.0)
+    {
+        return false;
+    }
+
+    float angularWeight = 1.0;
+#if VPT_LOCAL_SHAPE_SAMPLING
+    angularWeight = vptLocalEmitterAngularWeight(
+        emitterBlock, typeCode, hitPos, samplePosition, lightDirection
+    );
+    if(angularWeight <= 0.0)
+    {
+        return false;
+    }
+#endif
+
     float scale = 3.2 * LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
         localLightProfileBrightness(typeCode, emissionLevel) *
         vptLocalLightDistanceAttenuation(distanceToLight) *
         vptLocalLightRangeFade(distanceToLight, typeCode, emissionLevel);
-    contribution = vliDecodeEmitterColor(typeCode) * scale * cosine;
-    return true;
+    contribution =
+        vliDecodeEmitterColor(typeCode) * scale * angularWeight * brdfTerm;
+    return max(contribution.r, max(contribution.g, contribution.b)) > 0.0;
 }
 
 // 与 RIS 尾部完全相同的可见性/染色模型（见 evaluateVPTRISDirectLightingSingle
@@ -7280,81 +7838,83 @@ vec3 vptLocalEmitterSampleTransmittance(
     return transmittance;
 }
 
-// RTXDI_GetTemporalReprojectionOffset（:397-410）：radius=5，offset∈[-2.5,2.5)，
-// 强转 int 后落在 {-2,-1,0,1,2}。
 ivec2 vptTemporalReprojectionOffset(inout uint rngState)
 {
-    const float radius = 5.0;
+    const float radius = 3.0;
     const vec2 offsetRandom = vec2(rand(rngState), rand(rngState));
     return ivec2((offsetRandom - vec2(0.5)) * radius);
 }
 
-// 历史条目与当前接收面是否同一个面（= RTXDI_IsValidNeighbor 的世界空间等价判据）。
 bool vptReservoirReceiverMatches(
     VPTDirectHistory history,
     vec3 hitPos,
     vec3 receiverNormal,
     float positionEpsilon,
+    float planeEpsilon,
     float normalCosine)
 {
-    return length(history.normalAndPadding.xyz - hitPos) <= positionEpsilon &&
-        dot(normalize(history.reservoirNormalAndPadding.xyz), receiverNormal) >=
-            normalCosine;
+    vec3 delta = history.normalAndPadding.xyz - hitPos;
+    if(length(delta) > positionEpsilon)
+    {
+        return false;
+    }
+    if(abs(dot(delta, receiverNormal)) > planeEpsilon)
+    {
+        return false;
+    }
+    vec3 rawHistNormal = history.reservoirNormalAndPadding.xyz;
+    if(dot(rawHistNormal, rawHistNormal) <= 1.0e-8)
+    {
+        return false;
+    }
+    return dot(normalize(rawHistNormal), receiverNormal) >= normalCosine;
 }
 
-// =====================================================
-// 时域重投影探测：RTXDI_TemporalResampling:432-467 的 9 次尝试。
-//
-// 为什么必须 9 次：单次重投影在曲面玻璃、快速转动的边缘、以及深度不连续处几乎
-// 必然失败，历史一丢就退回 1 样本 ⇒ 这就是"RTX DI 很吵"的主因。
-// 第 9 次（i == 8）故意**不做**相似性判据：SDK 原注释说它是给 disocclusion 与
-// 透过曲面玻璃看到的表面准备的兜底。
-// =====================================================
+// Official RTXDI 4x4 XOR block permutation (ResamplingFunctions.slangh:346-356),
+// enabled every frame under DLSS-RR (rtx_options.cpp:328 permutationSamplingNthFrame=1)
+// to break temporal sample lock-in so DLSS-RR sees decorrelated noise.
+ivec2 vptApplyPermutationSampling(ivec2 prevPixelPos, uint frameIdx)
+{
+    const uint mask = 3u;
+    uint h = frameIdx * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    h ^= (h >> 22u);
+    ivec2 offset = ivec2(int(h & mask), int((h >> 2u) & mask));
+    prevPixelPos += offset;
+    prevPixelPos.x ^= int(mask);
+    prevPixelPos.y ^= int(mask);
+    prevPixelPos -= offset;
+    return prevPixelPos;
+}
+
 bool vptProbeTemporalHistory(
     vec3 hitPos,
     vec3 receiverNormal,
-    ivec2 pixelCoord,
     ivec2 renderSize,
-    uint lightRevision,
     float positionEpsilon,
+    float planeEpsilon,
     float normalCosine,
-    inout uint rngState,
+    bool allowPermutation,
     out ivec2 historyCoord,
-    out bool fromMotionVector)
+    out VPTDirectHistory matchedHistory)
 {
     historyCoord = ivec2(-1);
-    fromMotionVector = false;
 
     uint reprojectedIndex = 0u;
-    const bool hasReprojection =
-        vptReprojectPreviousPixel(hitPos, renderSize, reprojectedIndex);
+    if(!vptReprojectPreviousPixel(hitPos, renderSize, reprojectedIndex))
+    {
+        return false;
+    }
     const ivec2 reprojectedCoord = ivec2(
         int(reprojectedIndex % uint(renderSize.x)),
         int(reprojectedIndex / uint(renderSize.x)));
 
-    for(int attempt = 0; attempt < VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS; ++attempt)
+    const int maxAttempts = allowPermutation ? 2 : 1;
+    for(int attempt = 0; attempt < maxAttempts; ++attempt)
     {
-        ivec2 coord;
-        bool requireSimilarity = true;
-
-        // 只有"尝试次数 > 1"时，最后一次才是 SDK 的"同像素免判据"兜底；
-        // 置 1 时退化成旧行为（只试运动矢量像素 + 相似性判据）。
-        const bool lastAttempt =
-            (attempt == VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS - 1);
-        if(VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS > 1 && lastAttempt)
-        {
-            coord = pixelCoord;
-            requireSimilarity = false;
-        }
-        else
-        {
-            if(!hasReprojection)
-            {
-                continue;
-            }
-            coord = reprojectedCoord +
-                (attempt == 0 ? ivec2(0) : vptTemporalReprojectionOffset(rngState));
-        }
+        ivec2 coord = (allowPermutation && attempt == 0)
+            ? vptApplyPermutationSampling(reprojectedCoord, cam.frameCount)
+            : reprojectedCoord;
 
         if(any(lessThan(coord, ivec2(0))) ||
            any(greaterThanEqual(coord, renderSize)))
@@ -7365,7 +7925,7 @@ bool vptProbeTemporalHistory(
         const VPTDirectHistory probe = vptReadPrimaryHistory(
             uint(coord.y * renderSize.x + coord.x));
 
-        if(abs(probe.hitPositionAndValid.w - 2.0) >= 0.5)
+        if(probe.hitPositionAndValid.w < 1.5)
         {
             continue;
         }
@@ -7373,257 +7933,44 @@ bool vptProbeTemporalHistory(
         {
             continue;
         }
-        // 灯表内容变了 ⇒ 灯身份不可验证（对应 SDK 的 TranslateLightIndex 失败）。
-        if(abs(probe.hitPositionAndValid.z - float(lightRevision)) >= 0.5)
+        if(!vptReservoirReceiverMatches(
+            probe, hitPos, receiverNormal, positionEpsilon, planeEpsilon, normalCosine))
         {
             continue;
         }
-        if(requireSimilarity &&
-           !vptReservoirReceiverMatches(
-               probe, hitPos, receiverNormal, positionEpsilon, normalCosine))
+        if(probe.hitPositionAndValid.x > 0.0)
         {
-            continue;
+            uint packedIdentity = uint(probe.radianceAndSampleCount.w + 0.5);
+            if(!vptValidateCachedEmitterVoxel(
+                probe.radianceAndSampleCount.xyz,
+                packedIdentity >> 5u,
+                packedIdentity & 31u))
+            {
+                continue;
+            }
         }
 
         historyCoord = coord;
-        fromMotionVector = requireSimilarity;
+        matchedHistory = probe;
         return true;
     }
 
     return false;
 }
 
-// =====================================================
-// 2026-10-26：RTXDI 语义的 reservoir 累积状态。
-//
-// 字段与 RTXDI_Reservoir（Reservoir.slangh:24-34）一一对应：
-//   samplePos / sampleIdentity   ≈ lightIdx + uv（我们是一块发射体上的采样点）
-//   weightSum                    combine 阶段的加权和（finalize 前口径）
-//   M                            历史长度，单位**帧**（initial sampling 后 = 1）
-//   targetPdf                    选中样本在**当前接收面**上的 p̂
-//   pi / piSum                   BASIC bias correction 的 MIS 归一分子 / 分母
-// =====================================================
-struct VPTReservoirState
-{
-    vec3 samplePos;
-    uint sampleIdentity;
-    vec3 selectedContribution;
-    float weightSum;
-    float M;
-    float piSum;
-    float targetPdf;
-    float pi;
-    bool selectedPrevious;
-};
-
-VPTReservoirState vptReservoirStateEmpty()
-{
-    VPTReservoirState state;
-    state.samplePos = vec3(0.0);
-    state.sampleIdentity = 0u;
-    state.selectedContribution = vec3(0.0);
-    state.weightSum = 0.0;
-    state.M = 0.0;
-    state.piSum = 0.0;
-    state.targetPdf = 0.0;
-    state.pi = 0.0;
-    state.selectedPrevious = false;
-    return state;
-}
-
-// RTXDI_CombineReservoirs（ResamplingFunctions.slangh:66-95）逐行等价：
-//   risWeight = targetPdf * candidateWeight * candidateM
-//   M += candidateM；weightSum += risWeight；按占比做 WRS 抽取
-bool vptCombineReservoir(
-    inout VPTReservoirState state,
-    vec3 candidateSample,
-    uint candidateIdentity,
-    vec3 candidateContribution,
-    float candidateWeight,
-    float candidateM,
-    float candidateTargetPdf,
-    inout uint rngState)
-{
-    const float risWeight =
-        candidateTargetPdf * candidateWeight * candidateM;
-    if(risWeight <= 0.0)
-    {
-        return false;
-    }
-
-    state.M += candidateM;
-    state.weightSum += risWeight;
-
-    if(rand(rngState) * state.weightSum >= risWeight)
-    {
-        return false;
-    }
-
-    state.samplePos = candidateSample;
-    state.sampleIdentity = candidateIdentity;
-    state.selectedContribution = candidateContribution;
-    state.targetPdf = max(candidateTargetPdf, 1.0e-6);
-    state.selectedPrevious = true;
-    return true;
-}
-
-// 把一个历史 reservoir 合并进当前 state。时域与空间共用这一个入口，差别只有：
-//   · historyClampM > 0 ⇒ 时域，按 maxHistoryLength（单位帧）钳候选 M；
-//   · 空间的 piSum 用**邻居表面**的 p̂（SDK :797-810 同一口径），我们这里就是历史
-//     条目里存的上一帧接收面。
-bool vptMergeReservoirCandidate(
-    inout VPTReservoirState state,
-    ivec2 historyCoord,
-    ivec2 renderSize,
-    vec3 hitPos,
-    vec3 N,
-    vec3 receiverNormal,
-    bool waterColumnReceiver,
-    bool geometricFaceKnown,
-    vec3 geometricFaceRecovered,
-    uint lightRevision,
-    float positionEpsilon,
-    float normalCosine,
-    float historyClampM,
-    bool testVisibility,
-    inout uint rngState,
-    out float candidateConfidence)
-{
-    candidateConfidence = 0.0;
-
-    if(any(lessThan(historyCoord, ivec2(0))) ||
-       any(greaterThanEqual(historyCoord, renderSize)))
-    {
-        return false;
-    }
-
-    const uint historyIndex =
-        uint(historyCoord.y * renderSize.x + historyCoord.x);
-    const VPTDirectHistory history = vptReadPrimaryHistory(historyIndex);
-
-    if(abs(history.hitPositionAndValid.w - 2.0) >= 0.5)
-    {
-        return false;
-    }
-    // 灯表 revision 不同 ⇒ 灯身份不可验证（对应 SDK 的 light hash / TranslateLightIndex）。
-    if(abs(history.hitPositionAndValid.z - float(lightRevision)) >= 0.5)
-    {
-        return false;
-    }
-    if(history.hitPositionAndValid.y < 0.5)
-    {
-        return false;
-    }
-    if(length(history.normalAndPadding.xyz - hitPos) > positionEpsilon)
-    {
-        return false;
-    }
-    if(dot(normalize(history.reservoirNormalAndPadding.xyz), receiverNormal) <
-       normalCosine)
-    {
-        return false;
-    }
-
-    const uint packedIdentity = uint(history.radianceAndSampleCount.w + 0.5);
-    const vec3 candidateSample = history.radianceAndSampleCount.xyz;
-
-    // p̂ 在当前接收面上（= SDK 的 RAB_GetLightSampleTargetPdfForSurface(candidate, surface)）
-    vec3 contributionNow;
-    if(!vptLocalEmitterContributionAt(
-        hitPos,
-        N,
-        waterColumnReceiver,
-        geometricFaceKnown,
-        geometricFaceRecovered,
-        candidateSample,
-        packedIdentity >> 5u,
-        packedIdentity & 31u,
-        contributionNow))
-    {
-        return false;
-    }
-    const float targetNow = max(dot(contributionNow,
-        vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
-
-    // p̂ 在**上一帧接收面**上（= SDK 的 GetSurfaceForTemporalBiasCorrection + 重新求值）。
-    // 这是 BASIC / RAY_TRACED bias correction 的分母项；求不出来就退化用 targetNow。
-    float targetPreviousSurface = targetNow;
-    {
-        vec3 contributionPreviousSurface;
-        if(vptLocalEmitterContributionAt(
-            history.normalAndPadding.xyz,
-            normalize(history.reservoirNormalAndPadding.xyz),
-            waterColumnReceiver,
-            false,
-            vec3(0.0, 1.0, 0.0),
-            candidateSample,
-            packedIdentity >> 5u,
-            packedIdentity & 31u,
-            contributionPreviousSurface))
-        {
-            targetPreviousSurface = max(dot(contributionPreviousSurface,
-                vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
-        }
-    }
-
-    const float candidateWeight = max(history.hitPositionAndValid.x, 0.0);
-    float candidateM = max(history.hitPositionAndValid.y, 1.0);
-    if(historyClampM > 0.0 && candidateM > historyClampM)
-    {
-        candidateM = historyClampM;
-    }
-    if(candidateWeight <= 0.0 || candidateM <= 0.0)
-    {
-        return false;
-    }
-
-    // RAY_TRACED bias correction（SDK :598-611）：选中的历史样本重验一次可见性，
-    // 不可见则把 temporalP 置 0 —— 它既影响 pi，也影响 piSum 的分母项。
-    // 代价：每次时域复用最多 +1 条射线；空间复用不做（SDK 的空间那条要每邻域一条）。
-#if VPT_DIRECT_WRS_RAY_TRACED_BC
-    if(testVisibility && targetPreviousSurface > 0.0)
-    {
-        const vec3 previousVisibility = vptLocalEmitterSampleTransmittance(
-            history.normalAndPadding.xyz,
-            candidateSample);
-        if(max(previousVisibility.r,
-               max(previousVisibility.g, previousVisibility.b)) <= 0.0)
-        {
-            targetPreviousSurface = 0.0;
-        }
-    }
-#endif
-
-    // piSum 累加"该候选在自己接收面上"的 p̂×M（SDK :616 与 :810 同一口径）。
-    state.piSum += targetPreviousSurface * candidateM;
-
-    if(vptCombineReservoir(
-        state,
-        candidateSample,
-        packedIdentity,
-        contributionNow,
-        candidateWeight,
-        candidateM,
-        targetNow,
-        rngState))
-    {
-        // 选中的是这个候选 ⇒ 它的 pi 用上一帧接收面上的 p̂（SDK :614）。
-        state.pi = targetPreviousSurface;
-    }
-
-    candidateConfidence = history.reservoirNormalAndPadding.w;
-    return true;
-}
-
 vec3 evaluateVPTDirectLightReservoirTail(
     vec3 hitPos,
     vec3 N,
+    vec3 viewDir,
     vec3 hitAlbedo,
+    vec3 f0,
+    float metallic,
+    float roughness,
     bool waterColumnReceiver,
     bool geometricFaceKnown,
     vec3 geometricFaceRecovered,
-    float currentWeightSum,
-    vec3 currentContribution,
+    float initialW,
+    float initialProxyTarget,
     vec3 currentSample,
     uint currentEmission,
     uint currentTypeCode,
@@ -7631,281 +7978,213 @@ vec3 evaluateVPTDirectLightReservoirTail(
     inout uint rngState
 )
 {
-    const ivec2 pixelCoord = ivec2(gl_LaunchIDEXT.xy);
-    const ivec2 renderSize = ivec2(rtLaunchSize());
-    const uint currentIndex =
-        uint(pixelCoord.y * renderSize.x + pixelCoord.x);
-    const vec3 luminanceWeights = vec3(0.2126, 0.7152, 0.0722);
-
-    vec3 receiverNormal = geometricFaceKnown
-        ? normalize(geometricFaceRecovered)
-        : N;
-
-    // ---- initial sampling ----
-    // SDK：RTXDI_FinalizeResampling(localState, 1.0, localState.M) 把 weightSum 归一成 W，
-    // 随后 localState.M = 1（ResamplingFunctions.slangh:280-281）。所以每帧的 reservoir
-    // 代表 1 帧历史，weightSum 进入 combine 时是 p̂·W 的口径。
-    const float proposalCount = float(vptRisProposalCount());
-    const float currentTargetPdf =
-        max(dot(currentContribution, luminanceWeights), 1.0e-6);
-    const float initialW =
-        currentWeightSum / max(currentTargetPdf * proposalCount, 1.0e-6);
-
-    VPTReservoirState state = vptReservoirStateEmpty();
-    state.samplePos = currentSample;
-    // 2026-10-31：档案 id 5 bit ⇒ emission 左移 5。整包 9 bit，仍远小于 24 bit
-    // 的 float 尾数精度上限（历史做法见 state.sampleIdentity 的注释）。
-    state.sampleIdentity = (currentEmission << 5u) | currentTypeCode;
-    state.selectedContribution = currentContribution;
-    state.weightSum = currentTargetPdf * initialW;
-    state.M = 1.0;
-    state.piSum = currentTargetPdf;
-    state.targetPdf = currentTargetPdf;
-    state.pi = currentTargetPdf;
-    state.selectedPrevious = false;
-
-    const uint lightRevision = localLightBuffer.header.y;
-    const float receiverPositionEpsilon =
-        vptJitterCompensatedPositionEpsilon(hitPos);
-    const float cameraDistance = length(hitPos - cam.viewInverse[3].xyz);
-
-    float accumulatedConfidence = 0.0;
-    bool historyReprojected = false;
-    float candidateConfidence = 0.0;
-
-    // ---- temporal reuse ----
-    if(cam.historyValid != 0u)
-    {
-        ivec2 historyCoord;
-        bool fromMotionVector = false;
-        if(vptProbeTemporalHistory(
-            hitPos,
-            receiverNormal,
-            pixelCoord,
-            renderSize,
-            lightRevision,
-            receiverPositionEpsilon,
-            VPT_DIRECT_WRS_NORMAL_COSINE,
-            rngState,
-            historyCoord,
-            fromMotionVector))
-        {
-            // historyLimit = maxHistoryLength * state.M（ResamplingFunctions.slangh:485）。
-            // 单位是帧：maxHistoryLength=4、state.M=1 ⇒ 4。
-            const float historyLimit = VPT_DIRECT_WRS_HISTORY_LENGTH * state.M;
-
-            historyReprojected = vptMergeReservoirCandidate(
-                state,
-                historyCoord,
-                renderSize,
-                hitPos,
-                N,
-                receiverNormal,
-                waterColumnReceiver,
-                geometricFaceKnown,
-                geometricFaceRecovered,
-                lightRevision,
-                receiverPositionEpsilon,
-                VPT_DIRECT_WRS_NORMAL_COSINE,
-                historyLimit,
-                /*testVisibility=*/ true,
-                rngState,
-                candidateConfidence);
-
-            // SDK: isGBufferSimilar = (i < 8) —— 只有运动矢量路径命中才算"重投影成功"，
-            // 同像素兜底命中不推进置信度。
-            if(historyReprojected && !fromMotionVector)
-            {
-                historyReprojected = false;
-            }
-        }
-    }
-
-    // ---- spatial reuse ----
-    // SDK：中心样本先 Combine 进来（:682），再按 numSamples 抽邻域（:696-753），
-    // 采样数由 3×3 平均置信决定（rtxdi_spatial_reuse.comp.slang:106-120）。
-#if VPT_DIRECT_WRS_SPATIAL_SAMPLES > 0
-    // 2026-11-02 稀疏瘦身：非活跃像素的颜色根本不写（见 sparseWriteImage），
-    // 空间复用对它纯属带宽浪费 —— 每次 tap 都是一次 64 B/px 的随机读。
-    // 只保留 temporal，足够让下一帧变活跃时有一份新鲜 reservoir；合并组合
-    // 变化不影响无偏性，只影响那部分像素（本来就不输出）的样本方差。
-    if(shadingActive || VPT_SPARSE_INACTIVE_THIN == 0)
-    {
-        float summedConfidence = 0.0;
-        for(int sy = -1; sy <= 1; ++sy)
-        {
-            for(int sx = -1; sx <= 1; ++sx)
-            {
-                ivec2 neighbour = pixelCoord + ivec2(sx, sy);
-                if(any(lessThan(neighbour, ivec2(0))) ||
-                   any(greaterThanEqual(neighbour, renderSize)))
-                {
-                    continue;
-                }
-                summedConfidence += vptReadPrimaryHistory(
-                    uint(neighbour.y * renderSize.x + neighbour.x))
-                    .reservoirNormalAndPadding.w;
-            }
-        }
-        const float historyFrames =
-            summedConfidence * (VPT_DIRECT_WRS_CONFIDENCE_LENGTH / 9.0);
-        const int spatialSampleCount =
-            historyFrames < float(VPT_DIRECT_WRS_DISOCLUSION_FRAMES)
-                ? VPT_DIRECT_WRS_SPATIAL_SAMPLES_DISOC
-                : VPT_DIRECT_WRS_SPATIAL_SAMPLES;
-
-        const float spatialPositionEpsilon = max(
-            receiverPositionEpsilon,
-            VPT_DIRECT_WRS_SPATIAL_DEPTH * max(cameraDistance, 1.0));
-
-        float spatialConfidence = 0.0;
-        for(int tap = 0; tap < spatialSampleCount; ++tap)
-        {
-            const float offsetX = rand(rngState) * 2.0 - 1.0;
-            const float offsetY = rand(rngState) * 2.0 - 1.0;
-            const ivec2 spatialOffset = ivec2(
-                int(round(offsetX * float(VPT_DIRECT_WRS_SPATIAL_RADIUS))),
-                int(round(offsetY * float(VPT_DIRECT_WRS_SPATIAL_RADIUS))));
-
-            vptMergeReservoirCandidate(
-                state,
-                pixelCoord + spatialOffset,
-                renderSize,
-                hitPos,
-                N,
-                receiverNormal,
-                waterColumnReceiver,
-                geometricFaceKnown,
-                geometricFaceRecovered,
-                lightRevision,
-                spatialPositionEpsilon,
-                VPT_DIRECT_WRS_SPATIAL_NORMAL,
-                0.0,
-                /*testVisibility=*/ false,
-                rngState,
-                spatialConfidence);
-        }
-    }
-#endif
-
-    // ---- best-light sampling ----
-    // SDK：RTXDI_SampleSingleLight（ResamplingFunctions.slangh:294-344）把"上一帧该格
-    // 选中的灯"作为**额外一个候选**并入，invSourcePdf = 1.0、weightSum = targetPdf>0 ? 1 : 0。
-    // Remix 在 initial_sampling.comp:102-105 里紧接着 SampleRandomLights 调它。
-    //
-    // 2026-11-02：这一版**不再偏离** Remix —— 上一帧每个 tile 的 argmax 由
-    // vptBestLightInsert() 在写 history 后原子写入 binding 80，这里读回来即可。
-    //   Remix: RTXDI_FindGradientSampleAndBestLight（:1330-1412）由 compute_gradients +
-    //   filter_gradients 两个 pass 写 per-tile SSBO；本工程把这一步并进 shading
-    //   dispatch（reservoir 与 shading 同 dispatch、没有 G-buffer），用 atomicMax
-    //   直接以"本帧贡献亮度"选胜者，语义等价、少两个 pass。
-    //   M 仍钳到 1（一个候选），piSum 用它自己接收面上的 p̂（helper 内计算）。
-#if VPT_DIRECT_WRS_BEST_LIGHT
-    // 同上：best-light 也是为"要被着色的像素"准备候选的，非活跃像素拿它没有意义。
-    if(shadingActive || VPT_SPARSE_INACTIVE_THIN == 0)
-    {
-        ivec2 bestLightPixel = pixelCoord;
-        if(cam.historyValid != 0u && vptBestLightRead(pixelCoord, bestLightPixel))
-        {
-            const bool bestLightInRange =
-                all(greaterThanEqual(bestLightPixel, ivec2(0))) &&
-                all(lessThan(bestLightPixel, renderSize));
-            if(bestLightInRange && bestLightPixel != pixelCoord)
-            {
-                float bestLightConfidence = 0.0;
-                vptMergeReservoirCandidate(
-                    state,
-                    bestLightPixel,
-                    renderSize,
-                    hitPos,
-                    N,
-                    receiverNormal,
-                    waterColumnReceiver,
-                    geometricFaceKnown,
-                    geometricFaceRecovered,
-                    lightRevision,
-                    // 不要求同面：best light 本来就是从格内**别的像素**取样本。
-                    1.0e9,
-                    -1.0,
-                    // M 钳到 1 帧，避免它压过时域历史。
-                    1.0,
-                    /*testVisibility=*/ false,
-                    rngState,
-                    bestLightConfidence);
-            }
-        }
-    }
-#endif
-
-    accumulatedConfidence = historyReprojected
-        ? min(candidateConfidence +
-              1.0 / VPT_DIRECT_WRS_CONFIDENCE_LENGTH, 1.0)
-        : 1.0 / VPT_DIRECT_WRS_CONFIDENCE_LENGTH;
-
-    // 稀疏渲染关闭时的旧行为：非活跃像素跳过着色。
     if(!shadingActive && cam.sparseParams.z <= 0.5)
     {
         return vec3(0.0);
     }
 
-    // ---- finalize（RTXDI_FinalizeResampling，:97-106）----
-    //   weightSum = weightSum * pi / (targetPdf * piSum)
-    // 未选中历史样本时 pi 就是当前样本自己的 p̂（:560/614）。
-    const float piFinal = state.selectedPrevious
-        ? state.pi
-        : state.targetPdf;
-    const float mergedWeightSum = state.weightSum;
-    const float mergedM = max(state.M, 1.0);
-    const float finalW = mergedWeightSum * piFinal /
-        max(state.targetPdf * state.piSum, 1.0e-6);
+    const ivec2 pixelCoord = ivec2(gl_LaunchIDEXT.xy);
+    const ivec2 renderSize = ivec2(rtLaunchSize());
+    const uint currentIndex =
+        uint(pixelCoord.y * renderSize.x + pixelCoord.x);
+    const vec3 luminanceWeights = vec3(0.2126, 0.7152, 0.0722);
+    const float albedoLuma = max(dot(max(hitAlbedo, vec3(0.0)), luminanceWeights), 0.04);
+    const float specProxyGain = (f0.x >= 0.0 && !waterColumnReceiver)
+        ? (max(max(f0.r, max(f0.g, f0.b)), 0.04) *
+           (1.0 - clamp(roughness, 0.0, 1.0)) * 0.5)
+        : 0.0;
 
-    const vec3 selectedContribution = state.selectedContribution;
-    const vec3 selectedSample = state.samplePos;
-    const uint selectedEmission = state.sampleIdentity >> 5u;
-    const uint selectedTypeCode = state.sampleIdentity & 31u;
+    vec3 receiverNormal = geometricFaceKnown
+        ? normalize(geometricFaceRecovered)
+        : N;
+    const float receiverPositionEpsilon =
+        vptJitterCompensatedPositionEpsilon(hitPos);
+    const vec3 camPos =
+        (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    const float receiverPlaneEpsilon =
+        clamp(0.015 * length(camPos - hitPos), 0.05, 0.25);
 
-    // reservoir 先落盘、再判可见性：被遮挡的样本下一帧仍可复用并重新测遮挡
-    //（官方 temporal reuse 也是先存 reservoir，可见性只影响着色）。
+    // Scheme B Step 1: test initial proposal visibility BEFORE temporal Pairwise MIS (at most 1 ray/px).
+    float qM = shadingActive ? 1.0 : 0.0;
+    float qTargetPdf = 0.0;
+    float qW = 0.0;
+    vec3 qTrans = vec3(0.0);
+    vec3 qSample = currentSample;
+    uint qEmission = currentEmission;
+    uint qTypeCode = currentTypeCode;
+
+    if(shadingActive && initialW > 0.0 && initialProxyTarget > 0.0 && currentEmission > 0u)
+    {
+        vec3 initTrans = vptLocalEmitterSampleTransmittance(hitPos, currentSample);
+        if(max(initTrans.r, max(initTrans.g, initTrans.b)) > 0.0)
+        {
+            qTargetPdf = initialProxyTarget;
+            qW = initialW;
+            qTrans = initTrans;
+        }
+    }
+
+    // Scheme B Step 2: 0-ray temporal history probe + O(1) voxel validation.
+    bool hasHistory = false;
+    VPTDirectHistory hist;
+    float hM = 0.0;
+    float hW = 0.0;
+    float hTargetAtCurr = 0.0;
+    float hTargetAtHist = 0.0;
+    vec3 hSample = vec3(0.0);
+    uint hEmission = 0u;
+    uint hTypeCode = 0u;
+    vec3 hTrans = vec3(1.0);
+    float candidateConfidence = 0.0;
+
+    if(cam.historyValid != 0u)
+    {
+        ivec2 historyCoord;
+        if(vptProbeTemporalHistory(
+            hitPos,
+            receiverNormal,
+            renderSize,
+            receiverPositionEpsilon,
+            receiverPlaneEpsilon,
+            VPT_DIRECT_WRS_NORMAL_COSINE,
+            shadingActive,
+            historyCoord,
+            hist))
+        {
+            uint hPackedIdentity = uint(hist.radianceAndSampleCount.w + 0.5);
+            uint candEmission = hPackedIdentity >> 5u;
+            uint candTypeCode = hPackedIdentity & 31u;
+            vec3 candSample = hist.radianceAndSampleCount.xyz;
+            vec3 candCenter = floor(candSample) + vec3(0.5);
+            float candW = max(hist.hitPositionAndValid.x, 0.0);
+            float candM = clamp(
+                hist.hitPositionAndValid.y, 1.0, VPT_DIRECT_WRS_HISTORY_LENGTH);
+            if(candW > 0.0 && candEmission > 0u)
+            {
+                float targetNow = vptLocalEmitterProxyTarget(
+                    hitPos, N, viewDir, albedoLuma, specProxyGain,
+                    waterColumnReceiver, geometricFaceKnown, geometricFaceRecovered,
+                    candCenter, candEmission, candTypeCode
+                );
+                if(targetNow > 1.0e-6)
+                {
+                    hasHistory = true;
+                    hSample = candSample;
+                    hEmission = candEmission;
+                    hTypeCode = candTypeCode;
+                    hTargetAtCurr = targetNow;
+                    hW = candW;
+                    hM = candM;
+                    hTrans = vptUnpackTransmittance24(hist.hitPositionAndValid.z);
+                    candidateConfidence = hist.reservoirNormalAndPadding.w;
+                    hTargetAtHist = max(hist.normalAndPadding.w, 1.0e-6);
+                }
+            }
+            else
+            {
+                hasHistory = true;
+                hW = 0.0;
+                hM = candM;
+                hTargetAtCurr = 0.0;
+                hTargetAtHist = 0.0;
+                candidateConfidence = hist.reservoirNormalAndPadding.w;
+            }
+        }
+    }
+
+    // Scheme B Step 3: Exact 2-domain Pairwise MIS combine using fast proxy targets.
+    float weightQ = 0.0;
+    if(qW > 0.0 && qTargetPdf > 0.0)
+    {
+        float qTargetAtHist = qTargetPdf;
+        if(hasHistory)
+        {
+            vec3 qCenter = floor(qSample) + vec3(0.5);
+            vec3 histNorm = normalize(hist.reservoirNormalAndPadding.xyz);
+            qTargetAtHist = vptLocalEmitterProxyTarget(
+                hist.normalAndPadding.xyz,
+                histNorm,
+                viewDir, albedoLuma, specProxyGain,
+                waterColumnReceiver, true, histNorm,
+                qCenter, qEmission, qTypeCode
+            );
+        }
+        float mQ = hasHistory
+            ? (qM * qTargetPdf) / max(qM * qTargetPdf + hM * qTargetAtHist, 1.0e-12)
+            : 1.0;
+        weightQ = mQ * qTargetPdf * qW;
+    }
+
+    float weightH = 0.0;
+    if(hasHistory && hW > 0.0 && hTargetAtCurr > 0.0)
+    {
+        float mH = (hM * hTargetAtHist) /
+            max(hM * hTargetAtHist + qM * hTargetAtCurr, 1.0e-12);
+        weightH = mH * hTargetAtCurr * hW;
+    }
+
+    float combinedWeightSum = weightQ + weightH;
+    bool pickHistory = false;
+    if(combinedWeightSum > 0.0)
+    {
+        pickHistory = (weightQ <= 0.0) ||
+            (weightH > 0.0 && rand(rngState) * combinedWeightSum < weightH);
+    }
+
+    vec3 winnerSample = pickHistory ? hSample : qSample;
+    uint winnerEmission = pickHistory ? hEmission : qEmission;
+    uint winnerTypeCode = pickHistory ? hTypeCode : qTypeCode;
+    float winnerTargetPdf = pickHistory ? hTargetAtCurr : qTargetPdf;
+    vec3 winnerTrans = pickHistory ? hTrans : qTrans;
+    float finalW = (combinedWeightSum > 0.0 && winnerTargetPdf > 1.0e-8)
+        ? min(combinedWeightSum / winnerTargetPdf, 20.0)
+        : 0.0;
+
+    float rawMergedM = min(
+        qM + (hasHistory ? hM : 0.0), VPT_DIRECT_WRS_HISTORY_LENGTH);
+    float storedM = (finalW > 0.0) ? rawMergedM : min(rawMergedM, 2.0);
+    float accumulatedConfidence = (finalW > 0.0)
+        ? clamp(storedM / VPT_DIRECT_WRS_HISTORY_LENGTH, 0.0, 1.0)
+        : 0.0;
+
     VPTDirectHistory outputHistory;
     outputHistory.radianceAndSampleCount = vec4(
-        selectedSample,
-        float((selectedEmission << 5u) | selectedTypeCode)
+        winnerSample,
+        float((winnerEmission << 5u) | winnerTypeCode)
     );
     outputHistory.hitPositionAndValid = vec4(
         finalW,
-        mergedM,
-        float(lightRevision),
-        2.0
+        storedM,
+        vptPackTransmittance24(winnerTrans),
+        shadingActive ? 2.0 : 3.0
     );
-    // normalAndPadding.w 存 targetPdf（RTXDI_Reservoir 的必填字段，bias correction 要用），
-    // reservoirNormalAndPadding.w 存重投影置信度（ReprojectionConfidence）。
-    outputHistory.normalAndPadding = vec4(hitPos, state.targetPdf);
+    outputHistory.normalAndPadding = vec4(hitPos, winnerTargetPdf);
     outputHistory.reservoirNormalAndPadding =
         vec4(receiverNormal, accumulatedConfidence);
     vptWritePrimaryHistory(currentIndex, outputHistory);
 
-    if(!shadingActive || mergedWeightSum <= 0.0)
+    if(!shadingActive || finalW <= 0.0 || winnerEmission == 0u)
     {
         return vec3(0.0);
     }
 
-    // 合并后只发 1 条可见性射线。
-    vec3 transmittance = vptLocalEmitterSampleTransmittance(
-        hitPos, selectedSample);
-    if(max(transmittance.r, max(transmittance.g, transmittance.b)) <= 0.0)
+#if VPT_DIRECT_SPATIAL_PASS && (defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_STAGE))
+    if(cam.sparseParams.x >= 1.5)
     {
         return vec3(0.0);
     }
-    // 2026-11-02：把最终直射贡献的亮度记进本 tile 的 best-light 槽位。
-    // 只有真正可见（transmittance > 0）的像素才参与 argmax —— 被遮挡的样本
-    // 下一帧拿来当候选只会白花一次可见性测试。
-    const vec3 localDirectTerm =
-        selectedContribution * finalW * max(hitAlbedo, vec3(0.0)) * 0.92;
-    const vec3 tintedTerm = applyLocalGlassTint(localDirectTerm, transmittance);
-#if VPT_DIRECT_WRS_BEST_LIGHT
-    vptBestLightInsert(pixelCoord, dot(tintedTerm, luminanceWeights));
 #endif
-    return tintedTerm;
+
+    vec3 winnerContribution;
+    if(!vptLocalEmitterContributionAt(
+        hitPos, N, viewDir, hitAlbedo, f0, metallic, roughness,
+        waterColumnReceiver, geometricFaceKnown, geometricFaceRecovered,
+        winnerSample, winnerEmission, winnerTypeCode,
+        winnerContribution))
+    {
+        return vec3(0.0);
+    }
+    return applyLocalGlassTint(winnerContribution * finalW, winnerTrans);
 }
 
 
@@ -7985,6 +8264,10 @@ void sampleVPTDualDirectionalIrradiance(
 {
     outPrimary = vec3(0.0);
     outSecondary = vec3(0.0);
+    if(VPT_DIRECTIONAL_CACHE_WORDS == 0u)
+    {
+        return;
+    }
 
     ivec3 sectionCoord = ivec3(floor(worldPos / 16.0));
     // 2026-10-03 **"发光/间接"在 Section 边界断成硬直线的修复**。
@@ -8386,14 +8669,15 @@ struct GlassSurfaceInfo {
 #include "rgen_pbr_eval.glsl"
 #include "rgen_sun_lighting.glsl"
 #include "rgen_local_lights.glsl"
+#ifndef ORION_K2I_COMPOSE_COMPUTE
 #include "rgen_glass_reflection.glsl"
-#include "rgen_secondary_lights.glsl"
 #include "rgen_receiver_gi.glsl"
 #include "rgen_water_caustics.glsl"
 #include "rgen_glass_primary.glsl"
 #include "rgen_transparent_primary.glsl"
 #include "rgen_water_receiver.glsl"
 #include "rgen_glossy.glsl"
+#endif
 #include "rgen_dh_far.glsl"
 #include "rgen_vpt_sparse.glsl"
 #include "rgen_gi_temporal.glsl"

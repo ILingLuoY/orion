@@ -1280,8 +1280,10 @@ inline constexpr float AE_DEFAULT_CLOUD_WEIGHT = 1.0f;
 inline constexpr float AE_DEFAULT_TRANSITION_EV = 1.5f;
 // 反投影深度 <= 该值视为"没有几何命中"（reversed-Z）。
 inline constexpr float AE_SKY_DEPTH_EPS = 1.0e-6f;
-// HDR 显示路径的自动曝光强度。必须与 rr_hdr_encode.comp 的
-// AE_EXPOSURE_STRENGTH 一致（SDR 用 UI 可调的 g_postExposureStrength）。
+// 2026-11-23 起**退役**：rr_hdr_encode.comp 改为读 PostPush.exposureStrength
+// （即 UI 的"自动曝光强度"，默认 0.6，与旧值逐位相同），HDR 与 SDR 同口径；
+// 云合成（Clouds.cpp）也改用 g_postExposureStrength，不再按 HDR 分支取常量。
+// 保留此常量仅供 A/B 与文档追溯，不要再作为运行期口径引用。
 inline constexpr float AE_HDR_EXPOSURE_STRENGTH = 0.6f;
 
 // 必须与 rr_ae_adapt.comp 的 AeParams 逐字节一致。
@@ -2209,10 +2211,9 @@ inline constexpr uint32_t VLI_SOURCE_WORDS = 16u * 16u * 16u;
 inline constexpr uint32_t VLI_PROBE_EDGE = 9u;
 inline constexpr uint32_t VLI_PROBE_WORDS = VLI_PROBE_EDGE * VLI_PROBE_EDGE * VLI_PROBE_EDGE;
 inline constexpr uint32_t VPT_DIRECTION_COUNT = 6u;
-inline constexpr uint32_t VPT_DIRECTIONAL_CACHE_WORDS =
-    VPT_DIRECTION_COUNT * VLI_PROBE_WORDS;
+inline constexpr uint32_t VPT_DIRECTIONAL_CACHE_WORDS = 0u;
 inline constexpr uint32_t VLI_PAGE_WORDS =
-    VLI_SOURCE_WORDS + VPT_DIRECTIONAL_CACHE_WORDS;
+    VLI_SOURCE_WORDS;
 inline constexpr uint32_t VPT_SURFACE_FACES_PER_SECTION =
     VLI_SOURCE_WORDS * VPT_DIRECTION_COUNT;
 inline constexpr uint32_t VPT_PROBES_PER_PAGE_PER_FRAME = VLI_PROBE_WORDS;
@@ -2359,6 +2360,103 @@ struct SectionMemorySlab
 inline constexpr VkDeviceSize SECTION_MEMORY_POOL_RESTORED_KEEP_BYTES =
     268435456u;
 inline constexpr size_t SECTION_MEMORY_POOL_RESTORED_KEEP_SLABS = 4u;
+
+// =====================================================
+// 2026-11-23 CPU 侧性能批（只动 C++，不碰 spv ⇒ 不触发冷编）
+// 备份：$MOD\.tmp\backup_20261123_pre_cpu_perf\
+// 每项独立可摘除：把对应常量置 false 即逐位回到旧路径。
+//
+// ① 实体/本地玩家/手部层判等：整层 FNV 哈希 → size + memcmp（大层 4 路并行、
+//    首 256KB 先探）。动画中的层第一块就不等 ⇒ 直接退出；旧写法先算完整层哈希
+//    才比 size（实测 entityFrameVertexHash 3~15ms，且全程持 g_chunkMutex）。
+inline constexpr bool CPUPERF_ENTITY_MEMCMP_CHANGE = true;
+// ② 主机内存（非 device-local 堆）slab 不再受 VRAM 闸门的 keep 上限约束，
+//    单独按下面的上限保留。OMM data/triangle 输入只活一帧，旧策略下 slab
+//    整块空了就 vkFreeMemory、下一帧再 vkAllocateMemory 32~64MB 主机内存
+//    （[OMM SLOW] dataPoolMs/triPoolMs 5~43ms 的来源）。设备侧上限不变。
+inline constexpr bool CPUPERF_HOST_SLAB_KEEP = true;
+inline constexpr size_t SECTION_MEMORY_POOL_HOST_KEEP_SLABS = 16u;
+inline constexpr VkDeviceSize SECTION_MEMORY_POOL_HOST_KEEP_BYTES =
+    268435456u;
+// ③ 顶点 staging 池（主机内存）先攒到 N 个槽再开始顶替空闲小槽。
+//    旧 adopt 每建一块大的就销毁一块空闲小的，配合每 2 帧的实体重建在飞
+//    ⇒ 反复 vkAllocateMemory 16/32MB（[PERF L10 ALLOC] 3~5ms/次）。
+inline constexpr bool CPUPERF_STAGING_POOL_KEEP = true;
+inline constexpr size_t CPUPERF_STAGING_POOL_KEEP_SLOTS = 4u;
+// ④ 热路径日志不再逐条 flush（[RT SECTION SLOW]/[RT BLD BREAKDOWN]/
+//    [RT OMM GATE]），RTLogWrite 的时间戳按秒缓存（省掉每行 localtime+put_time）。
+inline constexpr bool CPUPERF_QUIET_HOT_LOGS = true;
+// ⑤ 设备函数指针 / 内存属性缓存（每个 OMM/BLAS 段都要查的
+//    vkGetDeviceProcAddr、每次分配都要查的 vkGetPhysicalDeviceMemoryProperties）。
+inline constexpr bool CPUPERF_CACHE_DEVICE_QUERIES = true;
+// ⑥ 诊断：[RT GEOMETRY SLOW] 分段日志在 >=15ms 恒打之外，>=6ms 每 60 帧抽样
+//    一条，用来拆每 2 帧一次、7~12ms 的实体重建到底花在哪一段。
+inline constexpr bool CPUPERF_GEOMETRY_SLOW_SAMPLE = true;
+// =====================================================
+
+// =====================================================
+// 2026-11-23 锁竞争批（区块加载期卡顿；只动 C++）
+// 备份：$MOD\.tmp\backup_20261123_pre_lock_contention\
+//
+// 证据（18:02 / 18:06 两段加载，rt_debug.log）：
+//   [RT GEOMETRY CAPSLOW] ms=3.55 Mcycles=0.83、ms=4.34 Mcycles=0.32 ——
+//   采集线程（THREAD_PRIORITY_BELOW_NORMAL）持 g_chunkMutex 的墙钟时间里只有
+//   ~5–20% 真在跑 CPU，其余是加载期 CPU 饱和下被抢占（优先级反转）。
+//   [CHUNK LOCK] site=capture 545 次、最长 86ms；[VLI WORKER] lockWait 10–25ms，
+//   渲染线程 [RT VLI SLOW] wait 5–26ms 排在一串上传线程后面。
+//
+// ⑦ 持锁期间把当前线程临时提到 ABOVE_NORMAL（采集线程持 g_chunkMutex、
+//    VLI 上传线程持 g_vliMutex），出锁恢复原优先级。只升不降。
+inline constexpr bool CPUPERF_LOCK_HOLDER_BOOST = true;
+// ⑧ uploadVoxelLightSection：源字拷贝 + 发光体索引/别名表构建（纯函数）挪到
+//    g_vliMutex 外预先算好；锁内只剩判等、灯表、修订号写入与 apply。
+//    修订号仍在锁内按原顺序分配，写回 emitterIndexWords[1]（别名表不依赖它）。
+inline constexpr bool CPUPERF_VLI_PREBUILD_OUTSIDE_LOCK = true;
+// ⑨ VRAM 闸门 over 常驻时的 staging 抖动（2026-11-23 18:23 局）：
+//    over 从 18:28 起一直为真（ratio 0.82–0.84，低水位 0.62 够不着），而
+//    updateVramGovernor 每次调用都把顶点 staging 池 / BLAS scratch 池裁到只剩最大槽，
+//    下一帧再重新分配 ⇒ 5 分钟 1808 次主机 staging + 1614 次 1MB scratch 分配
+//    （freedMB 3778），内存紧张时单次 vkAllocateMemory 10–49ms。
+//    顶点 staging 池与纹理上传 staging 都在**主机内存**，裁掉它不降显存；
+//    BLAS scratch 是显存但只有几 MB。改为：主机侧 staging 不再因显存闸门裁剪，
+//    BLAS scratch 与纹理大 staging 只在 over 的进入沿裁一次。
+//    （over 期间设备 slab keepCap=0 的既有策略不动。）
+inline constexpr bool CPUPERF_GOV_TRIM_ON_ENTER_ONLY = true;
+
+struct ScopedLockHolderPriorityBoost
+{
+    int previousPriority = THREAD_PRIORITY_ERROR_RETURN;
+    bool raised = false;
+
+    ScopedLockHolderPriorityBoost()
+    {
+        if constexpr(!CPUPERF_LOCK_HOLDER_BOOST)
+        {
+            return;
+        }
+
+        const HANDLE thread = GetCurrentThread();
+        previousPriority = GetThreadPriority(thread);
+
+        if(previousPriority != THREAD_PRIORITY_ERROR_RETURN &&
+           previousPriority < THREAD_PRIORITY_ABOVE_NORMAL)
+        {
+            raised = SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL) != FALSE;
+        }
+    }
+
+    ScopedLockHolderPriorityBoost(const ScopedLockHolderPriorityBoost&) = delete;
+    ScopedLockHolderPriorityBoost& operator=(const ScopedLockHolderPriorityBoost&) = delete;
+
+    ~ScopedLockHolderPriorityBoost()
+    {
+        if(raised)
+        {
+            SetThreadPriority(GetCurrentThread(), previousPriority);
+        }
+    }
+};
+// =====================================================
 
 // =====================================================
 // 2026-10-15（OOM 崩溃修复）：显存/内存耗尽专用异常 + 跳过计数。
@@ -2857,6 +2955,16 @@ VkDeviceSize sectionBuildPoolSlotBytes(VkDeviceSize requiredBytes);
 void destroyPooledSectionBuildBuffers();
 void releaseDeferredSectionBuildResources();
 bool hdrOutputActive();
+// 2026-11-23：Windows「高级颜色 / 系统 HDR」状态（DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO）。
+// 动机：驱动报告 ST2084 支持 ≠ 系统会用 HDR 合成 swapchain；系统 HDR 关闭时输出
+// HDR10/PQ 会让画面发灰。实现与语义约定见 backend/DisplayHdr.cpp。
+extern std::atomic<bool> g_winHdrQueryValid;
+extern std::atomic<bool> g_winHdrSupported;
+extern std::atomic<bool> g_winHdrEnabled;
+// slCreateWin32Surface 记下的游戏窗口，用来定位所在显示器的 HDR 状态。
+extern std::atomic<void*> g_gameHwnd;
+bool windowsHdrAllowsHdrOutput();
+void refreshWindowsDisplayHdrState(void* hwnd);
 bool glassAlphaBlendEnvFlag(const char* name);
 bool glassAlphaBlendEnvDisabled(const char* name);
 bool glassAlphaBlendNeighborSearchEnabled();
@@ -3145,6 +3253,8 @@ void VKAPI_PTR rtxCountedCmdBuildAccelerationStructures(
     const VkAccelerationStructureBuildRangeInfoKHR* const* buildRangeInfos);
 PFN_vkCmdBuildAccelerationStructuresKHR getCmdBuildAccelerationStructures();
 PFN_vkCmdTraceRaysKHR getCmdTraceRays();
+PFN_vkCmdTraceRaysIndirectKHR getCmdTraceRaysIndirect();
+bool traceRaysIndirectSupported();
 void rtxCacheRealMicromapFunctions(VkDevice device);
 VkResult VKAPI_PTR rtxCountedCreateMicromapEXT(
     VkDevice device,
@@ -3204,6 +3314,11 @@ bool sameVertexPayload(
     const std::vector<Vertex>& a,
     const std::vector<Vertex>& b
 );
+// 2026-11-23 CPU批①：size + memcmp，>=4MB 时首段探测后 4 路并行、任一路不等即全停。
+bool sameVertexPayloadParallel(
+    const std::vector<Vertex>& a,
+    const std::vector<Vertex>& b
+);
 int32_t rtSignExtendBits(uint64_t raw, uint32_t bits);
 int32_t rtFloorDivPow2(int32_t value, uint32_t shift);
 uint64_t rtSectionBucketKeyOf(uint64_t classKey);
@@ -3248,6 +3363,7 @@ uint32_t sharcEntryCount();
 bool sharcUpdateEnabled();
 bool sharcQueryEnabled();
 bool sharcAbEnabled();
+uint32_t sharcUpdateBlockForResolution(uint32_t width, uint32_t height);
 uint32_t sharcModeLane();
 uint32_t localLightGridHash32(
     int32_t x,
@@ -3670,6 +3786,11 @@ void recordDirectAtrous(
 void recordNRDLocalDenoiser(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 void createVLIComputePipeline();
 void destroyVLIResources();
+void createVPTLightGridResources();
+void destroyVPTLightGridResources();
+void updateVPTLightGridDescriptor();
+void recordVPTLightGridBuild(VkCommandBuffer cmd);
+void recordVPTRestirSpatialPass(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 void updateRTOutputDescriptor();
 void updateWaterSimulationRayDescriptor();
 void updateWaterSimFftDescriptor();
@@ -4763,6 +4884,10 @@ extern VkPipelineLayout
     g_sdrPostPipelineLayout;
 extern VkPipeline
     g_sdrPostPipeline;
+extern VkBuffer
+    g_sdrAces2LutBuffer;
+extern VkDeviceMemory
+    g_sdrAces2LutMemory;
 extern std::atomic<bool> g_hdrRequested;
 extern std::atomic<bool> g_hdrSurfaceSupported;
 extern VkDescriptorPool  g_hdrEncodeDescriptorPool;
@@ -5670,6 +5795,9 @@ extern std::atomic<float> g_postGainB;
 extern std::atomic<int>   g_mirrorBounceCount;
 extern std::atomic<int>   g_tlasCullDistance;
 extern std::atomic<int>   g_tlasFrustumCullMargin;
+extern float              g_lastTlasCullForward[3];
+extern float              g_lastTlasCullPos[3];
+extern bool               g_lastTlasCullValid;
 extern std::atomic<float> g_postBloomStrength;
 extern std::atomic<float> g_cgExposureEV;
 extern std::atomic<float> g_cgBlackPoint;
@@ -5940,6 +6068,25 @@ extern VkDeviceMemory g_vptBestLightMemory;
 extern VkDeviceSize g_vptBestLightBytes;
 extern uint32_t g_vptBestLightTileColumns;
 extern uint32_t g_vptBestLightTileRows;
+// M3 (ReGIR 4x4x4 GPU Light Grid, binding 99) + M4-B (Spatial Reuse Compute)
+constexpr uint32_t VPT_LIGHT_GRID_DIM_X = 24u;
+constexpr uint32_t VPT_LIGHT_GRID_DIM_Y = 16u;
+constexpr uint32_t VPT_LIGHT_GRID_DIM_Z = 24u;
+constexpr uint32_t VPT_LIGHT_GRID_CELLS =
+    VPT_LIGHT_GRID_DIM_X * VPT_LIGHT_GRID_DIM_Y * VPT_LIGHT_GRID_DIM_Z;
+constexpr uint32_t VPT_LIGHT_GRID_SLOTS = 32u;
+constexpr VkDeviceSize VPT_LIGHT_GRID_BYTES =
+    16u +
+    static_cast<VkDeviceSize>(VPT_LIGHT_GRID_CELLS) * 16u +
+    static_cast<VkDeviceSize>(VPT_LIGHT_GRID_CELLS) * VPT_LIGHT_GRID_SLOTS * 4u +
+    static_cast<VkDeviceSize>(VPT_LIGHT_GRID_CELLS) * VPT_LIGHT_GRID_SLOTS * 16u;
+extern VkBuffer g_vptLightGridBuffer;
+extern VkDeviceMemory g_vptLightGridMemory;
+extern VkPipeline g_vptLightGridPipeline;
+extern VkPipelineLayout g_vptLightGridPipelineLayout;
+extern VkPipeline g_vptRestirSpatialPipeline;
+extern VkPipelineLayout g_vptRestirSpatialPipelineLayout;
+extern bool g_vptRestirSpatialActiveFrame;
 extern std::mutex g_vliMutex;
 extern std::unordered_map<uint64_t, VLISectionCpuPage> g_vliSections;
 extern std::unordered_map<uint64_t, std::vector<uint64_t>> g_vliChunkSectionIndex;
@@ -6098,6 +6245,25 @@ extern VkStridedDeviceAddressRegionKHR g_k2iRaygenRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2iMissRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2iHitRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2iCallableRegion;
+// 2026-11-24: K2-I 稀疏紧凑间接调度与 0-ray compose 管线/资源（binding 92 / 100）
+extern VkPipeline g_k2iComposePipeline;
+extern VkBuffer g_k2iComposeSbtBuffer;
+extern VkDeviceMemory g_k2iComposeSbtMemory;
+extern VkStridedDeviceAddressRegionKHR g_k2iComposeRaygenRegion;
+extern VkImage g_k2GiTraceImage;
+extern VkDeviceMemory g_k2GiTraceMemory;
+extern VkImageView g_k2GiTraceView;
+extern VkImageLayout g_k2GiTraceLayout;
+extern uint32_t g_k2GiTraceWidth;
+extern uint32_t g_k2GiTraceHeight;
+extern VkBuffer g_k2iCompactBuffer;
+extern VkDeviceMemory g_k2iCompactMemory;
+extern VkDeviceAddress g_k2iCompactBufferAddress;
+extern uint32_t g_k2iCompactCapacityPixels;
+extern VkPipeline g_k2iCompactPipeline;
+extern bool g_k2iCompactPipelineFailed;
+extern VkPipeline g_k2locCompactPipeline;
+extern bool g_k2locCompactPipelineFailed;
 // ④ K2-D 再拆分（默认开，ORION_K2_SPLIT2=0 回退 ③ 两腿）：K2-SUN + K2-LOC
 extern VkPipeline g_k2sunPipeline;
 extern VkPipeline g_k2sunAPipeline;
@@ -6158,6 +6324,8 @@ extern uint32_t g_k1LandingSlots;
 
 void ensureK1K2Pipelines();
 void destroyK1K2Pipeline();
+void ensureK2iCompactResources(uint32_t width, uint32_t height);
+void destroyK2iCompactResources();
 void ensureK1LandingBuffer(uint32_t width, uint32_t height, uint32_t slots);
 void destroyK1LandingBuffer();
 // P2 跨腿材质复用中转 buffer 生命周期（仅复用开关打开时分配/绑定）。
@@ -6449,6 +6617,10 @@ struct RtxSectionBuildBufferPool
 {
     std::vector<RtxSectionBuildBufferSlot> slots;
 
+    // 2026-11-23 CPU批③：槽数未到 keepSlots 前 adopt 只追加、不顶替空闲槽。
+    // 0 = 旧行为。只有 g_vertexStagingPool（主机内存）设了非 0。
+    size_t keepSlots = 0u;
+
     // 取一个空闲且 >= requiredBytes 的槽（best fit，避免小批占住大块），
     // 成功则标记在飞并返回其副本。
     bool tryAcquire(
@@ -6495,6 +6667,13 @@ struct RtxSectionBuildBufferPool
         slot.memory = memory;
         slot.bytes = bytes;
         slot.inFlight = true;
+
+        if(CPUPERF_STAGING_POOL_KEEP && slots.size() < keepSlots)
+        {
+            slots.push_back(slot);
+
+            return slot;
+        }
 
         size_t victim = slots.size();
 

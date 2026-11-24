@@ -102,6 +102,37 @@ public class VulkanBackendMixin {
                             .RAYTRACINGINVOCATIONREORDER
             );
 
+    private static final VulkanPNextStruct RTP_FEATURES_STRUCT =
+            new VulkanPNextStruct(
+                    VkPhysicalDeviceRayTracingPipelineFeaturesKHR.class
+            );
+
+    private static final VulkanFeature RTP_TRACE_RAYS_INDIRECT_FEATURE =
+            new VulkanFeature(
+                    RTP_FEATURES_STRUCT,
+                    "rayTracingPipelineTraceRaysIndirect",
+                    VkPhysicalDeviceRayTracingPipelineFeaturesKHR
+                            .RAYTRACINGPIPELINETRACERAYSINDIRECT
+            );
+
+    private static boolean supportsTraceRaysIndirectFeature(
+            VulkanPhysicalDevice physicalDevice
+    ) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkPhysicalDeviceFeatures2 available =
+                    VkPhysicalDeviceFeatures2.calloc(stack).sType$Default();
+            RTP_FEATURES_STRUCT.findOrCreateStructInPNextChain(
+                    available,
+                    stack
+            );
+            VK12.vkGetPhysicalDeviceFeatures2(
+                    physicalDevice.vkPhysicalDevice(),
+                    available
+            );
+            return RTP_TRACE_RAYS_INDIRECT_FEATURE.get(available);
+        }
+    }
+
     private static boolean supportsSerFeature(
             VulkanPhysicalDevice physicalDevice
     ) {
@@ -474,13 +505,15 @@ public class VulkanBackendMixin {
 
         vulkanFeatures.add(
                 new VulkanFeature(
-                        new VulkanPNextStruct(
-                                VkPhysicalDeviceRayTracingPipelineFeaturesKHR.class
-                        ),
+                        RTP_FEATURES_STRUCT,
                         "rayTracingPipeline",
                         VkPhysicalDeviceRayTracingPipelineFeaturesKHR.RAYTRACINGPIPELINE
                 )
         );
+
+        if (supportsTraceRaysIndirectFeature(physicalDevice)) {
+            vulkanFeatures.add(RTP_TRACE_RAYS_INDIRECT_FEATURE);
+        }
 
         
 

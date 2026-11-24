@@ -6,6 +6,7 @@
 #include "TrackingHooks.h"
 
 #include <atomic>
+#include <ctime>
 #include <chrono>
 #include <thread>
 
@@ -256,6 +257,34 @@ void RTLogWrite(
 
     std::lock_guard<std::mutex> lock(g_rtLogMutex);
 
+    if constexpr(CPUPERF_QUIET_HOT_LOGS)
+    {
+        // 2026-11-23 CPU批④：同一秒内复用已格式化的时间戳（仍在锁内，localtime 安全）。
+        static std::time_t s_lastStampSecond = static_cast<std::time_t>(-1);
+        static char s_stamp[16] = "00:00:00";
+
+        if(t != s_lastStampSecond)
+        {
+            const std::tm* local = std::localtime(&t);
+
+            if(local == nullptr ||
+               std::strftime(s_stamp, sizeof(s_stamp), "%H:%M:%S", local) == 0u)
+            {
+                std::snprintf(s_stamp, sizeof(s_stamp), "--:--:--");
+            }
+
+            s_lastStampSecond = t;
+        }
+
+        rtLogFile
+            << "[CPP] "
+            << s_stamp
+            << " "
+            << msg
+            << "\n";
+    }
+    else
+    {
     rtLogFile
         << "[CPP] "
         << std::put_time(
@@ -265,6 +294,7 @@ void RTLogWrite(
         << " "
         << msg
         << "\n";
+    }
 
     if(flush)
     {

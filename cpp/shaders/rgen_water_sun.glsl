@@ -121,6 +121,7 @@ const float WATER_EXTINCTION_DISTANCE =
         else
 #endif
         {
+            #ifndef ORION_K2I_COMPOSE_COMPUTE
             #ifdef ORION_RT_STAGE_COUNTERS
             rtCntRayIssued();
             #endif
@@ -137,6 +138,9 @@ const float WATER_EXTINCTION_DISTANCE =
                 10000.0,
                 0
             );
+            #else
+            payload.hitDistance = -1.0;
+            #endif
         }
 
         // 没有任何几何体阻挡。

@@ -90,7 +90,13 @@ vec3 tracePrimaryWaterReceiverIndirectReworked(
 
     uint pathState = lodRandom ^ 0x57474942u;
     vec3 currentDirection =
-        sampleHemisphereCosine(normalize(receiverNormal), pathState);
+        sampleHemisphereCosine2D(
+            normalize(receiverNormal),
+            vec2(
+                glassBlueNoiseSample(rtLogicalPixelCoord(), cam.frameCount, 69u),
+                glassBlueNoiseSample(rtLogicalPixelCoord(), cam.frameCount, 70u)
+            )
+        );
     vec3 currentOrigin = receiverPos + currentDirection * 0.001;
     vec3 throughput = receiverAlbedo * BSDF_GI_THROUGHPUT_SCALE;
 #if GI_GLASS_RECEIVER_INDIRECT
@@ -128,6 +134,14 @@ const float WATER_EXTINCTION_DISTANCE =
         hit.state = makeTraceState(
             insideWater ? RT_PURPOSE_WATER_MEDIUM : RT_PURPOSE_FULL
         );
+        hit.state |= RT_STATE_GI_SKIP_CLOUDS_BIT;
+        if(cam.giHalfParams.z > 0.5f)
+        {
+            hit.state |= RT_STATE_GI_NO_POM_BIT;
+        }
+#if GI_SKIP_SUN_DISK
+        hit.state |= RT_STATE_NO_SUN_DISK_BIT;
+#endif
 #ifdef RT_ENABLE_SER
         // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
         if(cam.perfSerAb.z != 0u)

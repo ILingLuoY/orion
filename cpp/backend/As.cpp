@@ -86,8 +86,48 @@ PFN_vkDestroyAccelerationStructureKHR getDestroyAccelerationStructure()
         ? &rtxCountedDestroyAccelerationStructureKHR
         : nullptr;
 }
-PFN_vkGetAccelerationStructureBuildSizesKHR getGetAccelerationStructureBuildSizes(){return g_device?reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(vkGetDeviceProcAddr(g_device,"vkGetAccelerationStructureBuildSizesKHR")):nullptr;}
-PFN_vkGetAccelerationStructureDeviceAddressKHR getGetAccelerationStructureDeviceAddress(){return g_device?reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(vkGetDeviceProcAddr(g_device,"vkGetAccelerationStructureDeviceAddressKHR")):nullptr;}
+PFN_vkGetAccelerationStructureBuildSizesKHR getGetAccelerationStructureBuildSizes()
+{
+    // 2026-11-23 CPU批⑤：按设备缓存（每个 OMM/BLAS 段都要调一次）。
+    if constexpr(CPUPERF_CACHE_DEVICE_QUERIES)
+    {
+        static VkDevice s_device = VK_NULL_HANDLE;
+        static PFN_vkGetAccelerationStructureBuildSizesKHR s_fn = nullptr;
+
+        if(s_device != g_device)
+        {
+            s_fn = g_device
+                ? reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(vkGetDeviceProcAddr(g_device, "vkGetAccelerationStructureBuildSizesKHR"))
+                : nullptr;
+            s_device = g_device;
+        }
+
+        return s_fn;
+    }
+
+    return g_device?reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(vkGetDeviceProcAddr(g_device,"vkGetAccelerationStructureBuildSizesKHR")):nullptr;
+}
+PFN_vkGetAccelerationStructureDeviceAddressKHR getGetAccelerationStructureDeviceAddress()
+{
+    // 2026-11-23 CPU批⑤：按设备缓存（每个 OMM/BLAS 段都要调一次）。
+    if constexpr(CPUPERF_CACHE_DEVICE_QUERIES)
+    {
+        static VkDevice s_device = VK_NULL_HANDLE;
+        static PFN_vkGetAccelerationStructureDeviceAddressKHR s_fn = nullptr;
+
+        if(s_device != g_device)
+        {
+            s_fn = g_device
+                ? reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(vkGetDeviceProcAddr(g_device, "vkGetAccelerationStructureDeviceAddressKHR"))
+                : nullptr;
+            s_device = g_device;
+        }
+
+        return s_fn;
+    }
+
+    return g_device?reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(vkGetDeviceProcAddr(g_device,"vkGetAccelerationStructureDeviceAddressKHR")):nullptr;
+}
 void VKAPI_PTR rtxCountedCmdBuildAccelerationStructures(
     VkCommandBuffer commandBuffer,
     uint32_t infoCount,
@@ -148,6 +188,57 @@ PFN_vkCmdTraceRaysKHR getCmdTraceRays()
             : nullptr;
     }
     return cachedFunction;
+}
+PFN_vkCmdTraceRaysIndirectKHR getCmdTraceRaysIndirect()
+{
+    static VkDevice cachedDevice = VK_NULL_HANDLE;
+    static PFN_vkCmdTraceRaysIndirectKHR cachedFunction = nullptr;
+    if(cachedDevice != g_device)
+    {
+        cachedDevice = g_device;
+        cachedFunction = g_device
+            ? reinterpret_cast<PFN_vkCmdTraceRaysIndirectKHR>(
+                vkGetDeviceProcAddr(g_device, "vkCmdTraceRaysIndirectKHR")
+            )
+            : nullptr;
+    }
+    return cachedFunction;
+}
+bool traceRaysIndirectSupported()
+{
+    static VkPhysicalDevice cachedPhys = VK_NULL_HANDLE;
+    static bool cachedSupported = false;
+    if(cachedPhys != g_physicalDevice)
+    {
+        cachedPhys = g_physicalDevice;
+        cachedSupported = false;
+        if(g_physicalDevice != VK_NULL_HANDLE && g_instance != VK_NULL_HANDLE)
+        {
+            auto fn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceFeatures2")
+            );
+            if(!fn)
+            {
+                fn = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                    vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceFeatures2KHR")
+                );
+            }
+            if(fn)
+            {
+                VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipeFeatures{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR
+                };
+                VkPhysicalDeviceFeatures2 features2{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2
+                };
+                features2.pNext = &rtPipeFeatures;
+                fn(g_physicalDevice, &features2);
+                cachedSupported =
+                    (rtPipeFeatures.rayTracingPipelineTraceRaysIndirect == VK_TRUE);
+            }
+        }
+    }
+    return cachedSupported && (getCmdTraceRaysIndirect() != nullptr);
 }
 void rtxCacheRealMicromapFunctions(VkDevice device)
 {
@@ -230,8 +321,48 @@ PFN_vkDestroyMicromapEXT getDestroyMicromap()
         ? &rtxCountedDestroyMicromapEXT
         : nullptr;
 }
-PFN_vkCmdBuildMicromapsEXT getCmdBuildMicromaps(){return g_device?reinterpret_cast<PFN_vkCmdBuildMicromapsEXT>(vkGetDeviceProcAddr(g_device,"vkCmdBuildMicromapsEXT")):nullptr;}
-PFN_vkGetMicromapBuildSizesEXT getMicromapBuildSizes(){return g_device?reinterpret_cast<PFN_vkGetMicromapBuildSizesEXT>(vkGetDeviceProcAddr(g_device,"vkGetMicromapBuildSizesEXT")):nullptr;}
+PFN_vkCmdBuildMicromapsEXT getCmdBuildMicromaps()
+{
+    // 2026-11-23 CPU批⑤：按设备缓存（每个 OMM/BLAS 段都要调一次）。
+    if constexpr(CPUPERF_CACHE_DEVICE_QUERIES)
+    {
+        static VkDevice s_device = VK_NULL_HANDLE;
+        static PFN_vkCmdBuildMicromapsEXT s_fn = nullptr;
+
+        if(s_device != g_device)
+        {
+            s_fn = g_device
+                ? reinterpret_cast<PFN_vkCmdBuildMicromapsEXT>(vkGetDeviceProcAddr(g_device, "vkCmdBuildMicromapsEXT"))
+                : nullptr;
+            s_device = g_device;
+        }
+
+        return s_fn;
+    }
+
+    return g_device?reinterpret_cast<PFN_vkCmdBuildMicromapsEXT>(vkGetDeviceProcAddr(g_device,"vkCmdBuildMicromapsEXT")):nullptr;
+}
+PFN_vkGetMicromapBuildSizesEXT getMicromapBuildSizes()
+{
+    // 2026-11-23 CPU批⑤：按设备缓存（每个 OMM/BLAS 段都要调一次）。
+    if constexpr(CPUPERF_CACHE_DEVICE_QUERIES)
+    {
+        static VkDevice s_device = VK_NULL_HANDLE;
+        static PFN_vkGetMicromapBuildSizesEXT s_fn = nullptr;
+
+        if(s_device != g_device)
+        {
+            s_fn = g_device
+                ? reinterpret_cast<PFN_vkGetMicromapBuildSizesEXT>(vkGetDeviceProcAddr(g_device, "vkGetMicromapBuildSizesEXT"))
+                : nullptr;
+            s_device = g_device;
+        }
+
+        return s_fn;
+    }
+
+    return g_device?reinterpret_cast<PFN_vkGetMicromapBuildSizesEXT>(vkGetDeviceProcAddr(g_device,"vkGetMicromapBuildSizesEXT")):nullptr;
+}
 PFN_vkCmdPipelineBarrier2Omm getCmdPipelineBarrier2Omm()
 {
     if(!g_device)

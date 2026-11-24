@@ -215,6 +215,7 @@ public final class EntityRtCapture {
      */
     public static void resetEntityFrameOpen() {
         entityFrameOpen = false;
+        handCaptureWindow = false;
     }
 
     /**
@@ -250,6 +251,11 @@ public final class EntityRtCapture {
     }
 
     private static boolean handPhase;
+    private static boolean handCaptureWindow;
+
+    public static void beginHandCaptureWindow() {
+        handCaptureWindow = true;
+    }
 
     /**
      * 进入手部阶段：开窗 + 标记"这一段提交的是手"。
@@ -299,6 +305,7 @@ public final class EntityRtCapture {
         if (activeBatch.get() != null) throw new IllegalStateException("Entity model capture leaked across frames");
         ++captureFrameSerial;
         entityFrameOpen = true;
+        handCaptureWindow = false;
         textBatchSlot = 0;
         captureFrameActive = true;
         bannerPatternLayerRanks.clear();
@@ -336,6 +343,7 @@ public final class EntityRtCapture {
     public static void endFrame() {
         captureFrameActive = false;
         entityFrameOpen = false;
+        handCaptureWindow = false;
         flushTextBatch();
 
         if (LOG_TEXT_PERF && textPerfFrame && (textGlyphs != 0 || textUploads != 0)) {
@@ -1157,7 +1165,7 @@ public final class EntityRtCapture {
      * 所以只能按类名判。
      */
     private static boolean isFirstPersonHandState(ModelFeatureRenderer.Submit<?> submit) {
-        if (!Minecraft.getInstance().options.getCameraType().isFirstPerson()) return false;
+        if (!handCaptureWindow || !Minecraft.getInstance().options.getCameraType().isFirstPerson()) return false;
         final Object state = submit.state();
         return state != null && "Unit".equals(state.getClass().getSimpleName());
     }
@@ -1402,31 +1410,30 @@ public final class EntityRtCapture {
                 for (int j = 0; j < 3; ++j) {
                     float sum = 0.0f;
                     for (int k = 0; k < 3; ++k) {
-                        sum += hp[i * 4 + k] * hc[j * 4 + k];
+                        sum += hp[k * 4 + i] * hc[k * 4 + j];
                     }
                     m[i * 3 + j] = sum;
                 }
             }
-            final float tx = prevCameraWorldX
-                    - (m[0] * cameraWorldX + m[1] * cameraWorldY + m[2] * cameraWorldZ);
-            final float ty = prevCameraWorldY
-                    - (m[3] * cameraWorldX + m[4] * cameraWorldY + m[5] * cameraWorldZ);
-            final float tz = prevCameraWorldZ
-                    - (m[6] * cameraWorldX + m[7] * cameraWorldY + m[8] * cameraWorldZ);
             batch.poseDelta[0] = m[0];
             batch.poseDelta[1] = m[1];
             batch.poseDelta[2] = m[2];
-            batch.poseDelta[3] = tx;
+            batch.poseDelta[3] = 0.0f;
             batch.poseDelta[4] = m[3];
             batch.poseDelta[5] = m[4];
             batch.poseDelta[6] = m[5];
-            batch.poseDelta[7] = ty;
+            batch.poseDelta[7] = 0.0f;
             batch.poseDelta[8] = m[6];
             batch.poseDelta[9] = m[7];
             batch.poseDelta[10] = m[8];
-            batch.poseDelta[11] = tz;
+            batch.poseDelta[11] = 0.0f;
             batch.hasPoseDelta = true;
         }
+        final boolean handCameraMoved = HAND_CAMERA_MV && batch.diagHand
+                && prevCameraRotationValid
+                && (Math.abs(prevCameraWorldX - cameraWorldX) > 1.0e-6f
+                        || Math.abs(prevCameraWorldY - cameraWorldY) > 1.0e-6f
+                        || Math.abs(prevCameraWorldZ - cameraWorldZ) > 1.0e-6f);
 
         long motionPointer = 0L;
         final long motionStartNanos =
@@ -1447,7 +1454,7 @@ public final class EntityRtCapture {
                     final float py = positions.getFloat(offset + 4);
                     final float pz = positions.getFloat(offset + 8);
                     if (needMotion) {
-                        final float mx;
+                        float mx;
                         final float my;
                         final float mz;
                         if (useVertexHistory) {
@@ -1459,6 +1466,9 @@ public final class EntityRtCapture {
                             mx = delta[0] * px + delta[1] * py + delta[2] * pz + delta[3] - px;
                             my = delta[4] * px + delta[5] * py + delta[6] * pz + delta[7] - py;
                             mz = delta[8] * px + delta[9] * py + delta[10] * pz + delta[11] - pz;
+                            if (handCameraMoved && mx == 0.0F && my == 0.0F && mz == 0.0F) {
+                                mx = 1.0e-7F;
+                            }
                         }
                         anyMotion |= mx != 0.0F || my != 0.0F || mz != 0.0F;
                         motion.putFloat(mx).putFloat(my).putFloat(mz);
@@ -3026,7 +3036,7 @@ public final class EntityRtCapture {
         // 2026-11-03 诊断：第一人称下这条 custom 路径就是"手持物品"（RenderTypeFeatureRendererMixin
         // 的注释第 28 行：Item → 物品展示框里的物品、掉落物、第一人称手持物品）。
         // 打上标记后 uploadBatch 会顺带打印它的 vertexCount 与 UV 范围。
-        customBatch.diagHand = Minecraft.getInstance().options.getCameraType().isFirstPerson();
+        customBatch.diagHand = handCaptureWindow && Minecraft.getInstance().options.getCameraType().isFirstPerson();
         if (endPortal && !endPortalLogged) {
             endPortalLogged = true;
             System.out.println("[RTX-ENTITY] end portal geometry captured, slot="
@@ -3275,6 +3285,7 @@ public final class EntityRtCapture {
             this.textureSlot = textureSlot;
             this.localPlayerProxy = localPlayerProxy;
             this.emissive = emissive;
+            this.diagHand = false;
             this.projectiveUv = false;
             this.positionOnlyCapture = false;
             this.coplanarLayering = false;

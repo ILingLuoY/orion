@@ -68,14 +68,42 @@ vec3 upsampleGiHalf(ivec2 fullCoord, float centerViewDepth)
 void main() {
     ivec2 size = imageSize(image);
 
+#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
+    const bool k2iCompactTraceActive = (k2iSparseCompact.mode != 0u);
+    ivec2 pixelCoord;
+    if(k2iCompactTraceActive)
+    {
+        const uint compactIdx = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+        if(compactIdx >= k2iSparseCompact.activeCount)
+        {
+            return;
+        }
+        const uint packedCoord = k2iSparseCompact.activeCoords[compactIdx];
+        pixelCoord = ivec2(int(packedCoord & 0xFFFFu), int(packedCoord >> 16u));
+        if(pixelCoord.x >= size.x || pixelCoord.y >= size.y)
+        {
+            return;
+        }
+    }
+    else
+    {
+        if(gl_LaunchIDEXT.x >= size.x || gl_LaunchIDEXT.y >= size.y)
+        {
+            return;
+        }
+        pixelCoord = ivec2(gl_LaunchIDEXT.xy);
+    }
+#else
+    const bool k2iCompactTraceActive = false;
     if (gl_LaunchIDEXT.x >= size.x ||
         gl_LaunchIDEXT.y >= size.y) {
         return;
     }
+#endif
 
     // 2026-10-11 5a：SHaRC 寻址探针（mode == 1 时由宿主打开，见 sharcProbeWriteBack）。
     // 放在所有渲染之前：探针只做缓存读写，与像素是否被遮挡无关，越早越省事。
-    if (sharcMode() == 1u && gl_LaunchIDEXT.x == 0u && gl_LaunchIDEXT.y == 0u) {
+    if (!k2iCompactTraceActive && sharcMode() == 1u && gl_LaunchIDEXT.x == 0u && gl_LaunchIDEXT.y == 0u) {
         sharcProbeWriteBack();
     }
 
@@ -99,15 +127,18 @@ void main() {
     //
     // 只在主变体上有效（GI_HALFRES 变体的 LaunchID 是半分辨率坐标）。
     // =====================================================
-    if(cam.perfAblationStage.w == 7u)
+#if !SHARC_UPDATE
+    if(!k2iCompactTraceActive && cam.perfAblationStage.w == 7u)
     {
         imageStore(
             glassAlphaBlendMetaImage,
             ivec2(gl_LaunchIDEXT.xy),
             vec4(1.0, 1.0, 0.0, 0.0));
     }
+#endif
 
 
+#if !((defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY))
 #if GI_HALFRES
     // 2026-10-24 半分辨率 GI 变体：dispatch 是 (w+1)/2 × (h+1)/2，每个 invocation
     // 负责 2×2 块里的**一个**子像素；相位 (frameCount&1, frameCount>>1&1) 逐帧轮转，
@@ -135,6 +166,7 @@ void main() {
     ivec2 pixelCoord =
         ivec2(gl_LaunchIDEXT.xy);
 #endif
+#endif
 
 #if SHARC_UPDATE
     // 块级 dispatch：launchID 是**块坐标**，不是像素坐标（见 sharcUpdateBlockOffset）。
@@ -142,9 +174,11 @@ void main() {
     // 越界，直接退出（不追路径、不写任何输出图 —— 所有输出由渲染 pass 覆写）。
     {
         const ivec2 sharcBlock = ivec2(gl_LaunchIDEXT.xy);
+        const uint sharcBlockSize = sharcUpdateBlockSize();
 
         pixelCoord =
-            sharcBlock * SHARC_UPDATE_BLOCK + sharcUpdateBlockOffset(sharcBlock);
+            sharcBlock * int(sharcBlockSize) +
+            sharcUpdateBlockOffset(sharcBlock, sharcBlockSize);
 
         if(pixelCoord.x >= size.x || pixelCoord.y >= size.y)
         {
@@ -196,7 +230,7 @@ void main() {
 
     const bool rtSampleThisPixel =
         rtUserSpp >= 1.0 ||
-        (((gl_LaunchIDEXT.x + gl_LaunchIDEXT.y) & 1u) == (cam.frameCount & 1u));
+        (((uint(pixelCoord.x) + uint(pixelCoord.y)) & 1u) == (cam.frameCount & 1u));
 
     if(!rtSampleThisPixel)
     {
@@ -204,16 +238,19 @@ void main() {
         return;
     }
 
-#if !GI_HALFRES
+#if !GI_HALFRES && !SHARC_UPDATE
     // 2026-11-21 P0-1：per-pixel 旁路槽清槽。样本循环**外**每像素无条件清一次
     //（vec4(0)，a=0 = 无有效偏移）；miss / 未被本帧重写的像素读回按 0 处理。
     // 不能每条射线清：多样本共享同一槽位，后写覆盖先写（蓝图 §3.6）。
     // 半分辨率 GI 变体不参与本信道：其 LaunchID 是半分辨率坐标，写全分辨率图会
     // 错位（蓝图 §3.6 / 风险 1）；读回侧同样被 #if !GI_HALFRES 守卫。
-    imageStore(
-        hitOffsetImage,
-        ivec2(gl_LaunchIDEXT.xy),
-        vec4(0.0, 0.0, 0.0, 0.0));
+    if(!k2iCompactTraceActive)
+    {
+        imageStore(
+            hitOffsetImage,
+            pixelCoord,
+            vec4(0.0, 0.0, 0.0, 0.0));
+    }
 #endif
 
     // [0] 被统计的像素数（所有比率的分母）
@@ -287,6 +324,10 @@ bool rrTransparentReceiverIsPane =
 // =====================================================
 #ifndef GI_RR_DELTA_FLAG
 #define GI_RR_DELTA_FLAG 1
+#endif
+
+#ifndef RR_GUIDE_PURIFY_V1
+#define RR_GUIDE_PURIFY_V1 1
 #endif
 
 float rrDeltaCrossedFlag =
@@ -491,7 +532,7 @@ vec3 primaryHitWorldOffset =
 if(s == 0)
 {
     const vec4 hitOffsetSlot =
-        imageLoad(hitOffsetImage, ivec2(gl_LaunchIDEXT.xy));
+        imageLoad(hitOffsetImage, pixelCoord);
 
     if(hitOffsetSlot.a >= 0.5)
     {
@@ -1383,7 +1424,7 @@ if (s == 0)
 // =====================================================
 bool vptPixelActive = true;
 #if !SHARC_UPDATE && !GI_HALFRES
-vptPixelActive = vptSparsePixelIsActive(uvec2(gl_LaunchIDEXT.xy));
+vptPixelActive = vptSparsePixelIsActive(uvec2(pixelCoord));
 #endif
 
 // 2026-10-27 阶段 3：带出循环（只有做稀疏的变体需要；SHARC_UPDATE / GI_HALFRES
@@ -1400,10 +1441,12 @@ if(s == 0)
 vec3 sampleColor =
     vec3(0.0);
 
-#if defined(ORION_K2_INDIRECT_STAGE)
+#if defined(ORION_K2_INDIRECT_STAGE) && !SHARC_UPDATE
 // ③ K2-I：直射级交接图在分叉前整体载入一次（水支在源序上先于 RTAO 桩出现，
 // GLSL 要求先声明后使用）。rgb = 直射三项和（或水的完整着色），a = rtaoFactor。
 const vec4 k2DirectFromImage = imageLoad(k2DirectImage, pixelCoord);
+#elif defined(ORION_K2_INDIRECT_STAGE)
+const vec4 k2DirectFromImage = vec4(0.0, 0.0, 0.0, 1.0);
 #endif
 
         // ==========================================
@@ -1422,6 +1465,16 @@ if (primaryHitDistance < 0.0) {
         vec4(0.0, 0.0, 0.0, 60000.0)
     );
     return;
+#endif
+
+#if RR_GUIDE_PURIFY_V1
+    if(s == 0)
+    {
+        rrDiffuseAlbedo = vec3(0.0);
+        rrSpecularAlbedo = vec3(0.0);
+        rrNormalRoughness = vec4(normalize(-worldDir.xyz), 1.0);
+        rrSpecularHitDistance = 65504.0;
+    }
 #endif
 
     sampleColor =
@@ -1507,6 +1560,15 @@ bool rainWallSurfaceCandidate =
 // T1-2 payload materialId=3 is generic translucent terrain
 // and must never enter the water path.
 if (matId > 0.5 && matId < 2.5) {
+#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
+    if(k2iCompactTraceActive)
+    {
+        return;
+    }
+#endif
+#if SHARC_UPDATE
+    continue;
+#endif
 #ifndef ORION_K1_PRIMARY
 // ④ K1 死分支摘除：K1 的主命中组（地形/水/实体/粒子）全部在切点落 landing 后
 // continue，水像素永远走不到水分支体（水面着色整体延期给 K2）⇒ K1 编译期摘除。
@@ -1556,6 +1618,8 @@ if (matId > 0.5 && matId < 2.5) {
                             waterGuideRoughness
                         );
 
+#if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
                     vec3 rrWaterReflectionDir =
                         normalize(
                             reflect(
@@ -1706,6 +1770,14 @@ if (matId > 0.5 && matId < 2.5) {
                         rrSpecularHitDistance =
                             65504.0;
                     }
+#elif defined(ORION_K2_INDIRECT_STAGE)
+                    rrSpecularHitDistance = ptLandingRecords[
+                        ptLandingRecordIndex(
+                            uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x),
+                            s
+                        )
+                    ].d.w;
+#endif
                 }
 #endif
 
@@ -2092,6 +2164,15 @@ else
                     pixelCoord,
                     vec4(sampleColor, 0.0)
                 );
+                if(s == 0)
+                {
+                    ptLandingRecords[
+                        ptLandingRecordIndex(
+                            uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x),
+                            s
+                        )
+                    ].d.w = rrSpecularHitDistance;
+                }
                 continue;
 #elif defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_B)
                 // ④ K2-LOC / ⑤ K2-SUNB 水出口：不 store —— k2DirectImage 已由
@@ -2723,6 +2804,106 @@ vec3 materialF0 =
             255.0
         );
 
+// =====================================================
+// 2026-11-22 Round 2 (Item A): zero-ray shoreline wetness band (hoisted 2026-11-23).
+// Hoisted before the K2 split so K2-SUNB (direct), K2-LOC (glossy reflections),
+// and K2-I (indirect GI) all observe consistent wet albedo / roughness / normal.
+// =====================================================
+float shoreWetnessApplied = 0.0;
+
+#ifndef WATER_SHORELINE_WETNESS
+#define WATER_SHORELINE_WETNESS 1
+#endif
+#if WATER_SHORELINE_WETNESS && !defined(ORION_K2_DIRECT_SUN_STAGE_A)
+if(rainSolidSurfaceCandidate &&
+   cam.glassCausticParams.w > 0.5 &&
+   cam.waterSimState.w == 0u &&
+   rtLodDistance < 48.0)
+{
+    const float waterY = cam.waterSimSurfaceAndOrigin.x;
+    const float hAboveWater = hitPos.y - waterY;
+    if(hAboveWater > -0.35 && hAboveWater < 1.40)
+    {
+        const vec2 maskUv =
+            (hitPos.xz - cam.glassCausticParams.xy) * cam.glassCausticParams.z;
+        if(all(greaterThan(maskUv, vec2(0.02))) && all(lessThan(maskUv, vec2(0.98))))
+        {
+            float waterProx = 0.0;
+            if(primaryGeometricNormal.y > 0.5)
+            {
+                const float stepUv = cam.glassCausticParams.z * 0.90;
+                float mC = textureLod(waterBiomeMaskMap, maskUv, 0.0).a;
+                float mE = textureLod(waterBiomeMaskMap, maskUv + vec2(stepUv, 0.0), 0.0).a;
+                float mW = textureLod(waterBiomeMaskMap, maskUv - vec2(stepUv, 0.0), 0.0).a;
+                float mN = textureLod(waterBiomeMaskMap, maskUv + vec2(0.0, stepUv), 0.0).a;
+                float mS = textureLod(waterBiomeMaskMap, maskUv - vec2(0.0, stepUv), 0.0).a;
+                waterProx = max(mC, max(max(mE, mW), max(mN, mS)));
+            }
+            else if(abs(primaryGeometricNormal.y) < 0.5)
+            {
+                const vec2 outUv =
+                    maskUv + primaryGeometricNormal.xz * (cam.glassCausticParams.z * 0.55);
+                waterProx = textureLod(waterBiomeMaskMap, outUv, 0.0).a;
+            }
+
+            if(waterProx > 0.12)
+            {
+                float shoreNoise = evaluateContinuousRainWetnessNoise(hitPos.xz * 1.35);
+                float maxWetHeight =
+                    (primaryGeometricNormal.y > 0.5 ? 0.65 : 0.95) + 0.35 * shoreNoise;
+                float heightMask = (1.0 - smoothstep(0.05, maxWetHeight, hAboveWater)) *
+                    smoothstep(-0.35, -0.05, hAboveWater);
+                float distFade = 1.0 - smoothstep(32.0, 48.0, rtLodDistance);
+                float shoreWetness = clamp(
+                    smoothstep(0.12, 0.72, waterProx) * heightMask * distFade,
+                    0.0,
+                    1.0);
+                if(shoreWetness > 0.005)
+                {
+                    shoreWetnessApplied = shoreWetness;
+                    albedo *= 1.0 - shoreWetness * 0.42;
+                    if(isMetal)
+                    {
+                        materialF0 = albedo;
+                    }
+                    // 2026-11-24: match damp roughness to glossy full-res distance cutoff so
+                    // 16..48 block shorelines don't enter half-rate stochastic glossy flicker.
+                    const float shoreGlossFullDist =
+                        float(clamp(cam.perfSecondary.w, 16u, 96u));
+                    const float shoreNearGloss = 1.0 - smoothstep(
+                        shoreGlossFullDist * 0.65, shoreGlossFullDist * 0.98, rtLodDistance);
+                    const float shoreTargetRoughness = mix(0.45, 0.18, shoreNearGloss);
+                    roughness = min(
+                        roughness, mix(roughness, shoreTargetRoughness, shoreWetness * 0.85));
+                    if(primaryGeometricNormal.y > 0.5)
+                    {
+                        normal = normalize(
+                            mix(normal, primaryGeometricNormal, shoreWetness * 0.35));
+                    }
+                    pbr2ReflectionStrength = evaluatePBR2ReflectionStrength(
+                        roughness,
+                        f0MetalCode);
+#if RR_GUIDE_PURIFY_V1
+                    if(s == 0 && matId <= 0.5)
+                    {
+                        vec3 wetGuideV = normalize(-worldDir.xyz);
+                        float wetGuideNdotV = abs(dot(normal, wetGuideV));
+                        rrDiffuseAlbedo = albedo * (1.0 - metallic);
+                        rrSpecularAlbedo = rrEnvBRDFApprox2(
+                            materialF0,
+                            roughness * roughness,
+                            wetGuideNdotV
+                        );
+                        rrNormalRoughness = vec4(normal, roughness);
+                    }
+#endif
+                }
+            }
+        }
+    }
+}
+#endif
+
 // B①：原 B 方案的切点（材质求值后）已上移到 fork 的 else 顶部 —— 新架构下
 // K1 精简 rchit 不做材质求值，切点在解析之前落身份（见 else 顶部的
 // ORION_K1_PRIMARY 段）。
@@ -2854,10 +3035,14 @@ for(
     ++i
 )
 {
+    vec2 aoBn = vec2(
+        glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 61u + uint(i) * 2u),
+        glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 62u + uint(i) * 2u)
+    );
     vec3 aoDir =
-        sampleHemisphereCosine(
+        sampleHemisphereCosine2D(
             normal,
-            seed
+            aoBn
         );
 
 
@@ -3097,6 +3282,18 @@ bool prepareDiffuseGI =
 
 if(prepareDiffuseGI)
 {
+#if !SHARC_UPDATE
+    vec2 giBn = vec2(
+        glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 51u),
+        glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 52u)
+    );
+    bounceDir =
+        sampleHemisphereCosine2D(
+            normalize(normal),
+            giBn
+        );
+    g2bPrimaryMixtureWeight = 1.0;
+#else
     // LL-P3.2: the primary vertex never guides -- a light-targeted first ray
     // would land on the emitter and re-add the ReSTIR DI direct term.  Passing
     // false also takes the same branch (and consumes the same RNG draws) as
@@ -3109,6 +3306,7 @@ if(prepareDiffuseGI)
         g2bPrimaryMixtureWeight,
         false
     );
+#endif
 }
 else
 {
@@ -4228,7 +4426,7 @@ if(
 
     albedo *=
         1.0 -
-        rainGroundWetness *
+        max(rainGroundWetness - shoreWetnessApplied, 0.0) *
         sqrt(REFERENCE_DEFAULT_POROSITY) *
         REFERENCE_POROSITY_ABSORPTION;
 }
@@ -4440,7 +4638,7 @@ if(rainWallWetness > 0.0)
 {
     albedo *=
         1.0 -
-        rainWallWetness * RAIN_WALL_ALBEDO_DARKENING;
+        max(rainWallWetness - shoreWetnessApplied, 0.0) * RAIN_WALL_ALBEDO_DARKENING;
 
     roughness =
         mix(roughness, RAIN_WALL_FILM_ROUGHNESS, rainWallWetness);
@@ -4484,79 +4682,6 @@ if(rainWallWetness > 0.0)
         f0MetalCode
     );
 }
-
-// =====================================================
-// 2026-11-22 Round 2 (Item A): zero-ray shoreline wetness band.
-// Darkens and smooths exterior solid faces touching water within capillary height.
-// =====================================================
-#ifndef WATER_SHORELINE_WETNESS
-#define WATER_SHORELINE_WETNESS 1
-#endif
-#if WATER_SHORELINE_WETNESS
-if(rainSolidSurfaceCandidate &&
-   cam.glassCausticParams.w > 0.5 &&
-   cam.waterSimState.w == 0u &&
-   rtLodDistance < 48.0)
-{
-    const float waterY = cam.waterSimSurfaceAndOrigin.x;
-    const float hAboveWater = hitPos.y - waterY;
-    if(hAboveWater > -0.35 && hAboveWater < 1.40)
-    {
-        const vec2 maskUv =
-            (hitPos.xz - cam.glassCausticParams.xy) * cam.glassCausticParams.z;
-        if(all(greaterThan(maskUv, vec2(0.02))) && all(lessThan(maskUv, vec2(0.98))))
-        {
-            float waterProx = 0.0;
-            if(primaryGeometricNormal.y > 0.5)
-            {
-                const float stepUv = cam.glassCausticParams.z * 0.90;
-                float mC = textureLod(waterBiomeMaskMap, maskUv, 0.0).a;
-                float mE = textureLod(waterBiomeMaskMap, maskUv + vec2(stepUv, 0.0), 0.0).a;
-                float mW = textureLod(waterBiomeMaskMap, maskUv - vec2(stepUv, 0.0), 0.0).a;
-                float mN = textureLod(waterBiomeMaskMap, maskUv + vec2(0.0, stepUv), 0.0).a;
-                float mS = textureLod(waterBiomeMaskMap, maskUv - vec2(0.0, stepUv), 0.0).a;
-                waterProx = max(mC, max(max(mE, mW), max(mN, mS)));
-            }
-            else if(abs(primaryGeometricNormal.y) < 0.5)
-            {
-                const vec2 outUv =
-                    maskUv + primaryGeometricNormal.xz * (cam.glassCausticParams.z * 0.55);
-                waterProx = textureLod(waterBiomeMaskMap, outUv, 0.0).a;
-            }
-
-            if(waterProx > 0.12)
-            {
-                float shoreNoise = evaluateContinuousRainWetnessNoise(hitPos.xz * 1.35);
-                float maxWetHeight =
-                    (primaryGeometricNormal.y > 0.5 ? 0.65 : 0.95) + 0.35 * shoreNoise;
-                float heightMask = (1.0 - smoothstep(0.05, maxWetHeight, hAboveWater)) *
-                    smoothstep(-0.35, -0.05, hAboveWater);
-                float distFade = 1.0 - smoothstep(32.0, 48.0, rtLodDistance);
-                float shoreWetness = clamp(
-                    smoothstep(0.12, 0.72, waterProx) * heightMask * distFade,
-                    0.0,
-                    1.0);
-                if(shoreWetness > 0.005)
-                {
-                    float existingRainWet = max(rainGroundWetness, rainWallWetness);
-                    float extraShoreWet = max(shoreWetness - existingRainWet, 0.0);
-                    albedo *= 1.0 - extraShoreWet * 0.42;
-                    roughness = min(roughness, mix(roughness, 0.075, shoreWetness * 0.88));
-                    if(primaryGeometricNormal.y > 0.5)
-                    {
-                        normal = normalize(
-                            mix(normal, primaryGeometricNormal, shoreWetness * 0.35));
-                        NdotL = max(0.0, dot(normal, sunDir));
-                    }
-                    pbr2ReflectionStrength = evaluatePBR2ReflectionStrength(
-                        roughness,
-                        f0MetalCode);
-                }
-            }
-        }
-    }
-}
-#endif
 
 // =====================================================
 // A1 - GGX Direct Sun Lighting
@@ -4757,9 +4882,12 @@ if(matId > 0.2 && matId < 0.45)
 
         vec3 sssDirection =
             normalize(
-                sampleHemisphereCosine(
+                sampleHemisphereCosine2D(
                     -normal,
-                    sssSeed
+                    vec2(
+                        glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 65u),
+                        glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 66u)
+                    )
                 )
             );
 
@@ -4894,7 +5022,7 @@ if(matId > 0.2 && matId < 0.45)
 // 左半屏 = false。必须在两个本地光项之前声明（GLSL 单遍编译）。
 bool splitHalfRight =
     DBG_SPLIT_ABLATION &&
-    (float(gl_LaunchIDEXT.x) >= 0.5 * float(rtLaunchSize().x));
+    (float(pixelCoord.x) >= 0.5 * float(rtLaunchSize().x));
 
 // 2026-09-30 收口：本地光只剩经典 0.31 RIS 一种方案（ReSTIR DI 链已整链删除），
 // 发射体邻接自发光（命中面**背后**体素的 emission，hitPos - normal*0.02）
@@ -4923,8 +5051,8 @@ if(DBG_SPLIT_ABLATION)
 // （Orion indirect.rgen.slang:57）。XOR 保留乘法乘积的逐位结构，会让
 // 种子低位在屏幕上呈周期性 → 候选选择/可见性跟着周期化 → 整齐的点阵与线条。
 // 本文件其余 5 处同类种子构造（3877/3917/7501/12441/15800）同步改为加法。
-uint vptRisSeed = uint(gl_LaunchIDEXT.x) * 1973u +
-    uint(gl_LaunchIDEXT.y) * 9277u ^ cam.frameCount * 26699u;
+uint vptRisSeed = uint(pixelCoord.x) * 1973u +
+    uint(pixelCoord.y) * 9277u ^ cam.frameCount * 26699u;
 pcg_hash(vptRisSeed);
 // Exact direct local light for the primary receiver, read from the same baked
 // 16^3 x 6 block-face cache the emitter solve writes (with its own DDA
@@ -5004,9 +5132,11 @@ if(!vptPixelActive && cam.sparseParams.x >= 0.5 && cam.sparseParams.z > 0.5)
 }
 #endif
 vec3 localDirectLight = vec3(0.0);
+vec3 primaryLocalGeomFace = vec3(0.0);
 if(runPrimaryDirectLight)
 {
 #if LOCAL_RIS_PRIMARY_TEMPORAL
+primaryLocalGeomFace = vptGeometricFaceNormalFromRay(hitPos, worldDir.xyz);
 localDirectLight = evaluateVPTCandidateDirectTemporal(
 #if VPT_TRANSPARENT_HISTORY_KEY
     // Opaque primary: the surface point IS the receiver, so it is its own key.
@@ -5015,8 +5145,8 @@ localDirectLight = evaluateVPTCandidateDirectTemporal(
     hitPos,
     normal,
     albedo,
-    vptGeometricFaceNormalFromRay(hitPos, worldDir.xyz),
-    ivec2(gl_LaunchIDEXT.xy),
+    primaryLocalGeomFace,
+    pixelCoord,
     ivec2(rtLaunchSize())
 );
 #else
@@ -5026,11 +5156,12 @@ localDirectLight = evaluateVPTCandidateDirectTemporal(
 // 2026-10-07：带上主命中的 LabPBR 材质 —— materialF0 / metallic / roughness 都是本
 // 作用域里**已经解码好**的那一份（见 18122 附近的 F0/Metal 解码块），不必重算，也不能
 // 用太阳那段的 directF0（它在内层大括号里，这里看不到）。
+primaryLocalGeomFace = vptGeometricFaceNormalFromRay(hitPos, worldDir.xyz);
 localDirectLight = evaluateVPTRISDirectLightingPrimary(
     hitPos,
     normal,
     albedo,
-    vptGeometricFaceNormalFromRay(hitPos, worldDir.xyz),
+    primaryLocalGeomFace,
     materialF0,
     metallic,
     roughness,
@@ -5040,13 +5171,48 @@ localDirectLight = evaluateVPTRISDirectLightingPrimary(
 );
 #endif
 }
-uint vptBounceSeed = uint(gl_LaunchIDEXT.x) * 31847u ^
-    uint(gl_LaunchIDEXT.y) * 11213u ^ cam.frameCount * 6971u;
+uint vptBounceSeed = uint(pixelCoord.x) * 31847u ^
+    uint(pixelCoord.y) * 11213u ^ cam.frameCount * 6971u;
 pcg_hash(vptBounceSeed);
 // Keep the local-light secondary DDA on the same 10-chunk temporal budget as
 // direct local lighting.  This avoids an unbudgeted extra voxel traversal in
 // the distant tiers.  The classic 0.31 RIS chain always runs it: the
 // neighbour-voxel bounce proxy is one of its three terms.
+#ifndef VPT_LOCAL_SECONDARY_SHARC_LOD
+#define VPT_LOCAL_SECONDARY_SHARC_LOD 1
+#endif
+#if VPT_LOCAL_SECONDARY_SHARC_LOD
+const bool localSecSharcTrim = sharcQueryActive() && (cam.perfPrimary.z >= 2u);
+bool runLocalSecondary = false;
+float localSecondaryLodWeight = 1.0;
+if(localSecSharcTrim)
+{
+    const float secScale = perfL10TierScale();
+    if(rtLodDistance < 32.0 * secScale)
+    {
+        runLocalSecondary = true;
+    }
+    else if(rtLodDistance < 64.0 * secScale)
+    {
+        runLocalSecondary = rtLodHalfSample;
+        localSecondaryLodWeight = 2.0;
+    }
+}
+else
+{
+    runLocalSecondary = rtLodDistance < 64.0 * perfL10TierScale();
+    if(rtLodDistance >= 64.0 * perfL10TierScale() && rtLodDistance < 128.0 * perfL10TierScale())
+    {
+        runLocalSecondary = rtLodHalfSample;
+        localSecondaryLodWeight = 2.0;
+    }
+    else if(rtLodDistance >= 128.0 * perfL10TierScale() && rtLodDistance < 160.0 * perfL10TierScale())
+    {
+        runLocalSecondary = rtLodQuarterSample;
+        localSecondaryLodWeight = 4.0;
+    }
+}
+#else
 bool runLocalSecondary = rtLodDistance < 64.0 * perfL10TierScale();
 float localSecondaryLodWeight = 1.0;
 if(rtLodDistance >= 64.0 * perfL10TierScale() && rtLodDistance < 128.0 * perfL10TierScale())
@@ -5059,6 +5225,7 @@ else if(rtLodDistance >= 128.0 * perfL10TierScale() && rtLodDistance < 160.0 * p
     runLocalSecondary = rtLodQuarterSample;
     localSecondaryLodWeight = 4.0;
 }
+#endif
 
 // 2026-10-26 稀疏渲染：非活跃像素跳过本地光二级弹射（DDA）。
 if(!vptPixelActive)
@@ -5100,7 +5267,12 @@ uint waterReflectionInterval =
 bool runWaterReflection =
     waterReflectionInterval > 0u &&
     (waterReflectionInterval == 1u ||
-     (cam.frameCount % waterReflectionInterval) == 0u);
+     (cam.frameCount % waterReflectionInterval) == 0u)
+#if WATER_REFLECT_SUN_OPT_V1
+    && sunDir.y > 0.02
+    && rtLodDistance < 96.0 * perfL10TierScale()
+#endif
+    ;
 float waterReflectedSunFactor =
     runWaterReflection
         ? traceWaterReflectedSun(
@@ -5110,14 +5282,18 @@ float waterReflectedSunFactor =
         )
         : 0.0;
 
-vec3 waterReflectedSunLight =
-    getTimeDrivenSkyLightColor() *
-    3.2 *
-    getTimeDrivenSkyLightRadianceScale() *
-    albedo *
-    (1.0 - metallic) *
-    waterReflectedSunFactor *
-    c3CloudSunTransmittance(hitPos, sunDir);
+vec3 waterReflectedSunLight = vec3(0.0);
+if(waterReflectedSunFactor > 1.0e-5)
+{
+    waterReflectedSunLight =
+        getTimeDrivenSkyLightColor() *
+        3.2 *
+        getTimeDrivenSkyLightRadianceScale() *
+        albedo *
+        (1.0 - metallic) *
+        waterReflectedSunFactor *
+        c3CloudSunTransmittance(hitPos, sunDir);
+}
     // =====================================================
 // A2-1
 // Independent ray-traced GGX glossy reflection
@@ -5197,10 +5373,19 @@ else if(rtLodDistance >= 160.0 * perfL10TierScale())
     glossySampleLevel = 3;
 }
 
+#ifndef VPT_GLOSSY_ROUGH_CUTOFF
+#define VPT_GLOSSY_ROUGH_CUTOFF 1
+#endif
 // 粗糙度级（ORION_GLOSSY_ROUGH_LOD）：只往上抬，不往回降。
 if(cam.giHalfParams.w > 0.5f)
 {
-    if(roughness >= 0.65)
+    if(roughness >= 0.80 && metallic < 0.05 &&
+       max(materialF0.r, max(materialF0.g, materialF0.b)) <= 0.06 &&
+       VPT_GLOSSY_ROUGH_CUTOFF != 0)
+    {
+        glossySampleLevel = 3;
+    }
+    else if(roughness >= 0.65)
     {
         glossySampleLevel = max(glossySampleLevel, 2);
     }
@@ -5315,13 +5500,16 @@ if(runGlossyRT)
     // [14] 光泽反射求值（每像素最多一次；真正的那根光线在本块之后才发）。
     perfRayStatAdd(14u, 1u);
 
+    vec2 glossyBn = vec2(
+        glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 41u),
+        glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 42u)
+    );
     glossyH =
-        normalize(
-            sampleGGX(
-                glossyRayNormal,
-                roughness,
-                seed
-            )
+        sampleGGXVNDF(
+            glossyRayNormal,
+            V,
+            roughness,
+            glossyBn
         );
 
     glossyDir =
@@ -5397,16 +5585,8 @@ if(
 
 
     // =================================================
-    // GGX D / G
+    // GGX VNDF weight: F * G(V, L) / G1(V)
     // =================================================
-
-    float glossyD =
-        distributionGGX(
-            glossyRayNormal,
-            glossyH,
-            roughness
-        );
-
 
     float glossyG =
         geometrySmith(
@@ -5417,65 +5597,16 @@ if(
         );
 
 
-    // =================================================
-    // Cook-Torrance GGX specular BRDF
-    //
-    // D * G * F
-    // -------------------------
-    // 4 * NdotV * NdotL
-    // =================================================
-
-    vec3 glossySpecularBRDF =
-        (
-            glossyD *
-            glossyG *
-            glossyF
-        ) /
-        max(
-            4.0 *
-            glossyNdotV *
-            glossyNdotL,
-            1.0e-5
+    float glossyG1V =
+        ggxVNDFMaskingG1(
+            glossyNdotV,
+            roughness
         );
 
-
-    // =================================================
-    // GGX reflection PDF
-    //
-    // sampleGGX():
-    //     PDF(H) = D * NdotH
-    //
-    // half-vector -> reflected direction:
-    //     PDF(L) = PDF(H) / (4 * VdotH)
-    // =================================================
-
-    float glossySpecularPdf =
-        max(
-            (
-                glossyD *
-                glossyNdotH
-            ) /
-            max(
-                4.0 *
-                glossyVdotH,
-                1.0e-5
-            ),
-            1.0e-5
-        );
-
-
-    // =================================================
-    // Monte-Carlo throughput
-    //
-    // BRDF * cos(theta) / PDF
-    // =================================================
 
     vec3 glossyWeight =
-        (
-            glossySpecularBRDF *
-            glossyNdotL
-        ) /
-        glossySpecularPdf;
+        glossyF *
+        (glossyG / max(glossyG1V, 1.0e-5));
 
 
     vec3 incomingGlossyRadiance =
@@ -5485,6 +5616,7 @@ if(
                 glossyRayNormal * 0.001,
             glossyDir,
             sunDir,
+            roughness,
             seed,
             glossySpecularHitDistance
         );
@@ -5507,10 +5639,17 @@ if(s == 0 && matId <= 0.5)
     // 随机 GGX 样本的距离每帧在"近处墙 / 远处天空"之间跳 ⇒ RR 认为镜面事件
     // 每帧都换位置 ⇒ 历史被判失配 ⇒ 静止时颗粒永不收敛（阴影里最明显）。
     // 粗糙面的反射本来就模糊，用稳定的表面距离当 guide 更符合 RR 的契约。
+#if RR_GUIDE_PURIFY_V1
+    rrSpecularHitDistance =
+        (roughness >= 0.5 || (!runGlossyRT && cam.ssHybridParams.z >= 0.5f))
+            ? max(primaryHitDistance, 1.0)
+            : glossySpecularHitDistance;
+#else
     rrSpecularHitDistance =
         (primaryRoughness >= 0.5)
             ? max(primaryHitDistance, 1.0)
             : glossySpecularHitDistance;
+#endif
 #else
     rrSpecularHitDistance =
         glossySpecularHitDistance;
@@ -5536,14 +5675,32 @@ if(s == 0 && matId <= 0.5)
                         rtaoFactor
                     )
                 );
+                const uint spatialLandingIdx = ptLandingRecordIndex(
+                    uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x),
+                    s
+                );
                 ptLandingStoreGlossyExtra(
-                    ptLandingRecordIndex(
-                        uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x),
-                        s
-                    ),
+                    spatialLandingIdx,
                     glossyReflectionLight,
                     rrSpecularHitDistance
                 );
+                if(cam.sparseParams.x >= 1.5 && s == 0 && runPrimaryDirectLight)
+                {
+                    ptLandingStoreSpatialMaterial(
+                        spatialLandingIdx,
+                        albedo,
+                        roughness,
+                        materialF0,
+                        metallic,
+                        normal,
+                        primaryLocalGeomFace,
+                        vptPixelActive
+                    );
+                }
+                else
+                {
+                    ptLandingRecords[spatialLandingIdx].c.w = 0u;
+                }
                 continue;
 #elif defined(ORION_K2_DIRECT_LOCAL_STAGE)
                 // ==========================================
@@ -5564,14 +5721,32 @@ if(s == 0 && matId <= 0.5)
                         k2DirectAccum.a
                     )
                 );
+                const uint spatialLandingIdx = ptLandingRecordIndex(
+                    uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x),
+                    s
+                );
                 ptLandingStoreGlossyExtra(
-                    ptLandingRecordIndex(
-                        uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x),
-                        s
-                    ),
+                    spatialLandingIdx,
                     glossyReflectionLight,
                     rrSpecularHitDistance
                 );
+                if(cam.sparseParams.x >= 1.5 && s == 0 && runPrimaryDirectLight)
+                {
+                    ptLandingStoreSpatialMaterial(
+                        spatialLandingIdx,
+                        albedo,
+                        roughness,
+                        materialF0,
+                        metallic,
+                        normal,
+                        primaryLocalGeomFace,
+                        vptPixelActive
+                    );
+                }
+                else
+                {
+                    ptLandingRecords[spatialLandingIdx].c.w = 0u;
+                }
                 continue;
 #endif
 // ④ GI/稀疏合成/公共尾段：主变体 + K2-I 编译；K2-D/K2-SUN/K2-LOC 全部不编译。
@@ -5624,7 +5799,10 @@ vec3 currentThroughput =
 // 表面的 BSDF 采样 ⇒ 来源锥宽 = 主命中的 roughness。把真实来源喂给参考的
 // footprint 公式（公式本身一字不改），第一跳（间接命中，非 primary/visibility hit，
 // 不违反 AGENTS.md:508）即可按参考自己的判据决定用不用缓存。
-float materialRoughnessPrev = roughness;
+// GI 循环第一跳永远是纯漫反射余弦半球（镜面另在 K2-LOC 独立追踪）；对齐 NVIDIA
+// Pathtracer.hlsl:675（diffuse lobe 记 1.0），近场墙角接触 GI 仍由
+// payload.hitDistance > sharcVoxelSize * sqrt(3.0) 硬门槛保护，不会被误替换。
+float materialRoughnessPrev = 1.0;
 
 #if SHARC_UPDATE
 SharcState sharcState;
@@ -5779,10 +5957,15 @@ int giBounceLimit =
     // 命中后同样不再发第二跳），未命中时是纯损失：那一份能量缺失，靠 update 把缓存
     // 热起来补回。⚠ 这是自造口径、不在参考实现里；A/B 与回退都用 ORION_SHARC=0。
     // ========================================================================
+#ifndef SHARC_FORCE_ONE_BOUNCE_CLAMP
+#define SHARC_FORCE_ONE_BOUNCE_CLAMP 0
+#endif
+#if SHARC_FORCE_ONE_BOUNCE_CLAMP
     if(sharcQueryActive())
     {
         giBounceLimit = min(giBounceLimit, 1);
     }
+#endif
 #endif
 
 
@@ -5890,6 +6073,7 @@ float diffuseGILodWeight =
 if (cam.giHalfParams.x == 0.0f)
 #endif
 {
+#ifndef ORION_K2_INDIRECT_COMPOSE_ONLY
 // 2026-10-11 5b-3：回路永远跑（主命中不再提前退出）。截断发生在**回路内部**的
 // 间接命中处 —— 见下面 "5b-3：SHaRC 查询" 段。
 // [1] 本像素是否跑 diffuse GI
@@ -5914,7 +6098,7 @@ while(
     // ------------------------------------------------------------------------
     {
         const bool sharcLoopDiagSampled =
-            ((gl_LaunchIDEXT.x * 7u + gl_LaunchIDEXT.y * 13u) & 255u) == 0u;
+            ((uint(pixelCoord.x) * 7u + uint(pixelCoord.y) * 13u) & 255u) == 0u;
 
         // ⚠ 2026-10-12 实机根因修复：同上面的 lock[12]，这里也必须先过 `sharcMode()`。
         // 它是回路体第一条语句、只挂空间散列 ⇒ ORION_SHARC=0 时同样会向**设备地址 0**
@@ -5994,7 +6178,7 @@ while(
                             // 默认 1.0 = 现行为（逐位不变）；A/B 用
                             // -DGI_RR_MAX_SURVIVAL=0.9 编第二份 SPV 对比。
 #ifndef GI_RR_MAX_SURVIVAL
-#define GI_RR_MAX_SURVIVAL 1.0
+#define GI_RR_MAX_SURVIVAL 0.9
 #endif
                             // stage 37 = 同局消融臂（上限 0.9），base 下等于 GI_RR_MAX_SURVIVAL
                             float rrSurvival = min(
@@ -6036,7 +6220,7 @@ while(
 #endif
 #if GI_RR_BLUE_NOISE
                             float rrRoll = glassBlueNoiseSample(
-                                uvec2(gl_LaunchIDEXT.xy),
+                                uvec2(pixelCoord),
                                 cam.frameCount,
                                 diffuseBounceCount + 37u);
 #else
@@ -6071,6 +6255,7 @@ while(
                     hit.state = makeTraceState(
                         currentInsideWater ? RT_PURPOSE_WATER_MEDIUM : RT_PURPOSE_FULL
                     );
+                    hit.state |= RT_STATE_GI_SKIP_CLOUDS_BIT;
 
                     // 2026-10-25 A/B：GI 射线跳过 POM（含 POM 自阴影）。
                     // 命中侧只需让 getPOMDepthScale() 返回 0 即可走既有早退分支。
@@ -6863,6 +7048,17 @@ vec3 nextUnifiedEmission =
 // - real sun visibility / water transmittance
 // =====================================================
 
+#if GI_BOUNCE_LAMBERT_DIRECT
+vec3 bounceDirect =
+    evaluateDirectSunLightingDiffuse(
+        nextHitPos,
+        nextNormal,
+        nextAlbedo,
+        nextF0Metal,
+        nextPOMSelfShadow,
+        sunDir
+    );
+#else
 vec3 bounceDirect =
     evaluateDirectSunLighting(
         nextHitPos,
@@ -6881,6 +7077,7 @@ vec3 bounceDirect =
         nextPOMSelfShadow,
         sunDir
     );
+#endif
 
 // =====================================================
 // Sun -> Water -> GI secondary surface
@@ -6919,12 +7116,55 @@ float nextMetallic =
 // 判据与主路径**逐字同源重算**（同样的 UBO 输入 ⇒ 同样的值），这样整帧的这一项
 // 要么都在、要么都不在 —— 时域滤波只面对一件事，比"半帧有半帧没有"更干净。
 // 局部重算而不引用上游变量：两处未必在同一层大括号里，重算比跨作用域引用安全。
+#ifndef GI_BOUNCE_WATER_SUN_OPT
+#define GI_BOUNCE_WATER_SUN_OPT 1
+#endif
 uint bounceWaterReflectionInterval =
     clamp(cam.perfSecondary.z, 0u, 4u);
+#if GI_BOUNCE_WATER_SUN_OPT
+uint effectiveBounceWaterInterval =
+    bounceWaterReflectionInterval == 0u ? 0u : max(bounceWaterReflectionInterval, 4u);
+bool runBounceWaterReflection =
+    diffuseBounceCount == 0 &&
+    effectiveBounceWaterInterval > 0u &&
+    (cam.frameCount % effectiveBounceWaterInterval) == 0u &&
+    rtLodDistance < 48.0 * perfL10TierScale() &&
+    payload.hitDistance < 32.0
+#if WATER_REFLECT_SUN_OPT_V1
+    && sunDir.y > 0.02
+#endif
+    ;
+float bounceWaterReflectedSunFactor =
+    runBounceWaterReflection
+        ? traceWaterReflectedSun(
+            nextHitPos,
+            nextNormal,
+            sunDir
+        )
+        : 0.0;
+
+vec3 bounceWaterReflectedSun = vec3(0.0);
+if(bounceWaterReflectedSunFactor > 1.0e-5)
+{
+    bounceWaterReflectedSun =
+        getTimeDrivenSkyLightColor() *
+        3.2 *
+        getTimeDrivenSkyLightRadianceScale() *
+        nextAlbedo *
+        (1.0 - nextMetallic) *
+        bounceWaterReflectedSunFactor *
+        c3CloudSunTransmittance(nextHitPos, sunDir);
+}
+#else
 bool runBounceWaterReflection =
     bounceWaterReflectionInterval > 0u &&
     (bounceWaterReflectionInterval == 1u ||
-     (cam.frameCount % bounceWaterReflectionInterval) == 0u);
+     (cam.frameCount % bounceWaterReflectionInterval) == 0u)
+#if WATER_REFLECT_SUN_OPT_V1
+    && sunDir.y > 0.02
+    && rtLodDistance < 96.0 * perfL10TierScale()
+#endif
+    ;
 float bounceWaterReflectedSunFactor =
     runBounceWaterReflection
         ? traceWaterReflectedSun(
@@ -6943,6 +7183,7 @@ vec3 bounceWaterReflectedSun =
     (1.0 - nextMetallic) *
     bounceWaterReflectedSunFactor *
     c3CloudSunTransmittance(nextHitPos, sunDir);
+#endif
 
 
 // =====================================================
@@ -7029,13 +7270,19 @@ vec3 bounceLocalDiffuse =
     //           SHARC 关 ⇒ 必崩（16:10、16:24 两局 frame 1~7）。这条修完两者都安全。
     // 教训：凡是访问缓存缓冲的仪器，门控必须与**查询本身**同源（sharcMode()），
     //       而不能只靠"采样率"这类无关条件。
-    if(sharcMode() != 0u &&
-       ((gl_LaunchIDEXT.x * 7u + gl_LaunchIDEXT.y * 13u) & 255u) == 0u)
+    const bool sharcSampleDiag =
+        sharcMode() != 0u &&
+        ((uint(pixelCoord.x) * 7u + uint(pixelCoord.y) * 13u) & 255u) == 0u;
+    if(sharcSampleDiag)
     {
         RWStructuredBuffer_uint sharcDiagCounter =
             RWStructuredBuffer_uint(sharcCacheAddress(3u));
 
         atomicAdd(sharcDiagCounter.data[12], 1u);
+        if(sharcValidHit)
+        {
+            atomicAdd(sharcDiagCounter.data[13], 1u);
+        }
     }
 
     if(sharcValidHit && sharcQueryActive())
@@ -7044,6 +7291,8 @@ vec3 bounceLocalDiffuse =
         sharcQueryHitData.positionWorld = nextHitPos;
         sharcQueryHitData.normalWorld =
             dot(nextNormal, currentDir) > 0.0 ? -nextNormal : nextNormal;
+        sharcQueryHitData.materialDemodulation = max(nextAlbedo, vec3(0.05));
+        sharcQueryHitData.emissive = nextUnifiedEmission;
 
         vec3 sharcRadiance = vec3(0.0);
 
@@ -7052,10 +7301,13 @@ vec3 bounceLocalDiffuse =
         {
             indirectLight += sharcRadiance * currentThroughput;
 
-            RWStructuredBuffer_uint sharcQueryCounter =
-                RWStructuredBuffer_uint(sharcCacheAddress(3u));
+            if(sharcSampleDiag)
+            {
+                RWStructuredBuffer_uint sharcQueryCounter =
+                    RWStructuredBuffer_uint(sharcCacheAddress(3u));
 
-            atomicAdd(sharcQueryCounter.data[11], 1u);
+                atomicAdd(sharcQueryCounter.data[11], 1u);
+            }
 
             break; // 参考 :564：查到缓存即终止路径
         }
@@ -7138,6 +7390,8 @@ indirectLight +=
     sharcUpdateHitData.positionWorld = nextHitPos;
     sharcUpdateHitData.normalWorld =
         dot(nextNormal, currentDir) > 0.0 ? -nextNormal : nextNormal;
+    sharcUpdateHitData.materialDemodulation = max(nextAlbedo, vec3(0.05));
+    sharcUpdateHitData.emissive = nextUnifiedEmission;
 
     // 与 update/pixel 选择同源：独立 RNG 状态，避免扰动本工程自己的采样流
     // （update 变体是独立 dispatch，本来也不影响成像路径）。
@@ -7147,7 +7401,6 @@ indirectLight +=
         float(0x01000000u);
 
     const vec3 sharcUpdateRadiance =
-        nextUnifiedEmission +
         bounceDirect +
         bounceWaterReflectedSun +
         bounceLocalDiffuse;
@@ -7339,12 +7592,11 @@ vec3 nextBounceWeight =
 if(chooseNextSpecular)
 {
     vec3 nextH =
-        normalize(
-            sampleGGX(
-                nextNormal,
-                nextRoughness,
-                seed
-            )
+        sampleGGXVNDF(
+            nextNormal,
+            nextV,
+            nextRoughness,
+            vec2(rand(seed), rand(seed))
         );
 
 
@@ -7404,14 +7656,6 @@ if(chooseNextSpecular)
         );
 
 
-    float nextD =
-        distributionGGX(
-            nextNormal,
-            nextH,
-            nextRoughness
-        );
-
-
     float nextG =
         geometrySmith(
             nextNormal,
@@ -7421,54 +7665,21 @@ if(chooseNextSpecular)
         );
 
 
-    vec3 nextSpecularBRDF =
-        (
-            nextD *
-            nextG *
-            nextF
-        ) /
-        max(
-            4.0 *
-            nextNdotV *
-            nextNdotL,
-            1.0e-5
-        );
-
-
-    // sampleGGX() 当前采样的是 GGX half vector：
-    //
-    // PDF(H) = D(H) * NdotH
-    //
-    // reflection 映射：
-    //
-    // PDF(L) =
-    // PDF(H) / (4 * VdotH)
-    float nextSpecularPdf =
-        max(
-            (
-                nextD *
-                nextNdotH
-            ) /
-            max(
-                4.0 *
-                nextVdotH,
-                1.0e-5
-            ),
-            1.0e-5
+    float nextG1V =
+        ggxVNDFMaskingG1(
+            nextNdotV,
+            nextRoughness
         );
 
 
     nextBounceWeight =
         (
-            nextSpecularBRDF *
-            nextNdotL
+            nextF *
+            (nextG / max(nextG1V, 1.0e-5))
         ) /
-        (
-            nextSpecularPdf *
-            max(
-                nextSpecularProbability,
-                1.0e-5
-            )
+        max(
+            nextSpecularProbability,
+            1.0e-5
         );
 }
 #endif // !GI_BOUNCE_DIFFUSE_ONLY
@@ -7559,6 +7770,28 @@ currentThroughput *=
 SharcSetThroughput(sharcState, nextBounceWeight * BSDF_GI_THROUGHPUT_SCALE);
 #endif
 
+#if !SHARC_UPDATE
+#ifndef GI_DEEP_RUSSIAN_ROULETTE
+#define GI_DEEP_RUSSIAN_ROULETTE 1
+#endif
+#if GI_DEEP_RUSSIAN_ROULETTE
+if(diffuseBounceCount >= 2)
+{
+    const float rrSurvive = clamp(
+        max(currentThroughput.r, max(currentThroughput.g, currentThroughput.b)),
+        0.05,
+        0.95
+    );
+    const float rrU = float(pcg_hash(seed) & 0x00ffffffu) * (1.0 / 16777216.0);
+    if(rrU > rrSurvive)
+    {
+        break;
+    }
+    currentThroughput /= rrSurvive;
+}
+#endif
+#endif
+
 // 参考 Pathtracer.hlsl:673-675：把**本顶点**的粗糙度累加进 materialRoughnessPrev，
 // 供下一跳算光锥足迹用（漫反射顶点记 1.0，镜面顶点记其粗糙度）。
 // 原句：materialRoughnessPrev += brdfType == DIFFUSE_TYPE ? 1.0f : material.roughness;
@@ -7580,7 +7813,27 @@ currentDir =
 
 // 结束 GI while
 }
+#else
+if(runDiffuseGI)
+{
+    indirectLight = imageLoad(k2GiTraceImage, pixelCoord).rgb;
+}
+#endif
 }   // 结束 2026-10-24 的 giHalfParams.x 运行时分支（起点见 diffuseGILodWeight 之后）
+#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
+if(k2iCompactTraceActive)
+{
+    imageStore(
+        k2GiTraceImage,
+        pixelCoord,
+        vec4(min(indirectLight, vec3(60000.0)), 1.0)
+    );
+    return;
+}
+#endif
+#if SHARC_UPDATE
+continue;
+#endif
 
 #if GI_HALFRES
 // ============================================================================
@@ -7786,6 +8039,9 @@ const float sparseRadianceScale = 1.0;
 // 能冲到 50+，钳不住，那些跳亮样本被 RR 时域保留 ⇒ 叶子持续偏亮。
 #define VPT_SPARSE_LIT_LUMA_MAX 4.0
 #endif
+#ifndef VPT_SPARSE_LIT_LUMA_SOFT_CEIL
+#define VPT_SPARSE_LIT_LUMA_SOFT_CEIL 8.0
+#endif
 
 // 2026-11-02：不再包含 directLight —— 太阳软影不再稀疏（见上方 RTAO 那段），
 // 它每帧都是满采样的有效值，不该参与 1/rate 补偿，也不该参与"稀疏项"的 firefly 钳制。
@@ -7815,7 +8071,11 @@ if(sparseRadianceScale > 1.0)
     const float sparseLumaMax = float(VPT_SPARSE_LIT_LUMA_MAX);
     if(sparseSumLuma > sparseLumaMax)
     {
-        sparsePreScaleGain = sparseLumaMax / sparseSumLuma;
+        const float knee = sparseLumaMax;
+        const float headroom = max(float(VPT_SPARSE_LIT_LUMA_SOFT_CEIL) - knee, 0.5);
+        const float excess = sparseSumLuma - knee;
+        const float compressedLuma = knee + headroom * (excess / (excess + headroom));
+        sparsePreScaleGain = compressedLuma / sparseSumLuma;
     }
 }
 #endif
@@ -8181,6 +8441,9 @@ sampleColor =
         accumulatedSampleColor += sampleColor;
 #endif // ORION_K2_DIRECT_STAGE（③：aerial/累积归 K2-I，K2-D 每像素都提前 continue）
     }
+#if SHARC_UPDATE
+    return;
+#endif
 
 // ④ 公共尾段（compose/guide/输出）归 K2-I；K2-D/K2-SUN/K2-LOC 不编译。
 #if !defined(ORION_K2_DIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
@@ -8271,6 +8534,35 @@ if(rrUseReceiverDepthGuide)
             )
         );
     }
+
+#if !GI_HALFRES && !SHARC_UPDATE
+    if(cam.perfAblationStage.z != 0u &&
+       dot(rrTransparentReceiverWorldPos, rrTransparentReceiverWorldPos) > 1.0e-8)
+    {
+        const vec4 receiverPrevClip =
+            cam.prevViewProj * vec4(rrTransparentReceiverWorldPos, 1.0);
+        const vec4 receiverCurClip =
+            cam.viewProj * vec4(rrTransparentReceiverWorldPos, 1.0);
+
+        if(abs(receiverPrevClip.w) > 1.0e-6 &&
+           abs(receiverCurClip.w) > 1.0e-6)
+        {
+            const vec2 receiverPrevNdc =
+                receiverPrevClip.xy / receiverPrevClip.w;
+            const vec2 receiverCurNdc =
+                receiverCurClip.xy / receiverCurClip.w;
+            const vec2 receiverMotion =
+                (receiverPrevNdc - receiverCurNdc) * vec2(0.5, -0.5);
+
+            imageStore(
+                dlssMotionImage,
+                pixelCoord,
+                vec4(receiverMotion, 0.0, 1.0)
+            );
+            rtDebugPrimaryMotion = receiverMotion;
+        }
+    }
+#endif
 }
 
 
@@ -8842,7 +9134,12 @@ if ((cam.dhFarFieldParams.x > 0.5 || dhFarModeRequested == 14
 
                     hit.hitDistance = 1.0;
                     hit.state = makeTraceState(RT_PURPOSE_FULL);
+                    hit.state |= RT_STATE_GI_SKIP_CLOUDS_BIT;
+#if GI_SKIP_SUN_DISK
+                    hit.state |= RT_STATE_NO_SUN_DISK_BIT;
+#endif
 
+                    #ifndef ORION_K2I_COMPOSE_COMPUTE
                     #ifdef ORION_RT_STAGE_COUNTERS
                     rtCntRayIssued();
                     #endif
@@ -8859,6 +9156,9 @@ if ((cam.dhFarFieldParams.x > 0.5 || dhFarModeRequested == 14
                         10000.0,
                         0
                     );
+                    #else
+                    payload.hitDistance = -1.0;
+                    #endif
 
                     if (payload.hitDistance < 0.0) {
                         // 与 GI 循环的 miss 项逐字一致（17490）：rmiss 已经把

@@ -256,7 +256,7 @@
   "cloudFarStepDensity": 0.28,
   "giRoulette": 1,
   "directLightMode": 0,
-  "indirectMode": 0,
+  "indirectMode": 1,
   "sparseRatePercent": 30,
   "sunMarchFarDistance": 128,
   "motionDebugView": 0,

@@ -1,0 +1,761 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    #include "camera_ubo.glsl"
+} cam;
+
+#include "local_light_profile.glsl"
+
+const uint VLI_PAGE_TABLE_CAPACITY = 8192u;
+const uint VLI_PAGE_WORDS = 4096u;
+const uint VPT_EMITTER_HEADER_WORDS = 4u;
+const uint VLI_SOURCE_WORDS = 4096u;
+const uint VPT_EMITTER_PAGE_WORDS = VPT_EMITTER_HEADER_WORDS + VLI_SOURCE_WORDS;
+const uint VPT_SOURCE_DIRECTORY_MAX_SECTIONS = 125u;
+const uint VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE = 1u + VPT_SOURCE_DIRECTORY_MAX_SECTIONS;
+const float VPT_LOCAL_MAX_DISTANCE = 30.0;
+const float VPT_LOCAL_FADE_START_FRACTION = 0.40;
+const uint VPT_LIGHT_GRID_CELLS = 9216u;
+const uint VPT_LIGHT_GRID_SLOTS = 32u;
+
+layout(std430, binding = 22, set = 0) readonly buffer PageTable
+{
+    uint words[];
+} vliPageTableBuffer;
+
+layout(std430, binding = 23, set = 0) readonly buffer VLIPagesBuffer
+{
+    uint words[];
+} vliPagesBuffer;
+
+layout(std430, binding = 28, set = 0) readonly buffer VPTEmitterIndexPagesBuffer
+{
+    uint words[];
+} vptEmitterIndexPagesBuffer;
+
+struct VPTSourceDirectoryEntry
+{
+    uint pageIndex;
+    uint emitterCountAndOffset;
+    uint aliasThresholdQ16;
+    uint aliasIndex;
+    float selectionProbability;
+};
+
+layout(std430, binding = 31, set = 0) readonly buffer VPTSourceDirectoryPagesBuffer
+{
+    VPTSourceDirectoryEntry entries[];
+} vptSourceDirectoryPagesBuffer;
+
+layout(std430, binding = 99, set = 0) writeonly buffer VPTLightGridBuffer
+{
+    uvec4 header;
+    uvec4 cellMeta[9216];
+    uint aliasWords[9216 * 32];
+    uvec4 slots[9216 * 32];
+} vptLightGridBuffer;
+
+layout(push_constant) uniform GridBuildPush
+{
+    uvec4 gridParams;
+};
+
+float vptLocalLightRangeScale()
+{
+    float user = cam.rainWallParams1.w;
+    return (user >= 0.05 && user <= 8.0) ? user : 1.0;
+}
+
+float vptLocalLightRange(uint typeCode, float emissionLevel)
+{
+    float base = localLightProfileBaseRange(typeCode, emissionLevel);
+    return clamp(base * vptLocalLightRangeScale(), 1.5, VPT_LOCAL_MAX_DISTANCE);
+}
+
+float vptLocalLightRangeFade(float distanceToLight, uint typeCode, float emissionLevel)
+{
+    float range = vptLocalLightRange(typeCode, emissionLevel);
+    return 1.0 - smoothstep(
+        range * VPT_LOCAL_FADE_START_FRACTION,
+        range,
+        distanceToLight
+    );
+}
+
+float vptLocalLightDistanceAttenuation(float distanceToLight)
+{
+    return 0.55 / (1.0 + 0.18 * distanceToLight +
+        0.025 * distanceToLight * distanceToLight);
+}
+
+uint vliHash32(ivec3 sectionCoord)
+{
+    uint h = uint(sectionCoord.x) * 0x8da6b343u;
+    h ^= uint(sectionCoord.y) * 0xd8163841u;
+    h ^= uint(sectionCoord.z) * 0xcb1ab31fu;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    return h;
+}
+
+bool vliLookupSectionPage(ivec3 sectionCoord, out uint pageIndex)
+{
+    uint slot = vliHash32(sectionCoord) & (VLI_PAGE_TABLE_CAPACITY - 1u);
+    for(uint probe = 0u; probe < VLI_PAGE_TABLE_CAPACITY; ++probe)
+    {
+        uint base = slot * 4u;
+        uint pagePlusOne = vliPageTableBuffer.words[base + 3u];
+        if(pagePlusOne == 0u)
+        {
+            pageIndex = 0u;
+            return false;
+        }
+        if(
+            int(vliPageTableBuffer.words[base + 0u]) == sectionCoord.x &&
+            int(vliPageTableBuffer.words[base + 1u]) == sectionCoord.y &&
+            int(vliPageTableBuffer.words[base + 2u]) == sectionCoord.z
+        )
+        {
+            pageIndex = pagePlusOne - 1u;
+            return true;
+        }
+        slot = (slot + 1u) & (VLI_PAGE_TABLE_CAPACITY - 1u);
+    }
+    pageIndex = 0u;
+    return false;
+}
+
+int vliFloorDiv(int value, int divisor)
+{
+    return value >= 0 ? value / divisor : -((-value + divisor - 1) / divisor);
+}
+
+int vliPositiveMod(int value, int divisor)
+{
+    int result = value % divisor;
+    return result < 0 ? result + divisor : result;
+}
+
+bool vptReadSourceVoxel(ivec3 worldBlock, out uint source)
+{
+    ivec3 sectionCoord = worldBlock >> 4;
+    uint pageIndex;
+    if(!vliLookupSectionPage(sectionCoord, pageIndex))
+    {
+        source = 0u;
+        return false;
+    }
+    ivec3 local = worldBlock & 15;
+    uint index = uint(local.x) + 16u * (uint(local.z) + 16u * uint(local.y));
+    source = vliPagesBuffer.words[pageIndex * VLI_PAGE_WORDS + index];
+    return true;
+}
+
+bool vptGridVoxelBlocked(vec3 origin, vec3 target, ivec3 targetBlock, ivec3 emitterBlock)
+{
+    vec3 segment = target - origin;
+    float totalDist = length(segment);
+    if(totalDist <= 0.05)
+    {
+        return false;
+    }
+    vec3 rayDir = segment / totalDist;
+    vec3 startPos = origin + rayDir * 0.02;
+    float marchLimit = totalDist - 0.04;
+    if(marchLimit <= 0.02)
+    {
+        return false;
+    }
+
+    ivec3 cell = ivec3(floor(startPos));
+    if(all(equal(cell, emitterBlock)) || all(equal(cell, targetBlock)))
+    {
+        return false;
+    }
+
+    ivec3 stepDir = ivec3(sign(rayDir));
+    vec3 invDir = 1.0 / max(abs(rayDir), vec3(1.0e-6));
+    vec3 nextBoundary = vec3(cell) + vec3(
+        stepDir.x > 0 ? 1 : 0,
+        stepDir.y > 0 ? 1 : 0,
+        stepDir.z > 0 ? 1 : 0
+    );
+    vec3 tMax = vec3(
+        stepDir.x != 0 ? abs(nextBoundary.x - startPos.x) * invDir.x : 1.0e30,
+        stepDir.y != 0 ? abs(nextBoundary.y - startPos.y) * invDir.y : 1.0e30,
+        stepDir.z != 0 ? abs(nextBoundary.z - startPos.z) * invDir.z : 1.0e30
+    );
+
+    bool memoValid = false;
+    ivec3 memoSection = ivec3(0);
+    uint memoPage = 0u;
+
+    for(int iter = 0; iter < 32; ++iter)
+    {
+        float nextT = min(tMax.x, min(tMax.y, tMax.z));
+        if(nextT >= marchLimit)
+        {
+            break;
+        }
+        if(tMax.x <= tMax.y && tMax.x <= tMax.z)
+        {
+            cell.x += stepDir.x;
+            tMax.x += invDir.x;
+        }
+        else if(tMax.y <= tMax.z)
+        {
+            cell.y += stepDir.y;
+            tMax.y += invDir.y;
+        }
+        else
+        {
+            cell.z += stepDir.z;
+            tMax.z += invDir.z;
+        }
+
+        if(all(equal(cell, emitterBlock)) || all(equal(cell, targetBlock)))
+        {
+            break;
+        }
+        ivec3 sec = cell >> 4;
+        if(!memoValid || any(notEqual(sec, memoSection)))
+        {
+            if(!vliLookupSectionPage(sec, memoPage))
+            {
+                return false;
+            }
+            memoSection = sec;
+            memoValid = true;
+        }
+        ivec3 loc = cell & 15;
+        uint vIdx = uint(loc.x) + 16u * (uint(loc.z) + 16u * uint(loc.y));
+        uint source = vliPagesBuffer.words[memoPage * VLI_PAGE_WORDS + vIdx];
+        if((source & 3u) == 1u)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+shared uint s_hasDir;
+shared ivec3 s_dirSection;
+shared uint s_dirBase;
+shared uint s_secCount;
+shared uint s_count;
+shared uint s_batchValid;
+shared float s_minP;
+shared uint s_cornerState[8];
+shared int s_blockX[64];
+shared uint s_packedYMeta[64];
+shared int s_blockZ[64];
+shared float s_pCell[64];
+
+void main()
+{
+    uint cellIdx = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint dimX = max(gridParams.x, 1u);
+    uint dimY = max(gridParams.y, 1u);
+    uint dimZ = max(gridParams.z, 1u);
+    if(cellIdx >= VPT_LIGHT_GRID_CELLS || cellIdx >= dimX * dimY * dimZ)
+    {
+        return;
+    }
+
+    vec3 camPos = (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    ivec3 gridOriginCell = ivec3(floor(camPos / 4.0)) - ivec3(
+        int(dimX / 2u),
+        int(dimY / 2u),
+        int(dimZ / 2u)
+    );
+    uint livePageCount = gridParams.w;
+
+    if(cellIdx == 0u && lane == 0u)
+    {
+        vptLightGridBuffer.header = uvec4(
+            uint(gridOriginCell.x),
+            uint(gridOriginCell.y),
+            uint(gridOriginCell.z),
+            (livePageCount > 0u) ? 1u : 0u
+        );
+    }
+
+    uint cx = cellIdx % dimX;
+    uint cz = (cellIdx / dimX) % dimZ;
+    uint cy = cellIdx / (dimX * dimZ);
+    ivec3 cellCoord = gridOriginCell + ivec3(int(cx), int(cy), int(cz));
+    vec3 cellMin = vec3(cellCoord) * 4.0;
+    vec3 cellMax = cellMin + vec3(4.0);
+    vec3 cellCenter = cellMin + vec3(2.0);
+    vec3 padMin = cellMin - vec3(0.5);
+    vec3 padMax = cellMax + vec3(0.5);
+
+    s_pCell[lane] = -1.0;
+    s_pCell[32u + lane] = -1.0;
+    if(lane < 8u)
+    {
+        ivec3 cBlock = cellCoord * 4 + ivec3(
+            ((lane & 1u) != 0u) ? 3 : 0,
+            ((lane & 2u) != 0u) ? 3 : 0,
+            ((lane & 4u) != 0u) ? 3 : 0
+        );
+        uint cSrc = 0u;
+        s_cornerState[lane] = !vptReadSourceVoxel(cBlock, cSrc)
+            ? 2u
+            : (((cSrc & 3u) == 1u) ? 0u : 1u);
+    }
+
+    if(lane == 0u)
+    {
+        s_hasDir = 0u;
+        s_dirSection = ivec3(0);
+        s_dirBase = 0u;
+        s_secCount = 0u;
+        s_count = 0u;
+        s_batchValid = 0u;
+        s_minP = 0.0;
+
+        if(livePageCount > 0u)
+        {
+            ivec3 receiverSection = ivec3(floor(cellCenter / 16.0));
+            uint receiverPage = 0u;
+            ivec3 dirSection = receiverSection;
+            bool hasPage = vliLookupSectionPage(receiverSection, receiverPage);
+            if(!hasPage)
+            {
+                float bestDistSq = 1.0e30;
+                for(uint n = 0u; n < 6u; ++n)
+                {
+                    ivec3 nb = receiverSection + (
+                        n == 0u ? ivec3( 1,  0,  0) :
+                        n == 1u ? ivec3(-1,  0,  0) :
+                        n == 2u ? ivec3( 0,  1,  0) :
+                        n == 3u ? ivec3( 0, -1,  0) :
+                        n == 4u ? ivec3( 0,  0,  1) :
+                                  ivec3( 0,  0, -1)
+                    );
+                    uint nbPage;
+                    if(vliLookupSectionPage(nb, nbPage))
+                    {
+                        vec3 d = cellCenter - (vec3(nb) * 16.0 + vec3(8.0));
+                        float dSq = dot(d, d);
+                        if(dSq < bestDistSq)
+                        {
+                            bestDistSq = dSq;
+                            hasPage = true;
+                            dirSection = nb;
+                            receiverPage = nbPage;
+                        }
+                    }
+                }
+            }
+
+            if(hasPage)
+            {
+                uint dirBase = receiverPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
+                uint secCount = min(
+                    vptSourceDirectoryPagesBuffer.entries[dirBase].pageIndex,
+                    VPT_SOURCE_DIRECTORY_MAX_SECTIONS
+                );
+                if(secCount == 0u)
+                {
+                    for(uint n = 0u; n < 6u; ++n)
+                    {
+                        ivec3 nb = dirSection + (
+                            n == 0u ? ivec3( 1,  0,  0) :
+                            n == 1u ? ivec3(-1,  0,  0) :
+                            n == 2u ? ivec3( 0,  1,  0) :
+                            n == 3u ? ivec3( 0, -1,  0) :
+                            n == 4u ? ivec3( 0,  0,  1) :
+                                      ivec3( 0,  0, -1)
+                        );
+                        uint nbPage;
+                        if(!vliLookupSectionPage(nb, nbPage))
+                        {
+                            continue;
+                        }
+                        uint nbBase = nbPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
+                        uint nbCount = min(
+                            vptSourceDirectoryPagesBuffer.entries[nbBase].pageIndex,
+                            VPT_SOURCE_DIRECTORY_MAX_SECTIONS
+                        );
+                        if(nbCount > 0u)
+                        {
+                            dirSection = nb;
+                            dirBase = nbBase;
+                            secCount = nbCount;
+                            break;
+                        }
+                    }
+                }
+                if(secCount > 0u)
+                {
+                    s_hasDir = 1u;
+                    s_dirSection = dirSection;
+                    s_dirBase = dirBase;
+                    s_secCount = secCount;
+                }
+            }
+        }
+    }
+
+    barrier();
+
+    if(s_hasDir == 0u || s_secCount == 0u)
+    {
+        if(lane == 0u)
+        {
+            vptLightGridBuffer.cellMeta[cellIdx] = uvec4(0u);
+        }
+        return;
+    }
+
+    for(uint s = 0u; s < s_secCount; ++s)
+    {
+        VPTSourceDirectoryEntry dirEntry =
+            vptSourceDirectoryPagesBuffer.entries[s_dirBase + 1u + s];
+        uint sourcePage = dirEntry.pageIndex;
+        uint sourceMetadata = dirEntry.emitterCountAndOffset;
+        uint emitterCount = sourceMetadata & 0x1fffu;
+        if(emitterCount == 0u)
+        {
+            continue;
+        }
+
+        ivec3 srcSection = s_dirSection + ivec3(
+            int((sourceMetadata >> 13u) & 7u) - 2,
+            int((sourceMetadata >> 16u) & 7u) - 2,
+            int((sourceMetadata >> 19u) & 7u) - 2
+        );
+        vec3 secMin = vec3(srcSection) * 16.0;
+        vec3 secMax = secMin + vec3(16.0);
+        vec3 boxDelta = max(max(padMin - secMax, secMin - padMax), vec3(0.0));
+        if(dot(boxDelta, boxDelta) >= VPT_LOCAL_MAX_DISTANCE * VPT_LOCAL_MAX_DISTANCE)
+        {
+            continue;
+        }
+
+        for(uint eBase = 0u; eBase < emitterCount; eBase += 32u)
+        {
+            if(lane == 0u)
+            {
+                s_batchValid = 0u;
+            }
+            s_pCell[32u + lane] = -1.0;
+            barrier();
+
+            uint e = eBase + lane;
+            if(e < emitterCount)
+            {
+                uint packedEmitter = vptEmitterIndexPagesBuffer.words[
+                    sourcePage * VPT_EMITTER_PAGE_WORDS +
+                    VPT_EMITTER_HEADER_WORDS + e
+                ];
+                uint emission = (packedEmitter >> 12u) & 15u;
+                uint typeCode = (packedEmitter >> 16u) & 31u;
+                ivec3 emitterBlock = srcSection * 16 + ivec3(
+                    int(packedEmitter & 15u),
+                    int((packedEmitter >> 4u) & 15u),
+                    int((packedEmitter >> 8u) & 15u)
+                );
+                vec3 emitterCenter = vec3(emitterBlock) + vec3(0.5);
+                vec3 closestInCell = clamp(emitterCenter, padMin, padMax);
+                float distToCell = length(emitterCenter - closestInCell);
+                float emissionLevel = float(emission);
+                if(emission > 0u &&
+                   distToCell < vptLocalLightRange(typeCode, emissionLevel))
+                {
+                    vec3 lightCol = localLightProfileColor(typeCode);
+                    float lightLuma = max(dot(lightCol, vec3(0.2126, 0.7152, 0.0722)), 0.08);
+                    float pCell = max(
+                        lightLuma *
+                        localLightProfileBrightness(typeCode, emissionLevel) *
+                        vptLocalLightDistanceAttenuation(distToCell + 0.5) *
+                        max(vptLocalLightRangeFade(distToCell, typeCode, emissionLevel), 1.0e-3),
+                        1.0e-6
+                    );
+                    if(pCell > s_minP)
+                    {
+                        bool visible = true;
+                        if(distToCell >= 2.0)
+                        {
+                            bool anyVisible = false;
+                            vec3 bestTargetPt = vec3(0.0);
+                            ivec3 bestTargetBlock = ivec3(0);
+                            float bestTargetDistSq = 1.0e30;
+                            bool hasTarget = false;
+
+                            const ivec3 faceDirs[6] = ivec3[6](
+                                ivec3( 1,  0,  0),
+                                ivec3(-1,  0,  0),
+                                ivec3( 0,  1,  0),
+                                ivec3( 0, -1,  0),
+                                ivec3( 0,  0,  1),
+                                ivec3( 0,  0, -1)
+                            );
+                            for(int f = 0; f < 6; ++f)
+                            {
+                                ivec3 d = faceDirs[f];
+                                bool facesCell =
+                                    (f == 0) ? (padMax.x > float(emitterBlock.x + 1)) :
+                                    (f == 1) ? (padMin.x < float(emitterBlock.x)) :
+                                    (f == 2) ? (padMax.y > float(emitterBlock.y + 1)) :
+                                    (f == 3) ? (padMin.y < float(emitterBlock.y)) :
+                                    (f == 4) ? (padMax.z > float(emitterBlock.z + 1)) :
+                                               (padMin.z < float(emitterBlock.z));
+                                if(!facesCell)
+                                {
+                                    continue;
+                                }
+                                ivec3 adjBlock = emitterBlock + d;
+                                uint adjSrc;
+                                if(!vptReadSourceVoxel(adjBlock, adjSrc))
+                                {
+                                    anyVisible = true;
+                                    break;
+                                }
+                                if((adjSrc & 3u) != 1u)
+                                {
+                                    vec3 adjPt = vec3(adjBlock) + vec3(0.5);
+                                    vec3 toCell = closestInCell - adjPt;
+                                    float dSq = dot(toCell, toCell);
+                                    if(dSq < bestTargetDistSq)
+                                    {
+                                        bestTargetDistSq = dSq;
+                                        bestTargetBlock = adjBlock;
+                                        bestTargetPt = adjPt;
+                                        hasTarget = true;
+                                    }
+                                }
+                            }
+
+                            int openProbes = 0;
+                            if(!anyVisible && hasTarget)
+                            {
+                                vec3 insetMin = cellMin + vec3(0.5);
+                                vec3 insetMax = cellMax - vec3(0.5);
+                                vec3 nearestProbe = floor(clamp(closestInCell, insetMin, insetMax)) + vec3(0.5);
+                                for(int p = 0; p < 9; ++p)
+                                {
+                                    vec3 probe = nearestProbe;
+                                    if(p == 0)
+                                    {
+                                        uint probeSrc;
+                                        if(!vptReadSourceVoxel(ivec3(floor(probe)), probeSrc))
+                                        {
+                                            anyVisible = true;
+                                            break;
+                                        }
+                                        if((probeSrc & 3u) == 1u)
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        uint cs = s_cornerState[p - 1];
+                                        if(cs == 2u)
+                                        {
+                                            anyVisible = true;
+                                            break;
+                                        }
+                                        if(cs == 0u)
+                                        {
+                                            continue;
+                                        }
+                                        int k = p - 1;
+                                        probe = cellMin + vec3(
+                                            ((k & 1) != 0) ? 3.5 : 0.5,
+                                            ((k & 2) != 0) ? 3.5 : 0.5,
+                                            ((k & 4) != 0) ? 3.5 : 0.5
+                                        );
+                                    }
+                                    openProbes++;
+                                    if(!vptGridVoxelBlocked(probe, bestTargetPt, bestTargetBlock, emitterBlock))
+                                    {
+                                        anyVisible = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if(!anyVisible && (!hasTarget || openProbes > 0))
+                            {
+                                visible = false;
+                            }
+                        }
+
+                        if(visible)
+                        {
+                            s_blockX[32u + lane] = emitterBlock.x;
+                            s_packedYMeta[32u + lane] =
+                                (uint(clamp(emitterBlock.y + 32768, 0, 65535)) & 0xffffu) |
+                                (((emission << 5u) | typeCode) << 16u);
+                            s_blockZ[32u + lane] = emitterBlock.z;
+                            s_pCell[32u + lane] = pCell;
+                            atomicAdd(s_batchValid, 1u);
+                        }
+                    }
+                }
+            }
+            barrier();
+
+            if(s_batchValid > 0u)
+            {
+                if(s_count + s_batchValid <= VPT_LIGHT_GRID_SLOTS)
+                {
+                    if(lane == 0u)
+                    {
+                        uint cur = s_count;
+                        for(uint i = 0u; i < 32u; ++i)
+                        {
+                            if(s_pCell[32u + i] > 0.0)
+                            {
+                                s_blockX[cur] = s_blockX[32u + i];
+                                s_packedYMeta[cur] = s_packedYMeta[32u + i];
+                                s_blockZ[cur] = s_blockZ[32u + i];
+                                s_pCell[cur] = s_pCell[32u + i];
+                                cur++;
+                            }
+                        }
+                        s_count = cur;
+                        if(cur == VPT_LIGHT_GRID_SLOTS)
+                        {
+                            float minP = s_pCell[0];
+                            for(uint i = 1u; i < VPT_LIGHT_GRID_SLOTS; ++i)
+                            {
+                                minP = min(minP, s_pCell[i]);
+                            }
+                            s_minP = minP;
+                        }
+                    }
+                }
+                else
+                {
+                    for(uint k = 2u; k <= 64u; k <<= 1u)
+                    {
+                        for(uint j = k >> 1u; j > 0u; j >>= 1u)
+                        {
+                            uint i = ((lane & ~(j - 1u)) << 1u) | (lane & (j - 1u));
+                            uint ixj = i | j;
+                            bool descHalf = ((i & k) == 0u);
+                            float pi = s_pCell[i];
+                            float pj = s_pCell[ixj];
+                            bool swapNeeded = descHalf ? (pi < pj) : (pi > pj);
+                            if(swapNeeded)
+                            {
+                                int tx = s_blockX[i];
+                                s_blockX[i] = s_blockX[ixj];
+                                s_blockX[ixj] = tx;
+                                uint ty = s_packedYMeta[i];
+                                s_packedYMeta[i] = s_packedYMeta[ixj];
+                                s_packedYMeta[ixj] = ty;
+                                int tz = s_blockZ[i];
+                                s_blockZ[i] = s_blockZ[ixj];
+                                s_blockZ[ixj] = tz;
+                                s_pCell[i] = pj;
+                                s_pCell[ixj] = pi;
+                            }
+                            barrier();
+                        }
+                    }
+                    if(lane == 0u)
+                    {
+                        s_count = VPT_LIGHT_GRID_SLOTS;
+                        s_minP = s_pCell[VPT_LIGHT_GRID_SLOTS - 1u];
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+
+    uint count = min(s_count, VPT_LIGHT_GRID_SLOTS);
+    if(count == 0u)
+    {
+        if(lane == 0u)
+        {
+            vptLightGridBuffer.cellMeta[cellIdx] = uvec4(0u);
+        }
+        return;
+    }
+
+    if(lane < count)
+    {
+        vptLightGridBuffer.slots[cellIdx * VPT_LIGHT_GRID_SLOTS + lane] = uvec4(
+            uint(s_blockX[lane]),
+            s_packedYMeta[lane],
+            uint(s_blockZ[lane]),
+            floatBitsToUint(s_pCell[lane])
+        );
+    }
+
+    if(lane == 0u)
+    {
+        float sumP = 0.0;
+        for(uint i = 0u; i < count; ++i)
+        {
+            sumP += s_pCell[i];
+        }
+        vptLightGridBuffer.cellMeta[cellIdx] = uvec4(
+            count, floatBitsToUint(sumP), 0u, 0u
+        );
+        if(count > 4u && sumP > 0.0)
+        {
+            float prob[32];
+            uint smallIdx[32];
+            uint largeIdx[32];
+            uint smallTop = 0u;
+            uint largeTop = 0u;
+            float invAvg = float(count) / sumP;
+            for(uint i = 0u; i < count; ++i)
+            {
+                float pr = s_pCell[i] * invAvg;
+                prob[i] = pr;
+                if(pr < 1.0)
+                {
+                    smallIdx[smallTop++] = i;
+                }
+                else
+                {
+                    largeIdx[largeTop++] = i;
+                }
+            }
+            while(smallTop > 0u && largeTop > 0u)
+            {
+                uint l = smallIdx[--smallTop];
+                uint g = largeIdx[--largeTop];
+                uint thresh = clamp(uint(round(clamp(prob[l], 0.0, 1.0) * 65535.0)), 0u, 65535u);
+                vptLightGridBuffer.aliasWords[cellIdx * VPT_LIGHT_GRID_SLOTS + l] =
+                    thresh | (g << 16u);
+                prob[g] = (prob[g] + prob[l]) - 1.0;
+                if(prob[g] < 1.0)
+                {
+                    smallIdx[smallTop++] = g;
+                }
+                else
+                {
+                    largeIdx[largeTop++] = g;
+                }
+            }
+            while(largeTop > 0u)
+            {
+                uint g = largeIdx[--largeTop];
+                vptLightGridBuffer.aliasWords[cellIdx * VPT_LIGHT_GRID_SLOTS + g] =
+                    65535u | (g << 16u);
+            }
+            while(smallTop > 0u)
+            {
+                uint l = smallIdx[--smallTop];
+                vptLightGridBuffer.aliasWords[cellIdx * VPT_LIGHT_GRID_SLOTS + l] =
+                    65535u | (l << 16u);
+            }
+        }
+    }
+}

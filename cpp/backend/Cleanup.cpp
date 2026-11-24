@@ -211,6 +211,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
         destroyK1LandingBuffer();
         // P2 跨腿材质复用中转 buffer（binding 94）
         destroyMatReuseBuffer();
+        destroyK2iCompactResources();
         destroyK1K2Pipeline();
 
 
@@ -548,6 +549,25 @@ destroySharcUpdatePipeline();
                 VK_NULL_HANDLE;
         }
 
+        if(g_sdrAces2LutBuffer)
+        {
+            vkDestroyBuffer(
+                g_device,
+                g_sdrAces2LutBuffer,
+                nullptr
+            );
+            g_sdrAces2LutBuffer = VK_NULL_HANDLE;
+        }
+        if(g_sdrAces2LutMemory)
+        {
+            vkFreeMemory(
+                g_device,
+                g_sdrAces2LutMemory,
+                nullptr
+            );
+            g_sdrAces2LutMemory = VK_NULL_HANDLE;
+        }
+
 
 
         if(g_aeHistogramPipeline)
@@ -838,6 +858,7 @@ destroySharcUpdatePipeline();
     }
     g_asBuilt =
         false;
+    g_lastTlasCullValid = false;
     g_nextSectionRebuildFrame = 0u;
     g_firstPendingSectionFrame = 0u;
     g_lastObservedSectionRevision =

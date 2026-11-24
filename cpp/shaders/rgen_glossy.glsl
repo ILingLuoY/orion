@@ -28,8 +28,9 @@
 
 uint orionGlossyRrSeed()
 {
-    return (uint(gl_LaunchIDEXT.x) * 1973u +
-            uint(gl_LaunchIDEXT.y) * 9277u +
+    const uvec2 p = rtLogicalPixelCoord();
+    return (p.x * 1973u +
+            p.y * 9277u +
             uint(cam.frameCount) * 26699u) | 1u;
 }
 
@@ -56,11 +57,19 @@ bool orionGlossyStepLodEnabled()
     return (GLOSSY_STEP_LOD_DEFAULT_ON != 0) || (cam.pomSecondaryParams.y > 0.5f);
 }
 
+#ifndef GLOSSY_SHARC_CONTINUATION
+#define GLOSSY_SHARC_CONTINUATION 1
+#endif
+#ifndef WATER_REFLECT_SUN_OPT_V1
+#define WATER_REFLECT_SUN_OPT_V1 1
+#endif
+
 vec3 tracePrimaryGlossyReflectionRadiance(
     vec3 primarySurfaceOrigin,
     vec3 startOrigin,
     vec3 startDirection,
     vec3 sunDirection,
+    float primarySurfaceRoughness,
     inout uint state,
     out float firstSpecularHitDistance
 )
@@ -198,6 +207,16 @@ int mirrorBounceLimit =
 // 首次命中后按粗糙度/距离收紧的**有效**层数（见下方 pathStep==0 段）。
 uint orionGlossyRrState = orionGlossyRrSeed();
 int orionGlossyBounceLimit = mirrorBounceLimit;
+
+#if GLOSSY_SHARC_CONTINUATION
+float glossyRoughnessPrev = clamp(primarySurfaceRoughness, 0.0, 0.99);
+const bool glossySharcEnabled = sharcQueryActive() && (cam.perfPrimary.z > 0u);
+SharcParameters glossySharcParams;
+if(glossySharcEnabled)
+{
+    glossySharcParams = sharcBuildParameters();
+}
+#endif
 
 
 for(
@@ -452,6 +471,41 @@ for(
 
 if(hitMaterialId <= 0.5)
 {
+    const bool hitIsPureMirror =
+        decodeMetallicFromCode(decodeF0MetalCode(hitF0Metal)) > 0.5 &&
+        hitRoughness < 0.05;
+
+#if GLOSSY_SHARC_CONTINUATION
+    if(!hitIsPureMirror && glossySharcEnabled)
+    {
+        const uint glossySharcLevel = HashGridGetLevel(
+            hitPos, glossySharcParams.hashGridParameters);
+        const float glossySharcVoxelSize = HashGridGetVoxelSize(
+            glossySharcLevel, glossySharcParams.hashGridParameters);
+        const float glossySharcR = min(glossyRoughnessPrev, 0.99);
+        const float glossySharcAlpha = glossySharcR * glossySharcR;
+        const float glossySharcFootprint = hitDistance *
+            sqrt(0.5 * glossySharcAlpha * glossySharcAlpha /
+                 max(1.0 - glossySharcAlpha * glossySharcAlpha, 1.0e-5));
+        if(hitDistance > glossySharcVoxelSize * sqrt(3.0) &&
+           glossySharcFootprint > glossySharcVoxelSize)
+        {
+            SharcHitData glossySharcHit;
+            glossySharcHit.positionWorld = hitPos;
+            glossySharcHit.normalWorld =
+                dot(hitNormal, currentDirection) > 0.0 ? -hitNormal : hitNormal;
+            glossySharcHit.materialDemodulation = max(hitAlbedo, vec3(0.05));
+            glossySharcHit.emissive = hitEmission;
+            vec3 glossySharcRad = vec3(0.0);
+            if(SharcGetCachedRadiance(
+                glossySharcParams, glossySharcHit, glossySharcRad, false))
+            {
+                return accumulatedRadiance + throughput * glossySharcRad;
+            }
+        }
+    }
+#endif
+
     // =================================================
     // A3-4
     //
@@ -481,10 +535,6 @@ if(hitMaterialId <= 0.5)
     //   · 走确定性镜像续弹（reflect 方向，吞吐 × Fresnel，无随机采样）
     //   · 层数到顶 → 退化为普通墙面观感（拿它自己的 direct/自发光兜底）并返回
     // 非镜面命中走原有随机续弹（上限与行为都不变）。
-    const bool hitIsPureMirror =
-        decodeMetallicFromCode(decodeF0MetalCode(hitF0Metal)) > 0.5 &&
-        hitRoughness < 0.05;
-
     if(hitIsPureMirror)
     {
         if(mirrorBounceCount >= orionGlossyBounceLimit)
@@ -549,6 +599,16 @@ if(hitMaterialId <= 0.5)
     accumulatedRadiance +=
         throughput *
         surfaceRadiance;
+
+#ifndef GLOSSY_ROUGH_SKIP_CONTINUATION
+#define GLOSSY_ROUGH_SKIP_CONTINUATION 1
+#endif
+#if GLOSSY_ROUGH_SKIP_CONTINUATION
+    if(primarySurfaceRoughness >= 0.35)
+    {
+        return accumulatedRadiance;
+    }
+#endif
 
 
     // =================================================
@@ -678,12 +738,11 @@ if(hitMaterialId <= 0.5)
     if(chooseBounceSpecular)
     {
         vec3 bounceH =
-            normalize(
-                sampleGGX(
-                    hitNormal,
-                    bounceRoughness,
-                    state
-                )
+            sampleGGXVNDF(
+                hitNormal,
+                bounceV,
+                bounceRoughness,
+                vec2(rand(state), rand(state))
             );
 
 
@@ -744,14 +803,6 @@ if(hitMaterialId <= 0.5)
             );
 
 
-        float bounceD =
-            distributionGGX(
-                hitNormal,
-                bounceH,
-                bounceRoughness
-            );
-
-
         float bounceG =
             geometrySmith(
                 hitNormal,
@@ -761,61 +812,25 @@ if(hitMaterialId <= 0.5)
             );
 
 
-        vec3 bounceSpecularBRDF =
-            (
-                bounceD *
-                bounceG *
-                bounceF
-            ) /
-            max(
-                4.0 *
-                bounceNdotV *
-                bounceNdotL,
-                1.0e-5
-            );
-
-        // 2026-10-16 多散射能量补偿：间接镜面延续与直接太阳同口径。
-        bounceSpecularBRDF *=
-            multiscatterEnergyCompensation(
-                bounceF0,
+        float bounceG1V =
+            ggxVNDFMaskingG1(
+                bounceNdotV,
                 bounceRoughness
-            );
-
-
-        // sampleGGX:
-        //
-        // PDF(H) = D * NdotH
-        //
-        // reflection mapping:
-        //
-        // PDF(L) =
-        // PDF(H) / (4 * VdotH)
-        float bounceSpecularPdf =
-            max(
-                (
-                    bounceD *
-                    bounceNdotH
-                ) /
-                max(
-                    4.0 *
-                    bounceVdotH,
-                    1.0e-5
-                ),
-                1.0e-5
             );
 
 
         bounceWeight =
             (
-                bounceSpecularBRDF *
-                bounceNdotL
+                bounceF *
+                multiscatterEnergyCompensation(
+                    bounceF0,
+                    bounceRoughness
+                ) *
+                (bounceG / max(bounceG1V, 1.0e-5))
             ) /
-            (
-                bounceSpecularPdf *
-                max(
-                    bounceSpecularProbability,
-                    1.0e-5
-                )
+            max(
+                bounceSpecularProbability,
+                1.0e-5
             );
     }
 
@@ -884,6 +899,9 @@ if(hitMaterialId <= 0.5)
     currentDirection =
         bounceDirection;
 
+#if GLOSSY_SHARC_CONTINUATION
+    glossyRoughnessPrev += chooseBounceSpecular ? bounceRoughness : 1.0;
+#endif
 
     opaqueContinuationCount +=
         1;
@@ -1081,6 +1099,13 @@ float traceWaterReflectedSun(
     vec3 sunDirection
 )
 {
+#if WATER_REFLECT_SUN_OPT_V1
+    if(sunDirection.y <= 0.02)
+    {
+        return 0.0;
+    }
+#endif
+
     const vec3 WATER_PLANE_NORMAL =
         vec3(0.0, 1.0, 0.0);
 
@@ -1127,6 +1152,12 @@ float traceWaterReflectedSun(
 
     hit.state = makeTraceState(RT_PURPOSE_CLASSIFY);
 
+#if WATER_REFLECT_SUN_OPT_V1
+    const float waterReflectMaxDist = 64.0;
+#else
+    const float waterReflectMaxDist = 10000.0;
+#endif
+
 #ifdef RT_ENABLE_SER
     // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
     if(cam.perfSerAb.z != 0u)
@@ -1136,7 +1167,7 @@ float traceWaterReflectedSun(
             receiverPos + toWaterDir * 0.001,
             0.02,
             toWaterDir,
-            10000.0,
+            waterReflectMaxDist,
             secondaryTraverseFlags(),
             0xff,
             0u
@@ -1158,7 +1189,7 @@ float traceWaterReflectedSun(
             receiverPos + toWaterDir * 0.001,
             0.02,
             toWaterDir,
-            10000.0,
+            waterReflectMaxDist,
             0
         );
     }

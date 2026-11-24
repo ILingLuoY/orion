@@ -55,9 +55,17 @@ const float FOG_CLOUD_SHADOW_EXTENT   = 512.0;
 const float FOG_LOCAL_LIGHT_MAX_DIST  = 80.0;
 const float FOG_RADIANCE_CLAMP        = 16.0;
 
+#ifndef FOG_SILHOUETTE_FIX
+#define FOG_SILHOUETTE_FIX 1
+#endif
+
 shared float sCellMinDist[4][4];
 shared float sCellMaxDist[4][4];
 shared vec2  sCellFarUv[4][4];
+#if FOG_SILHOUETTE_FIX
+shared vec2  sCellAwayDir[4][4];
+shared uint  sCellHasSky[4][4];
+#endif
 
 // Exact geometric visibility ray query (1 = lit, 0 = occluded).
 // Confirms solid OMM/cutout/entity triangles while letting glass (SBT 2) and water (SBT 3) pass.
@@ -342,6 +350,10 @@ void main()
         float cellMax = maxDistance;
         float cellMin = maxDistance;
         vec2 farUv = vec2(0.5);
+#if FOG_SILHOUETTE_FIX
+        vec2 awayDir = vec2(0.0);
+        uint tileHasSky = 0u;
+#endif
         const ivec2 depthSize = textureSize(sceneDepth, 0);
         if(coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
         {
@@ -353,19 +365,38 @@ void main()
             vec2 minDepthUv = centerUv;
             vec2 maxDepthUv = centerUv;
             bool hasSky = false;
+#if FOG_SILHOUETTE_FIX
+            uint skyMask = 0u;
+            vec2 tapCenterUvs[16];
+            vec2 solidUvSum = vec2(0.0);
+            float solidCount = 0.0;
+#else
             float bestSkyDist2 = 1.0e9;
+#endif
 
             for(int ty = 0; ty < 4; ++ty)
             {
                 for(int tx = 0; tx < 4; ++tx)
                 {
+#if FOG_SILHOUETTE_FIX
+                    const vec2 offset = (vec2(float(tx), float(ty)) * (1.0 / 3.0) - 0.5) * 0.94 * tileStep;
+#else
                     const vec2 offset = (vec2(float(tx), float(ty)) * (1.0 / 3.0) - 0.5) * 0.90 * tileStep;
+#endif
                     const vec2 sampleUv = clamp(centerUv + offset, vec2(0.0005), vec2(0.9995));
                     const ivec2 dCoord = clamp(ivec2(sampleUv * vec2(depthSize)), ivec2(0), depthSize - ivec2(1));
+#if FOG_SILHOUETTE_FIX
+                    const vec2 snappedUv = (vec2(dCoord) + 0.5) / vec2(depthSize);
+                    const int tapIdx = ty * 4 + tx;
+                    tapCenterUvs[tapIdx] = snappedUv;
+#endif
                     const float d = texelFetch(sceneDepth, dCoord, 0).r;
                     if(d <= 1.0e-5)
                     {
                         hasSky = true;
+#if FOG_SILHOUETTE_FIX
+                        skyMask |= (1u << uint(tapIdx));
+#else
                         const vec2 delta = sampleUv - centerUv;
                         const float dist2 = dot(delta, delta);
                         if(dist2 < bestSkyDist2)
@@ -373,13 +404,22 @@ void main()
                             bestSkyDist2 = dist2;
                             farUv = sampleUv;
                         }
+#endif
                     }
                     else
                     {
+#if FOG_SILHOUETTE_FIX
+                        solidUvSum += snappedUv;
+                        solidCount += 1.0;
+#endif
                         if(d < minRawDepth)
                         {
                             minRawDepth = d;
+#if FOG_SILHOUETTE_FIX
+                            minDepthUv = snappedUv;
+#else
                             minDepthUv = sampleUv;
+#endif
                         }
                         if(d > maxRawDepth)
                         {
@@ -390,11 +430,75 @@ void main()
                 }
             }
 
+#if FOG_SILHOUETTE_FIX
+            tileHasSky = hasSky ? 1u : 0u;
+            if(hasSky)
+            {
+                if(skyMask == 0xFFFFu)
+                {
+                    farUv = centerUv;
+                }
+                else
+                {
+                    int bestIdx = -1;
+                    int bestSolidDist2 = -1;
+                    float bestCenterDist2 = 1.0e9;
+                    for(int i = 0; i < 16; ++i)
+                    {
+                        if((skyMask & (1u << uint(i))) == 0u)
+                        {
+                            continue;
+                        }
+                        const int ix = i & 3;
+                        const int iy = i >> 2;
+                        int minSolidDist2 = 1000;
+                        for(int j = 0; j < 16; ++j)
+                        {
+                            if((skyMask & (1u << uint(j))) != 0u)
+                            {
+                                continue;
+                            }
+                            const int dx = ix - (j & 3);
+                            const int dy = iy - (j >> 2);
+                            minSolidDist2 = min(minSolidDist2, dx * dx + dy * dy);
+                        }
+                        const vec2 delta = tapCenterUvs[i] - centerUv;
+                        const float centerDist2 = dot(delta, delta);
+                        if(bestIdx < 0 ||
+                           minSolidDist2 > bestSolidDist2 ||
+                           (minSolidDist2 == bestSolidDist2 && centerDist2 < bestCenterDist2))
+                        {
+                            bestIdx = i;
+                            bestSolidDist2 = minSolidDist2;
+                            bestCenterDist2 = centerDist2;
+                        }
+                    }
+                    if(bestIdx >= 0)
+                    {
+                        farUv = tapCenterUvs[bestIdx];
+                    }
+                }
+                if(solidCount > 0.5)
+                {
+                    const vec2 dAway = farUv - (solidUvSum / solidCount);
+                    if(dot(dAway, dAway) > 1.0e-12)
+                    {
+                        awayDir = normalize(dAway);
+                    }
+                }
+            }
+            else
+            {
+                cellMax = min(maxDistance, fogSceneDistanceForDepth(minDepthUv, minRawDepth, cam.projInverse));
+                farUv = minDepthUv;
+            }
+#else
             if(!hasSky)
             {
                 cellMax = min(maxDistance, fogSceneDistanceForDepth(minDepthUv, minRawDepth, cam.projInverse));
                 farUv = minDepthUv;
             }
+#endif
             if(maxRawDepth > 1.0e-5)
             {
                 cellMin = min(cellMax, fogSceneDistanceForDepth(maxDepthUv, maxRawDepth, cam.projInverse));
@@ -407,6 +511,10 @@ void main()
         sCellMinDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = cellMin;
         sCellMaxDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = cellMax;
         sCellFarUv[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = farUv;
+#if FOG_SILHOUETTE_FIX
+        sCellAwayDir[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = awayDir;
+        sCellHasSky[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = tileHasSky;
+#endif
     }
     barrier();
 
@@ -467,10 +575,10 @@ void main()
         segEnd = min(d1, max(d0, cellMaxDist - 0.18));
     }
 
-    const vec3 worldDir = fogWorldRayDirection(uv, cam.projInverse, cam.viewInverse);
+    vec3 worldDir = fogWorldRayDirection(uv, cam.projInverse, cam.viewInverse);
     const vec3 cameraPos = cam.viewInverse[3].xyz;
     const float dist = mix(d0, segEnd, zOffset);
-    const vec3 fogPos = cameraPos + worldDir * dist;
+    vec3 fogPos = cameraPos + worldDir * dist;
 
     float rayDistAtUv = maxDistance;
     {
@@ -490,6 +598,9 @@ void main()
     vec3 inScatter = vec3(0.0);
     const bool isOverworld = abs(cam.weatherParams.z - 1.0) < 0.25;
     float geomVis = isOverworld ? 0.0 : 1.0;
+#if FOG_SILHOUETTE_FIX
+    bool occludedFromCamera = sampleBehindDepth;
+#endif
 
     if(totalScatter > 1.0e-6)
     {
@@ -529,9 +640,41 @@ void main()
             // 1) Direct Sun / Moon volumetric lighting with exact view LOS + sun RT occlusion.
             if(directEnergy > 1.0e-5 && lightDir.y > 0.01)
             {
-                const float viewVis = sampleBehindDepth
+                float viewVis = sampleBehindDepth
                     ? 0.0
                     : fogTraceViewLineOfSight(cameraPos, worldDir, 0.05, dist);
+#if FOG_SILHOUETTE_FIX
+                if(viewVis < 0.5 &&
+                   d0 >= cellMinDist &&
+                   sCellHasSky[gl_LocalInvocationID.x][gl_LocalInvocationID.y] != 0u)
+                {
+                    const vec2 awayDir = sCellAwayDir[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+                    if(dot(awayDir, awayDir) > 0.25)
+                    {
+                        const ivec2 ds = max(textureSize(sceneDepth, 0), ivec2(1));
+                        const vec2 retryUv = clamp(
+                            uv + awayDir * (1.25 / vec2(ds)),
+                            vec2(0.0005),
+                            vec2(0.9995));
+                        const vec3 retryDir = fogWorldRayDirection(
+                            retryUv, cam.projInverse, cam.viewInverse);
+                        const float retryVis = fogTraceViewLineOfSight(
+                            cameraPos, retryDir, 0.05, dist);
+                        if(retryVis > 0.5)
+                        {
+                            uv = retryUv;
+                            worldDir = retryDir;
+                            fogPos = cameraPos + worldDir * dist;
+                            viewVis = 1.0;
+                            occludedFromCamera = false;
+                        }
+                    }
+                }
+                if(viewVis < 0.5)
+                {
+                    occludedFromCamera = true;
+                }
+#endif
                 if(viewVis > 0.5)
                 {
                     const float sunRayMax = clamp(
@@ -613,7 +756,11 @@ void main()
 
         // 3) Local Lights (torches, lanterns, lava) within near/mid range when VolReSTIR is off.
         const float localScatter = hazeSigmaS + shaftSigmaS * 0.20;
+#if FOG_SILHOUETTE_FIX
+        if(!occludedFromCamera && dist < FOG_LOCAL_LIGHT_MAX_DIST && localScatter > 1.0e-5)
+#else
         if(!sampleBehindDepth && dist < FOG_LOCAL_LIGHT_MAX_DIST && localScatter > 1.0e-5)
+#endif
         {
             inScatter += fogEvaluateLocalLights(fogPos, worldDir, localScatter);
         }
@@ -636,11 +783,26 @@ void main()
         inScatter = vec3(0.0);
     }
     inScatter = clamp(inScatter, vec3(0.0), vec3(FOG_RADIANCE_CLAMP));
+#if FOG_SILHOUETTE_FIX
+    float outSigmaT = totalSigmaT;
+    if(occludedFromCamera)
+    {
+        // Never emit unlit extinction (black soot) for samples occluded behind foreground geometry.
+        inScatter = vec3(0.0);
+        outSigmaT = 0.0;
+    }
+    vec4 currentVal = vec4(inScatter, outSigmaT);
+
+    // 5) 3D Temporal Reprojection & Accumulation (rejects silhouette discontinuities & tightens shadow clamp).
+    const bool silhouetteSlice = (d0 >= cellMinDist - 0.05) && ((cellMaxDist - cellMinDist) > 1.0);
+    if(!silhouetteSlice && !occludedFromCamera && pc.params.z > 0.5 && cam.historyValid != 0u && useJitter)
+#else
     vec4 currentVal = vec4(inScatter, totalSigmaT);
 
     // 5) 3D Temporal Reprojection & Accumulation (rejects silhouette discontinuities & tightens shadow clamp).
     const bool silhouetteSlice = (d0 >= cellMinDist - 0.05) && ((cellMaxDist - cellMinDist) > 1.0);
     if(!silhouetteSlice && pc.params.z > 0.5 && cam.historyValid != 0u && useJitter)
+#endif
     {
         // Reproject the UNJITTERED depth-clamped froxel center for exact temporal alignment.
         const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);

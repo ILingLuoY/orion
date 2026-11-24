@@ -1,0 +1,155 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// =============================================================================
+// 批4b（2026-11-22）：植物真几何摇摆 —— 逐帧顶点位移 compute。
+//
+// 原理：foliage split（SECTION_AS_CLASS_FOLIAGE）的顶点 buffer 是 device-local
+// + SSBO 可寻址（Sections.cpp 的 BLAS build 输入与命中着色器读同一份）⇒ 本
+// pass 就地写 x/y/z，随后 BLAS refit（MODE_UPDATE，顶点数/字节数不变）⇒
+// 剪影与着色由构造保证一致（批3"纹理滑"问题根治）。
+//
+// 调度（Frame.cpp，照 dh_lod_raster 的 per-section push-constant 模式）：
+//   每个 foliage section 一次 dispatch；全部数据走 push constant（无描述符）：
+//   vertexAddress（顶点区地址）/ motionAddress（motion 段地址，0 = 无）/
+//   vertexCount / 时间 / 风强 / 风向（宿主从 g_windAngle 预算 cos/sin）/
+//   阵风强度。零绑定 ⇒ 零描述符池开销。
+//
+// 位移模型（批3 UV 模型的 per-vertex 升级，风场参数与 windFoliageUvSway 同源）：
+//   · 高度杠杆 lever = fract(worldY)：块底 0 不动、块顶 1 全摆（根固定叶尖摆）
+//   · 块相位去同步（同块刚体摆，跨树冠行进传播）
+//   · 主摆（沿风行进正弦）+ 侧摆 + 高频叶颤 + gust 门控（55 格行进噪声）
+//   · 幅度 cam.windParams.y（风强）整体缩放
+// 写回：position += disp * lever；motion tail 同步写 prev = cur − delta
+//（DLSS-RR 对摆动叶子的重投影正确；motionAddress == 0 = 该段无 motion 数据）。
+// =============================================================================
+
+layout(local_size_x = 64) in;
+
+// SectionVertex32 位置字段（scalar 布局，与 SectionVertex32 逐字节对应）：
+//   x,y,z @ 0..11, u,v @ 12..19, color @ 20..23, materialId @ 24..27, pad2 @ 28..31
+layout(buffer_reference, scalar) buffer SectionVertexRef {
+    float x; float y; float z; float u; float v;
+    uint packedColor; float materialId; float pad2;
+};
+
+// motion tail 的 float 三元组（12B/顶点，与 VertexMotions 逐字节一致）。
+layout(buffer_reference, scalar) buffer MotionTailRef {
+    float mx; float my; float mz;
+};
+
+layout(push_constant) uniform FoliageSwayPush
+{
+    uint64_t vertexAddress;   // 顶点区首地址（binding-21 表项的 .xy）
+    uint64_t motionAddress;   // motion 段首地址（0 = 该段无 motion 数据）
+    uint vertexCount;         // 本段叶道顶点数（32B 步长）
+    float timeSeconds;        // cam.padding 同源（宿主直填）
+    float amplitudeScale;     // 风强（cam.windParams.y 同源直填，0..2）
+    float windDirX;           // cos(风向角)
+    float windDirY;           // sin(风向角)
+    float gustStrength;       // cam.windParams.z（0..1）
+} swayPush;
+
+// 2D 整数 hash → [0,1)（与 wind_common.glsl 的 windHash2 同式，本 TU 无 cam
+// 不 include 它 —— 风向/风强/阵风强度全部走 push constant）。
+float swayHash2(vec2 cell)
+{
+    uvec2 h = uvec2(ivec2(cell));
+    h *= uvec2(1597334677u, 3812015801u);
+    uint seed = h.x ^ h.y;
+    uvec2 v = seed ^ uvec2(2246822519u, 3266489917u);
+    v ^= v >> 16u;
+    v *= 2246822519u;
+    v ^= v >> 13u;
+    return float(v.x & 0x00ffffffu) / 16777216.0;
+}
+
+float swayValueNoise(vec2 p)
+{
+    vec2 cell = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = swayHash2(cell);
+    float b = swayHash2(cell + vec2(1.0, 0.0));
+    float c = swayHash2(cell + vec2(0.0, 1.0));
+    float d = swayHash2(cell + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// 阵风标量场 0..1（与 windGustField 同式：55 格行进噪声 + 分钟级起伏）
+float swayGustField(vec2 worldXZ, float timeSeconds)
+{
+    if(swayPush.gustStrength <= 0.001)
+    {
+        return 0.0;
+    }
+    vec2 dir = vec2(swayPush.windDirX, swayPush.windDirY);
+    vec2 travel = worldXZ * 0.018 - dir * (timeSeconds * 1.1);
+    float g = swayValueNoise(travel);
+    float global = 0.75 + 0.25 * sin(timeSeconds * 0.13);
+    return clamp(g * global, 0.0, 1.0);
+}
+
+void main()
+{
+    const uint vertexIndex = gl_GlobalInvocationID.x;
+    if(vertexIndex >= swayPush.vertexCount)
+    {
+        return;
+    }
+
+    SectionVertexRef vertex =
+        SectionVertexRef(swayPush.vertexAddress +
+            uint64_t(vertexIndex) * 32u);
+
+    const vec3 basePos = vec3(vertex.x, vertex.y, vertex.z);
+
+    // ---- 摆动模型（per-vertex）------------------------------------------
+    const vec2 wdir = vec2(swayPush.windDirX, swayPush.windDirY);
+    const vec2 wperp = vec2(-wdir.y, wdir.x);
+    const float t = swayPush.timeSeconds;
+
+    // 高度杠杆：块底 0（根固定）、块顶 1（叶尖全摆）。+0.001 防 fract(1.0)=0。
+    const float lever = clamp(fract(basePos.y + 0.001), 0.0, 1.0);
+
+    // 块相位去同步：同块顶点同相位（整块刚体摆），跨树冠行进传播
+    const vec3 cell = floor(basePos + 0.5);
+    const float cellPhase = dot(cell, vec3(2.7, 1.3, 3.1)) * 1.9;
+
+    const float travel = dot(basePos.xz, wdir);
+    const float side = dot(basePos.xz, wperp);
+
+    const float gustGate =
+        0.45 + 0.55 * swayGustField(basePos.xz, t);
+    const float mainWave = sin(t * 1.9 + travel * 0.55 + cellPhase);
+    const float sideWave = sin(t * 3.1 + side * 0.62 + cellPhase * 1.3);
+    const float flutter = sin(
+        t * 5.3 + basePos.x * 2.1 + basePos.y * 1.3 + basePos.z * 1.7);
+
+    // 位移（格）：闲置 ~0.020，阵风峰值 ~0.095；风强滑条 0..2 整体乘
+    const float disp = (0.020 + 0.075 * gustGate) * swayPush.amplitudeScale;
+
+    const vec3 displacement =
+        vec3(
+            wdir.x * mainWave + wperp.x * sideWave * 0.45,
+            flutter * 0.30,
+            wdir.y * mainWave + wperp.y * sideWave * 0.45
+        ) * (disp * lever);
+
+    // ---- 写回位置与 motion tail -----------------------------------------
+    vertex.x = basePos.x + displacement.x;
+    vertex.y = basePos.y + displacement.y;
+    vertex.z = basePos.z + displacement.z;
+
+    if(swayPush.motionAddress != 0u)
+    {
+        MotionTailRef motion = MotionTailRef(
+            swayPush.motionAddress + uint64_t(vertexIndex) * 12u);
+        // prev = cur − displacement（DLSS-RR/时域重投影读的相机相对位移）
+        motion.mx = -displacement.x;
+        motion.my = -displacement.y;
+        motion.mz = -displacement.z;
+    }
+}

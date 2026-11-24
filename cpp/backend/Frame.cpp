@@ -456,13 +456,12 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->perfSerAb[3] = g_perfL10SerPrimToggle;
 
     // 2026-11-16：可见性射线 inline ray query 可选臂闸门（ORION_VIS_QUERY，4 位掩码）。
-    //   bit0 = AO 点位 / bit1 = 水面太阳点位 / bit2 = 水体入口太阳点位；默认 0 =
-    //   全部走既有 traceRayEXT（旧行为）。按 env-switches.md 约定只读一次，改完重启
-    //   客户端生效；回退：不设或 =0 即旧路径。逐点位独立开关、独立回退。
+    //   bit0 = AO 点位 / bit1 = 水面太阳点位 / bit2 = 水体入口太阳点位；2026-11-23 起默认 7 =
+    //   三处全走内联 rayQueryEXT 省 SBT/hit-shader 调度；回退：ORION_VIS_QUERY=0 退回 traceRayEXT。
     static const uint32_t visQueryMask = []()
     {
         const char* raw = std::getenv("ORION_VIS_QUERY");
-        const long parsed = raw ? std::strtol(raw, nullptr, 10) : 0L;
+        const long parsed = raw ? std::strtol(raw, nullptr, 10) : 7L;
         if(parsed < 0L) return 0u;
         return static_cast<uint32_t>(parsed) & 0x7u;
     }();
@@ -653,7 +652,14 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
         g_sparseRateHistoryReset.store(true, std::memory_order_relaxed);
     }
 
-    ubo->sparseParams[0] = static_cast<float>(directLightModeCurrent);
+    const bool spatialPassWillRun =
+        directLightModeCurrent >= 1 &&
+        g_vptRestirSpatialPipeline != VK_NULL_HANDLE &&
+        k2DirectIndirectSplitEnabled();
+    g_vptRestirSpatialActiveFrame = spatialPassWillRun;
+    ubo->sparseParams[0] = spatialPassWillRun
+        ? 2.0f
+        : static_cast<float>(directLightModeCurrent);
     const float sparseRateForMask = sparseSamplingRateEffective();
 
     g_sparseEffectiveRate.store(sparseRateForMask, std::memory_order_relaxed);
@@ -1983,6 +1989,36 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
         rebuildLocalLightGpuBuffer();
     }
 
+    bool forceCameraCullRebuild = false;
+    if(g_asBuilt && tlasCullMode() >= 2 && g_lastTlasCullValid)
+    {
+        const float* vi = g_cameraUboHost.viewInverse;
+        const float rawFx = -vi[8];
+        const float rawFy = -vi[9];
+        const float rawFz = -vi[10];
+        const float fLen = std::sqrt(rawFx * rawFx + rawFy * rawFy + rawFz * rawFz);
+        if(fLen > 1.0e-6f)
+        {
+            const float fx = rawFx / fLen;
+            const float fy = rawFy / fLen;
+            const float fz = rawFz / fLen;
+            const float fwdDot =
+                fx * g_lastTlasCullForward[0] +
+                fy * g_lastTlasCullForward[1] +
+                fz * g_lastTlasCullForward[2];
+            const float dx = vi[12] - g_lastTlasCullPos[0];
+            const float dy = vi[13] - g_lastTlasCullPos[1];
+            const float dz = vi[14] - g_lastTlasCullPos[2];
+            const float distSq = dx * dx + dy * dy + dz * dz;
+            if(fwdDot < 0.9945f || distSq > 64.0f)
+            {
+                g_worldGeometryDirty.store(true, std::memory_order_release);
+                g_nextSectionRebuildFrame = 0u;
+                forceCameraCullRebuild = true;
+            }
+        }
+    }
+
     if(g_worldGeometryDirty.load(std::memory_order_acquire))
     {
         if(g_entityRebuildRequested.exchange(false, std::memory_order_acq_rel))
@@ -2008,7 +2044,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
                 lastDynRebuildFrame == 0u ||
                 g_perfL10FrameSerial >= lastDynRebuildFrame + dynRebuildInterval;
 
-            if(!dynRebuildDue)
+            if(!dynRebuildDue && !forceCameraCullRebuild)
             {
                 g_entityRebuildRequested.store(true, std::memory_order_release);
             }
@@ -2115,6 +2151,30 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
 
     if(g_cameraUboBuffer != VK_NULL_HANDLE)
     {
+        // 2026-11-24: lock CameraUBO glassCausticParams & waterSurfaceY to the latest
+        // mask staging snapshot right before uploading UBO to the GPU command buffer.
+        {
+            bool maskValidNow = false;
+            float maskOriginXNow = 0.0f;
+            float maskOriginZNow = 0.0f;
+            {
+                std::lock_guard<std::mutex> guard(g_waterSimMaskMutex);
+                maskValidNow = g_waterSimMaskValid;
+                maskOriginXNow = g_waterSimMaskOriginX;
+                maskOriginZNow = g_waterSimMaskOriginZ;
+            }
+            const bool nowInWaterNow = g_cameraUboHost.playerInWater > 0.5f;
+            const bool nearbyWaterSurfaceNow =
+                g_waterNearbySurfaceY > -500.0f &&
+                std::fabs(g_cameraUboHost.playerY - g_waterNearbySurfaceY) <= 32.0f;
+            g_cameraUboHost.waterSurfaceY = g_waterSimLastSurfaceY;
+            g_cameraUboHost.glassCausticParams[0] = maskOriginXNow;
+            g_cameraUboHost.glassCausticParams[1] = maskOriginZNow;
+            g_cameraUboHost.glassCausticParams[2] =
+                1.0f / static_cast<float>(WATER_SIM_MASK_EXTENT);
+            g_cameraUboHost.glassCausticParams[3] =
+                (maskValidNow && (nowInWaterNow || nearbyWaterSurfaceNow)) ? 1.0f : 0.0f;
+        }
         vkCmdUpdateBuffer(
             cmd,
             g_cameraUboBuffer,
@@ -2206,6 +2266,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
         const auto rtxVliBegin = std::chrono::steady_clock::now();
 
         recordVLIUpdates(cmd);
+        recordVPTLightGridBuild(cmd);
 
         const double rtxVliMs =
             std::chrono::duration<double, std::milli>(
@@ -3090,6 +3151,135 @@ if(g_dlssOutputImage == VK_NULL_HANDLE ||
             << std::endl;
     }
 
+    {
+        bool motionTransitionedFromUndefined = false;
+        if(g_motionImage != VK_NULL_HANDLE &&
+           g_motionLayout != VK_IMAGE_LAYOUT_GENERAL)
+        {
+            VkImageMemoryBarrier motionToGeneral{};
+            motionToGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            motionToGeneral.oldLayout = g_motionLayout;
+            motionToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            motionToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            motionToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            motionToGeneral.srcAccessMask = 0;
+            motionToGeneral.dstAccessMask =
+                VK_ACCESS_TRANSFER_WRITE_BIT |
+                VK_ACCESS_SHADER_WRITE_BIT |
+                VK_ACCESS_SHADER_READ_BIT;
+            motionToGeneral.image = g_motionImage;
+            motionToGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            motionToGeneral.subresourceRange.baseMipLevel = 0;
+            motionToGeneral.subresourceRange.levelCount = 1;
+            motionToGeneral.subresourceRange.baseArrayLayer = 0;
+            motionToGeneral.subresourceRange.layerCount = 1;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT |
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0, nullptr,
+                0, nullptr,
+                1, &motionToGeneral
+            );
+
+            g_motionLayout = VK_IMAGE_LAYOUT_GENERAL;
+            motionTransitionedFromUndefined = true;
+        }
+
+        if(g_hitOffsetImage != VK_NULL_HANDLE &&
+           g_hitOffsetLayout != VK_IMAGE_LAYOUT_GENERAL)
+        {
+            VkImageMemoryBarrier hitOffsetToGeneral{};
+            hitOffsetToGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            hitOffsetToGeneral.oldLayout = g_hitOffsetLayout;
+            hitOffsetToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            hitOffsetToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            hitOffsetToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            hitOffsetToGeneral.srcAccessMask = 0;
+            hitOffsetToGeneral.dstAccessMask =
+                VK_ACCESS_SHADER_WRITE_BIT |
+                VK_ACCESS_SHADER_READ_BIT;
+            hitOffsetToGeneral.image = g_hitOffsetImage;
+            hitOffsetToGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            hitOffsetToGeneral.subresourceRange.baseMipLevel = 0;
+            hitOffsetToGeneral.subresourceRange.levelCount = 1;
+            hitOffsetToGeneral.subresourceRange.baseArrayLayer = 0;
+            hitOffsetToGeneral.subresourceRange.layerCount = 1;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0,
+                0, nullptr,
+                0, nullptr,
+                1, &hitOffsetToGeneral
+            );
+
+            g_hitOffsetLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+
+        static VkImage motionImageClearedFor = VK_NULL_HANDLE;
+        const bool needsMotionClear =
+            (g_motionImage != VK_NULL_HANDLE) &&
+            (motionImageClearedFor != g_motionImage || motionTransitionedFromUndefined);
+
+        if(needsMotionClear)
+        {
+            VkClearColorValue motionZero{};
+            motionZero.float32[0] = 0.0f;
+            motionZero.float32[1] = 0.0f;
+            motionZero.float32[2] = 0.0f;
+            motionZero.float32[3] = 0.0f;
+
+            VkImageSubresourceRange motionRange{};
+            motionRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            motionRange.baseMipLevel = 0;
+            motionRange.levelCount = 1;
+            motionRange.baseArrayLayer = 0;
+            motionRange.layerCount = 1;
+
+            vkCmdClearColorImage(
+                cmd,
+                g_motionImage,
+                VK_IMAGE_LAYOUT_GENERAL,
+                &motionZero,
+                1,
+                &motionRange
+            );
+
+            VkImageMemoryBarrier motionClearToTrace{};
+            motionClearToTrace.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            motionClearToTrace.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            motionClearToTrace.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            motionClearToTrace.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            motionClearToTrace.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            motionClearToTrace.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            motionClearToTrace.dstAccessMask =
+                VK_ACCESS_SHADER_WRITE_BIT |
+                VK_ACCESS_SHADER_READ_BIT;
+            motionClearToTrace.image = g_motionImage;
+            motionClearToTrace.subresourceRange = motionRange;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0, nullptr,
+                0, nullptr,
+                1, &motionClearToTrace
+            );
+
+            motionImageClearedFor = g_motionImage;
+        }
+    }
+
 
 
 VkImageMemoryBarrier rrGuideBarriers[5]{};
@@ -3455,7 +3645,10 @@ if(rrGuideBarrierCount > 0)
     recordDhLodRasterPass(cmd);
 
     recordSharcZeroFillIfNeeded(cmd);
-recordSharcUpdate(cmd, renderWidth, renderHeight);
+    if(!k2DirectIndirectSplitEnabled())
+    {
+        recordSharcUpdate(cmd, renderWidth, renderHeight);
+    }
     rtCheckpoint(cmd, "frame:post-sharc-update");
     rtSpikeSharc = rtMark();
 
@@ -3575,7 +3768,10 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
     recordGlassAlphaBlend(cmd, renderWidth, renderHeight);
 
     rtCheckpoint(cmd, "frame:sharc-resolve");
-    recordSharcResolve(cmd);
+    if(!k2DirectIndirectSplitEnabled())
+    {
+        recordSharcResolve(cmd);
+    }
     rtCheckpoint(cmd, "frame:post-sharc-resolve");
     rtSpikeSharcResolve = rtMark();
 
@@ -4082,95 +4278,6 @@ if(dlssLayoutBarrierCount > 0)
         VK_IMAGE_LAYOUT_GENERAL;
 }
 
-    static VkImage motionImageClearedFor = VK_NULL_HANDLE;
-
-    const bool needsMotionClear =
-        motionImageClearedFor != g_motionImage;
-
-    VkClearColorValue motionZero{};
-    motionZero.float32[0] = 0.0f;
-    motionZero.float32[1] = 0.0f;
-    motionZero.float32[2] = 0.0f;
-    motionZero.float32[3] = 0.0f;
-
-
-    VkImageSubresourceRange motionRange{};
-
-    motionRange.aspectMask =
-        VK_IMAGE_ASPECT_COLOR_BIT;
-
-    motionRange.baseMipLevel = 0;
-    motionRange.levelCount = 1;
-
-    motionRange.baseArrayLayer = 0;
-    motionRange.layerCount = 1;
-
-
-    if(needsMotionClear)
-    {
-        vkCmdClearColorImage(
-            cmd,
-            g_motionImage,
-            VK_IMAGE_LAYOUT_GENERAL,
-            &motionZero,
-            1,
-            &motionRange
-        );
-    }
-
-    VkImageMemoryBarrier motionClearToDLSS{};
-
-    motionClearToDLSS.sType =
-        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-
-    motionClearToDLSS.oldLayout =
-        VK_IMAGE_LAYOUT_GENERAL;
-
-    motionClearToDLSS.newLayout =
-        VK_IMAGE_LAYOUT_GENERAL;
-
-    motionClearToDLSS.srcQueueFamilyIndex =
-        VK_QUEUE_FAMILY_IGNORED;
-
-    motionClearToDLSS.dstQueueFamilyIndex =
-        VK_QUEUE_FAMILY_IGNORED;
-
-    motionClearToDLSS.srcAccessMask =
-        VK_ACCESS_TRANSFER_WRITE_BIT;
-
-    motionClearToDLSS.dstAccessMask =
-        VK_ACCESS_MEMORY_READ_BIT;
-
-    motionClearToDLSS.image =
-        g_motionImage;
-
-    motionClearToDLSS.subresourceRange =
-        motionRange;
-
-
-    if(needsMotionClear)
-    {
-        vkCmdPipelineBarrier(
-            cmd,
-
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-
-            0,
-
-            0,
-            nullptr,
-
-            0,
-            nullptr,
-
-            1,
-            &motionClearToDLSS
-        );
-
-        motionImageClearedFor =
-            g_motionImage;
-    }
     if(g_dlssRRReady || g_dlssReady)
     {
         if(!g_currentSLFrameValid ||

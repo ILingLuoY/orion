@@ -367,20 +367,6 @@ bool isRtWeatherRain =
 
     vec3 geoNormal = normalize(cross(pos1 - pos0, pos2 - pos0));
 
-    // 2026-11-22 批3：叶面法线顺风小倾角（阵风调制，≤~0.12 rad）——光照响应级
-    // 摇摆。仅叶道（顶点 materialId 0.25）；水/玻璃/实体/粒子不受影响。
-    if(materialId > 0.2 && materialId < 0.45 &&
-       !isEntityMaterial && !isParticleMaterial)
-    {
-        const vec3 wdir3 = vec3(windDirXZ().x, 0.0, windDirXZ().y);
-        const float tiltPhase = dot(pos0 + pos1 + pos2, wdir3) * 0.55;
-        const float tilt =
-            (sin(uintBitsToFloat(cam.padding) * 1.9 + tiltPhase) *
-                (0.55 + 0.45 * windGustField(pos0.xz, uintBitsToFloat(cam.padding)))) *
-            0.12 * windStrength();
-        geoNormal = normalize(geoNormal + wdir3 * tilt);
-    }
-
     // =====================================================
     // DISTANCE_ONLY FAST PATH
     //
@@ -1246,29 +1232,6 @@ safeMax =
         safeMax,
         spriteCenter
     );
-
-
-// =====================================================
-// 2026-11-22 批3：植物 UV 摇摆（叶道 materialId 0.25）
-//
-// texCoord 在此处（sprite 矩形已定、POM/图集采样之前）加摆——后续 POM 从
-// 摆动后的基准 UV 出发，剪影与着色一致。rt_test.rahit 的 alpha test 用
-// wind_common 的同一函数同一输入 ⇒ 镂空轮廓逐位一致地摆。
-// 排除实体/粒子（它们的 materialId 编码与叶道撞区间）。
-// =====================================================
-if(materialId > 0.2 && materialId < 0.45 &&
-   !isEntityMaterial && !isParticleMaterial)
-{
-    const vec3 swayWorldPos =
-        pos0 * barycentrics.x +
-        pos1 * barycentrics.y +
-        pos2 * barycentrics.z;
-    texCoord = windFoliageUvSway(
-        texCoord,
-        uv0, uv1, uv2,
-        swayWorldPos,
-        atlasTexel);
-}
 
 
 // =====================================================

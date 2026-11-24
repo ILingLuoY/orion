@@ -2421,7 +2421,7 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setPerformanceSe
     // JNI_FALSE，整组性能设置不落地。
     if(aoNearSamples < 0 || aoNearSamples > 5 ||
        aoMidSamples < 0 || aoMidSamples > 2 ||
-       giBounces < 0 || giBounces > 4 ||
+       giBounces < 0 || giBounces > 8 ||
        sunShadowSamples < 1 || sunShadowSamples > 2 ||
        localLightRisCandidates < 1 || localLightRisCandidates > 32 ||
        localLightAreaSamples < 1 || localLightAreaSamples > 2 ||

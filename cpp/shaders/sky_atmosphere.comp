@@ -11,7 +11,14 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #include "bruneton/atmosphere.glsl"
 #include "bruneton/common.glsl"
 #include "bruneton/runtime.glsl"
+#ifndef SKY_ATM_EXPOSURE_V2
+#define SKY_ATM_EXPOSURE_V2 1
+#endif
+#if SKY_ATM_EXPOSURE_V2
+const float SKY_ATM_EXPOSURE = 0.00072;
+#else
 const float SKY_ATM_EXPOSURE = 0.00033;
+#endif
 #ifndef SKY_ATM_DEBUG
 #define SKY_ATM_DEBUG 0
 #endif
@@ -527,7 +534,11 @@ void main()
         radiance += bow * SKY_RAINBOW_STRENGTH * lowSunVisibility;
     }
 
+#if SKY_ATM_EXPOSURE_V2
+    radiance = clamp(radiance * cam.skyParams1.z, 0.0, 16.0);
+#else
     radiance = clamp(radiance * cam.skyParams1.z, 0.0, 8.0);
+#endif
     float rCam = length(cameraKm);
     float muSun = dot(cameraKm, sunDirB) / rCam;
     vec3 sunTrans = GetTransmittanceToSun(

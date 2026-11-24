@@ -1,0 +1,69 @@
+#version 460
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 78, set = 0, r8ui) uniform readonly uimage2D sparseActiveMaskImage;
+
+struct PTLandingRecord
+{
+    vec4 a;
+    uvec4 b;
+    uvec4 c;
+    vec4 d;
+    vec4 e;
+};
+
+layout(std430, binding = 88, set = 0) readonly buffer PTLandingSSBO
+{
+    PTLandingRecord ptLandingRecords[];
+};
+
+layout(binding = 92, set = 0, rgba16f) uniform readonly image2D k2GiTraceImage;
+
+layout(std430, binding = 100, set = 0) buffer K2iSparseCompactSSBO
+{
+    uint width;
+    uint height;
+    uint depth;
+    uint mode;
+    uint activeCount;
+    uint activeCoords[];
+} k2iCompact;
+
+void main()
+{
+    const ivec2 size = imageSize(k2GiTraceImage);
+    const ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    const bool inBounds = (pixelCoord.x < size.x && pixelCoord.y < size.y);
+
+    bool activePixel = false;
+    if(inBounds)
+    {
+        const ivec2 blockCoord = ivec2(pixelCoord.x >> 2, pixelCoord.y >> 1);
+        const uint bitIndex = (uint(pixelCoord.y & 1) << 2u) | uint(pixelCoord.x & 3);
+        const uint maskVal = imageLoad(sparseActiveMaskImage, blockCoord).r;
+        const bool maskActive = ((maskVal >> bitIndex) & 1u) != 0u;
+        const uint linearIdx = uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x);
+        const bool hasLanding = ptLandingRecords[linearIdx].a.x > 0.5;
+        activePixel = maskActive && hasLanding;
+    }
+
+    const uvec4 ballot = subgroupBallot(activePixel);
+    const uint count = subgroupBallotBitCount(ballot);
+    uint base = 0u;
+    if(subgroupElect() && count > 0u)
+    {
+        base = atomicAdd(k2iCompact.activeCount, count);
+        const uint neededCols = (base + count + uint(size.y) - 1u) / uint(size.y);
+        atomicMax(k2iCompact.width, neededCols);
+    }
+    base = subgroupBroadcastFirst(base);
+
+    if(activePixel)
+    {
+        const uint slot = base + subgroupBallotExclusiveBitCount(ballot);
+        k2iCompact.activeCoords[slot] =
+            (uint(pixelCoord.x) & 0xFFFFu) | ((uint(pixelCoord.y) & 0xFFFFu) << 16u);
+    }
+}

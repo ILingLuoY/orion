@@ -1641,7 +1641,7 @@ bool rebuildWorldGeometry(
                 const double sectionClassRetireMs =
                     g_sectionASRetireMs - sectionClassRetireMsBefore;
 
-                RTLogFlushed(
+                (CPUPERF_QUIET_HOT_LOGS ? RTLog : RTLogFlushed)(
                     "[RT SECTION SLOW] frame=" +
                     std::to_string(g_perfL10FrameSerial) +
                     " key=" + std::to_string(plan.classKey) +
@@ -1687,7 +1687,7 @@ bool rebuildWorldGeometry(
         if(ommDeferredSectionsThisFrame > 0u &&
            (g_perfL10FrameSerial % 60u) == 0u)
         {
-            RTLogFlushed(
+            (CPUPERF_QUIET_HOT_LOGS ? RTLog : RTLogFlushed)(
                 "[RT OMM GATE] frame=" +
                 std::to_string(g_perfL10FrameSerial) +
                 " deferred=" + std::to_string(ommDeferredSectionsThisFrame) +
@@ -1699,7 +1699,7 @@ bool rebuildWorldGeometry(
 
         if(bldTotalMs >= 5.0)
         {
-            RTLogFlushed(
+            (CPUPERF_QUIET_HOT_LOGS ? RTLog : RTLogFlushed)(
                 "[RT BLD BREAKDOWN] frame=" +
                 std::to_string(g_perfL10FrameSerial) +
                 " totalMs=" + std::to_string(bldTotalMs) +
@@ -2898,8 +2898,37 @@ bool rebuildWorldGeometry(
         const bool cullPrimaryMaskActive = tlasCullModeValue == 5;
         static int s_cullPrimaryMaskedCount = 0;
 
+        const float effectiveCullMargin =
+            (cullMarginLane > 0)
+                ? static_cast<float>(cullMarginLane)
+                : (cullCasterFrustumActive ? 24.0f : 0.0f);
         const float cullSphereRadius =
-            13.8564f + static_cast<float>(std::max(cullMarginLane, 0));
+            13.8564f + effectiveCullMargin;
+
+        if(tlasCullModeValue >= 2)
+        {
+            const CameraUBO* cullCamUbo =
+                g_cameraUboMapped != nullptr
+                    ? static_cast<const CameraUBO*>(g_cameraUboMapped)
+                    : nullptr;
+            if(cullCamUbo != nullptr)
+            {
+                const float fx = -cullCamUbo->viewInverse[8];
+                const float fy = -cullCamUbo->viewInverse[9];
+                const float fz = -cullCamUbo->viewInverse[10];
+                const float fLen = std::sqrt(fx * fx + fy * fy + fz * fz);
+                if(fLen > 1.0e-6f)
+                {
+                    g_lastTlasCullForward[0] = fx / fLen;
+                    g_lastTlasCullForward[1] = fy / fLen;
+                    g_lastTlasCullForward[2] = fz / fLen;
+                    g_lastTlasCullPos[0] = cullCamUbo->viewInverse[12];
+                    g_lastTlasCullPos[1] = cullCamUbo->viewInverse[13];
+                    g_lastTlasCullPos[2] = cullCamUbo->viewInverse[14];
+                    g_lastTlasCullValid = true;
+                }
+            }
+        }
 
         static bool s_tlasCullModeLogged = false;
 
@@ -4687,7 +4716,19 @@ bool rebuildWorldGeometry(
                 perfL10RebuildStart
             ).count();
 
-        if(rtxRebuildTotalMs >= 15.0)
+        // 2026-11-23 CPU批⑥：>=15ms 恒打（旧口径）；另加 >=6ms 每 60 帧抽样一条。
+        static uint64_t s_geometrySlowSampleFrame = 0u;
+        const bool geometrySlowSampled =
+            CPUPERF_GEOMETRY_SLOW_SAMPLE &&
+            rtxRebuildTotalMs >= 6.0 &&
+            g_perfL10FrameSerial >= s_geometrySlowSampleFrame + 60u;
+
+        if(geometrySlowSampled)
+        {
+            s_geometrySlowSampleFrame = g_perfL10FrameSerial;
+        }
+
+        if(rtxRebuildTotalMs >= 15.0 || geometrySlowSampled)
         {
             const auto rtxSegMs =
                 [](const std::chrono::steady_clock::time_point& from,

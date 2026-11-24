@@ -1174,6 +1174,12 @@ currentMapDepth =
 #ifndef POM_SELF_SHADOW_FULL_TEXELS
 #define POM_SELF_SHADOW_FULL_TEXELS 0.25
 #endif
+#ifndef POM_RES_ADAPTIVE_SHADOW
+#define POM_RES_ADAPTIVE_SHADOW 1
+#endif
+#ifndef POM_SELF_SHADOW_MIN_DEPTH_FRAC
+#define POM_SELF_SHADOW_MIN_DEPTH_FRAC 0.32
+#endif
 
 float tracePOMSelfShadow(
     vec2 hitUV,
@@ -1259,20 +1265,46 @@ float tracePOMSelfShadow(
     // 5 LSB 的纹素噪声只剩 ~6%。
     // 三档 A/B 见文件内 POM_SELF_SHADOW_FULL_TEXELS。
     // =====================================================
-    float selfShadowTexelWorld =
-        1.0 /
+    float selfShadowSpriteRes =
         max(
             spriteSpan.x *
                 float(textureSize(normalAtlas, 0).x),
             1.0
         );
 
+    float selfShadowTexelWorld =
+        1.0 / selfShadowSpriteRes;
+
+#if POM_RES_ADAPTIVE_SHADOW
+    float selfShadowFullDepthWorld =
+        max(
+            max(
+                selfShadowTexelWorld *
+                    POM_SELF_SHADOW_FULL_TEXELS,
+                pomDepthScale *
+                    POM_SELF_SHADOW_MIN_DEPTH_FRAC
+            ),
+            1.0e-6
+        );
+
+    float resLog2 =
+        clamp(log2(max(selfShadowSpriteRes / 16.0, 1.0)), 0.0, 5.0);
+
+    // Mirror pomSharp bit via cam.pomParams.x > 0.5
+    float selfShadowBias01 =
+        (cam.pomParams.x > 0.5)
+            ? mix(0.008, 0.024, clamp(resLog2 * 0.25, 0.0, 1.0))
+            : 0.004;
+#else
     float selfShadowFullDepthWorld =
         max(
             selfShadowTexelWorld *
                 POM_SELF_SHADOW_FULL_TEXELS,
             1.0e-6
         );
+
+    const float selfShadowBias01 = 0.004;
+#endif
 
 
     float maxBlockDepthWorld =
@@ -1335,7 +1367,7 @@ float tracePOMSelfShadow(
             (
                 rayDepth -
                 blockerDepth -
-                0.004
+                selfShadowBias01
             ) *
             pomDepthScale;
 
@@ -1402,6 +1434,10 @@ float materialHitT = 0.0;
 vec3 materialRayOrigin = vec3(0.0);
 vec3 materialRayDirection = vec3(0.0, 0.0, -1.0);
 
+vec3 g_hitWorldOffset = vec3(0.0);
+bool g_hitOffsetValid = false;
+layout(binding = 98, set = 0, rgba16f) coherent uniform image2D hitOffsetImage;
+
 #include "material_resolve_glass.glsl"
 
 void main()
@@ -1440,6 +1476,13 @@ void main()
         gl_WorldRayDirectionEXT,
         vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y)
     );
+    if(getRayPurpose(payload.state) == RT_PURPOSE_PRIMARY_SKY)
+    {
+        imageStore(
+            hitOffsetImage,
+            ivec2(gl_LaunchIDEXT.xy),
+            vec4(g_hitWorldOffset, g_hitOffsetValid ? 1.0 : 0.0));
+    }
     #ifdef ORION_RT_STAGE_COUNTERS
     rtCntFlushHit();
     #endif

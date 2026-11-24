@@ -5,9 +5,30 @@
 #include "OrionInternal.h"
 #include "TrackingHooks.h"
 
+// 2026-11-23 CPU批⑤：内存属性按物理设备缓存（createBuffer / 池化分配每次都查）。
+static const VkPhysicalDeviceMemoryProperties& cachedMemoryProperties(VkPhysicalDevice pd)
+{
+    static VkPhysicalDevice s_pd = VK_NULL_HANDLE;
+    static VkPhysicalDeviceMemoryProperties s_props{};
+
+    if(s_pd != pd)
+    {
+        vkGetPhysicalDeviceMemoryProperties(pd, &s_props);
+        s_pd = pd;
+    }
+
+    return s_props;
+}
 uint32_t findMemoryType(VkPhysicalDevice pd,uint32_t filter,VkMemoryPropertyFlags props){
     VkPhysicalDeviceMemoryProperties mp{};
-    vkGetPhysicalDeviceMemoryProperties(pd,&mp);
+    if constexpr(CPUPERF_CACHE_DEVICE_QUERIES)
+    {
+        mp = cachedMemoryProperties(pd);
+    }
+    else
+    {
+        vkGetPhysicalDeviceMemoryProperties(pd,&mp);
+    }
 
 
     for(uint32_t i=0;i<mp.memoryTypeCount;i++)
@@ -48,7 +69,14 @@ uint32_t findMemoryType(VkPhysicalDevice pd,uint32_t filter,VkMemoryPropertyFlag
 // 地址表、TLAS 实例表）用 —— 那些走 PCIe 会变慢，保持现状。
 uint32_t findHostUploadMemoryType(VkPhysicalDevice pd,uint32_t filter,VkMemoryPropertyFlags props){
     VkPhysicalDeviceMemoryProperties mp{};
-    vkGetPhysicalDeviceMemoryProperties(pd,&mp);
+    if constexpr(CPUPERF_CACHE_DEVICE_QUERIES)
+    {
+        mp = cachedMemoryProperties(pd);
+    }
+    else
+    {
+        vkGetPhysicalDeviceMemoryProperties(pd,&mp);
+    }
 
     for(uint32_t i=0;i<mp.memoryTypeCount;i++)
     {

@@ -1,0 +1,960 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    #include "camera_ubo.glsl"
+} cam;
+
+#include "local_light_profile.glsl"
+#define GLASS_TINT_NO_DDA 1
+#include "glass_tint_common.glsl"
+
+const uint VLI_PAGE_TABLE_CAPACITY = 8192u;
+const uint VLI_PAGE_WORDS = 4096u;
+const float LOCAL_LIGHT_ENERGY_SCALE = 0.35;
+const float VPT_LOCAL_MAX_DISTANCE = 30.0;
+const float VPT_LOCAL_FADE_START_FRACTION = 0.40;
+const float BSDF_LOCAL_DIFFUSE_SCALE = 0.92;
+const float BSDF_LOCAL_SPECULAR_SCALE = 0.28;
+const float BSDF_LOCAL_MIN_SPEC_ROUGHNESS = 0.35;
+const float SPATIAL_PI = 3.14159265359;
+
+layout(std430, binding = 22, set = 0) readonly buffer PageTable
+{
+    uint words[];
+} vliPageTableBuffer;
+
+layout(std430, binding = 23, set = 0) readonly buffer VLIPagesBuffer
+{
+    uint words[];
+} vliPagesBuffer;
+
+struct VPTDirectHistory
+{
+    vec4 radianceAndSampleCount;
+    vec4 hitPositionAndValid;
+    vec4 normalAndPadding;
+    vec4 reservoirNormalAndPadding;
+};
+
+layout(std430, binding = 26, set = 0) readonly buffer VPTDirectHistoryBuffer0
+{
+    VPTDirectHistory entries[];
+} vptDirectHistoryBuffer0;
+
+layout(std430, binding = 27, set = 0) readonly buffer VPTDirectHistoryBuffer1
+{
+    VPTDirectHistory entries[];
+} vptDirectHistoryBuffer1;
+
+struct PTLandingRecord
+{
+    vec4 a;
+    uvec4 b;
+    uvec4 c;
+    vec4 d;
+    vec4 e;
+};
+
+layout(std430, binding = 88, set = 0) readonly buffer PTLandingSSBO
+{
+    PTLandingRecord ptLandingRecords[];
+};
+
+layout(binding = 89, set = 0, rgba16f) uniform image2D k2DirectImage;
+
+layout(push_constant) uniform SpatialPush
+{
+    uvec4 spatialParams;
+};
+
+uint pcgHash(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float rand01(inout uint state)
+{
+    return float(pcgHash(state) >> 8u) * (1.0 / 16777216.0);
+}
+
+uint ptLandingSlotCount()
+{
+    return uint(max(1, int(clamp(cam.rtSampleParams.x, 0.5, 4.0) + 0.5)));
+}
+
+VPTDirectHistory readCurrHistory(uint index)
+{
+    return (cam.historyReadIndex == 0u)
+        ? vptDirectHistoryBuffer1.entries[index]
+        : vptDirectHistoryBuffer0.entries[index];
+}
+
+vec3 octDecode(vec2 e)
+{
+    vec3 v = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+    if(v.z < 0.0)
+    {
+        vec2 sgn = vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
+        v.xy = (1.0 - abs(v.yx)) * sgn;
+    }
+    float l = dot(v, v);
+    return l > 1.0e-8 ? v * inversesqrt(l) : vec3(0.0, 1.0, 0.0);
+}
+
+vec3 decodeAxisFace(uint code)
+{
+    if(code == 0u) return vec3( 1.0,  0.0,  0.0);
+    if(code == 1u) return vec3(-1.0,  0.0,  0.0);
+    if(code == 2u) return vec3( 0.0,  1.0,  0.0);
+    if(code == 3u) return vec3( 0.0, -1.0,  0.0);
+    if(code == 4u) return vec3( 0.0,  0.0,  1.0);
+    if(code == 5u) return vec3( 0.0,  0.0, -1.0);
+    return vec3(0.0);
+}
+
+vec3 vptUnpackTransmittance24(float packed)
+{
+    uint bits = floatBitsToUint(packed);
+    if((bits & 0xff800000u) != 0x3f800000u)
+    {
+        return vec3(1.0);
+    }
+    float r = float(bits & 255u) / 255.0;
+    float g = float((bits >> 8u) & 255u) / 255.0;
+    float b = float((bits >> 16u) & 127u) / 127.0;
+    return vec3(r, g, b);
+}
+
+float localLightIntensity()
+{
+    float user = uintBitsToFloat(cam.historyPadding1) - 1.0;
+    return (user >= 0.0 && user <= 16.0) ? user : 1.0;
+}
+
+float vptLocalLightRangeScale()
+{
+    float user = cam.rainWallParams1.w;
+    return (user >= 0.05 && user <= 8.0) ? user : 1.0;
+}
+
+float vptLocalLightRange(uint typeCode, float emissionLevel)
+{
+    float base = localLightProfileBaseRange(typeCode, emissionLevel);
+    return clamp(base * vptLocalLightRangeScale(), 1.5, VPT_LOCAL_MAX_DISTANCE);
+}
+
+float vptLocalLightRangeFade(float distanceToLight, uint typeCode, float emissionLevel)
+{
+    float range = vptLocalLightRange(typeCode, emissionLevel);
+    return 1.0 - smoothstep(
+        range * VPT_LOCAL_FADE_START_FRACTION,
+        range,
+        distanceToLight
+    );
+}
+
+float vptLocalLightDistanceAttenuation(float distanceToLight)
+{
+    return 0.55 / (1.0 + 0.18 * distanceToLight +
+        0.025 * distanceToLight * distanceToLight);
+}
+
+int vliFloorDiv(int value, int divisor)
+{
+    return value >= 0 ? value / divisor : -((-value + divisor - 1) / divisor);
+}
+
+int vliPositiveMod(int value, int divisor)
+{
+    int result = value % divisor;
+    return result < 0 ? result + divisor : result;
+}
+
+uint vliHash32(ivec3 sectionCoord)
+{
+    uint h = uint(sectionCoord.x) * 0x8da6b343u;
+    h ^= uint(sectionCoord.y) * 0xd8163841u;
+    h ^= uint(sectionCoord.z) * 0xcb1ab31fu;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    return h;
+}
+
+bool vliLookupSectionPage(ivec3 sectionCoord, out uint pageIndex)
+{
+    uint slot = vliHash32(sectionCoord) & (VLI_PAGE_TABLE_CAPACITY - 1u);
+    for(uint probe = 0u; probe < VLI_PAGE_TABLE_CAPACITY; ++probe)
+    {
+        uint base = slot * 4u;
+        uint pagePlusOne = vliPageTableBuffer.words[base + 3u];
+        if(pagePlusOne == 0u)
+        {
+            pageIndex = 0u;
+            return false;
+        }
+        if(
+            int(vliPageTableBuffer.words[base + 0u]) == sectionCoord.x &&
+            int(vliPageTableBuffer.words[base + 1u]) == sectionCoord.y &&
+            int(vliPageTableBuffer.words[base + 2u]) == sectionCoord.z
+        )
+        {
+            pageIndex = pagePlusOne - 1u;
+            return true;
+        }
+        slot = (slot + 1u) & (VLI_PAGE_TABLE_CAPACITY - 1u);
+    }
+    pageIndex = 0u;
+    return false;
+}
+
+bool vptReadSourceVoxel(ivec3 worldBlock, out uint source)
+{
+    ivec3 sectionCoord = ivec3(
+        vliFloorDiv(worldBlock.x, 16),
+        vliFloorDiv(worldBlock.y, 16),
+        vliFloorDiv(worldBlock.z, 16)
+    );
+    uint pageIndex;
+    if(!vliLookupSectionPage(sectionCoord, pageIndex))
+    {
+        source = 0u;
+        return false;
+    }
+    ivec3 local = ivec3(
+        vliPositiveMod(worldBlock.x, 16),
+        vliPositiveMod(worldBlock.y, 16),
+        vliPositiveMod(worldBlock.z, 16)
+    );
+    uint index = uint(local.x) + 16u * (uint(local.z) + 16u * uint(local.y));
+    source = vliPagesBuffer.words[pageIndex * VLI_PAGE_WORDS + index];
+    return true;
+}
+
+bool vptSpatialVoxelBlocked(vec3 origin, vec3 target, ivec3 emitterBlock)
+{
+    vec3 segment = target - origin;
+    float totalDist = length(segment);
+    if(totalDist <= 0.05)
+    {
+        return false;
+    }
+    vec3 rayDir = segment / totalDist;
+    vec3 startPos = origin + rayDir * 0.02;
+    float marchLimit = totalDist - 0.04;
+    if(marchLimit <= 0.02)
+    {
+        return false;
+    }
+
+    ivec3 cell = ivec3(floor(startPos));
+    if(all(equal(cell, emitterBlock)))
+    {
+        return false;
+    }
+
+    ivec3 stepDir = ivec3(sign(rayDir));
+    vec3 invDir = 1.0 / max(abs(rayDir), vec3(1.0e-6));
+    vec3 nextBoundary = vec3(cell) + vec3(
+        stepDir.x > 0 ? 1 : 0,
+        stepDir.y > 0 ? 1 : 0,
+        stepDir.z > 0 ? 1 : 0
+    );
+    vec3 tMax = vec3(
+        stepDir.x != 0 ? abs(nextBoundary.x - startPos.x) * invDir.x : 1.0e30,
+        stepDir.y != 0 ? abs(nextBoundary.y - startPos.y) * invDir.y : 1.0e30,
+        stepDir.z != 0 ? abs(nextBoundary.z - startPos.z) * invDir.z : 1.0e30
+    );
+
+    for(int iter = 0; iter < 36; ++iter)
+    {
+        float nextT = min(tMax.x, min(tMax.y, tMax.z));
+        if(nextT >= marchLimit)
+        {
+            break;
+        }
+        if(tMax.x <= tMax.y && tMax.x <= tMax.z)
+        {
+            cell.x += stepDir.x;
+            tMax.x += invDir.x;
+        }
+        else if(tMax.y <= tMax.z)
+        {
+            cell.y += stepDir.y;
+            tMax.y += invDir.y;
+        }
+        else
+        {
+            cell.z += stepDir.z;
+            tMax.z += invDir.z;
+        }
+
+        if(all(equal(cell, emitterBlock)))
+        {
+            break;
+        }
+        uint source;
+        if(!vptReadSourceVoxel(cell, source))
+        {
+            return false;
+        }
+        if((source & 3u) == 1u)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0)
+{
+    vec3 x = vec3(1.0) - vec3(clamp(cosTheta, 0.0, 1.0));
+    vec3 x2 = x * x;
+    return F0 + (vec3(1.0) - F0) * ((x2 * x2) * x);
+}
+
+float distributionGGX(vec3 N, vec3 H, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+    float denom = NdotH2 * (a2 - 1.0) + 1.0;
+    return a2 / max(SPATIAL_PI * denom * denom, 1.0e-6);
+}
+
+float geometrySchlickGGX(float NdotX, float roughness)
+{
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    return NdotX / (NdotX * (1.0 - k) + k);
+}
+
+float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    return geometrySchlickGGX(NdotV, roughness) *
+           geometrySchlickGGX(NdotL, roughness);
+}
+
+float ggxEavgApprox(float perceptualRoughness)
+{
+    float r2 = perceptualRoughness * perceptualRoughness;
+    return
+        1.00068
+        - 0.16407 * perceptualRoughness
+        - 1.64700 * r2
+        + 1.88283 * perceptualRoughness * r2
+        - 0.66608 * r2 * r2;
+}
+
+vec3 multiscatterEnergyCompensation(vec3 f0, float perceptualRoughness)
+{
+    return vec3(1.0) + f0 * (1.0 / ggxEavgApprox(perceptualRoughness) - 1.0);
+}
+
+vec3 spatialDynamicLightBRDF(
+    vec3 N,
+    vec3 V,
+    vec3 L,
+    vec3 albedo,
+    vec3 f0,
+    float metallic,
+    float roughness
+)
+{
+    float NdotL = max(dot(N, L), 0.0);
+    if(NdotL <= 0.0)
+    {
+        return vec3(0.0);
+    }
+    if(f0.x < 0.0)
+    {
+        return albedo * (BSDF_LOCAL_DIFFUSE_SCALE * NdotL);
+    }
+
+    float specularRoughness = max(roughness, BSDF_LOCAL_MIN_SPEC_ROUGHNESS);
+    float NdotV = max(dot(N, V), 1.0e-4);
+    vec3 halfVec = V + L;
+    float halfLen = length(halfVec);
+    vec3 H = halfLen > 1.0e-6 ? (halfVec / halfLen) : N;
+    float VdotH = max(dot(V, H), 0.0);
+
+    vec3 F = fresnelSchlick(VdotH, f0);
+    float D = distributionGGX(N, H, specularRoughness);
+    float G = geometrySmith(N, V, L, specularRoughness);
+    vec3 specular = ((D * G * F) / max(4.0 * NdotV * NdotL, 1.0e-4)) *
+        multiscatterEnergyCompensation(f0, specularRoughness);
+
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+    vec3 diffuseTerm = kD * albedo * (NdotL * BSDF_LOCAL_DIFFUSE_SCALE);
+    vec3 specularTerm = specular * (NdotL * BSDF_LOCAL_SPECULAR_SCALE);
+    return diffuseTerm + specularTerm;
+}
+
+void vptEmitterVisibleFaceWeights(
+    ivec3 emitterBlock,
+    vec3 hitPos,
+    out vec3 posW,
+    out vec3 negW,
+    out float totalW
+)
+{
+    const vec3 bMin = vec3(emitterBlock);
+    const vec3 bMax = bMin + vec3(1.0);
+    const vec3 bCenter = bMin + vec3(0.5);
+    posW = vec3(0.0);
+    negW = vec3(0.0);
+    for(int a = 0; a < 3; ++a)
+    {
+        if(hitPos[a] > bMax[a] + 1.0e-4)
+        {
+            vec3 fc = bCenter;
+            fc[a] = bMax[a];
+            vec3 d = hitPos - fc;
+            float len = max(length(d), 1.0e-5);
+            posW[a] = max(d[a] / len, 1.0e-4);
+        }
+        else if(hitPos[a] < bMin[a] - 1.0e-4)
+        {
+            vec3 fc = bCenter;
+            fc[a] = bMin[a];
+            vec3 d = fc - hitPos;
+            float len = max(length(d), 1.0e-5);
+            negW[a] = max(d[a] / len, 1.0e-4);
+        }
+    }
+    totalW = dot(posW, vec3(1.0)) + dot(negW, vec3(1.0));
+}
+
+float vptLocalEmitterAngularWeight(
+    ivec3 emitterBlock,
+    uint typeCode,
+    vec3 hitPos,
+    vec3 lightSample,
+    vec3 lightDirToEmitter
+)
+{
+    if(localLightProfilePointLike(typeCode))
+    {
+        return 1.0;
+    }
+
+    vec3 posW;
+    vec3 negW;
+    float totalW;
+    vptEmitterVisibleFaceWeights(emitterBlock, hitPos, posW, negW, totalW);
+    if(totalW <= 1.0e-6)
+    {
+        return 1.0;
+    }
+
+    vec3 rel = lightSample - (vec3(emitterBlock) + vec3(0.5));
+    vec3 absRel = abs(rel);
+    vec3 emitterFaceNormal = vec3(0.0);
+    float faceW = 0.0;
+    if(absRel.x >= absRel.y && absRel.x >= absRel.z)
+    {
+        bool isPos = rel.x >= 0.0;
+        emitterFaceNormal.x = isPos ? 1.0 : -1.0;
+        faceW = isPos ? posW.x : negW.x;
+    }
+    else if(absRel.y >= absRel.z)
+    {
+        bool isPos = rel.y >= 0.0;
+        emitterFaceNormal.y = isPos ? 1.0 : -1.0;
+        faceW = isPos ? posW.y : negW.y;
+    }
+    else
+    {
+        bool isPos = rel.z >= 0.0;
+        emitterFaceNormal.z = isPos ? 1.0 : -1.0;
+        faceW = isPos ? posW.z : negW.z;
+    }
+
+    if(faceW <= 1.0e-6)
+    {
+        return 0.0;
+    }
+    float emitterFacing = max(dot(emitterFaceNormal, -lightDirToEmitter), 0.0);
+    float faceProb = faceW / totalW;
+    return min(emitterFacing / max(faceProb, 1.0e-5), 2.0);
+}
+
+// Fast scalar proxy matching rt_test.rgen vptLocalEmitterProxyTarget 1:1.
+float vptSpatialProxyTarget(
+    vec3 hitPos,
+    vec3 N,
+    vec3 viewDir,
+    float albedoLuma,
+    float specProxyGain,
+    bool geomKnown,
+    vec3 geomFace,
+    vec3 emitterCenter,
+    uint emission,
+    uint typeCode
+)
+{
+    if(emission == 0u)
+    {
+        return 0.0;
+    }
+    vec3 toLight = emitterCenter - hitPos;
+    float distSq = dot(toLight, toLight);
+    if(distSq <= 1.0e-6)
+    {
+        return 0.0;
+    }
+    float distanceToLight = sqrt(distSq);
+    float emissionLevel = float(emission);
+    if(distanceToLight > vptLocalLightRange(typeCode, emissionLevel))
+    {
+        return 0.0;
+    }
+
+    vec3 lightDir = toLight / distanceToLight;
+    float clampedCos = max(dot(N, lightDir), 0.0);
+    if(geomKnown)
+    {
+        clampedCos = min(clampedCos, max(dot(geomFace, lightDir), 0.0));
+    }
+    if(clampedCos <= 0.0 && distanceToLight > 1.5)
+    {
+        return 0.0;
+    }
+    float effCos = max(clampedCos, 0.05);
+
+    float brdfProxy = albedoLuma * BSDF_LOCAL_DIFFUSE_SCALE * effCos;
+    if(specProxyGain > 0.0)
+    {
+        vec3 halfVec = viewDir + lightDir;
+        float halfLen = length(halfVec);
+        if(halfLen > 1.0e-6)
+        {
+            vec3 H = halfVec / halfLen;
+            float ndoth = max(dot(N, H), 0.0);
+            float nh2 = ndoth * ndoth;
+            float nh4 = nh2 * nh2;
+            float nh16 = nh4 * nh4 * nh4 * nh4;
+            brdfProxy += specProxyGain * nh16 * effCos;
+        }
+    }
+
+    float scale = 3.2 * LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
+        localLightProfileBrightness(typeCode, emissionLevel) *
+        vptLocalLightDistanceAttenuation(distanceToLight) *
+        vptLocalLightRangeFade(distanceToLight, typeCode, emissionLevel);
+    vec3 lightColor = localLightProfileColor(typeCode);
+    float lightLuma = max(dot(lightColor, vec3(0.2126, 0.7152, 0.0722)), 1.0e-4);
+    return lightLuma * scale * brdfProxy;
+}
+
+// Exact Cook-Torrance GGX + face angular weight, evaluated ONCE for the winning sample.
+bool vptSpatialFullContributionAt(
+    vec3 hitPos,
+    vec3 N,
+    vec3 viewDir,
+    vec3 hitAlbedo,
+    vec3 f0,
+    float metallic,
+    float roughness,
+    bool geomKnown,
+    vec3 geomFace,
+    vec3 samplePosition,
+    uint emission,
+    uint typeCode,
+    out vec3 contribution
+)
+{
+    contribution = vec3(0.0);
+    if(emission == 0u)
+    {
+        return false;
+    }
+    vec3 toLight = samplePosition - hitPos;
+    float distSq = dot(toLight, toLight);
+    if(distSq <= 1.0e-6)
+    {
+        return false;
+    }
+    float distToLight = sqrt(distSq);
+    float emissionLevel = float(emission);
+    ivec3 emitterBlock = ivec3(floor(samplePosition));
+    vec3 emitterCenter = vec3(emitterBlock) + vec3(0.5);
+    if(length(emitterCenter - hitPos) > vptLocalLightRange(typeCode, emissionLevel))
+    {
+        return false;
+    }
+
+    vec3 lightDir = toLight / distToLight;
+    float shadingNdotL = max(dot(N, lightDir), 0.0);
+    float clampedNdotL = geomKnown
+        ? min(shadingNdotL, max(dot(geomFace, lightDir), 0.0))
+        : shadingNdotL;
+    if(clampedNdotL <= 0.0)
+    {
+        return false;
+    }
+
+    float horizonScale = (shadingNdotL > 1.0e-6)
+        ? clamp(clampedNdotL / shadingNdotL, 0.0, 1.0)
+        : 0.0;
+    vec3 brdfTerm = spatialDynamicLightBRDF(
+        N, viewDir, lightDir, max(hitAlbedo, vec3(0.0)), f0, metallic, roughness
+    ) * horizonScale;
+    if(max(brdfTerm.r, max(brdfTerm.g, brdfTerm.b)) <= 0.0)
+    {
+        return false;
+    }
+
+    float angularWeight = vptLocalEmitterAngularWeight(
+        emitterBlock, typeCode, hitPos, samplePosition, lightDir
+    );
+    if(angularWeight <= 0.0)
+    {
+        return false;
+    }
+
+    float scale = 3.2 * LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
+        localLightProfileBrightness(typeCode, emissionLevel) *
+        vptLocalLightDistanceAttenuation(distToLight) *
+        vptLocalLightRangeFade(distToLight, typeCode, emissionLevel);
+    contribution = localLightProfileColor(typeCode) * scale * angularWeight * brdfTerm;
+    return max(contribution.r, max(contribution.g, contribution.b)) > 0.0;
+}
+
+void unpackSpatialMaterial(
+    uvec4 c,
+    out vec3 albedo,
+    out float roughness,
+    out vec3 f0,
+    out float metallic,
+    out vec3 N,
+    out bool geomKnown,
+    out vec3 geomFace,
+    out bool pixelActive
+)
+{
+    vec4 albRough = unpackUnorm4x8(c.x);
+    vec4 f0Met = unpackUnorm4x8(c.y);
+    albedo = albRough.rgb;
+    roughness = albRough.a;
+    f0 = f0Met.rgb;
+    metallic = f0Met.a;
+    N = octDecode(unpackSnorm2x16(c.z));
+
+    uint flags = c.w;
+    uint faceCode = flags & 7u;
+    geomKnown = (faceCode < 6u);
+    geomFace = decodeAxisFace(faceCode);
+    bool hasPbr = (flags & 8u) != 0u;
+    if(!hasPbr)
+    {
+        f0 = vec3(-1.0);
+        metallic = -1.0;
+    }
+    pixelActive = (flags & 16u) != 0u;
+}
+
+void main()
+{
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    int width = int(spatialParams.x);
+    int height = int(spatialParams.y);
+    if(pixelCoord.x >= width || pixelCoord.y >= height)
+    {
+        return;
+    }
+
+    uint pixelLinear = uint(pixelCoord.y) * spatialParams.x + uint(pixelCoord.x);
+    uint slotCount = ptLandingSlotCount();
+    PTLandingRecord cRec = ptLandingRecords[pixelLinear * slotCount];
+    if(cRec.a.x <= 0.5 || (cRec.c.w >> 24u) != 0x5au)
+    {
+        return;
+    }
+
+    vec3 cAlbedo, cF0, cN, cGeomFace;
+    float cRoughness, cMetallic;
+    bool cGeomKnown, cActive;
+    unpackSpatialMaterial(
+        cRec.c, cAlbedo, cRoughness, cF0, cMetallic, cN, cGeomKnown, cGeomFace, cActive
+    );
+    if(!cActive)
+    {
+        return;
+    }
+
+    VPTDirectHistory cHist = readCurrHistory(pixelLinear);
+    if(cHist.hitPositionAndValid.w < 1.5)
+    {
+        return;
+    }
+    vec3 rawRecvN = cHist.reservoirNormalAndPadding.xyz;
+    if(dot(rawRecvN, rawRecvN) <= 1.0e-8)
+    {
+        return;
+    }
+    vec3 cRecvN = normalize(rawRecvN);
+    vec3 cHitPos = cHist.normalAndPadding.xyz;
+    vec3 camPos = (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    vec3 toCam = camPos - cHitPos;
+    float camDist = length(toCam);
+    vec3 cViewDir = camDist > 1.0e-6 ? (toCam / camDist) : vec3(0.0, 1.0, 0.0);
+    float cConf = cHist.reservoirNormalAndPadding.w;
+
+    const vec3 luminanceWeights = vec3(0.2126, 0.7152, 0.0722);
+    float cAlbedoLuma = max(dot(max(cAlbedo, vec3(0.0)), luminanceWeights), 0.04);
+    float cSpecGain = (cF0.x >= 0.0)
+        ? (max(max(cF0.r, max(cF0.g, cF0.b)), 0.04) *
+           (1.0 - clamp(cRoughness, 0.0, 1.0)) * 0.5)
+        : 0.0;
+
+    uint cPackedId = uint(cHist.radianceAndSampleCount.w + 0.5);
+    uint cEmission = cPackedId >> 5u;
+    uint cTypeCode = cPackedId & 31u;
+    vec3 cSample = cHist.radianceAndSampleCount.xyz;
+    vec3 cEmitterCenter = floor(cSample) + vec3(0.5);
+    float cW = max(cHist.hitPositionAndValid.x, 0.0);
+    float cM = clamp(cHist.hitPositionAndValid.y, 1.0, 4.0);
+    vec3 cTrans = vptUnpackTransmittance24(cHist.hitPositionAndValid.z);
+
+    float cTargetPdf = 0.0;
+    bool cValid = (cW > 0.0 && cHist.hitPositionAndValid.y >= 0.5 && cEmission > 0u);
+    if(cValid)
+    {
+        cTargetPdf = vptSpatialProxyTarget(
+            cHitPos, cN, cViewDir, cAlbedoLuma, cSpecGain,
+            cGeomKnown, cGeomFace, cEmitterCenter, cEmission, cTypeCode
+        );
+        if(cTargetPdf <= 1.0e-6)
+        {
+            cValid = false;
+            cW = 0.0;
+        }
+    }
+
+    uint rngState = (pixelLinear * 747796405u + 1u) ^ (cam.frameCount * 2891336453u + 19u);
+    pcgHash(rngState);
+
+    int numNeighbors = (cM < 2.0) ? 3 : 2;
+    float radius = (cM < 2.0) ? 28.0 : 24.0;
+    float posEps = min(max(0.35, 0.04 * camDist), 1.0);
+    float rotAngle = rand01(rngState) * 6.2831853;
+
+    bool nHasSample[3];
+    vec3 nSample[3];
+    uint nEmission[3];
+    uint nTypeCode[3];
+    vec3 nTrans[3];
+    float nTargetAtC[3];
+    float nTargetSelf[3];
+    float nTargetYc[3];
+    float nW[3];
+    float nM[3];
+    int geomCount = 0;
+
+    for(int t = 0; t < numNeighbors; ++t)
+    {
+        float angle = rotAngle + float(t) * 2.39996323;
+        float r = radius * sqrt((float(t) + rand01(rngState)) / float(numNeighbors));
+        ivec2 nbCoord = pixelCoord + ivec2(int(round(cos(angle) * r)), int(round(sin(angle) * r)));
+        if(nbCoord.x < 0 || nbCoord.x >= width || nbCoord.y < 0 || nbCoord.y >= height ||
+           all(equal(nbCoord, pixelCoord)))
+        {
+            continue;
+        }
+
+        uint nbLinear = uint(nbCoord.y) * spatialParams.x + uint(nbCoord.x);
+        VPTDirectHistory nbHist = readCurrHistory(nbLinear);
+        if(nbHist.hitPositionAndValid.w < 1.5 || nbHist.hitPositionAndValid.y < 0.5)
+        {
+            continue;
+        }
+
+        vec3 nbRawRecvN = nbHist.reservoirNormalAndPadding.xyz;
+        if(dot(nbRawRecvN, nbRawRecvN) <= 1.0e-8)
+        {
+            continue;
+        }
+        vec3 nbRecvN = normalize(nbRawRecvN);
+        vec3 nbHitPos = nbHist.normalAndPadding.xyz;
+        vec3 delta = nbHitPos - cHitPos;
+        if(length(delta) > posEps ||
+           abs(dot(delta, cRecvN)) > 0.05 ||
+           dot(nbRecvN, cRecvN) < 0.94)
+        {
+            continue;
+        }
+
+        PTLandingRecord nbRec = ptLandingRecords[nbLinear * slotCount];
+        if(nbRec.a.x <= 0.5 || (nbRec.c.w >> 24u) != 0x5au)
+        {
+            continue;
+        }
+
+        float nbW = max(nbHist.hitPositionAndValid.x, 0.0);
+        uint nbPackedId = uint(nbHist.radianceAndSampleCount.w + 0.5);
+        uint nbEm = nbPackedId >> 5u;
+        uint nbTc = nbPackedId & 31u;
+        vec3 nbSamp = nbHist.radianceAndSampleCount.xyz;
+        bool nbSampleOk = false;
+        float targetAtC = 0.0;
+        if(nbW > 0.0 && nbEm > 0u)
+        {
+            vec3 nbEmitterCenter = floor(nbSamp) + vec3(0.5);
+            targetAtC = vptSpatialProxyTarget(
+                cHitPos, cN, cViewDir, cAlbedoLuma, cSpecGain,
+                cGeomKnown, cGeomFace, nbEmitterCenter, nbEm, nbTc
+            );
+            if(targetAtC > 1.0e-6 &&
+               !vptSpatialVoxelBlocked(cHitPos, nbSamp, ivec3(floor(nbSamp))))
+            {
+                nbSampleOk = true;
+            }
+        }
+
+        float targetYc = 0.0;
+        if(cValid)
+        {
+            vec3 nAlbedo, nF0, nN, nGeomFace;
+            float nRoughness, nMetallic;
+            bool nGeomKnown, nActive;
+            unpackSpatialMaterial(
+                nbRec.c, nAlbedo, nRoughness, nF0, nMetallic, nN, nGeomKnown, nGeomFace, nActive
+            );
+            vec3 toCamN = camPos - nbHitPos;
+            float nCamDist = length(toCamN);
+            vec3 nViewDir = nCamDist > 1.0e-6 ? (toCamN / nCamDist) : vec3(0.0, 1.0, 0.0);
+            float nAlbedoLuma = max(dot(max(nAlbedo, vec3(0.0)), luminanceWeights), 0.04);
+            float nSpecGain = (nF0.x >= 0.0)
+                ? (max(max(nF0.r, max(nF0.g, nF0.b)), 0.04) *
+                   (1.0 - clamp(nRoughness, 0.0, 1.0)) * 0.5)
+                : 0.0;
+            targetYc = vptSpatialProxyTarget(
+                nbHitPos, nN, nViewDir, nAlbedoLuma, nSpecGain,
+                nGeomKnown, nGeomFace, cEmitterCenter, cEmission, cTypeCode
+            );
+            if(targetYc > 1.0e-6)
+            {
+                bool sameVisibleBlock = nbSampleOk &&
+                    all(equal(ivec3(floor(nbSamp)), ivec3(floor(cSample))));
+                if(!sameVisibleBlock &&
+                   vptSpatialVoxelBlocked(nbHitPos, cSample, ivec3(floor(cSample))))
+                {
+                    targetYc = 0.0;
+                }
+            }
+        }
+
+        nHasSample[geomCount] = nbSampleOk;
+        nSample[geomCount] = nbSamp;
+        nEmission[geomCount] = nbEm;
+        nTypeCode[geomCount] = nbTc;
+        nTrans[geomCount] = nbSampleOk
+            ? vptUnpackTransmittance24(nbHist.hitPositionAndValid.z)
+            : vec3(1.0);
+        nTargetAtC[geomCount] = nbSampleOk ? targetAtC : 0.0;
+        nTargetSelf[geomCount] = max(nbHist.normalAndPadding.w, 1.0e-6);
+        nTargetYc[geomCount] = targetYc;
+        nW[geomCount] = nbSampleOk ? nbW : 0.0;
+        nM[geomCount] = clamp(nbHist.hitPositionAndValid.y, 1.0, 4.0);
+        geomCount++;
+    }
+
+    vec3 winnerSample = cSample;
+    uint winnerEmission = cEmission;
+    uint winnerTypeCode = cTypeCode;
+    vec3 winnerTrans = cTrans;
+    float finalW = 0.0;
+
+    if(geomCount == 0)
+    {
+        if(cValid)
+        {
+            finalW = min(cW, 20.0);
+        }
+    }
+    else
+    {
+        float invK = 1.0 / float(geomCount);
+        float mC = 0.0;
+        float totalWeight = 0.0;
+        float winnerTargetPdf = 0.0;
+
+        for(int i = 0; i < geomCount; ++i)
+        {
+            if(nHasSample[i])
+            {
+                float alphaI = (nM[i] * nTargetSelf[i]) /
+                    max(nM[i] * nTargetSelf[i] + (cM * invK) * nTargetAtC[i], 1.0e-12);
+                float wI = (invK * alphaI) * nTargetAtC[i] * nW[i];
+                if(wI > 0.0)
+                {
+                    totalWeight += wI;
+                    if(rand01(rngState) * totalWeight < wI)
+                    {
+                        winnerSample = nSample[i];
+                        winnerEmission = nEmission[i];
+                        winnerTypeCode = nTypeCode[i];
+                        winnerTrans = nTrans[i];
+                        winnerTargetPdf = nTargetAtC[i];
+                    }
+                }
+            }
+            if(cValid)
+            {
+                float alphaIc = (nM[i] * nTargetYc[i]) /
+                    max(nM[i] * nTargetYc[i] + (cM * invK) * cTargetPdf, 1.0e-12);
+                mC += invK * (1.0 - alphaIc);
+            }
+        }
+
+        if(cValid && mC > 0.0)
+        {
+            float wC = mC * cTargetPdf * cW;
+            if(wC > 0.0)
+            {
+                totalWeight += wC;
+                if(rand01(rngState) * totalWeight < wC)
+                {
+                    winnerSample = cSample;
+                    winnerEmission = cEmission;
+                    winnerTypeCode = cTypeCode;
+                    winnerTrans = cTrans;
+                    winnerTargetPdf = cTargetPdf;
+                }
+            }
+        }
+
+        if(totalWeight > 0.0 && winnerTargetPdf > 1.0e-8)
+        {
+            finalW = min(totalWeight / winnerTargetPdf, 20.0);
+        }
+    }
+
+    if(finalW > 0.0 && winnerEmission > 0u)
+    {
+        vec3 winnerContrib;
+        if(vptSpatialFullContributionAt(
+            cHitPos, cN, cViewDir, cAlbedo, cF0, cMetallic, cRoughness,
+            cGeomKnown, cGeomFace, winnerSample, winnerEmission, winnerTypeCode, winnerContrib))
+        {
+            vec3 spatialDirect = glassApplyStainedTint(winnerContrib * finalW, winnerTrans);
+            vec4 accum = imageLoad(k2DirectImage, pixelCoord);
+            imageStore(
+                k2DirectImage,
+                pixelCoord,
+                vec4(accum.rgb + spatialDirect, accum.a)
+            );
+        }
+    }
+}

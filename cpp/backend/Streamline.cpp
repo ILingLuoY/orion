@@ -2513,6 +2513,18 @@ JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_slCreateWin32Surface
     fflush(stderr);
 
 
+    if(result == VK_SUCCESS && ci.hwnd != nullptr)
+    {
+        // 2026-11-23：记下游戏窗口并立刻查询一次系统 HDR 状态（显示器级别），
+        // 让 [HDR-SYS] 行尽早出现在日志里。语义见 backend/DisplayHdr.cpp。
+        g_gameHwnd.store(
+            reinterpret_cast<void*>(ci.hwnd));
+
+        refreshWindowsDisplayHdrState(
+            reinterpret_cast<void*>(ci.hwnd));
+    }
+
+
     return static_cast<jint>(
         result
     );
@@ -2672,6 +2684,13 @@ JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_slCreateSwapchain(
 
     const VkSwapchainCreateInfoKHR* effectiveCreateInfo =
         createInfo;
+
+    // 2026-11-23：每次 (重) 建 swapchain 前都刷新系统 HDR 状态。切 HDR 开关、
+    // 窗口重排、系统切换显示模式都会走到这里，保证下面 hdrOutputActive() 用的是
+    // 当前显示器真实的 advanced color 状态（见 backend/DisplayHdr.cpp）。
+    refreshWindowsDisplayHdrState(
+        g_gameHwnd.load());
+
 
     VkSwapchainCreateInfoKHR hdrCreateInfo{};
 

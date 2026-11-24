@@ -479,11 +479,38 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
     uint64_t entityFrameHash = 0u;
     uint64_t localPlayerFrameHash = 0u;
     uint64_t handFrameHash = 0u;
+    // 2026-11-23 CPU批①：开关打开时不再算整层哈希，改为与缓存层逐字节判等。
+    bool entitySameByBytes = false;
+    bool localPlayerSameByBytes = false;
+    bool handSameByBytes = false;
+    if constexpr(CPUPERF_ENTITY_MEMCMP_CHANGE)
+    {
+        PerfL10StallTimer compareTimer("entityFrameVertexCompare");
+        (void)compareTimer;
+
+        const auto cachedEntity = g_chunkMeshes.find(ENTITY_RT_LAYER_KEY);
+        const auto cachedLocalPlayer = g_chunkMeshes.find(LOCAL_PLAYER_RT_LAYER_KEY);
+        const auto cachedHand = g_chunkMeshes.find(HAND_RT_LAYER_KEY);
+
+        entitySameByBytes =
+            !useBuckets &&
+            cachedEntity != g_chunkMeshes.end() &&
+            sameVertexPayloadParallel(cachedEntity->second, g_entityFrameVertices);
+        localPlayerSameByBytes =
+            cachedLocalPlayer != g_chunkMeshes.end() &&
+            sameVertexPayloadParallel(cachedLocalPlayer->second, g_localPlayerFrameVertices);
+        handSameByBytes =
+            cachedHand != g_chunkMeshes.end() &&
+            sameVertexPayloadParallel(cachedHand->second, g_handFrameVertices);
+    }
+    else
+    {
     PERF_L10_TIME_STALL("entityFrameVertexHash", {
         entityFrameHash = useBuckets ? 0u : hashVertexPayload(g_entityFrameVertices);
         localPlayerFrameHash = hashVertexPayload(g_localPlayerFrameVertices);
         handFrameHash = hashVertexPayload(g_handFrameVertices);
     });
+    }
 
     const auto currentEntity = g_chunkMeshes.find(ENTITY_RT_LAYER_KEY);
     const auto currentLocalPlayer = g_chunkMeshes.find(LOCAL_PLAYER_RT_LAYER_KEY);
@@ -491,15 +518,19 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
         ? false
         : (currentEntity == g_chunkMeshes.end()
             ? !g_entityFrameVertices.empty()
-            : !(g_entityCachedHashValid &&
-                g_entityCachedHash == entityFrameHash &&
-                currentEntity->second.size() == g_entityFrameVertices.size()));
+            : !(CPUPERF_ENTITY_MEMCMP_CHANGE
+                ? entitySameByBytes
+                : (g_entityCachedHashValid &&
+                   g_entityCachedHash == entityFrameHash &&
+                   currentEntity->second.size() == g_entityFrameVertices.size())));
     const bool localPlayerChanged = currentLocalPlayer == g_chunkMeshes.end()
         ? !g_localPlayerFrameVertices.empty()
-        : !(g_localPlayerCachedHashValid &&
-            g_localPlayerCachedHash == localPlayerFrameHash &&
-            currentLocalPlayer->second.size() ==
-                g_localPlayerFrameVertices.size());
+        : !(CPUPERF_ENTITY_MEMCMP_CHANGE
+            ? localPlayerSameByBytes
+            : (g_localPlayerCachedHashValid &&
+               g_localPlayerCachedHash == localPlayerFrameHash &&
+               currentLocalPlayer->second.size() ==
+                   g_localPlayerFrameVertices.size()));
 
     // 2026-11-06：手部层改为与实体层同口径的指纹判等。
     //
@@ -515,9 +546,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
     const auto currentHand = g_chunkMeshes.find(HAND_RT_LAYER_KEY);
     const bool handChanged = currentHand == g_chunkMeshes.end()
         ? !g_handFrameVertices.empty()
-        : !(g_handCachedHashValid &&
-            g_handCachedHash == handFrameHash &&
-            currentHand->second.size() == g_handFrameVertices.size());
+        : !(CPUPERF_ENTITY_MEMCMP_CHANGE
+            ? handSameByBytes
+            : (g_handCachedHashValid &&
+               g_handCachedHash == handFrameHash &&
+               currentHand->second.size() == g_handFrameVertices.size()));
 
     // 观测（2026-11-06）：每 300 次 endEntityFrame 打一行手部层判等命中率。
     // 走 RTLog（缓冲、不 flush、不 fprintf），稳态开销可忽略；只用来确认这次改动

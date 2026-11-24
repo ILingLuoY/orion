@@ -14,6 +14,7 @@ layout(binding = 2, set = 0) uniform CameraProperties {
 // The Tyndall cloud field needs the same two 3D noise samplers the raygen
 // already binds in this set (38/39).  The include is the single source of
 // cloud density shared by the primary compute pass, reflections and shadows.
+#ifndef RMISS_SKIP_CLOUDS
 layout(binding = 38, set = 0) uniform sampler3D cloudShapeNoise;
 layout(binding = 39, set = 0) uniform sampler3D cloudCurlNoise;
 
@@ -21,6 +22,7 @@ layout(binding = 39, set = 0) uniform sampler3D cloudCurlNoise;
 // 高层平面云（2026-10-02 C 档）。必须在 tyndall_cloud_field.glsl 之后 ——
 // 它复用那里的 tyndallTime / tyndallSphereRoots / tyndallNoiseLod / TYNDALL_RADIUS。
 #include "high_cloud_field.glsl"
+#endif
 
 // Physical sky scattering and sun transmittance are precomputed by
 // sky_atmosphere.comp in an equirectangular projection before the RT pass.
@@ -55,7 +57,7 @@ const uint RT_PURPOSE_PRIMARY_SKY = 7u;
 // 只压日盘，日冕瓣（pow64，±8°）保留：它不是 delta，NEE 覆盖不到。
 // =====================================================
 #ifndef GI_SKIP_SUN_DISK
-#define GI_SKIP_SUN_DISK 0
+#define GI_SKIP_SUN_DISK 1
 #endif
 const uint RT_STATE_NO_SUN_DISK_BIT = 1u << 14u;
 
@@ -71,7 +73,8 @@ const uint RT_STATE_NO_SUN_DISK_BIT = 1u << 14u;
 #ifndef WATER_SKY_SUN_OCCLUSION
 #define WATER_SKY_SUN_OCCLUSION 1
 #endif
-const uint RT_STATE_NO_SUN_GLOW_BIT = 1u << 15u;
+const uint RT_STATE_NO_SUN_GLOW_BIT    = 1u << 15u;
+const uint RT_STATE_GI_SKIP_CLOUDS_BIT = 1u << 19u;
 
 // 球形壳体求交算法
 bool RayIntersectSphereSolution(vec3 RayOrigin, vec3 RayDirection, vec4 Sphere, inout vec2 Solutions) {
@@ -335,6 +338,7 @@ vec3 getTimeDrivenMoonDirection()
 // 自定义 sampler `endSkyAtlas` 已在上面声明（binding 60）。
 #include "end_sky_common.glsl"
 
+#ifndef RMISS_SKIP_CLOUDS
 // 2026-09-30 P2：实现移入 sky_model_common.glsl（单一共享版本）。
 // goldenStrength=1.0
 vec3 tyndallReflectionSunColor(vec3 lightDirection)
@@ -347,6 +351,7 @@ vec3 tyndallReflectionSunColorContinuous(vec3 lightDirection)
 {
     return skyModelSunColorContinuous(lightDirection, 1.0);
 }
+#endif
 
 // 火烧云强度，与 volumetric_clouds.comp 逐字一致。
 const float CLOUD_FIRE_RIM_STRENGTH = 3.0;
@@ -362,6 +367,7 @@ const float PREDAWN_STAR_FADE = 0.65;
 #include "aurora_common.glsl"
 
 
+#ifndef RMISS_SKIP_CLOUDS
 vec4 sampleVolumetricClouds(vec3 rayOrigin, vec3 rayDir, vec3 sunDir) {
     // 2026-10-02 修：高层平面云与体积云层是两套独立开关。旧实现把整个函数挂在
     // 体积云层开关（cloudParams1.w）上，且在 tyndallInterval 失败时也直接 return
@@ -496,6 +502,7 @@ vec4 sampleVolumetricClouds(vec3 rayOrigin, vec3 rayDir, vec3 sunDir) {
 
     return vec4(scattering, transmittance);
 }
+#endif
 
 // directionToEquirect 见 star_map_common.glsl（与 sky_atmosphere.comp 的
 // directionForPixel 严格互逆，是天空 LUT / 星图的共享映射）。
@@ -1911,8 +1918,10 @@ void main() {
     }
 #endif // END_ORB_ENABLE
 
-    // 次级光线保留 Tyndall 云行军；主光线天空像素由计算云管线合成。
-    if((payload.state & 0x7u) != RT_PURPOSE_PRIMARY_SKY)
+#ifndef RMISS_SKIP_CLOUDS
+    // 次级光线保留 Tyndall 云行军；主光线天空像素与漫反射 GI 跳过。
+    if((payload.state & 0x7u) != RT_PURPOSE_PRIMARY_SKY &&
+       (payload.state & RT_STATE_GI_SKIP_CLOUDS_BIT) == 0u)
     {
         // 2026-11-16：夜间云被月亮照亮 ⇒ 传月亮方向（与 rgen 的"夜间光源 =
         // 月亮"同口径）；白天仍是太阳。2026-11-19：交接点改由 skyDirectIsSun
@@ -1923,6 +1932,7 @@ void main() {
             skyDirectIsSun(sunElevation) ? sunDir : moonDir);
         finalColor = mix(finalColor, cloudResult.rgb, 1.0 - cloudResult.a);
     }
+#endif
 
     // Preserve RGB transmission accumulated by GLASS_VISIBILITY Any-Hit.
     // Ordinary sky/environment rays still receive the physical sky colour.

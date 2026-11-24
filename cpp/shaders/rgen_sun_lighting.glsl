@@ -78,6 +78,11 @@ vec3 evaluateDirectSunLighting(
             L
         );
 
+    if(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)) <= 1.0e-5)
+    {
+        return vec3(0.0);
+    }
+
     vec3 sunLightColor =
         getTimeDrivenSkyLightColor() *
         3.2 *
@@ -155,6 +160,81 @@ vec3 evaluateDirectSunLighting(
             diffuseTerm +
             specularTerm
         );
+}
+
+#ifndef GI_BOUNCE_LAMBERT_DIRECT
+#define GI_BOUNCE_LAMBERT_DIRECT 1
+#endif
+
+vec3 evaluateDirectSunLightingDiffuse(
+    vec3 hitPos,
+    vec3 hitNormal,
+    vec3 hitAlbedo,
+    float hitF0Metal,
+    float pomSelfShadow,
+    vec3 sunDirection
+)
+{
+    vec3 N =
+        normalize(
+            hitNormal
+        );
+
+    vec3 L =
+        normalize(
+            sunDirection
+        );
+
+    float NdotL =
+        max(
+            dot(N, L),
+            0.0
+        );
+
+    if(NdotL <= 0.0)
+    {
+        return vec3(0.0);
+    }
+
+    vec3 sunTransmittance =
+        traceSunTransmittanceThroughWater(
+            hitPos +
+                N * SUN_RAY_NORMAL_BIAS +
+                L * 0.001,
+            L
+        );
+
+    if(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)) <= 1.0e-5)
+    {
+        return vec3(0.0);
+    }
+
+    vec3 sunLightColor =
+        getTimeDrivenSkyLightColor() *
+        3.2 *
+        getTimeDrivenSkyLightRadianceScale() *
+        sunTransmittance *
+        c3CloudSunTransmittance(hitPos + N * SUN_RAY_NORMAL_BIAS + L * 0.001, L) *
+        clamp(
+            pomSelfShadow,
+            0.0,
+            1.0
+        );
+
+    int f0MetalCode =
+        decodeF0MetalCode(
+            hitF0Metal
+        );
+
+    float metallic =
+        decodeMetallicFromCode(
+            f0MetalCode
+        );
+
+    float diffuseScale =
+        metallic < 0.5 ? 0.96 : 0.25;
+
+    return sunLightColor * (hitAlbedo * diffuseScale * BSDF_SUN_DIFFUSE_SCALE * NdotL);
 }
 
 

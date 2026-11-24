@@ -154,6 +154,20 @@ vec3 sampleHemisphereCosine(vec3 normal, inout uint state) {
     return tangent * x + bitangent * y + normal * z;
 }
 
+vec3 sampleHemisphereCosine2D(vec3 normal, vec2 u) {
+    float phi = 6.2831853 * u.x;
+    float r = sqrt(clamp(u.y, 0.0, 0.999999));
+    float x = r * cos(phi);
+    float y = r * sin(phi);
+    float z = sqrt(max(0.0, 1.0 - x * x - y * y));
+
+    vec3 up = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, normal));
+    vec3 bitangent = cross(normal, tangent);
+
+    return tangent * x + bitangent * y + normal * z;
+}
+
 vec3 sampleGGX(vec3 normal, float roughness, inout uint state) {
     float alpha = max(roughness * roughness, 0.001); 
     float alpha2 = alpha * alpha;
@@ -169,6 +183,42 @@ vec3 sampleGGX(vec3 normal, float roughness, inout uint state) {
     vec3 bitangent = cross(normal, tangent);
 
     return tangent * H.x + bitangent * H.y + normal * H.z;
+}
+
+// Heitz 2018 isotropic GGX VNDF half-vector sampling (pure scalar, 0 local arrays).
+// Matches exact PDF(L) = D_GGX(H) * ggxVNDFMaskingG1(NdotV, roughness) / (4 * NdotV).
+vec3 sampleGGXVNDF(vec3 normal, vec3 viewDir, float roughness, vec2 u) {
+    float alpha = max(roughness * roughness, 0.001);
+    vec3 up = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, normal));
+    vec3 B = cross(normal, T);
+
+    vec3 Ve = vec3(dot(viewDir, T), dot(viewDir, B), max(dot(viewDir, normal), 1.0e-4));
+    vec3 Vh = normalize(vec3(alpha * Ve.x, alpha * Ve.y, Ve.z));
+
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    vec3 T1 = lensq > 0.0
+        ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(lensq)
+        : vec3(1.0, 0.0, 0.0);
+    vec3 T2 = cross(Vh, T1);
+
+    float r = sqrt(clamp(u.x, 0.0, 0.999999));
+    float phi = 6.2831853 * u.y;
+    float t1 = r * cos(phi);
+    float t2 = r * sin(phi);
+    float s = 0.5 * (1.0 + Vh.z);
+    t2 = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
+
+    vec3 Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+    vec3 Ne = normalize(vec3(alpha * Nh.x, alpha * Nh.y, max(0.0, Nh.z)));
+    return normalize(T * Ne.x + B * Ne.y + normal * Ne.z);
+}
+
+float ggxVNDFMaskingG1(float NdotV, float roughness) {
+    float alpha = max(roughness * roughness, 0.001);
+    float a2 = alpha * alpha;
+    float nv = max(NdotV, 1.0e-5);
+    return (2.0 * nv) / (nv + sqrt(a2 + (1.0 - a2) * nv * nv));
 }
 
 // 软化太阳方向采样（用于柔和阴影）

@@ -5,6 +5,11 @@
 #include "OrionInternal.h"
 #include "TrackingHooks.h"
 
+namespace
+{
+std::vector<uint8_t> s_waterSimMaskHostStaging;
+}
+
 void updateWaterSimulationRayDescriptor()
 {
     if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
@@ -3546,6 +3551,14 @@ void recordWaterSimulation(VkCommandBuffer cmd)
             maskValidSnapshot = g_waterSimMaskValid;
             maskOriginXSnapshot = g_waterSimMaskOriginX;
             maskOriginZSnapshot = g_waterSimMaskOriginZ;
+            if(maskDirty && g_waterSimMaskMapped != nullptr && !s_waterSimMaskHostStaging.empty())
+            {
+                std::memcpy(
+                    g_waterSimMaskMapped,
+                    s_waterSimMaskHostStaging.data(),
+                    s_waterSimMaskHostStaging.size()
+                );
+            }
         }
         if(!wasLayoutReady)
         {
@@ -4322,29 +4335,38 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateWaterSimMask(
     {
         return;
     }
-    std::lock_guard<std::mutex> guard(g_waterSimMaskMutex);
+    std::vector<uint8_t> incoming(static_cast<size_t>(rgbaSize));
     if(arrLen >= rgbaSize)
     {
         env->GetByteArrayRegion(
             mask,
             0,
             rgbaSize,
-            static_cast<jbyte*>(g_waterSimMaskMapped)
+            reinterpret_cast<jbyte*>(incoming.data())
         );
     }
     else
     {
         std::vector<jbyte> r8(static_cast<size_t>(texelCount));
         env->GetByteArrayRegion(mask, 0, texelCount, r8.data());
-        uint8_t* dst = static_cast<uint8_t*>(g_waterSimMaskMapped);
         for(jsize i = 0; i < texelCount; ++i)
         {
-            dst[i * 4 + 0] = 63u;
-            dst[i * 4 + 1] = 118u;
-            dst[i * 4 + 2] = 228u;
-            dst[i * 4 + 3] = static_cast<uint8_t>(r8[static_cast<size_t>(i)]);
+            incoming[static_cast<size_t>(i) * 4u + 0u] = 63u;
+            incoming[static_cast<size_t>(i) * 4u + 1u] = 118u;
+            incoming[static_cast<size_t>(i) * 4u + 2u] = 228u;
+            incoming[static_cast<size_t>(i) * 4u + 3u] =
+                static_cast<uint8_t>(r8[static_cast<size_t>(i)]);
         }
     }
+    std::lock_guard<std::mutex> guard(g_waterSimMaskMutex);
+    if(g_waterSimMaskValid &&
+       g_waterSimMaskOriginX == originX &&
+       g_waterSimMaskOriginZ == originZ &&
+       s_waterSimMaskHostStaging == incoming)
+    {
+        return;
+    }
+    s_waterSimMaskHostStaging = std::move(incoming);
     g_waterSimMaskOriginX = originX;
     g_waterSimMaskOriginZ = originZ;
     g_waterSimMaskValid = true;

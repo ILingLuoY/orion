@@ -25,9 +25,12 @@ vec3 traceTransparentLowCostGI(
 
 
     vec3 giDirection =
-        sampleHemisphereCosine(
+        sampleHemisphereCosine2D(
             N,
-            seed
+            vec2(
+                glassBlueNoiseSample(rtLogicalPixelCoord(), cam.frameCount, 67u),
+                glassBlueNoiseSample(rtLogicalPixelCoord(), cam.frameCount, 68u)
+            )
         );
 
 
@@ -35,6 +38,10 @@ vec3 traceTransparentLowCostGI(
         1.0;
 
     hit.state = makeTraceState(RT_PURPOSE_FULL);
+    hit.state |= RT_STATE_GI_SKIP_CLOUDS_BIT;
+#if GI_SKIP_SUN_DISK
+    hit.state |= RT_STATE_NO_SUN_DISK_BIT;
+#endif
 
     // 2026-10-25 A/B：低代价 GI 射线同样跳过 POM（与主 GI 回路同口径）。
     if(cam.giHalfParams.z > 0.5f)

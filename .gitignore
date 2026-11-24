@@ -148,6 +148,25 @@ cpp/external/**/.git
 /HANDOFF-*.md
 /CRASH_HANDOFF.md
 
+# 2026-11-24：shader 产物的临时/诊断副本，不进仓库。
+# 注意：不能写全局 *.spv —— src/main/resources/shaders 下的正式 SPV 必须入库，
+# 否则别人 clone 后 loadSpv 找不到 K1/K2/fog 的 SPV，直接黑屏（本次事故根因）。
+/src/main/resources/shaders/_*.spv
+/src/main/resources/shaders/.*.spv
+/src/main/resources/shaders/*.normal.spv
+/src/main/resources/shaders/*.brut.spv
+/src/main/resources/shaders/rt_ser_probe.spv
+/src/main/resources/shaders/rt_displaced.rint.spv
+/src/main/resources/shaders/cloud_preview.comp.spv
+/src/main/resources/shaders/viewer_upsample.comp.spv
+/src/main/resources/shaders/comp.spv
+/src/main/resources/shaders/rgen.spv
+/src/main/resources/shaders/rchit.spv
+/src/main/resources/shaders/rahit.spv
+/src/main/resources/shaders/rmiss.spv
+*.census.dis
+/cpp/shaders/.deploy_fingerprint.json
+
 # 开发期临时脚本与验证目录（_deploy_*/_perf_l10 等仍保留）
 /.build_scratch/
 /_tmp_*

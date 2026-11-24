@@ -78,6 +78,7 @@ public class GameRendererMixin {
         if (HAND_RT_ENABLED) {
             // 旧行为：给手单独开一个实体帧窗口，手几何进 RT，再取消光栅手。
             EntityRtCapture.beginEarlyFrame();
+            EntityRtCapture.beginHandCaptureWindow();
         } else {
             // 2026-11-16：手退回光栅。世界（含粒子/文字）在这一步之前已经全部
             // 提交完，所以这里直接收帧；手之后的 model/item 批次会撞上原生门禁

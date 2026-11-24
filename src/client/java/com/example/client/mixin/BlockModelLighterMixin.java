@@ -25,6 +25,9 @@ public class BlockModelLighterMixin {
             Boolean.getBoolean("rtx.debug");
 
     @Unique
+    private static final boolean STRIP_VANILLA_RASTER_SHADE = true;
+
+    @Unique
     private static boolean vulkan$isGlass(
             BlockState state
     ) {
@@ -123,6 +126,9 @@ public class BlockModelLighterMixin {
             QuadInstance outputInstance,
             CallbackInfo ci
     ) {
+        if (STRIP_VANILLA_RASTER_SHADE) {
+            outputInstance.setColor(-1);
+        }
         vulkan$tagGlass(
                 state,
                 outputInstance
@@ -143,6 +149,9 @@ public class BlockModelLighterMixin {
             QuadInstance outputInstance,
             CallbackInfo ci
     ) {
+        if (STRIP_VANILLA_RASTER_SHADE) {
+            outputInstance.setColor(-1);
+        }
         vulkan$tagGlass(
                 state,
                 outputInstance

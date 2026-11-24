@@ -321,6 +321,18 @@ void storeGlassAlphaBlendDeferred(
 #ifndef VPT_GLASS_DIELECTRIC_REWRITE
 #define VPT_GLASS_DIELECTRIC_REWRITE 1
 #endif
+#ifndef ORION_GLASS_TWO_INTERFACE_REFRACT
+#define ORION_GLASS_TWO_INTERFACE_REFRACT 1
+#endif
+#ifndef ORION_GLASS_RADIANCE_DOMINANCE_FIX
+#define ORION_GLASS_RADIANCE_DOMINANCE_FIX 1
+#endif
+#ifndef ORION_GLASS_FAR_NOISE_FIX
+#define ORION_GLASS_FAR_NOISE_FIX 1
+#endif
+#ifndef ORION_GLASS_LOCAL_RIS_SAMPLES
+#define ORION_GLASS_LOCAL_RIS_SAMPLES 2
+#endif
 #ifndef VPT_GLASS_MAX_INTERFACES
 // 一条视线最多跨过几个玻璃界面。1 块玻璃 = 2 个界面（进入 + 离开），
 // 8 允许"眼睛 -> 玻璃板×n -> 接收面"的叠放（真实遍历下 1 块板必付 2 个界面，
@@ -378,6 +390,9 @@ float glassDielectricFresnel(float cosThetaI, float etaI, float etaT)
 // ----------------------------------------------------------------------------
 // 所有玻璃族（普通玻璃 / 染色玻璃 / 遮光玻璃 / 冰 / 粘液 / 蜂蜜 / 地狱门）
 // 共用这一条路：贴图 alpha 只当覆盖率，Fresnel 与位移由 IOR 决定。
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_RADIANCE_DOMINANCE_FIX
+bool g_glassReflectionDominatesPixel = false;
+#endif
 vec3 tracePrimaryDielectricGlassRadiance(
     vec3 glassSurfacePosition,
     vec3 rayDirection,
@@ -395,6 +410,9 @@ vec3 tracePrimaryDielectricGlassRadiance(
 {
 #if RR_STABLE_GLASS_RADIANCE
     stableGlassRadiance = vec3(0.0);
+#endif
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_RADIANCE_DOMINANCE_FIX
+    g_glassReflectionDominatesPixel = false;
 #endif
     transmissionInfo.waterPathLength = 0.0;
     transmissionInfo.receiverWorldPos = vec3(0.0);
@@ -563,6 +581,10 @@ vec3 tracePrimaryDielectricGlassRadiance(
 #endif
     vec3 travelOrigin = glassSurfacePosition;
     bool reachedEndpoint = false;
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_TWO_INTERFACE_REFRACT
+    bool insideGlass = true;
+    float currentIor = entryIor;
+#endif
 
     for(int slabStep = 0; slabStep <= VPT_GLASS_MAX_INTERFACES; ++slabStep)
     {
@@ -732,6 +754,13 @@ vec3 tracePrimaryDielectricGlassRadiance(
         {
             // 天空 / 无命中：miss shader 已经把天空辐射写进 albedoPacked。
             transmittedRadiance += throughput * unpackAlbedoUnorm(hit.albedoPacked);
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_TWO_INTERFACE_REFRACT
+            rrGlassPaneTransmissionFilter =
+                clamp(throughput, vec3(0.0), vec3(1.0));
+#if GI_GLASS_DOMINANT_GUIDE
+            glassLobeTransmissionWeight = rrGlassPaneTransmissionFilter;
+#endif
+#endif
             reachedEndpoint = true;
             break;
         }
@@ -760,6 +789,78 @@ vec3 tracePrimaryDielectricGlassRadiance(
             {
                 faceNormal = -travelDirection;
             }
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_TWO_INTERFACE_REFRACT && VPT_GLASS_REAL_TRAVERSAL
+            if(dot(faceNormal, travelDirection) > 0.0)
+            {
+                faceNormal = -faceNormal;
+            }
+            const float interfaceCosine =
+                clamp(dot(-travelDirection, faceNormal), 1.0e-4, 1.0);
+
+            if(insideGlass)
+            {
+                // Exit face (glass -> air): restore air-side ray direction via Snell
+                // and apply exit Fresnel without multiplying tint a second time.
+                vec3 exitRefracted =
+                    refract(travelDirection, faceNormal, max(currentIor, 1.0));
+                if(dot(exitRefracted, exitRefracted) > 1.0e-8)
+                {
+                    const float exitFresnel = clamp(
+                        glassDielectricFresnel(interfaceCosine, currentIor, 1.0),
+                        0.0,
+                        VPT_GLASS_MAX_FRESNEL);
+                    throughput *= (1.0 - exitFresnel);
+                    travelDirection = normalize(mix(
+                        viewDirection,
+                        normalize(exitRefracted),
+                        clamp(VPT_GLASS_BENT_STRENGTH, 0.0, 1.0)));
+                }
+                else
+                {
+                    // Guard against TIR blackouts on perpendicular block corners.
+                    const float exitFresnel = clamp(
+                        glassDielectricFresnel(interfaceCosine, 1.0, currentIor),
+                        0.0,
+                        VPT_GLASS_MAX_FRESNEL);
+                    throughput *= (1.0 - exitFresnel);
+                    travelDirection = viewDirection;
+                }
+                insideGlass = false;
+                currentIor = 1.0;
+            }
+            else
+            {
+                // Entry face of a subsequent glass block (air -> glass).
+                const float nextIor =
+                    max(glassIorForProfile(int(getTransparentProfile(hitState))), 1.0);
+                const float nextEntryFresnel = clamp(
+                    glassDielectricFresnel(interfaceCosine, 1.0, nextIor),
+                    0.0,
+                    VPT_GLASS_MAX_FRESNEL);
+                const vec3 faceTint =
+                    clamp(unpackAlbedoUnorm(hit.albedoPacked), vec3(0.0), vec3(1.0));
+                throughput *= (1.0 - nextEntryFresnel) * faceTint;
+#if VPT_GLASS_TRANSMIT_BENT
+                {
+                    const vec3 nextBent = refract(
+                        travelDirection,
+                        faceNormal,
+                        1.0 / max(nextIor, 1.0e-6));
+                    if(dot(nextBent, nextBent) > 1.0e-8)
+                    {
+                        travelDirection = normalize(mix(
+                            travelDirection,
+                            normalize(nextBent),
+                            clamp(VPT_GLASS_BENT_STRENGTH, 0.0, 1.0)));
+                    }
+                }
+#endif
+                insideGlass = true;
+                currentIor = nextIor;
+            }
+            travelOrigin = hitPosition - faceNormal * 0.002;
+            continue;
+#else
             // 进入面 / 出射面：镜像后 faceNormal 恒与行进方向相反，翻面之前先记
             // 原始朝向。进入面（外法线与行进方向相反）= dot < 0。
             // 真实遍历下一块玻璃板会被命中两次（进 + 出），染色只在**进入**付一次
@@ -857,6 +958,7 @@ vec3 tracePrimaryDielectricGlassRadiance(
             }
 #endif
             continue;
+#endif
         }
 
         if(hitClass == RT_HIT_WATER)
@@ -923,6 +1025,102 @@ vec3 tracePrimaryDielectricGlassRadiance(
                 hit.pomSelfShadow,
                 sunDirection);
 
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_FAR_NOISE_FIX
+        {
+            uint receiverRisState =
+                uint(gl_LaunchIDEXT.x) * 1973u +
+                uint(gl_LaunchIDEXT.y) * 9277u ^
+                cam.frameCount * 26699u;
+            pcg_hash(receiverRisState);
+            const vec3 receiverGeoNormal =
+                vptGeometricFaceNormalFromRay(hitPosition, travelDirection);
+            vec3 receiverLocalVoxelDirect = vec3(0.0);
+            for(int risSampleIdx = 0;
+                risSampleIdx < ORION_GLASS_LOCAL_RIS_SAMPLES;
+                ++risSampleIdx)
+            {
+                receiverLocalVoxelDirect += evaluateVPTRISDirectLightingSingle(
+                    hitPosition,
+                    receiverNormal,
+                    receiverAlbedo,
+                    receiverGeoNormal,
+                    false,
+                    true,
+                    receiverRisState);
+            }
+            receiverLocalVoxelDirect *=
+                1.0 / float(max(ORION_GLASS_LOCAL_RIS_SAMPLES, 1));
+            const float receiverCameraDist = length(
+                hitPosition - (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz);
+            vec3 receiverLocalDirect =
+                receiverLocalVoxelDirect +
+                evaluateDynamicLightRISDirect(
+                    hitPosition,
+                    receiverNormal,
+                    receiverAlbedo,
+                    receiverCameraDist,
+                    vec3(-1.0),
+                    -1.0,
+                    1.0,
+                    receiverRisState);
+            const float localDirectLuma = dot(
+                max(receiverLocalDirect, vec3(0.0)),
+                vec3(0.2126, 0.7152, 0.0722));
+            if(localDirectLuma > 4.0)
+            {
+                receiverLocalDirect *= 4.0 / localDirectLuma;
+            }
+            receiverRadiance += receiverLocalDirect;
+        }
+
+        // 与不透明主命中同一个环境函数：旧玻璃链用的内联版在日落/室内只有
+        // 几个百分点 ⇒ 玻璃后的墙面接近死黑，而同一面墙直接看是亮的。
+        receiverRadiance +=
+            receiverAlbedo * getSurfaceAmbientRadiance();
+
+        // 间接光弹射：避免 32m+ 50%/75% RR 稀疏轮盘 + 2x/4x 放大造成远景玻璃亮点，
+        // 并对齐色调保持的最大亮度钳制。
+#ifndef VPT_GLASS_RECEIVER_GI
+#define VPT_GLASS_RECEIVER_GI 1
+#endif
+#if VPT_GLASS_RECEIVER_GI
+        {
+            const float receiverGILodDistance =
+                length(hitPosition - cam.viewInverse[3].xyz);
+            if(receiverGILodDistance < 128.0 * perfL10TierScale())
+            {
+                const float clampedGiLodDist =
+                    min(receiverGILodDistance, 31.0 * perfL10TierScale());
+#if GI_GLASS_RECEIVER_INDIRECT
+                vec3 receiverGiBounce =
+                    tracePrimaryWaterReceiverIndirectReworked(
+                        hitPosition,
+                        receiverNormal,
+                        receiverAlbedo,
+                        clampedGiLodDist,
+                        sunDirection,
+                        false);
+#else
+                vec3 receiverGiBounce =
+                    tracePrimaryWaterReceiverIndirectReworked(
+                        hitPosition,
+                        receiverNormal,
+                        receiverAlbedo,
+                        clampedGiLodDist,
+                        sunDirection);
+#endif
+                const float giBounceLuma = dot(
+                    max(receiverGiBounce, vec3(0.0)),
+                    vec3(0.2126, 0.7152, 0.0722));
+                if(giBounceLuma > 2.5)
+                {
+                    receiverGiBounce *= 2.5 / giBounceLuma;
+                }
+                receiverRadiance += receiverGiBounce;
+            }
+        }
+#endif
+#else
         {
             uint receiverRisState =
                 uint(gl_LaunchIDEXT.x) * 1973u +
@@ -976,9 +1174,13 @@ vec3 tracePrimaryDielectricGlassRadiance(
 #endif
         }
 #endif
+#endif
 
         rrGlassPaneTransmissionFilter =
             clamp(throughput, vec3(0.0), vec3(1.0));
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_TWO_INTERFACE_REFRACT && GI_GLASS_DOMINANT_GUIDE
+        glassLobeTransmissionWeight = rrGlassPaneTransmissionFilter;
+#endif
         transmittedRadiance += throughput * receiverRadiance;
         reachedEndpoint = true;
         break;
@@ -987,11 +1189,31 @@ vec3 tracePrimaryDielectricGlassRadiance(
     if(!reachedEndpoint)
     {
         // 板数预算用尽：用环境底光收尾，避免整块玻璃变黑。
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_TWO_INTERFACE_REFRACT
+        rrGlassPaneTransmissionFilter =
+            clamp(throughput, vec3(0.0), vec3(1.0));
+#if GI_GLASS_DOMINANT_GUIDE
+        glassLobeTransmissionWeight = rrGlassPaneTransmissionFilter;
+#endif
+#endif
         transmittedRadiance += throughput * getSurfaceAmbientRadiance();
     }
 
     const vec3 surfaceReflection =
         reflectionRadiance * slabReflection + sunSpecularGlint;
+
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_RADIANCE_DOMINANCE_FIX
+    {
+        const float reflRadLuma = dot(
+            max(surfaceReflection, vec3(0.0)),
+            vec3(0.2126, 0.7152, 0.0722));
+        const float transRadLuma = dot(
+            max(transmittedRadiance, vec3(0.0)),
+            vec3(0.2126, 0.7152, 0.0722));
+        g_glassReflectionDominatesPixel =
+            (reflRadLuma >= max(transRadLuma, 1.0e-4));
+    }
+#endif
 
 #if RR_STABLE_GLASS_RADIANCE
     // 反射瓣是零方差的确定性量，交给 RR 之后的合成路径单独加回。
@@ -1000,3 +1222,4 @@ vec3 tracePrimaryDielectricGlassRadiance(
 
     return surfaceReflection + transmittedRadiance;
 }
+

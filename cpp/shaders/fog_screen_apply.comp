@@ -21,6 +21,7 @@ layout(set = 0, binding = 0) uniform CameraProperties
 
 layout(set = 0, binding = 5) uniform sampler2D sceneDepth;
 layout(rgba16f, set = 0, binding = 24) uniform image2D applySceneColor;
+layout(rgba16f, set = 0, binding = 18) uniform readonly image3D fogDensityMeta;
 layout(set = 0, binding = 28) uniform sampler3D fogIntegrated;
 
 layout(push_constant) uniform FogFroxelPush
@@ -29,6 +30,10 @@ layout(push_constant) uniform FogFroxelPush
 } pc;
 
 #include "fog_froxel_common.glsl"
+
+#ifndef FOG_SILHOUETTE_FIX
+#define FOG_SILHOUETTE_FIX 1
+#endif
 
 void main()
 {
@@ -82,7 +87,54 @@ void main()
     const float wMin = 0.5 / float(layers);
     const float wMax = (float(layers) - 0.5) / float(layers);
     w = clamp(w + signedIgn * (1.0 / float(layers)) * ditherGate, wMin, wMax);
+#if FOG_SILHOUETTE_FIX
+    vec4 fog;
+    {
+        const ivec3 fogSize = textureSize(fogIntegrated, 0);
+        const int metaZ = clamp(layers - 1, 0, max(fogSize.z - 1, 0));
+        const vec2 fCoord = uv * vec2(fogSize.xy) - 0.5;
+        const ivec2 baseXy = ivec2(floor(fCoord));
+        const vec2 fracXy = clamp(fCoord - vec2(baseXy), 0.0, 1.0);
+        const vec2 invFogXy = 1.0 / vec2(max(fogSize.xy, ivec2(1)));
+
+        vec4 fogSum = vec4(0.0);
+        float wSum = 0.0;
+        float bestMaxDist = -1.0;
+        vec4 bestFog = vec4(0.0, 0.0, 0.0, 1.0);
+
+        for(int oy = 0; oy <= 1; ++oy)
+        {
+            for(int ox = 0; ox <= 1; ++ox)
+            {
+                const ivec2 cxy = clamp(
+                    baseXy + ivec2(ox, oy),
+                    ivec2(0),
+                    max(fogSize.xy - ivec2(1), ivec2(0)));
+                const float bW =
+                    (ox == 0 ? 1.0 - fracXy.x : fracXy.x) *
+                    (oy == 0 ? 1.0 - fracXy.y : fracXy.y);
+                const vec4 meta = imageLoad(fogDensityMeta, ivec3(cxy, metaZ));
+                const float tileMaxDist = (meta.a > 0.5) ? meta.g : maxDistance;
+                const float depthValid = smoothstep(
+                    lookupDistance * 0.72,
+                    lookupDistance * 0.96,
+                    tileMaxDist);
+                const vec2 tapUv = (vec2(cxy) + 0.5) * invFogXy;
+                const vec4 tapFog = textureLod(fogIntegrated, vec3(tapUv, w), 0.0);
+                fogSum += tapFog * (bW * depthValid);
+                wSum += bW * depthValid;
+                if(tileMaxDist > bestMaxDist)
+                {
+                    bestMaxDist = tileMaxDist;
+                    bestFog = tapFog;
+                }
+            }
+        }
+        fog = (wSum > 1.0e-4) ? (fogSum / wSum) : bestFog;
+    }
+#else
     vec4 fog = textureLod(fogIntegrated, vec3(uv, w), 0.0);
+#endif
 
     if(!all(equal(fog, fog)))
     {

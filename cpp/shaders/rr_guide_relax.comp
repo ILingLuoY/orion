@@ -27,6 +27,10 @@ layout(push_constant) uniform RRGuideRelaxPush
     float padding2;
 } pc;
 
+#ifndef RR_GUIDE_PURIFY_V1
+#define RR_GUIDE_PURIFY_V1 1
+#endif
+
 const float NEIGHBOR_EPS = 0.00002;
 const float NEIGHBOR_SCALE = 25.0;
 
@@ -73,11 +77,44 @@ void main()
 
     ivec2 local = tileLocal(pixel, groupBase);
     vec4 center = tile[local.x + 18 * local.y];
+#if RR_GUIDE_PURIFY_V1
+    float centerDepth = imageLoad(depthImage, pixel).r;
+#endif
 
     float deltaHere = tileDelta[local.x + 18 * local.y];
     float deltaNeighbor = 0.0;
     float normalSpread = 0.0;
 
+#if RR_GUIDE_PURIFY_V1
+    float centerLen2 = dot(center.xyz, center.xyz);
+    vec3 n0 = centerLen2 > 1.0e-8 ? center.xyz * inversesqrt(centerLen2) : vec3(0.0, 1.0, 0.0);
+    for(int i = 0; i < 4; ++i)
+    {
+        ivec2 o = local + OFFSETS[i];
+        vec4 n = tile[o.x + 18 * o.y];
+        deltaNeighbor = max(deltaNeighbor, tileDelta[o.x + 18 * o.y]);
+
+        float v = 0.02;
+        float nLen2 = dot(n.xyz, n.xyz);
+        if(tile[o.x + 18 * o.y].w > 0.0 && nLen2 > 1.0e-8)
+        {
+            v = clamp(1.0 - dot(n0, n.xyz * inversesqrt(nLen2)), 0.0, 1.0);
+        }
+        normalSpread += v;
+    }
+
+    float gate = max(deltaHere, deltaNeighbor);
+    float relax = clamp((normalSpread - NEIGHBOR_EPS) * NEIGHBOR_SCALE, 0.0, 1.0);
+    relax = clamp(relax * pc.relaxScale * gate, 0.0, 1.0);
+
+    float roughness = clamp(center.w, 0.0, 1.0);
+    float minR = gate > 0.0 ? max(pc.minRoughness, roughness) : roughness;
+    float relaxed = clamp(
+        mix(roughness, 1.0, relax),
+        minR,
+        1.0
+    );
+#else
     vec3 n0 = normalize(center.xyz);
     for(int i = 0; i < 4; ++i)
     {
@@ -103,6 +140,7 @@ void main()
         max(pc.minRoughness, roughness),
         1.0
     );
+#endif
 
     if(pc.farCloudDistance > 0.0)
     {
@@ -130,19 +168,34 @@ void main()
             float cloudDepth = clamp(
                 nearPlane / max(cloudDistance * cosine, 1.0e-3), 0.0, 1.0);
 
-            float deltaFlag = imageLoad(diffuseAlbedoImage, pixel).a;
+#if RR_GUIDE_PURIFY_V1
+            float sceneDist = centerDepth > 1.0e-6
+                ? nearPlane / max(centerDepth * cosine, 1.0e-5)
+                : 1.0e30;
+            if(centerDepth <= 1.0e-6 || sceneDist >= cloudDistance)
+#endif
+            {
+                float deltaFlag = imageLoad(diffuseAlbedoImage, pixel).a;
 
-            imageStore(diffuseAlbedoImage, pixel,
-                vec4(max(cloudLayer.rgb, vec3(0.0)), deltaFlag));
-            imageStore(specularAlbedoImage, pixel, vec4(0.0, 0.0, 0.0, 1.0));
-            imageStore(normalRoughnessImage, pixel,
-                vec4(-worldDirection, 1.0));
-            imageStore(specularHitDistanceImage, pixel,
-                vec4(cloudDistance, 0.0, 0.0, 0.0));
-            imageStore(depthImage, pixel, vec4(cloudDepth, 0.0, 0.0, 0.0));
-            return;
+                imageStore(diffuseAlbedoImage, pixel,
+                    vec4(max(cloudLayer.rgb, vec3(0.0)), deltaFlag));
+                imageStore(specularAlbedoImage, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+                imageStore(normalRoughnessImage, pixel,
+                    vec4(-worldDirection, 1.0));
+                imageStore(specularHitDistanceImage, pixel,
+                    vec4(cloudDistance, 0.0, 0.0, 0.0));
+                imageStore(depthImage, pixel, vec4(cloudDepth, 0.0, 0.0, 0.0));
+                return;
+            }
         }
     }
+
+#if RR_GUIDE_PURIFY_V1
+    if(centerDepth <= 1.0e-6)
+    {
+        return;
+    }
+#endif
 
     imageStore(
         normalRoughnessImage,

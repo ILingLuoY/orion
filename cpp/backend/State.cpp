@@ -597,7 +597,12 @@ size_t g_tlasInstanceCount=0;
 
 DeferredSectionBuildResources
     g_deferredSectionBuild;
-RtxSectionBuildBufferPool g_vertexStagingPool;
+RtxSectionBuildBufferPool g_vertexStagingPool = []
+{
+    RtxSectionBuildBufferPool pool;
+    pool.keepSlots = CPUPERF_STAGING_POOL_KEEP_SLOTS;
+    return pool;
+}();
 RtxSectionBuildBufferPool g_blasScratchPool;
 uint64_t g_sectionBuildPoolAllocCount = 0u;
 uint64_t g_sectionBuildPoolReuseCount = 0u;
@@ -703,6 +708,12 @@ VkPipelineLayout
 VkPipeline
     g_sdrPostPipeline =
         VK_NULL_HANDLE;
+VkBuffer
+    g_sdrAces2LutBuffer =
+        VK_NULL_HANDLE;
+VkDeviceMemory
+    g_sdrAces2LutMemory =
+        VK_NULL_HANDLE;
 std::atomic<bool> g_hdrRequested{false};
 std::atomic<bool> g_hdrSurfaceSupported{false};
 VkDescriptorPool  g_hdrEncodeDescriptorPool  = VK_NULL_HANDLE;
@@ -728,7 +739,11 @@ bool
 
 std::atomic_bool g_aeEnabled{true};
 std::atomic<float> g_aeCompensationEV{0.0f};
-float g_aeMinEV = -4.0f;
+// 2026-11-23: extend AE lower clamp from -4.0 to -5.5 EV so bright sunlit snow
+// (avgLogLuma ~ +2.25, raw targetEV ~ -4.72) stops pegging the -4.0 floor.
+// Rollback: set kAE_EXTENDED_MIN_EV = false.
+static constexpr bool kAE_EXTENDED_MIN_EV = true;
+float g_aeMinEV = kAE_EXTENDED_MIN_EV ? -5.5f : -4.0f;
 float g_aeMaxEV = 1.0f;
 float g_aeAdaptUpRate = 1.5f;
 float g_aeAdaptDownRate = 3.0f;
@@ -917,7 +932,7 @@ VkImageView g_glassAlphaBlendBoundShY = VK_NULL_HANDLE;
 std::atomic<int> g_giNearRateOverride{-1};
 std::atomic<int> g_glossyRoughLodOverride{-1};
 std::atomic<int> g_directLightModeOverride{-1};
-std::atomic<int> g_indirectModeOverride{-1};
+std::atomic<int> g_indirectModeOverride{1};
 std::atomic<int> g_sparseRatePercentOverride{-1};
 std::atomic<int> g_rtxdiReuseInactiveOverride{-1};
 
@@ -1634,6 +1649,9 @@ std::atomic<float> g_postGainB{1.0f};
 std::atomic<int>   g_mirrorBounceCount{1};
 std::atomic<int>   g_tlasCullDistance{0};
 std::atomic<int>   g_tlasFrustumCullMargin{0};
+float              g_lastTlasCullForward[3]{0.0f, 0.0f, -1.0f};
+float              g_lastTlasCullPos[3]{0.0f, 0.0f, 0.0f};
+bool               g_lastTlasCullValid = false;
 std::atomic<float> g_postBloomStrength{0.0f};
 std::atomic<float> g_cgExposureEV{0.00f};
 std::atomic<float> g_cgBlackPoint{0.00f};
@@ -1894,6 +1912,13 @@ VkDeviceMemory g_vptBestLightMemory = VK_NULL_HANDLE;
 VkDeviceSize g_vptBestLightBytes = 0;
 uint32_t g_vptBestLightTileColumns = 0u;
 uint32_t g_vptBestLightTileRows = 0u;
+VkBuffer g_vptLightGridBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_vptLightGridMemory = VK_NULL_HANDLE;
+VkPipeline g_vptLightGridPipeline = VK_NULL_HANDLE;
+VkPipelineLayout g_vptLightGridPipelineLayout = VK_NULL_HANDLE;
+VkPipeline g_vptRestirSpatialPipeline = VK_NULL_HANDLE;
+VkPipelineLayout g_vptRestirSpatialPipelineLayout = VK_NULL_HANDLE;
+bool g_vptRestirSpatialActiveFrame = false;
 std::mutex g_vliMutex;
 std::unordered_map<uint64_t, VLISectionCpuPage> g_vliSections;
 std::unordered_map<uint64_t, std::vector<uint64_t>> g_vliChunkSectionIndex;
@@ -2052,6 +2077,25 @@ VkStridedDeviceAddressRegionKHR g_k2iRaygenRegion{};
 VkStridedDeviceAddressRegionKHR g_k2iMissRegion{};
 VkStridedDeviceAddressRegionKHR g_k2iHitRegion{};
 VkStridedDeviceAddressRegionKHR g_k2iCallableRegion{};
+// 2026-11-24: K2-I 稀疏紧凑间接调度与 0-ray compose 管线/资源（binding 92 / 100）
+VkPipeline g_k2iComposePipeline = VK_NULL_HANDLE;
+VkBuffer g_k2iComposeSbtBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_k2iComposeSbtMemory = VK_NULL_HANDLE;
+VkStridedDeviceAddressRegionKHR g_k2iComposeRaygenRegion{};
+VkImage g_k2GiTraceImage = VK_NULL_HANDLE;
+VkDeviceMemory g_k2GiTraceMemory = VK_NULL_HANDLE;
+VkImageView g_k2GiTraceView = VK_NULL_HANDLE;
+VkImageLayout g_k2GiTraceLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+uint32_t g_k2GiTraceWidth = 0u;
+uint32_t g_k2GiTraceHeight = 0u;
+VkBuffer g_k2iCompactBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_k2iCompactMemory = VK_NULL_HANDLE;
+VkDeviceAddress g_k2iCompactBufferAddress = 0u;
+uint32_t g_k2iCompactCapacityPixels = 0u;
+VkPipeline g_k2iCompactPipeline = VK_NULL_HANDLE;
+bool g_k2iCompactPipelineFailed = false;
+VkPipeline g_k2locCompactPipeline = VK_NULL_HANDLE;
+bool g_k2locCompactPipelineFailed = false;
 // ④ K2-D 再拆分（默认开，ORION_K2_SPLIT2=0 回退到 ③ 的 K2-D/K2-I 两腿）：
 // K2-SUN（水+太阳直射/GGX/SSS/RTAO）+ K2-LOC（局部光/水面反射太阳/GGX 镜面）
 VkPipeline g_k2sunPipeline = VK_NULL_HANDLE;

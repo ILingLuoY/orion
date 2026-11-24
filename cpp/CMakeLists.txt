@@ -50,6 +50,9 @@ set(SOURCES
         backend/Cleanup.cpp
         backend/Clouds.cpp
         backend/Device.cpp
+        # 2026-11-23：Windows 高级颜色（系统 HDR）状态查询，供 hdrOutputActive()
+        # 门控使用，见 backend/DisplayHdr.cpp 头注释。
+        backend/DisplayHdr.cpp
         backend/Entities.cpp
         backend/Frame.cpp
         backend/Geometry.cpp

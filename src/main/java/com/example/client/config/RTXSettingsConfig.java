@@ -1788,7 +1788,7 @@ public final class RTXSettingsConfig {
     
 
     private static int indirectMode =
-            0;
+            1;
 
     private static int sparseRatePercent =
             0;
@@ -3971,7 +3971,7 @@ public final class RTXSettingsConfig {
 
             indirectMode =
                     data.indirectMode == null
-                            ? 0
+                            ? 1
                             : (data.indirectMode == 0 ? 0 : 1);
 
             sparseRatePercent =
@@ -3999,7 +3999,7 @@ public final class RTXSettingsConfig {
                             // 2026-11-07：上限 5 保留「关闭 RTAO」档，别在这里把它压回 4
                             validSetting(data.aoNearSamples, 1, 0, 5),
                             validSetting(data.aoMidSamples, 1, 0, 2),
-                            validSetting(data.giBounces, 1, 0, 4),
+                            validSetting(data.giBounces, 1, 0, 8),
                             validSetting(data.sunShadowSamples, 2, 1, 2),
                             validSetting(data.localLightRisCandidates, 4, 1, 32),
                             validSetting(data.localLightAreaSamples, 2, 1, 2),
@@ -5083,7 +5083,7 @@ public final class RTXSettingsConfig {
             // 存档不更新 ⇒ 重新打开设置又变回旧值。三处已同步放宽到 5。
             if(aoNearSamples < 0 || aoNearSamples > 5 ||
                     aoMidSamples < 0 || aoMidSamples > 2 ||
-                    giBounces < 0 || giBounces > 4 ||
+                    giBounces < 0 || giBounces > 8 ||
                     sunShadowSamples < 1 || sunShadowSamples > 2 ||
                     localLightRisCandidates < 1 || localLightRisCandidates > 32 ||
                     localLightAreaSamples < 1 || localLightAreaSamples > 2 ||

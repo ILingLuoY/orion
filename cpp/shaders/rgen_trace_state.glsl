@@ -1,5 +1,9 @@
 
+#ifdef ORION_K2I_COMPOSE_COMPUTE
+HitPayload payload;
+#else
 layout(location = 0) rayPayloadEXT HitPayload payload;
+#endif
 // Old mode keeps one variable for both roles; the seed assignments and the
 // Any-Hit-only sites were retargeted to `hit` when the split was introduced,
 // so alias it back instead of keeping two code paths.
@@ -247,7 +251,7 @@ const uint RT_STATE_CLEAR_GLASS_BIT    = 1u << 12u;
 // 两处必须同值：本文件与 rt_test.rmiss（rmiss 是独立 TU，宏不跨文件传递）。
 // =====================================================
 #ifndef GI_SKIP_SUN_DISK
-#define GI_SKIP_SUN_DISK 0
+#define GI_SKIP_SUN_DISK 1
 #endif
 const uint RT_STATE_NO_SUN_DISK_BIT    = 1u << 14u;
 
@@ -330,6 +334,10 @@ const uint RT_PURPOSE_PRIMARY_TRANSMISSION = 8u;
 #define ORION_GLASS_CHAIN_BIT 1
 #endif
 const uint RT_STATE_PRIMARY_TRANSMISSION_BIT = 1u << 18u;
+// 2026-11-24：漫反射 GI 射线跳过 rmiss 的 24 步 Tyndall 3D 云行军（bit 19）。
+// 水面/玻璃/glossy 镜面反射保留完整云层，仅半余弦积分后的漫反射 GI 略过，
+// 避免与 bit 14（阴影水面反射也置位，仍需云）混淆。
+const uint RT_STATE_GI_SKIP_CLOUDS_BIT       = 1u << 19u;
 
 const uint RT_HIT_OPAQUE               = 0u;
 const uint RT_HIT_WATER                = 1u;
@@ -392,6 +400,7 @@ vec3 traceVptLocalLightVisibility(
         return vec3(1.0);
     }
 
+    #ifndef ORION_K2I_COMPOSE_COMPUTE
     hit.hitDistance = 1.0;
     hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
     hit.parallaxRayTravel = 0.0;
@@ -425,6 +434,9 @@ vec3 traceVptLocalLightVisibility(
     }
 
     return clamp(unpackAlbedoUnorm(hit.albedoPacked), vec3(0.0), vec3(1.0));
+    #else
+    return vec3(1.0);
+    #endif
 }
 
 uint getRayPurpose(uint state)

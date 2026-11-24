@@ -11,6 +11,19 @@ static uint32_t s_vliHistFramesSinceLastClear = UINT32_MAX;
 static bool s_vliHistForceClear = true;
 // 实际 fill 次数（低频日志记账，非每帧打印）。
 static uint64_t s_vliHistActualClears = 0u;
+static uint64_t s_vptLightGridDataEpoch = 1u;
+static uint64_t s_vptLightGridGeoEpoch = 1u;
+static bool s_vptLightGridCacheValid = false;
+static int32_t s_vptLightGridLastOriginX = 0;
+static int32_t s_vptLightGridLastOriginY = 0;
+static int32_t s_vptLightGridLastOriginZ = 0;
+static uint32_t s_vptLightGridLastLivePages = 0u;
+static uint32_t s_vptLightGridLastLightRev = 0u;
+static uint64_t s_vptLightGridLastEpoch = 0u;
+static uint64_t s_vptLightGridLastGeoEpoch = 0u;
+static float s_vptLightGridLastRangeScale = -1.0f;
+static bool s_vptLightGridHasLastBuildTime = false;
+static std::chrono::steady_clock::time_point s_vptLightGridLastBuildTime{};
 
 
 // Total bytes of the capacity-sized VLI/VPT pools, i.e. every buffer that
@@ -21,7 +34,9 @@ VkDeviceSize vliPoolBytesForCapacity(uint32_t capacity)
     const VkDeviceSize pages = static_cast<VkDeviceSize>(capacity);
 
     return pages * VLI_PAGE_WORDS * sizeof(uint32_t)
-        + pages * VPT_DIRECTIONAL_CACHE_WORDS * sizeof(uint32_t)
+        + (VPT_DIRECTIONAL_CACHE_WORDS > 0u
+            ? static_cast<VkDeviceSize>(pages) * VPT_DIRECTIONAL_CACHE_WORDS * sizeof(uint32_t)
+            : static_cast<VkDeviceSize>(16u))
         + pages * VPT_SURFACE_FACES_PER_SECTION * sizeof(uint32_t)
         + (1u + pages) * sizeof(uint32_t)
         + pages * VPT_EMITTER_PAGE_WORDS * sizeof(uint32_t)
@@ -753,12 +768,13 @@ void createRayTracingDescriptorPoolAndSet()
         //（23 → 25；描述符按需写，但池配额按布局的静态绑定数扣减，不补
         // 会在 g_rayTracingDescriptorSet 分配时直接失败）。
         // 2026-11-21 P0-1：+1 = 主命中世界位移旁路槽 binding 98（25 → 26）。
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 26 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 28 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 },
         // 2026-11-05 B：+1 = K1/K2 landing SSBO（binding 88，21 → 22）。
         // 2026-11-16：+1 = RT 阶段三计数器 SSBO（binding 93，22 → 23；仅总闸开时写）。
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 23 }
+        // 2026-11-24：+1 = K2-I 紧凑间接调度 SSBO binding 100 / k2GiTraceImage binding 92。
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 40 }
     };
     VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pi.maxSets = 1;
@@ -843,7 +859,9 @@ VkDeviceSize poolByteSizeForCapacity(
     switch(poolIndex)
     {
         case 0u: return pages * VLI_PAGE_WORDS * sizeof(uint32_t);
-        case 1u: return pages * VPT_DIRECTIONAL_CACHE_WORDS * sizeof(uint32_t);
+        case 1u: return VPT_DIRECTIONAL_CACHE_WORDS > 0u
+            ? static_cast<VkDeviceSize>(pages) * VPT_DIRECTIONAL_CACHE_WORDS * sizeof(uint32_t)
+            : static_cast<VkDeviceSize>(16u);
         case 2u: return pages * VPT_SURFACE_FACES_PER_SECTION * sizeof(uint32_t);
         case 3u: return (pages + 1u) * sizeof(uint32_t);
         case 4u: return pages * VPT_EMITTER_PAGE_WORDS * sizeof(uint32_t);
@@ -901,6 +919,7 @@ void updateVLIDescriptors()
     }
 
     vkUpdateDescriptorSets(g_device, 9, writes, 0, nullptr);
+    updateVPTLightGridDescriptor();
 }
 
 
@@ -930,7 +949,9 @@ void createVLIPoolBuffers()
     createBuffer(
         g_device,
         g_physicalDevice,
-        pageCapacity * VPT_DIRECTIONAL_CACHE_WORDS * sizeof(uint32_t),
+        VPT_DIRECTIONAL_CACHE_WORDS > 0u
+            ? static_cast<VkDeviceSize>(pageCapacity) * VPT_DIRECTIONAL_CACHE_WORDS * sizeof(uint32_t)
+            : static_cast<VkDeviceSize>(16u),
         storageUsage,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         g_vliScratchBuffer,
@@ -1185,7 +1206,9 @@ void growVLIPageCapacityLocked(uint32_t requiredPages)
     };
     const VkDeviceSize oldPoolBytes[8] = {
         static_cast<VkDeviceSize>(previousCapacity) * VLI_PAGE_WORDS * sizeof(uint32_t),
-        static_cast<VkDeviceSize>(previousCapacity) * VPT_DIRECTIONAL_CACHE_WORDS * sizeof(uint32_t),
+        VPT_DIRECTIONAL_CACHE_WORDS > 0u
+            ? static_cast<VkDeviceSize>(previousCapacity) * VPT_DIRECTIONAL_CACHE_WORDS * sizeof(uint32_t)
+            : static_cast<VkDeviceSize>(16u),
         static_cast<VkDeviceSize>(previousCapacity) * VPT_SURFACE_FACES_PER_SECTION * sizeof(uint32_t),
         (static_cast<VkDeviceSize>(previousCapacity) + 1u) * sizeof(uint32_t),
         static_cast<VkDeviceSize>(previousCapacity) * VPT_EMITTER_PAGE_WORDS * sizeof(uint32_t),
@@ -2680,6 +2703,16 @@ void recordVLIUpdates(VkCommandBuffer cmd)
         g_vliNeedsInitialClear = false;
     }
 
+    if(didInitialClear || !tablePayloads.empty() ||
+       !emitterUploads.empty() || !sourceDirectoryUploads.empty())
+    {
+        ++s_vptLightGridDataEpoch;
+    }
+    if(!sourceUploads.empty())
+    {
+        ++s_vptLightGridGeoEpoch;
+    }
+
     for(const auto& update : tablePayloads)
     {
         vkCmdUpdateBuffer(
@@ -2811,12 +2844,8 @@ void recordVLIUpdates(VkCommandBuffer cmd)
         RTLog(ss.str());
     }
 
-    if(!tableUpdates.empty() || !sourceUploads.empty() ||
-       !emitterUploads.empty() || !emitterAliasUploads.empty() || !candidateUploads.empty() ||
-       !sourceDirectoryUploads.empty())
-    {
-        g_vptDirectHistoryNeedsClear = true;
-    }
+    // ReSTIR DI validates cached emitter voxels per-pixel in O(1); routine
+    // section uploads no longer wipe the full-screen temporal history buffer.
 
     g_vliMsUpload =
         std::chrono::duration<double, std::milli>(
@@ -2949,6 +2978,7 @@ void createVLIComputePipeline()
 {
     if(g_vliComputePipeline != VK_NULL_HANDLE)
     {
+        createVPTLightGridResources();
         return;
     }
 
@@ -2996,11 +3026,13 @@ void createVLIComputePipeline()
 
     vkDestroyShaderModule(g_device, shaderModule, nullptr);
     RTLog("[VLI-1.4] compute pipeline created");
+    createVPTLightGridResources();
 }
 
 
 void destroyVLIResources()
 {
+    destroyVPTLightGridResources();
     if(g_vliComputePipeline != VK_NULL_HANDLE)
     {
         vkDestroyPipeline(g_device, g_vliComputePipeline, nullptr);
@@ -3113,6 +3145,8 @@ void clearVLISections()
     g_vptEmitterRevision = 1u;
     g_vptTemporalFrame = 0u;
     g_vliNeedsInitialClear = true;
+    ++s_vptLightGridDataEpoch;
+    s_vptLightGridCacheValid = false;
 }
 void eraseVLITableSlot(uint32_t eraseSlot)
 {
@@ -3496,9 +3530,24 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
         }
     }
 
+    // 2026-11-23 锁竞争批⑧：纯计算部分在锁外做完（修订号占位 0，锁内回填）。
+    std::vector<uint32_t> prebuiltIncoming;
+    std::vector<uint32_t> prebuiltEmitterIndexWords;
+    std::vector<uint32_t> prebuiltEmitterAliasWords;
+    if constexpr(CPUPERF_VLI_PREBUILD_OUTSIDE_LOCK)
+    {
+        prebuiltIncoming.assign(incomingWords, incomingWords + VLI_SOURCE_WORDS);
+        prebuiltEmitterIndexWords =
+            buildVPTEmitterIndexWords(prebuiltIncoming, 0u);
+        prebuiltEmitterAliasWords =
+            buildVPTEmitterAliasWords(prebuiltEmitterIndexWords);
+    }
+
     {
         VliWorkerHoldProbe vliWorkerProbe;
 
+        // 2026-11-23 锁竞争批⑦：声明在 lock_guard 之前 ⇒ 解锁之后才恢复优先级。
+        const ScopedLockHolderPriorityBoost vliLockBoost;
         std::lock_guard<std::mutex> lock(g_vliMutex);
 
         vliWorkerProbe.lockWaitMs =
@@ -3524,12 +3573,20 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
             return;
         }
 
-        std::vector<uint32_t> incoming(VLI_SOURCE_WORDS);
+        std::vector<uint32_t> incoming;
+        if constexpr(CPUPERF_VLI_PREBUILD_OUTSIDE_LOCK)
+        {
+            incoming = std::move(prebuiltIncoming);
+        }
+        else
+        {
+        incoming.resize(VLI_SOURCE_WORDS);
         std::memcpy(
             incoming.data(),
             incomingWords,
             expectedBytes
         );
+        }
 
         vliWorkerProbe.cmpMs =
             VliWorkerHoldProbe::sinceMs(vliWorkerProbe.begin) -
@@ -3616,7 +3673,22 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
         }
         std::vector<LocalLightRecord> legacyBakeLights;
 
-        std::vector<uint32_t> emitterIndexWords =
+        std::vector<uint32_t> emitterIndexWords;
+        std::vector<uint32_t> emitterAliasWords;
+        if constexpr(CPUPERF_VLI_PREBUILD_OUTSIDE_LOCK)
+        {
+            // legacyBakeLights 恒空 ⇒ 原路径即 buildVPTEmitterIndexWords(incoming, rev)，
+            // 与锁外预构建同一函数；唯一差别是 words[1] 的修订号，这里回填。
+            emitterIndexWords = std::move(prebuiltEmitterIndexWords);
+            emitterAliasWords = std::move(prebuiltEmitterAliasWords);
+            if(emitterIndexWords.size() > 1u)
+            {
+                emitterIndexWords[1] = emitterRevision;
+            }
+        }
+        else
+        {
+        emitterIndexWords =
             buildVPTEmitterIndexWordsForSection(
                 sectionX,
                 sectionY,
@@ -3625,8 +3697,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
                 legacyBakeLights,
                 emitterRevision
             );
-        std::vector<uint32_t> emitterAliasWords =
+        emitterAliasWords =
             buildVPTEmitterAliasWords(emitterIndexWords);
+        }
 
         vliWorkerProbe.indexMs =
             VliWorkerHoldProbe::sinceMs(vliWorkerProbe.begin) -
@@ -4538,5 +4611,359 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
 
     RTLog(
         ss.str()
+    );
+}
+
+static VkDescriptorSet s_vptLightGridBoundSet = VK_NULL_HANDLE;
+
+void updateVPTLightGridDescriptor()
+{
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       g_vptLightGridBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorBufferInfo info{};
+    info.buffer = g_vptLightGridBuffer;
+    info.offset = 0;
+    info.range = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    write.dstSet = g_rayTracingDescriptorSet;
+    write.dstBinding = 99u;
+    write.descriptorCount = 1u;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &info;
+
+    vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+    s_vptLightGridBoundSet = g_rayTracingDescriptorSet;
+}
+
+void destroyVPTLightGridResources()
+{
+    if(g_vptLightGridPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_vptLightGridPipeline, nullptr);
+        g_vptLightGridPipeline = VK_NULL_HANDLE;
+    }
+    if(g_vptLightGridPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_vptLightGridPipelineLayout, nullptr);
+        g_vptLightGridPipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_vptRestirSpatialPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_vptRestirSpatialPipeline, nullptr);
+        g_vptRestirSpatialPipeline = VK_NULL_HANDLE;
+    }
+    if(g_vptRestirSpatialPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_vptRestirSpatialPipelineLayout, nullptr);
+        g_vptRestirSpatialPipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_vptLightGridBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_vptLightGridBuffer, nullptr);
+        g_vptLightGridBuffer = VK_NULL_HANDLE;
+    }
+    if(g_vptLightGridMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_vptLightGridMemory, nullptr);
+        g_vptLightGridMemory = VK_NULL_HANDLE;
+    }
+    s_vptLightGridBoundSet = VK_NULL_HANDLE;
+    g_vptRestirSpatialActiveFrame = false;
+    s_vptLightGridCacheValid = false;
+    ++s_vptLightGridDataEpoch;
+}
+
+void createVPTLightGridResources()
+{
+    if(g_vptLightGridBuffer == VK_NULL_HANDLE)
+    {
+        createBuffer(
+            g_device,
+            g_physicalDevice,
+            VPT_LIGHT_GRID_BYTES,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            g_vptLightGridBuffer,
+            g_vptLightGridMemory
+        );
+        updateVPTLightGridDescriptor();
+        RTLog("[VPT-M3] light grid buffer created bytes=" +
+              std::to_string(static_cast<unsigned long long>(VPT_LIGHT_GRID_BYTES)));
+    }
+
+    auto createComputePipe = [](
+        const char* spvPath,
+        const char* tag,
+        VkPipelineLayout& outLayout,
+        VkPipeline& outPipeline
+    )
+    {
+        if(outPipeline != VK_NULL_HANDLE)
+        {
+            return;
+        }
+        VkShaderModule mod = VK_NULL_HANDLE;
+        try
+        {
+            const std::vector<uint8_t> code = loadSpv(spvPath);
+            mod = createShaderModule(g_device, code);
+
+            VkPushConstantRange pushRange{};
+            pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            pushRange.offset = 0u;
+            pushRange.size = sizeof(uint32_t) * 4u;
+
+            VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            layoutInfo.setLayoutCount = 1u;
+            layoutInfo.pSetLayouts = &g_rayTracingDescriptorSetLayout;
+            layoutInfo.pushConstantRangeCount = 1u;
+            layoutInfo.pPushConstantRanges = &pushRange;
+            check(
+                vkCreatePipelineLayout(g_device, &layoutInfo, nullptr, &outLayout),
+                (std::string(tag) + " create pipeline layout failed").c_str()
+            );
+
+            VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = mod;
+            stage.pName = "main";
+
+            VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            pipeInfo.stage = stage;
+            pipeInfo.layout = outLayout;
+            check(
+                vkCreateComputePipelines(
+                    g_device, getSharedPipelineCache(), 1u, &pipeInfo, nullptr, &outPipeline
+                ),
+                (std::string(tag) + " create compute pipeline failed").c_str()
+            );
+
+            vkDestroyShaderModule(g_device, mod, nullptr);
+            mod = VK_NULL_HANDLE;
+            RTLog(std::string(tag) + " compute pipeline created");
+        }
+        catch(const std::exception& e)
+        {
+            if(mod != VK_NULL_HANDLE)
+            {
+                vkDestroyShaderModule(g_device, mod, nullptr);
+            }
+            if(outLayout != VK_NULL_HANDLE)
+            {
+                vkDestroyPipelineLayout(g_device, outLayout, nullptr);
+                outLayout = VK_NULL_HANDLE;
+            }
+            outPipeline = VK_NULL_HANDLE;
+            RTLog(std::string(tag) + " disabled: " + e.what());
+        }
+    };
+
+    createComputePipe(
+        "shaders/vpt_light_grid_build.comp.spv",
+        "[VPT-M3]",
+        g_vptLightGridPipelineLayout,
+        g_vptLightGridPipeline
+    );
+    createComputePipe(
+        "shaders/vpt_restir_spatial.comp.spv",
+        "[VPT-M4B]",
+        g_vptRestirSpatialPipelineLayout,
+        g_vptRestirSpatialPipeline
+    );
+}
+
+void recordVPTLightGridBuild(VkCommandBuffer cmd)
+{
+    if(g_vptLightGridPipeline == VK_NULL_HANDLE ||
+       g_vptLightGridPipelineLayout == VK_NULL_HANDLE ||
+       g_vptLightGridBuffer == VK_NULL_HANDLE ||
+       g_rayTracingDescriptorSet == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    if(s_vptLightGridBoundSet != g_rayTracingDescriptorSet)
+    {
+        updateVPTLightGridDescriptor();
+        s_vptLightGridCacheValid = false;
+    }
+
+    const int32_t originX = static_cast<int32_t>(std::floor(g_prevCameraViewInverse[12] / 4.0f)) -
+                            static_cast<int32_t>(VPT_LIGHT_GRID_DIM_X / 2u);
+    const int32_t originY = static_cast<int32_t>(std::floor(g_prevCameraViewInverse[13] / 4.0f)) -
+                            static_cast<int32_t>(VPT_LIGHT_GRID_DIM_Y / 2u);
+    const int32_t originZ = static_cast<int32_t>(std::floor(g_prevCameraViewInverse[14] / 4.0f)) -
+                            static_cast<int32_t>(VPT_LIGHT_GRID_DIM_Z / 2u);
+    const float rangeScale = g_localLightMaxDistance.load(std::memory_order_relaxed);
+    const bool urgentDirty =
+        !g_hasPrevCameraInverse ||
+        !s_vptLightGridCacheValid ||
+        originX != s_vptLightGridLastOriginX ||
+        originY != s_vptLightGridLastOriginY ||
+        originZ != s_vptLightGridLastOriginZ ||
+        g_vliNextPage != s_vptLightGridLastLivePages ||
+        g_localLightRevision != s_vptLightGridLastLightRev ||
+        s_vptLightGridDataEpoch != s_vptLightGridLastEpoch ||
+        rangeScale != s_vptLightGridLastRangeScale;
+    const bool geoDirty =
+        (s_vptLightGridGeoEpoch != s_vptLightGridLastGeoEpoch);
+    if(!urgentDirty && !geoDirty)
+    {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if(!urgentDirty && geoDirty && s_vptLightGridHasLastBuildTime)
+    {
+        const double elapsedMs = std::chrono::duration<double, std::milli>(
+            now - s_vptLightGridLastBuildTime
+        ).count();
+        if(elapsedMs < 250.0)
+        {
+            return;
+        }
+    }
+    s_vptLightGridCacheValid = g_hasPrevCameraInverse;
+    s_vptLightGridLastOriginX = originX;
+    s_vptLightGridLastOriginY = originY;
+    s_vptLightGridLastOriginZ = originZ;
+    s_vptLightGridLastLivePages = g_vliNextPage;
+    s_vptLightGridLastLightRev = g_localLightRevision;
+    s_vptLightGridLastEpoch = s_vptLightGridDataEpoch;
+    s_vptLightGridLastGeoEpoch = s_vptLightGridGeoEpoch;
+    s_vptLightGridLastRangeScale = rangeScale;
+    s_vptLightGridHasLastBuildTime = true;
+    s_vptLightGridLastBuildTime = now;
+
+    VkMemoryBarrier preBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    preBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    preBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u,
+        1u,
+        &preBarrier,
+        0u,
+        nullptr,
+        0u,
+        nullptr
+    );
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_vptLightGridPipeline);
+    vkCmdBindDescriptorSets(
+        cmd,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_vptLightGridPipelineLayout,
+        0u,
+        1u,
+        &g_rayTracingDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const uint32_t push[4] = {
+        VPT_LIGHT_GRID_DIM_X,
+        VPT_LIGHT_GRID_DIM_Y,
+        VPT_LIGHT_GRID_DIM_Z,
+        g_vliNextPage
+    };
+    vkCmdPushConstants(
+        cmd,
+        g_vptLightGridPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(push),
+        push
+    );
+    vkCmdDispatch(cmd, VPT_LIGHT_GRID_CELLS, 1u, 1u);
+
+    VkMemoryBarrier postBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    postBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    postBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u,
+        1u,
+        &postBarrier,
+        0u,
+        nullptr,
+        0u,
+        nullptr
+    );
+}
+
+void recordVPTRestirSpatialPass(VkCommandBuffer cmd, uint32_t width, uint32_t height)
+{
+    if(!g_vptRestirSpatialActiveFrame ||
+       g_vptRestirSpatialPipeline == VK_NULL_HANDLE ||
+       g_vptRestirSpatialPipelineLayout == VK_NULL_HANDLE ||
+       g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       width == 0u ||
+       height == 0u)
+    {
+        return;
+    }
+
+    VkMemoryBarrier rtToCompute{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    rtToCompute.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    rtToCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u,
+        1u,
+        &rtToCompute,
+        0u,
+        nullptr,
+        0u,
+        nullptr
+    );
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_vptRestirSpatialPipeline);
+    vkCmdBindDescriptorSets(
+        cmd,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_vptRestirSpatialPipelineLayout,
+        0u,
+        1u,
+        &g_rayTracingDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const uint32_t push[4] = { width, height, 0u, 0u };
+    vkCmdPushConstants(
+        cmd,
+        g_vptRestirSpatialPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(push),
+        push
+    );
+    vkCmdDispatch(cmd, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
+
+    VkMemoryBarrier computeToRt{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    computeToRt.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    computeToRt.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u,
+        1u,
+        &computeToRt,
+        0u,
+        nullptr,
+        0u,
+        nullptr
     );
 }
