@@ -381,6 +381,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
 
         createSDRPostPipeline();
 
+        prewarmVertexStagingPool();
+
         std::cout
             << "[RR-6.6] create HDR10 display pipeline"
             << std::endl;

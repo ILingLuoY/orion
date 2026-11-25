@@ -1596,6 +1596,12 @@ VkSampler volDepthSampler()
     }
     return g_volDepthSampler;
 }
+namespace
+{
+    constexpr bool kCLOUD_DESCRIPTOR_GENERATION_GUARD = true;
+    uint64_t g_volumetricCloudSetGeneration = 0u;
+}
+
 void createVolumetricCloudResources(uint32_t width, uint32_t height)
 {
     const uint32_t cloudWidth = width;
@@ -2138,6 +2144,7 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
     g_volumetricCloudResolveSet = descriptorSets[1];
     g_volumetricCloudCompositeSet = descriptorSets[2];
     g_volumetricLightSet = descriptorSets[3];
+    ++g_volumetricCloudSetGeneration;
 
     VkDescriptorBufferInfo cameraInfo{};
     cameraInfo.buffer = g_cameraUboBuffer;
@@ -2483,6 +2490,21 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
         writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
             g_volumetricCloudRenderSet, 22u, 0u, 1u,
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &fogDistSamplerInfo,
+            nullptr, nullptr };
+    }
+    VkAccelerationStructureKHR fogTlasInitHandle = g_tlas;
+    VkWriteDescriptorSetAccelerationStructureKHR fogTlasInitInfo{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+    };
+    fogTlasInitInfo.accelerationStructureCount = 1u;
+    fogTlasInitInfo.pAccelerationStructures = &fogTlasInitHandle;
+    if(kCLOUD_DESCRIPTOR_GENERATION_GUARD &&
+       fogTlasInitHandle != VK_NULL_HANDLE &&
+       writeCount < 64u)
+    {
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &fogTlasInitInfo,
+            g_volumetricCloudRenderSet, 16u, 0u, 1u,
+            VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr,
             nullptr, nullptr };
     }
     if(writeCount > 64u)
@@ -3298,6 +3320,7 @@ namespace
     bool g_cloudShadowFailed = false;
     bool g_cloudShadowLayoutReady = false;
     VkDescriptorSet g_cloudShadowBoundSet = VK_NULL_HANDLE;
+    uint64_t g_cloudShadowBoundGen = 0u;
 
     bool createCloudShadowPass()
     {
@@ -3497,7 +3520,9 @@ namespace
         }
 
         // 把结果挂到云 pass 的 binding 14（render set 可能晚于本 pass 创建）
-        if(g_cloudShadowBoundSet != g_volumetricCloudRenderSet &&
+        if((g_cloudShadowBoundSet != g_volumetricCloudRenderSet ||
+            (kCLOUD_DESCRIPTOR_GENERATION_GUARD &&
+             g_cloudShadowBoundGen != g_volumetricCloudSetGeneration)) &&
            g_volumetricCloudRenderSet != VK_NULL_HANDLE)
         {
             VkDescriptorImageInfo info{};
@@ -3514,6 +3539,7 @@ namespace
             vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
 
             g_cloudShadowBoundSet = g_volumetricCloudRenderSet;
+            g_cloudShadowBoundGen = g_volumetricCloudSetGeneration;
         }
 
         // 2026-11-18：**恢复消费方**。雾的太阳项现在真的按这张图做云隙光
@@ -3831,8 +3857,12 @@ namespace
         {
             static VkAccelerationStructureKHR boundFogTlas = VK_NULL_HANDLE;
             static VkDescriptorSet boundFogTlasSet = VK_NULL_HANDLE;
+            static uint64_t boundFogTlasGen = 0u;
 
-            if(boundFogTlas != g_tlas || boundFogTlasSet != g_volumetricCloudRenderSet)
+            if(boundFogTlas != g_tlas ||
+               boundFogTlasSet != g_volumetricCloudRenderSet ||
+               (kCLOUD_DESCRIPTOR_GENERATION_GUARD &&
+                boundFogTlasGen != g_volumetricCloudSetGeneration))
             {
                 VkAccelerationStructureKHR tlasHandle = g_tlas;
 
@@ -3856,8 +3886,10 @@ namespace
 
                 boundFogTlas = g_tlas;
                 boundFogTlasSet = g_volumetricCloudRenderSet;
+                boundFogTlasGen = g_volumetricCloudSetGeneration;
 
-                RTLogFlushed("[FOG RAY] TLAS bound to cloud render set binding 16");
+                RTLogFlushed("[FOG RAY] TLAS bound to cloud render set binding 16 gen=" +
+                    std::to_string(boundFogTlasGen));
             }
         }
 
@@ -4092,6 +4124,63 @@ namespace
     }
 }
 
+void syncFogRenderTargets()
+{
+    if(g_rtOutputView == VK_NULL_HANDLE ||
+       g_dlssDepthView == VK_NULL_HANDLE ||
+       g_volumetricCloudRenderSet == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // Keep binding 24 (g_rtOutputView) and binding 5 (g_dlssDepthView) strictly synchronized
+    // across resizes and descriptor set recreation (generation guard prevents ABA reuse bugs).
+    static VkImageView boundApplyTarget = VK_NULL_HANDLE;
+    static VkImageView boundApplyDepth = VK_NULL_HANDLE;
+    static VkDescriptorSet boundApplySet = VK_NULL_HANDLE;
+    static uint64_t boundApplyGen = 0u;
+    if(boundApplyTarget != g_rtOutputView ||
+       boundApplyDepth != g_dlssDepthView ||
+       boundApplySet != g_volumetricCloudRenderSet ||
+       (kCLOUD_DESCRIPTOR_GENERATION_GUARD &&
+        boundApplyGen != g_volumetricCloudSetGeneration))
+    {
+        VkDescriptorImageInfo targetInfo{};
+        targetInfo.imageView = g_rtOutputView;
+        targetInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo depthInfo{};
+        depthInfo.sampler = volDepthSampler();
+        depthInfo.imageView = g_dlssDepthView;
+        depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = g_volumetricCloudRenderSet;
+        writes[0].dstBinding = 24u;
+        writes[0].descriptorCount = 1u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].pImageInfo = &targetInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = g_volumetricCloudRenderSet;
+        writes[1].dstBinding = 5u;
+        writes[1].descriptorCount = 1u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].pImageInfo = &depthInfo;
+
+        vkUpdateDescriptorSets(g_device, 2u, writes, 0u, nullptr);
+        boundApplyTarget = g_rtOutputView;
+        boundApplyDepth = g_dlssDepthView;
+        boundApplySet = g_volumetricCloudRenderSet;
+        boundApplyGen = g_volumetricCloudSetGeneration;
+        RTLogFlushed("[FOG APPLY] bound rtOutputView + dlssDepthView " +
+            std::to_string(g_rtOutputWidth) + "x" +
+            std::to_string(g_rtOutputHeight) + " gen=" +
+            std::to_string(boundApplyGen));
+    }
+}
+
 void recordFogFroxelPasses(VkCommandBuffer cmd)
 {
     fogProbeLog();
@@ -4133,6 +4222,11 @@ void recordFogFroxelPasses(VkCommandBuffer cmd)
                 " set=" + bit(g_volumetricCloudRenderSet != VK_NULL_HANDLE));
         }
         return;
+    }
+
+    if(kCLOUD_DESCRIPTOR_GENERATION_GUARD)
+    {
+        syncFogRenderTargets();
     }
 
     const uint32_t froxelWidth = g_fogFroxelWidth;
@@ -4227,7 +4321,9 @@ void recordFogFroxelPasses(VkCommandBuffer cmd)
     // Pass 2: Volumetric lighting (exact RT ray query + cloud shadow + local lights + 3D temporal EMA).
     const float cloudShadowValid =
         (g_cloudEnabled.load() && g_cloudShadowLayoutReady &&
-         g_cloudShadowBoundSet == g_volumetricCloudRenderSet) ? 1.0f : 0.0f;
+         g_cloudShadowBoundSet == g_volumetricCloudRenderSet &&
+         (!kCLOUD_DESCRIPTOR_GENERATION_GUARD ||
+          g_cloudShadowBoundGen == g_volumetricCloudSetGeneration)) ? 1.0f : 0.0f;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_fogFroxelLightPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
         g_fogFroxelLightPipelineLayout, 0u, 1u, &g_volumetricCloudRenderSet, 0u, nullptr);
@@ -4328,46 +4424,7 @@ void recordFogScreenApply(VkCommandBuffer cmd)
         return;
     }
 
-    // Keep binding 24 (g_rtOutputView) and binding 5 (g_dlssDepthView) strictly synchronized across resizes.
-    static VkImageView boundApplyTarget = VK_NULL_HANDLE;
-    static VkImageView boundApplyDepth = VK_NULL_HANDLE;
-    static VkDescriptorSet boundApplySet = VK_NULL_HANDLE;
-    if(boundApplyTarget != g_rtOutputView ||
-       boundApplyDepth != g_dlssDepthView ||
-       boundApplySet != g_volumetricCloudRenderSet)
-    {
-        VkDescriptorImageInfo targetInfo{};
-        targetInfo.imageView = g_rtOutputView;
-        targetInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkDescriptorImageInfo depthInfo{};
-        depthInfo.sampler = volDepthSampler();
-        depthInfo.imageView = g_dlssDepthView;
-        depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkWriteDescriptorSet writes[2]{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = g_volumetricCloudRenderSet;
-        writes[0].dstBinding = 24u;
-        writes[0].descriptorCount = 1u;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[0].pImageInfo = &targetInfo;
-
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = g_volumetricCloudRenderSet;
-        writes[1].dstBinding = 5u;
-        writes[1].descriptorCount = 1u;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].pImageInfo = &depthInfo;
-
-        vkUpdateDescriptorSets(g_device, 2u, writes, 0u, nullptr);
-        boundApplyTarget = g_rtOutputView;
-        boundApplyDepth = g_dlssDepthView;
-        boundApplySet = g_volumetricCloudRenderSet;
-        RTLogFlushed("[FOG APPLY] bound rtOutputView + dlssDepthView " +
-            std::to_string(g_rtOutputWidth) + "x" +
-            std::to_string(g_rtOutputHeight));
-    }
+    syncFogRenderTargets();
 
     {
         VkImageMemoryBarrier sceneBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -4456,6 +4513,7 @@ namespace
 
     VkImageView g_cloudSkyLutBoundView = VK_NULL_HANDLE;
     VkDescriptorSet g_cloudSkyLutBoundSet = VK_NULL_HANDLE;
+    uint64_t g_cloudSkyLutBoundGen = 0u;
 
     void syncCloudSkyLutDescriptor()
     {
@@ -4467,7 +4525,9 @@ namespace
             return;
         }
         if(g_cloudSkyLutBoundSet == g_volumetricCloudRenderSet &&
-           g_cloudSkyLutBoundView == g_skyScatteringView)
+           g_cloudSkyLutBoundView == g_skyScatteringView &&
+           (!kCLOUD_DESCRIPTOR_GENERATION_GUARD ||
+            g_cloudSkyLutBoundGen == g_volumetricCloudSetGeneration))
         {
             return;
         }
@@ -4487,6 +4547,7 @@ namespace
 
         g_cloudSkyLutBoundSet = g_volumetricCloudRenderSet;
         g_cloudSkyLutBoundView = g_skyScatteringView;
+        g_cloudSkyLutBoundGen = g_volumetricCloudSetGeneration;
     }
 }
 
@@ -4915,7 +4976,11 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
     {
         static VkAccelerationStructureKHR fogTlasBound = VK_NULL_HANDLE;
         static VkDescriptorSet fogTlasBoundSet = VK_NULL_HANDLE;
-        if(fogTlasBound != g_tlas || fogTlasBoundSet != g_volumetricCloudRenderSet)
+        static uint64_t fogTlasBoundGen = 0u;
+        if(fogTlasBound != g_tlas ||
+           fogTlasBoundSet != g_volumetricCloudRenderSet ||
+           (kCLOUD_DESCRIPTOR_GENERATION_GUARD &&
+            fogTlasBoundGen != g_volumetricCloudSetGeneration))
         {
             VkAccelerationStructureKHR tlasHandle = g_tlas;
             VkWriteDescriptorSetAccelerationStructureKHR tlasInfo{
@@ -4937,7 +5002,9 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
 
             fogTlasBound = g_tlas;
             fogTlasBoundSet = g_volumetricCloudRenderSet;
-            RTLogFlushed("[FOG RAY] TLAS bound (frame-level)");
+            fogTlasBoundGen = g_volumetricCloudSetGeneration;
+            RTLogFlushed("[FOG RAY] TLAS bound (frame-level) gen=" +
+                std::to_string(fogTlasBoundGen));
         }
     }
 
@@ -5361,10 +5428,13 @@ after_clouds:
         {
             static VkDescriptorSet lastGodRayTlasSet = VK_NULL_HANDLE;
             static VkAccelerationStructureKHR lastGodRayTlas = VK_NULL_HANDLE;
+            static uint64_t lastGodRayTlasGen = 0u;
 
             if(g_tlas != VK_NULL_HANDLE &&
                (g_volumetricLightSet != lastGodRayTlasSet ||
-                g_tlas != lastGodRayTlas))
+                g_tlas != lastGodRayTlas ||
+                (kCLOUD_DESCRIPTOR_GENERATION_GUARD &&
+                 lastGodRayTlasGen != g_volumetricCloudSetGeneration)))
             {
                 VkAccelerationStructureKHR tlasHandle = g_tlas;
                 VkWriteDescriptorSetAccelerationStructureKHR tlasDescriptor{};
@@ -5398,6 +5468,7 @@ after_clouds:
 
                 lastGodRayTlasSet = g_volumetricLightSet;
                 lastGodRayTlas = g_tlas;
+                lastGodRayTlasGen = g_volumetricCloudSetGeneration;
             }
         }
 
@@ -6086,4 +6157,8 @@ void destroyVolumetricCloudResources()
     g_cloudCompositeBoundFar = VK_NULL_HANDLE;
     g_cloudSkyLutBoundView = VK_NULL_HANDLE;
     g_cloudSkyLutBoundSet = VK_NULL_HANDLE;
+    g_cloudSkyLutBoundGen = 0u;
+    g_cloudShadowBoundSet = VK_NULL_HANDLE;
+    g_cloudShadowBoundGen = 0u;
+    ++g_volumetricCloudSetGeneration;
 }

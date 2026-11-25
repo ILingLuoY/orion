@@ -18,7 +18,7 @@ const uint VPT_SOURCE_DIRECTORY_MAX_SECTIONS = 125u;
 const uint VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE = 1u + VPT_SOURCE_DIRECTORY_MAX_SECTIONS;
 const float VPT_LOCAL_MAX_DISTANCE = 30.0;
 const float VPT_LOCAL_FADE_START_FRACTION = 0.40;
-const uint VPT_LIGHT_GRID_CELLS = 9216u;
+const uint VPT_LIGHT_GRID_CELLS = 32000u;
 const uint VPT_LIGHT_GRID_SLOTS = 32u;
 
 layout(std430, binding = 22, set = 0) readonly buffer PageTable
@@ -53,9 +53,9 @@ layout(std430, binding = 31, set = 0) readonly buffer VPTSourceDirectoryPagesBuf
 layout(std430, binding = 99, set = 0) writeonly buffer VPTLightGridBuffer
 {
     uvec4 header;
-    uvec4 cellMeta[9216];
-    uint aliasWords[9216 * 32];
-    uvec4 slots[9216 * 32];
+    uvec4 cellMeta[32000];
+    uint aliasWords[32000 * 32];
+    uvec4 slots[32000 * 32];
 } vptLightGridBuffer;
 
 layout(push_constant) uniform GridBuildPush
@@ -90,6 +90,8 @@ float vptLocalLightDistanceAttenuation(float distanceToLight)
     return 0.55 / (1.0 + 0.18 * distanceToLight +
         0.025 * distanceToLight * distanceToLight);
 }
+
+#include "vpt_light_grid_common.glsl"
 
 uint vliHash32(ivec3 sectionCoord)
 {
@@ -244,17 +246,20 @@ bool vptGridVoxelBlocked(vec3 origin, vec3 target, ivec3 targetBlock, ivec3 emit
     return false;
 }
 
-shared uint s_hasDir;
-shared ivec3 s_dirSection;
-shared uint s_dirBase;
-shared uint s_secCount;
-shared uint s_count;
-shared uint s_batchValid;
+shared uint  s_validSecs;
+shared uint  s_srcPages[125];
+shared uint  s_srcCounts[125];
+shared int   s_srcSecX[125];
+shared int   s_srcSecY[125];
+shared int   s_srcSecZ[125];
+shared uint  s_count;
 shared float s_minP;
-shared uint s_cornerState[8];
-shared int s_blockX[64];
-shared uint s_packedYMeta[64];
-shared int s_blockZ[64];
+shared uint  s_hasResidual;
+shared uint  s_batchValid;
+shared uint  s_cornerState[8];
+shared int   s_blockX[64];
+shared uint  s_packedYMeta[64];
+shared int   s_blockZ[64];
 shared float s_pCell[64];
 
 void main()
@@ -293,7 +298,6 @@ void main()
     ivec3 cellCoord = gridOriginCell + ivec3(int(cx), int(cy), int(cz));
     vec3 cellMin = vec3(cellCoord) * 4.0;
     vec3 cellMax = cellMin + vec3(4.0);
-    vec3 cellCenter = cellMin + vec3(2.0);
     vec3 padMin = cellMin - vec3(0.5);
     vec3 padMax = cellMax + vec3(0.5);
 
@@ -314,101 +318,62 @@ void main()
 
     if(lane == 0u)
     {
-        s_hasDir = 0u;
-        s_dirSection = ivec3(0);
-        s_dirBase = 0u;
-        s_secCount = 0u;
+        s_validSecs = 0u;
         s_count = 0u;
-        s_batchValid = 0u;
         s_minP = 0.0;
+        s_hasResidual = 0u;
+        s_batchValid = 0u;
+    }
 
-        if(livePageCount > 0u)
+    barrier();
+
+    ivec3 secMin = ivec3(floor((padMin - vec3(VPT_LOCAL_MAX_DISTANCE)) / 16.0));
+    ivec3 secMax = ivec3(floor((padMax + vec3(VPT_LOCAL_MAX_DISTANCE)) / 16.0));
+    ivec3 secSpan = clamp(secMax - secMin + ivec3(1), ivec3(1), ivec3(7));
+    uint spanX = uint(secSpan.x);
+    uint spanXZ = spanX * uint(secSpan.z);
+    uint totalSecs = spanXZ * uint(secSpan.y);
+
+    for(uint idx = lane; idx < totalSecs && livePageCount > 0u; idx += 32u)
+    {
+        uint sx = idx % spanX;
+        uint sz = (idx / spanX) % uint(secSpan.z);
+        uint sy = idx / spanXZ;
+        ivec3 srcSection = secMin + ivec3(int(sx), int(sy), int(sz));
+        vec3 secMinW = vec3(srcSection) * 16.0;
+        vec3 secMaxW = secMinW + vec3(16.0);
+        vec3 boxDelta = max(max(padMin - secMaxW, secMinW - padMax), vec3(0.0));
+        if(dot(boxDelta, boxDelta) >= VPT_LOCAL_MAX_DISTANCE * VPT_LOCAL_MAX_DISTANCE)
         {
-            ivec3 receiverSection = ivec3(floor(cellCenter / 16.0));
-            uint receiverPage = 0u;
-            ivec3 dirSection = receiverSection;
-            bool hasPage = vliLookupSectionPage(receiverSection, receiverPage);
-            if(!hasPage)
+            continue;
+        }
+        uint pageIndex = 0u;
+        if(!vliLookupSectionPage(srcSection, pageIndex))
+        {
+            continue;
+        }
+        uint ec = min(
+            vptEmitterIndexPagesBuffer.words[pageIndex * VPT_EMITTER_PAGE_WORDS],
+            VLI_SOURCE_WORDS
+        );
+        if(ec > 0u)
+        {
+            uint dst = atomicAdd(s_validSecs, 1u);
+            if(dst < 125u)
             {
-                float bestDistSq = 1.0e30;
-                for(uint n = 0u; n < 6u; ++n)
-                {
-                    ivec3 nb = receiverSection + (
-                        n == 0u ? ivec3( 1,  0,  0) :
-                        n == 1u ? ivec3(-1,  0,  0) :
-                        n == 2u ? ivec3( 0,  1,  0) :
-                        n == 3u ? ivec3( 0, -1,  0) :
-                        n == 4u ? ivec3( 0,  0,  1) :
-                                  ivec3( 0,  0, -1)
-                    );
-                    uint nbPage;
-                    if(vliLookupSectionPage(nb, nbPage))
-                    {
-                        vec3 d = cellCenter - (vec3(nb) * 16.0 + vec3(8.0));
-                        float dSq = dot(d, d);
-                        if(dSq < bestDistSq)
-                        {
-                            bestDistSq = dSq;
-                            hasPage = true;
-                            dirSection = nb;
-                            receiverPage = nbPage;
-                        }
-                    }
-                }
-            }
-
-            if(hasPage)
-            {
-                uint dirBase = receiverPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
-                uint secCount = min(
-                    vptSourceDirectoryPagesBuffer.entries[dirBase].pageIndex,
-                    VPT_SOURCE_DIRECTORY_MAX_SECTIONS
-                );
-                if(secCount == 0u)
-                {
-                    for(uint n = 0u; n < 6u; ++n)
-                    {
-                        ivec3 nb = dirSection + (
-                            n == 0u ? ivec3( 1,  0,  0) :
-                            n == 1u ? ivec3(-1,  0,  0) :
-                            n == 2u ? ivec3( 0,  1,  0) :
-                            n == 3u ? ivec3( 0, -1,  0) :
-                            n == 4u ? ivec3( 0,  0,  1) :
-                                      ivec3( 0,  0, -1)
-                        );
-                        uint nbPage;
-                        if(!vliLookupSectionPage(nb, nbPage))
-                        {
-                            continue;
-                        }
-                        uint nbBase = nbPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
-                        uint nbCount = min(
-                            vptSourceDirectoryPagesBuffer.entries[nbBase].pageIndex,
-                            VPT_SOURCE_DIRECTORY_MAX_SECTIONS
-                        );
-                        if(nbCount > 0u)
-                        {
-                            dirSection = nb;
-                            dirBase = nbBase;
-                            secCount = nbCount;
-                            break;
-                        }
-                    }
-                }
-                if(secCount > 0u)
-                {
-                    s_hasDir = 1u;
-                    s_dirSection = dirSection;
-                    s_dirBase = dirBase;
-                    s_secCount = secCount;
-                }
+                s_srcPages[dst] = pageIndex;
+                s_srcCounts[dst] = ec;
+                s_srcSecX[dst] = srcSection.x;
+                s_srcSecY[dst] = srcSection.y;
+                s_srcSecZ[dst] = srcSection.z;
             }
         }
     }
 
     barrier();
 
-    if(s_hasDir == 0u || s_secCount == 0u)
+    uint validSecCount = min(s_validSecs, 125u);
+    if(validSecCount == 0u)
     {
         if(lane == 0u)
         {
@@ -417,30 +382,11 @@ void main()
         return;
     }
 
-    for(uint s = 0u; s < s_secCount; ++s)
+    for(uint s = 0u; s < validSecCount; ++s)
     {
-        VPTSourceDirectoryEntry dirEntry =
-            vptSourceDirectoryPagesBuffer.entries[s_dirBase + 1u + s];
-        uint sourcePage = dirEntry.pageIndex;
-        uint sourceMetadata = dirEntry.emitterCountAndOffset;
-        uint emitterCount = sourceMetadata & 0x1fffu;
-        if(emitterCount == 0u)
-        {
-            continue;
-        }
-
-        ivec3 srcSection = s_dirSection + ivec3(
-            int((sourceMetadata >> 13u) & 7u) - 2,
-            int((sourceMetadata >> 16u) & 7u) - 2,
-            int((sourceMetadata >> 19u) & 7u) - 2
-        );
-        vec3 secMin = vec3(srcSection) * 16.0;
-        vec3 secMax = secMin + vec3(16.0);
-        vec3 boxDelta = max(max(padMin - secMax, secMin - padMax), vec3(0.0));
-        if(dot(boxDelta, boxDelta) >= VPT_LOCAL_MAX_DISTANCE * VPT_LOCAL_MAX_DISTANCE)
-        {
-            continue;
-        }
+        uint sourcePage = s_srcPages[s];
+        uint emitterCount = s_srcCounts[s];
+        ivec3 srcSection = ivec3(s_srcSecX[s], s_srcSecY[s], s_srcSecZ[s]);
 
         for(uint eBase = 0u; eBase < emitterCount; eBase += 32u)
         {
@@ -468,41 +414,76 @@ void main()
                 vec3 emitterCenter = vec3(emitterBlock) + vec3(0.5);
                 vec3 closestInCell = clamp(emitterCenter, padMin, padMax);
                 float distToCell = length(emitterCenter - closestInCell);
-                float emissionLevel = float(emission);
-                if(emission > 0u &&
-                   distToCell < vptLocalLightRange(typeCode, emissionLevel))
+                float pCell = vptGridBaseWeight(
+                    emitterBlock, emission, typeCode, padMin, padMax
+                );
+                if(pCell > 0.0)
                 {
-                    vec3 lightCol = localLightProfileColor(typeCode);
-                    float lightLuma = max(dot(lightCol, vec3(0.2126, 0.7152, 0.0722)), 0.08);
-                    float pCell = max(
-                        lightLuma *
-                        localLightProfileBrightness(typeCode, emissionLevel) *
-                        vptLocalLightDistanceAttenuation(distToCell + 0.5) *
-                        max(vptLocalLightRangeFade(distToCell, typeCode, emissionLevel), 1.0e-3),
-                        1.0e-6
-                    );
-                    if(pCell > s_minP)
+                    bool visible = true;
+                    const bool dominatedByTop32 =
+                        (s_count >= VPT_LIGHT_GRID_SLOTS && pCell <= s_minP);
+                    if(dominatedByTop32)
                     {
-                        bool visible = true;
-                        if(distToCell >= 2.0)
+                        visible = false;
+                        if(distToCell == 0.0)
                         {
-                            bool anyVisible = false;
-                            vec3 bestTargetPt = vec3(0.0);
-                            ivec3 bestTargetBlock = ivec3(0);
-                            float bestTargetDistSq = 1.0e30;
-                            bool hasTarget = false;
-
-                            const ivec3 faceDirs[6] = ivec3[6](
-                                ivec3( 1,  0,  0),
-                                ivec3(-1,  0,  0),
-                                ivec3( 0,  1,  0),
-                                ivec3( 0, -1,  0),
-                                ivec3( 0,  0,  1),
-                                ivec3( 0,  0, -1)
-                            );
+                            atomicOr(s_hasResidual, 1u);
+                        }
+                        else
+                        {
+                            bool hasOpenFaceFast = false;
                             for(int f = 0; f < 6; ++f)
                             {
-                                ivec3 d = faceDirs[f];
+                                ivec3 faceDir =
+                                    (f == 0) ? ivec3( 1,  0,  0) :
+                                    (f == 1) ? ivec3(-1,  0,  0) :
+                                    (f == 2) ? ivec3( 0,  1,  0) :
+                                    (f == 3) ? ivec3( 0, -1,  0) :
+                                    (f == 4) ? ivec3( 0,  0,  1) :
+                                               ivec3( 0,  0, -1);
+                                uint adjSrc;
+                                if(!vptReadSourceVoxel(emitterBlock + faceDir, adjSrc) ||
+                                   (adjSrc & 3u) != 1u)
+                                {
+                                    hasOpenFaceFast = true;
+                                    break;
+                                }
+                            }
+                            if(hasOpenFaceFast)
+                            {
+                                atomicOr(s_hasResidual, 1u);
+                            }
+                        }
+                    }
+                    else if(distToCell > 0.0)
+                    {
+                        bool hasAnyOpenFace = false;
+                        bool anyVisible = false;
+                        vec3 bestTargetPt = vec3(0.0);
+                        ivec3 bestTargetBlock = ivec3(0);
+                        float bestTargetDistSq = 1.0e30;
+                        bool hasTarget = false;
+
+                        for(int f = 0; f < 6; ++f)
+                        {
+                            ivec3 faceDir =
+                                (f == 0) ? ivec3( 1,  0,  0) :
+                                (f == 1) ? ivec3(-1,  0,  0) :
+                                (f == 2) ? ivec3( 0,  1,  0) :
+                                (f == 3) ? ivec3( 0, -1,  0) :
+                                (f == 4) ? ivec3( 0,  0,  1) :
+                                           ivec3( 0,  0, -1);
+                            ivec3 adjBlock = emitterBlock + faceDir;
+                            uint adjSrc;
+                            if(!vptReadSourceVoxel(adjBlock, adjSrc))
+                            {
+                                hasAnyOpenFace = true;
+                                anyVisible = true;
+                                break;
+                            }
+                            if((adjSrc & 3u) != 1u)
+                            {
+                                hasAnyOpenFace = true;
                                 bool facesCell =
                                     (f == 0) ? (padMax.x > float(emitterBlock.x + 1)) :
                                     (f == 1) ? (padMin.x < float(emitterBlock.x)) :
@@ -510,18 +491,7 @@ void main()
                                     (f == 3) ? (padMin.y < float(emitterBlock.y)) :
                                     (f == 4) ? (padMax.z > float(emitterBlock.z + 1)) :
                                                (padMin.z < float(emitterBlock.z));
-                                if(!facesCell)
-                                {
-                                    continue;
-                                }
-                                ivec3 adjBlock = emitterBlock + d;
-                                uint adjSrc;
-                                if(!vptReadSourceVoxel(adjBlock, adjSrc))
-                                {
-                                    anyVisible = true;
-                                    break;
-                                }
-                                if((adjSrc & 3u) != 1u)
+                                if(facesCell)
                                 {
                                     vec3 adjPt = vec3(adjBlock) + vec3(0.5);
                                     vec3 toCell = closestInCell - adjPt;
@@ -535,10 +505,22 @@ void main()
                                     }
                                 }
                             }
+                        }
 
-                            int openProbes = 0;
-                            if(!anyVisible && hasTarget)
+                        if(!hasAnyOpenFace)
+                        {
+                            visible = false;
+                        }
+                        else if(distToCell >= 0.5 && !anyVisible)
+                        {
+                            if(!hasTarget)
                             {
+                                visible = false;
+                                atomicOr(s_hasResidual, 1u);
+                            }
+                            else
+                            {
+                                int openProbes = 0;
                                 vec3 insetMin = cellMin + vec3(0.5);
                                 vec3 insetMax = cellMax - vec3(0.5);
                                 vec3 nearestProbe = floor(clamp(closestInCell, insetMin, insetMax)) + vec3(0.5);
@@ -584,23 +566,24 @@ void main()
                                         break;
                                     }
                                 }
-                            }
-                            if(!anyVisible && (!hasTarget || openProbes > 0))
-                            {
-                                visible = false;
+                                if(!anyVisible && openProbes >= 4)
+                                {
+                                    visible = false;
+                                    atomicOr(s_hasResidual, 1u);
+                                }
                             }
                         }
+                    }
 
-                        if(visible)
-                        {
-                            s_blockX[32u + lane] = emitterBlock.x;
-                            s_packedYMeta[32u + lane] =
-                                (uint(clamp(emitterBlock.y + 32768, 0, 65535)) & 0xffffu) |
-                                (((emission << 5u) | typeCode) << 16u);
-                            s_blockZ[32u + lane] = emitterBlock.z;
-                            s_pCell[32u + lane] = pCell;
-                            atomicAdd(s_batchValid, 1u);
-                        }
+                    if(visible)
+                    {
+                        s_blockX[32u + lane] = emitterBlock.x;
+                        s_packedYMeta[32u + lane] =
+                            (uint(clamp(emitterBlock.y + 32768, 0, 65535)) & 0xffffu) |
+                            (((emission << 5u) | typeCode) << 16u);
+                        s_blockZ[32u + lane] = emitterBlock.z;
+                        s_pCell[32u + lane] = pCell;
+                        atomicAdd(s_batchValid, 1u);
                     }
                 }
             }
@@ -625,14 +608,14 @@ void main()
                             }
                         }
                         s_count = cur;
-                        if(cur == VPT_LIGHT_GRID_SLOTS)
+                        if(cur >= VPT_LIGHT_GRID_SLOTS)
                         {
-                            float minP = s_pCell[0];
-                            for(uint i = 1u; i < VPT_LIGHT_GRID_SLOTS; ++i)
+                            float mp = 1.0e30;
+                            for(uint i = 0u; i < VPT_LIGHT_GRID_SLOTS; ++i)
                             {
-                                minP = min(minP, s_pCell[i]);
+                                mp = min(mp, s_pCell[i]);
                             }
-                            s_minP = minP;
+                            s_minP = (mp < 1.0e29) ? mp : 0.0;
                         }
                     }
                 }
@@ -665,10 +648,12 @@ void main()
                             barrier();
                         }
                     }
+
                     if(lane == 0u)
                     {
                         s_count = VPT_LIGHT_GRID_SLOTS;
-                        s_minP = s_pCell[VPT_LIGHT_GRID_SLOTS - 1u];
+                        s_minP = max(s_pCell[VPT_LIGHT_GRID_SLOTS - 1u], 0.0);
+                        s_hasResidual = 1u;
                     }
                 }
             }
@@ -681,7 +666,7 @@ void main()
     {
         if(lane == 0u)
         {
-            vptLightGridBuffer.cellMeta[cellIdx] = uvec4(0u);
+            vptLightGridBuffer.cellMeta[cellIdx] = uvec4(0u, 0u, s_hasResidual, 0u);
         }
         return;
     }
@@ -696,63 +681,72 @@ void main()
         );
     }
 
+    barrier();
+
     if(lane == 0u)
     {
         float sumP = 0.0;
+        float minP = 1.0e30;
         for(uint i = 0u; i < count; ++i)
         {
-            sumP += s_pCell[i];
+            float p = s_pCell[i];
+            sumP += p;
+            minP = min(minP, p);
+        }
+        if(minP >= 1.0e29)
+        {
+            minP = 0.0;
         }
         vptLightGridBuffer.cellMeta[cellIdx] = uvec4(
-            count, floatBitsToUint(sumP), 0u, 0u
+            count, floatBitsToUint(sumP), s_hasResidual, floatBitsToUint(minP)
         );
-        if(count > 4u && sumP > 0.0)
+        if(count > 0u && sumP > 0.0)
         {
-            float prob[32];
-            uint smallIdx[32];
-            uint largeIdx[32];
+            // 复用共享内存后半段 [32..63]（排序与写出均已结束），实现零局部数组建 Alias 表
             uint smallTop = 0u;
             uint largeTop = 0u;
             float invAvg = float(count) / sumP;
             for(uint i = 0u; i < count; ++i)
             {
-                float pr = s_pCell[i] * invAvg;
-                prob[i] = pr;
+                float w = s_pCell[i];
+                float pr = w * invAvg;
+                s_pCell[32u + i] = pr;
                 if(pr < 1.0)
                 {
-                    smallIdx[smallTop++] = i;
+                    s_blockX[32u + (smallTop++)] = int(i);
                 }
                 else
                 {
-                    largeIdx[largeTop++] = i;
+                    s_packedYMeta[32u + (largeTop++)] = i;
                 }
             }
             while(smallTop > 0u && largeTop > 0u)
             {
-                uint l = smallIdx[--smallTop];
-                uint g = largeIdx[--largeTop];
-                uint thresh = clamp(uint(round(clamp(prob[l], 0.0, 1.0) * 65535.0)), 0u, 65535u);
+                uint l = uint(s_blockX[32u + (--smallTop)]);
+                uint g = s_packedYMeta[32u + (--largeTop)];
+                uint thresh = clamp(uint(round(clamp(s_pCell[32u + l], 0.0, 1.0) * 65535.0)), 0u, 65535u);
                 vptLightGridBuffer.aliasWords[cellIdx * VPT_LIGHT_GRID_SLOTS + l] =
                     thresh | (g << 16u);
-                prob[g] = (prob[g] + prob[l]) - 1.0;
-                if(prob[g] < 1.0)
+                float newProbG = (s_pCell[32u + g] + s_pCell[32u + l]) - 1.0;
+                s_pCell[32u + g] = newProbG;
+                if(newProbG < 1.0)
                 {
-                    smallIdx[smallTop++] = g;
+                    s_blockX[32u + (smallTop++)] = int(g);
                 }
                 else
                 {
-                    largeIdx[largeTop++] = g;
+                    s_packedYMeta[32u + (largeTop++)] = g;
                 }
             }
             while(largeTop > 0u)
             {
-                uint g = largeIdx[--largeTop];
+                uint g = s_packedYMeta[32u + (--largeTop)];
                 vptLightGridBuffer.aliasWords[cellIdx * VPT_LIGHT_GRID_SLOTS + g] =
                     65535u | (g << 16u);
             }
             while(smallTop > 0u)
             {
-                uint l = smallIdx[--smallTop];
+                uint l = uint(s_blockX[32u + (--smallTop)]);
                 vptLightGridBuffer.aliasWords[cellIdx * VPT_LIGHT_GRID_SLOTS + l] =
                     65535u | (l << 16u);
             }

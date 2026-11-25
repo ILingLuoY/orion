@@ -579,6 +579,9 @@ void createRRGBufferImages(
         g_rrSpecularHitDistanceImage !=
             VK_NULL_HANDLE &&
 
+        g_rrSpecularMotionImage !=
+            VK_NULL_HANDLE &&
+
         g_rrStableRadianceImage !=
             VK_NULL_HANDLE &&
 
@@ -609,6 +612,9 @@ void createRRGBufferImages(
             VK_NULL_HANDLE ||
 
         g_rrSpecularHitDistanceImage !=
+            VK_NULL_HANDLE ||
+
+        g_rrSpecularMotionImage !=
             VK_NULL_HANDLE ||
 
         g_rrStableRadianceImage !=
@@ -658,6 +664,14 @@ void createRRGBufferImages(
         g_rrSpecularHitDistanceMemory,
         g_rrSpecularHitDistanceView,
         g_rrSpecularHitDistanceLayout
+    );
+
+
+    destroyHistoryImage(
+        g_rrSpecularMotionImage,
+        g_rrSpecularMotionMemory,
+        g_rrSpecularMotionView,
+        g_rrSpecularMotionLayout
     );
 
 
@@ -718,6 +732,17 @@ void createRRGBufferImages(
         g_rrSpecularHitDistanceMemory,
         g_rrSpecularHitDistanceView,
         g_rrSpecularHitDistanceLayout
+    );
+
+
+    createRRGuideImage(
+        width,
+        height,
+        VK_FORMAT_R16G16_SFLOAT,
+        g_rrSpecularMotionImage,
+        g_rrSpecularMotionMemory,
+        g_rrSpecularMotionView,
+        g_rrSpecularMotionLayout
     );
 
 
@@ -1945,7 +1970,45 @@ void ensureSharcUpdatePipeline()
         g_sharcUpdatePipeline = VK_NULL_HANDLE;
     }
 }
-void recordSharcUpdate(VkCommandBuffer cmd, uint32_t width, uint32_t height)
+namespace
+{
+    uint32_t sharcResolveParityValue()
+    {
+        static const uint32_t sSharcResolveParity = []()
+        {
+            const char* raw = std::getenv("ORION_SHARC_RESOLVE_PARITY");
+            if(raw == nullptr || raw[0] == '\0')
+            {
+                return 2u;
+            }
+            const int parsed = std::atoi(raw);
+            if(parsed < 1)
+            {
+                return 1u;
+            }
+            return static_cast<uint32_t>(parsed > 4 ? 4 : parsed);
+        }();
+        return sSharcResolveParity;
+    }
+
+    uint32_t s_sharcResolveTick = 0u;
+
+    bool sharcResolveDueThisFrame()
+    {
+        if(!g_sharcZeroed || !g_sharcBuffersReady)
+        {
+            return false;
+        }
+        const uint32_t parity = sharcResolveParityValue();
+        return parity <= 1u || (s_sharcResolveTick % parity) == 0u;
+    }
+}
+
+void recordSharcUpdateImpl(
+    VkCommandBuffer cmd,
+    uint32_t width,
+    uint32_t height,
+    bool skipTrailingBarrier)
 {
     if(!g_sharcZeroed || !g_sharcBuffersReady)
     {
@@ -1994,8 +2057,15 @@ void recordSharcUpdate(VkCommandBuffer cmd, uint32_t width, uint32_t height)
           &g_sharcUpdateHitRegion, &g_sharcUpdateCallableRegion,
           sharcUpdateWidth, sharcUpdateHeight, 1u);
 
-    sharcCacheBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                      VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+    if(!skipTrailingBarrier)
+    {
+        sharcCacheBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                          VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+    }
+}
+void recordSharcUpdate(VkCommandBuffer cmd, uint32_t width, uint32_t height)
+{
+    recordSharcUpdateImpl(cmd, width, height, false);
 }
 void recordSharcResolve(VkCommandBuffer cmd)
 {
@@ -2018,24 +2088,8 @@ void recordSharcResolve(VkCommandBuffer cmd)
     // 成本：hash 32MB + accumulation 64MB + resolved 64MB + lock 16MB = 176MB，
     // 全量扫描（1<<22 entry ⇒ 65536 个 workgroup）的显存流量地板约 0.20~0.25 ms/帧。
     // ORION_SHARC_RESOLVE_PARITY=1 回到每帧（A/B 用），默认 2 = 隔帧。
-    static const uint32_t sSharcResolveParity = []()
-    {
-        const char* raw = std::getenv("ORION_SHARC_RESOLVE_PARITY");
-        if(raw == nullptr || raw[0] == '\0')
-        {
-            return 2u;
-        }
-        const int parsed = std::atoi(raw);
-        if(parsed < 1)
-        {
-            return 1u;
-        }
-        return static_cast<uint32_t>(parsed > 4 ? 4 : parsed);
-    }();
-    static uint32_t sSharcResolveTick = 0u;
-
-    if(sSharcResolveParity > 1u &&
-       (sSharcResolveTick++ % sSharcResolveParity) != 0u)
+    const uint32_t parity = sharcResolveParityValue();
+    if(parity > 1u && (s_sharcResolveTick++ % parity) != 0u)
     {
         return;
     }
@@ -3261,8 +3315,12 @@ void ensureK1K2Pipelines()
         auto ahit = loadSpv("shaders/rt_test.rahit.spv");
         auto translucentChit = loadSpv("shaders/rt_test_translucent.rchit.spv");
         auto translucentAhit = loadSpv("shaders/rt_test_translucent.rahit.spv");
-        // D1：材质层 callable（K2 的 landing 解析经它执行；K1 不用）
-        auto materialCode = loadSpv("shaders/rt_test_material.spv");
+        // D1：材质 callable（仅非拆分的单发 K2 挂；所有 k2Split 档都走内联
+        // ORION_K2_MATERIAL_INLINE，绝不调 executeCallableEXT，摘掉 145 KB 死模块与 SBT 槽位）
+        const bool includeMaterialCallable = !k2Split;
+        auto materialCode = includeMaterialCallable
+            ? loadSpv("shaders/rt_test_material.spv")
+            : std::vector<uint8_t>{};
 
         VkShaderModule mods[14]{};
         const char* entry = "main";
@@ -3304,11 +3362,16 @@ void ensureK1K2Pipelines()
         makeModule(ahit, mods[5]);
         makeModule(translucentChit, mods[6]);
         makeModule(translucentAhit, mods[7]);
-        makeModule(materialCode, mods[8]);
+        if(includeMaterialCallable)
+        {
+            makeModule(materialCode, mods[8]);
+        }
         makeModule(nocloudMiss, mods[13]);
 
         // 每条管线的 stage 0 换成自己的 rgen；stage 1（主命中组 chit）K1 用精简版；
-        // stage 6 = 材质 callable（两条管线共用同一模块，SBT 单记录即可）
+        // stage 6 = 材质 callable（仅单发 K2 启用，k2Split 全部走内联材质）
+        const uint32_t stageCount = includeMaterialCallable ? 7u : 6u;
+        const uint32_t groupCount = includeMaterialCallable ? 6u : 5u;
         VkPipelineShaderStageCreateInfo stages1[7]{};
         VkPipelineShaderStageCreateInfo stages2[7]{};
         const VkShaderStageFlagBits stageKinds[7] = {
@@ -3317,7 +3380,7 @@ void ensureK1K2Pipelines()
             VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
             VK_SHADER_STAGE_CALLABLE_BIT_KHR };
         const uint32_t stageModules[7] = { 0u, 2u, 4u, 5u, 6u, 7u, 8u };
-        for(uint32_t i = 0u; i < 7u; ++i)
+        for(uint32_t i = 0u; i < stageCount; ++i)
         {
             stages1[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
             stages1[i].stage = stageKinds[i];
@@ -3348,15 +3411,18 @@ void ensureK1K2Pipelines()
         groups[3].closestHitShader = 4u;
         groups[3].anyHitShader = 5u;
         groups[4] = groups[1];
-        // D1：材质 callable 组（general = stage 6）
-        groups[5] = groups[0];
-        groups[5].generalShader = 6u;
+        if(includeMaterialCallable)
+        {
+            // D1：材质 callable 组（general = stage 6）
+            groups[5] = groups[0];
+            groups[5].generalShader = 6u;
+        }
 
         VkRayTracingPipelineCreateInfoKHR pci{
             VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
-        pci.stageCount = 7u;
+        pci.stageCount = stageCount;
         pci.pStages = stages1;
-        pci.groupCount = 6u;
+        pci.groupCount = groupCount;
         pci.pGroups = groups;
         pci.maxPipelineRayRecursionDepth = 1u;
         pci.layout = g_rayTracingPipelineLayout;
@@ -3754,16 +3820,19 @@ void ensureK1K2Pipelines()
             sbtCursor =
                 alignTo(sbtCursor + SBT_HIT_RECORD_COUNT * handleAligned);
         }
-        const uint32_t callableOffset = sbtCursor;
-        sbtCursor = alignTo(sbtCursor + handleAligned);
-        for(uint32_t leg = 0u; leg < k2LegCount; ++leg)
+        uint32_t callableOffset = 0u;
+        if(includeMaterialCallable)
         {
-            legCallableOffset[leg] = sbtCursor;
+            callableOffset = sbtCursor;
             sbtCursor = alignTo(sbtCursor + handleAligned);
+            for(uint32_t leg = 0u; leg < k2LegCount; ++leg)
+            {
+                legCallableOffset[leg] = sbtCursor;
+                sbtCursor = alignTo(sbtCursor + handleAligned);
+            }
         }
         const uint32_t sbtSize = sbtCursor;
 
-        const uint32_t groupCount = 6u;
         std::vector<uint8_t> handles1((size_t)groupCount * hs, 0);
         // 2026-11-22 ⑤ 拆腿：legHandles [3]→[4]（同 offset 数组，越界即崩）。
         std::vector<uint8_t> legHandles[4]{
@@ -3796,10 +3865,11 @@ void ensureK1K2Pipelines()
             std::memcpy(data.data() + hitOffset + record * handleAligned,
                         handles1.data() + recordGroups[record] * hs, hs);
         }
-        // K1 的 callable region 挂第一条腿的 callable 记录（同一 callable
-        // 模块，句柄相同；K1 的 rgen 不发起 callable，挂上无影响）
-        std::memcpy(data.data() + callableOffset,
-                    legHandles[0].data() + 5u * hs, hs);
+        if(includeMaterialCallable)
+        {
+            std::memcpy(data.data() + callableOffset,
+                        legHandles[0].data() + 5u * hs, hs);
+        }
         for(uint32_t leg = 0u; leg < k2LegCount; ++leg)
         {
             std::memcpy(data.data() + legRaygenOffset[leg],
@@ -3812,8 +3882,11 @@ void ensureK1K2Pipelines()
                     data.data() + legHitOffset[leg] + record * handleAligned,
                     legHandles[leg].data() + recordGroups[record] * hs, hs);
             }
-            std::memcpy(data.data() + legCallableOffset[leg],
-                        legHandles[leg].data() + 5u * hs, hs);
+            if(includeMaterialCallable)
+            {
+                std::memcpy(data.data() + legCallableOffset[leg],
+                            legHandles[leg].data() + 5u * hs, hs);
+            }
         }
 
         createBuffer(g_device, g_physicalDevice, sbtSize,
@@ -3843,11 +3916,16 @@ void ensureK1K2Pipelines()
         g_k1HitRegion.deviceAddress = sbtAddress + hitOffset;
         g_k1HitRegion.stride = handleAligned;
         g_k1HitRegion.size = SBT_HIT_RECORD_COUNT * handleAligned;
-        // D1：材质 callable 记录（各腿共用同一 callable 模块；K1 的 rgen
-        // 不发起 callable，region 挂上对 K1 无影响）
-        g_k1CallableRegion.deviceAddress = sbtAddress + callableOffset;
-        g_k1CallableRegion.stride = handleAligned;
-        g_k1CallableRegion.size = handleAligned;
+        if(includeMaterialCallable)
+        {
+            g_k1CallableRegion.deviceAddress = sbtAddress + callableOffset;
+            g_k1CallableRegion.stride = handleAligned;
+            g_k1CallableRegion.size = handleAligned;
+        }
+        else
+        {
+            g_k1CallableRegion = {};
+        }
         if(!k2Split)
         {
             // 单发模式：腿 0 就是 K2，region 直接对上旧 extern
@@ -3873,10 +3951,17 @@ void ensureK1K2Pipelines()
             k2LegHit[leg]->deviceAddress = sbtAddress + legHitOffset[leg];
             k2LegHit[leg]->stride = handleAligned;
             k2LegHit[leg]->size = SBT_HIT_RECORD_COUNT * handleAligned;
-            k2LegCallable[leg]->deviceAddress =
-                sbtAddress + legCallableOffset[leg];
-            k2LegCallable[leg]->stride = handleAligned;
-            k2LegCallable[leg]->size = handleAligned;
+            if(includeMaterialCallable)
+            {
+                k2LegCallable[leg]->deviceAddress =
+                    sbtAddress + legCallableOffset[leg];
+                k2LegCallable[leg]->stride = handleAligned;
+                k2LegCallable[leg]->size = handleAligned;
+            }
+            else
+            {
+                *k2LegCallable[leg] = {};
+            }
         }
 
         {
@@ -4015,7 +4100,7 @@ void recordK2locDispatch(
     static const bool k2locCompactEnabled = []()
     {
         const char* raw = std::getenv("ORION_K2LOC_COMPACT");
-        return raw == nullptr || raw[0] != '0';
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
     }();
     static bool s_k2locCompactModeLogged = false;
 
@@ -4393,7 +4478,10 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
             {
                 if(g_sharcZeroed && g_sharcBuffersReady)
                 {
-                    recordSharcUpdate(cmd, width, height);
+                    const bool skipBarrier =
+                        sharcResolveDueThisFrame() &&
+                        g_sharcResolvePipeline != VK_NULL_HANDLE;
+                    recordSharcUpdateImpl(cmd, width, height, skipBarrier);
                     recordSharcResolve(cmd);
                 }
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -4475,7 +4563,10 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
             {
                 if(g_sharcZeroed && g_sharcBuffersReady)
                 {
-                    recordSharcUpdate(cmd, width, height);
+                    const bool skipBarrier =
+                        sharcResolveDueThisFrame() &&
+                        g_sharcResolvePipeline != VK_NULL_HANDLE;
+                    recordSharcUpdateImpl(cmd, width, height, skipBarrier);
                     recordSharcResolve(cmd);
                 }
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -4535,7 +4626,10 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
         if(g_perfGiBounces.load(std::memory_order_relaxed) > 0u &&
            g_sharcZeroed && g_sharcBuffersReady)
         {
-            recordSharcUpdate(cmd, width, height);
+            const bool skipBarrier =
+                sharcResolveDueThisFrame() &&
+                g_sharcResolvePipeline != VK_NULL_HANDLE;
+            recordSharcUpdateImpl(cmd, width, height, skipBarrier);
             recordSharcResolve(cmd);
         }
         rtCheckpoint(cmd, "k1k2:trace-k2i-2leg");
@@ -4660,11 +4754,9 @@ void sharcStatsTick()
         };
 
     const double sharcUpdatesPerFrame =
-        static_cast<double>(words[8]) /
-        static_cast<double>(g_sharcStatsFrameTick);
+        sharcSampledPerFrame(words[8], g_sharcStatsFrameTick);
     const double sharcFailsPerFrame =
-        static_cast<double>(words[10]) /
-        static_cast<double>(g_sharcStatsFrameTick);
+        sharcSampledPerFrame(words[10], g_sharcStatsFrameTick);
     const double sharcHitsPerFrame =
         sharcSampledPerFrame(words[11], g_sharcStatsFrameTick);
 

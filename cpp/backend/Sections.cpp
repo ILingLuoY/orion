@@ -91,6 +91,43 @@ VkDeviceSize sectionBuildPoolSlotBytes(VkDeviceSize requiredBytes)
 
     return bytes;
 }
+void prewarmVertexStagingPool()
+{
+    if(g_device == VK_NULL_HANDLE || g_physicalDevice == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    constexpr VkDeviceSize kPrewarmBytes = 32u * 1024u * 1024u;
+    constexpr size_t kPrewarmCount = 2u;
+    VkBuffer prewarmBuffers[kPrewarmCount]{};
+
+    for(size_t i = 0u; i < kPrewarmCount; ++i)
+    {
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        createBuffer(
+            g_device,
+            g_physicalDevice,
+            kPrewarmBytes,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            buf,
+            mem,
+            true
+        );
+        g_vertexStagingPool.adopt(buf, mem, kPrewarmBytes);
+        prewarmBuffers[i] = buf;
+    }
+
+    for(size_t i = 0u; i < kPrewarmCount; ++i)
+    {
+        g_vertexStagingPool.release(prewarmBuffers[i]);
+    }
+
+    RTLog("[STAGING PREWARM] preallocated 2x32MB HOST_VISIBLE staging slots");
+}
 void destroyPooledSectionBuildBuffers()
 {
     g_vertexStagingPool.releaseAll();
@@ -1986,6 +2023,16 @@ static void destroySectionASImmediate(RTSectionAS& section)
         section.hasSectionMemoryChunk = false;
     }
 
+    if(section.hasBlasMemoryChunk)
+    {
+        releaseSectionMemory(
+            section.blasMemorySlab,
+            section.blasMemoryChunk
+        );
+
+        section.hasBlasMemoryChunk = false;
+    }
+
 
     destroySectionOpacityMicromap(section);
 
@@ -2028,7 +2075,8 @@ namespace
                section.blasBuffer != VK_NULL_HANDLE ||
                section.vertexBuffer != VK_NULL_HANDLE ||
                section.opacityMicromap != VK_NULL_HANDLE ||
-               section.hasSectionMemoryChunk;
+               section.hasSectionMemoryChunk ||
+               section.hasBlasMemoryChunk;
     }
 
     void flushPendingSectionDestroys(bool force)
@@ -2990,10 +3038,19 @@ VkDeviceSize createSectionBLAS(
     const bool refitCapable =
         allowUpdate && !section.hasOpacityMicromap;
 
+    const bool compactCapable =
+        !refitCapable &&
+        !section.hasOpacityMicromap &&
+        getCmdWriteAccelerationStructuresProperties() != nullptr &&
+        getCmdCopyAccelerationStructure() != nullptr;
+
     buildInfo.flags =
         VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
         (refitCapable
             ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR
+            : 0) |
+        (compactCapable
+            ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR
             : 0);
 
     buildInfo.mode =
@@ -3102,101 +3159,189 @@ VkDeviceSize createSectionBLAS(
             1
         );
 
+    const bool useSeparateBlasChunk =
+        compactCapable &&
+        sizesInfo.accelerationStructureSize >= 16384u;
 
-    if(
-        vertexRequirements.size >
-        std::numeric_limits<VkDeviceSize>::max() -
-            (blasAlignment - 1)
-    )
+    if(useSeparateBlasChunk)
     {
-        throw std::runtime_error(
-            "Section shared allocation alignment overflow"
-        );
-    }
+        const uint32_t vertexMemoryTypeIndex =
+            findMemoryType(
+                g_physicalDevice,
+                vertexRequirements.memoryTypeBits,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+            );
+        const uint32_t blasMemoryTypeIndex =
+            findMemoryType(
+                g_physicalDevice,
+                blasRequirements.memoryTypeBits,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+            );
 
-
-    const VkDeviceSize blasMemoryOffset =
-        (
-            (
-                vertexRequirements.size +
-                blasAlignment -
-                1
-            ) /
-            blasAlignment
-        ) *
-        blasAlignment;
-
-
-    if(
-        blasMemoryOffset >
-        std::numeric_limits<VkDeviceSize>::max() -
-            blasRequirements.size
-    )
-    {
-        throw std::runtime_error(
-            "Section shared allocation size overflow"
-        );
-    }
-
-
-    const VkDeviceSize sharedMemoryBytes =
-        blasMemoryOffset +
-        blasRequirements.size;
-
-    const uint32_t sharedMemoryTypeIndex =
-        findMemoryType(
-            g_physicalDevice,
-            commonMemoryTypeBits,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-        );
-
-    VkDeviceSize chunkBase = 0u;
-
-    if(
-        !acquireSectionMemory(
-            sharedMemoryBytes,
-            std::max(
+        VkDeviceSize vertexChunkBase = 0u;
+        if(!acquireSectionMemory(
+                vertexRequirements.size,
                 vertexRequirements.alignment,
-                blasRequirements.alignment
+                vertexMemoryTypeIndex,
+                section.vertexMemory,
+                vertexChunkBase,
+                section.sectionMemoryChunkBytes,
+                section.sectionMemorySlab,
+                section.sectionMemoryChunk,
+                sectionPoolChunkWasteLog2()))
+        {
+            throw SectionMemoryUnavailableError(
+                "acquire Section vertex memory chunk failed"
+            );
+        }
+
+        VkDeviceMemory blasChunkMemory = VK_NULL_HANDLE;
+        VkDeviceSize blasChunkBase = 0u;
+        if(!acquireSectionMemory(
+                blasRequirements.size,
+                blasAlignment,
+                blasMemoryTypeIndex,
+                blasChunkMemory,
+                blasChunkBase,
+                section.blasMemoryChunkBytes,
+                section.blasMemorySlab,
+                section.blasMemoryChunk,
+                sectionPoolChunkWasteLog2()))
+        {
+            releaseSectionMemory(
+                section.sectionMemorySlab,
+                section.sectionMemoryChunk
+            );
+            throw SectionMemoryUnavailableError(
+                "acquire Section BLAS memory chunk failed"
+            );
+        }
+
+        section.hasSectionMemoryChunk = true;
+        section.hasBlasMemoryChunk = true;
+        section.compactCapable = true;
+        section.blasCompacted = false;
+
+        check(
+            vkBindBufferMemory(
+                g_device,
+                section.vertexBuffer,
+                section.vertexMemory,
+                vertexChunkBase
             ),
-            sharedMemoryTypeIndex,
-            section.vertexMemory,
-            chunkBase,
-            section.sectionMemoryChunkBytes,
-            section.sectionMemorySlab,
-            section.sectionMemoryChunk,
-            sectionPoolChunkWasteLog2()
-        )
-    )
-    {
-        throw SectionMemoryUnavailableError(
-            "acquire Section memory chunk failed"
+            "bind Section vertex buffer memory failed"
+        );
+
+        check(
+            vkBindBufferMemory(
+                g_device,
+                section.blasBuffer,
+                blasChunkMemory,
+                blasChunkBase
+            ),
+            "bind Section BLAS buffer memory failed"
         );
     }
+    else
+    {
+        if(
+            vertexRequirements.size >
+            std::numeric_limits<VkDeviceSize>::max() -
+                (blasAlignment - 1)
+        )
+        {
+            throw std::runtime_error(
+                "Section shared allocation alignment overflow"
+            );
+        }
 
-    section.hasSectionMemoryChunk = true;
+
+        const VkDeviceSize blasMemoryOffset =
+            (
+                (
+                    vertexRequirements.size +
+                    blasAlignment -
+                    1
+                ) /
+                blasAlignment
+            ) *
+            blasAlignment;
 
 
-    check(
-        vkBindBufferMemory(
-            g_device,
-            section.vertexBuffer,
-            section.vertexMemory,
-            chunkBase
-        ),
-        "bind Section vertex buffer memory failed"
-    );
+        if(
+            blasMemoryOffset >
+            std::numeric_limits<VkDeviceSize>::max() -
+                blasRequirements.size
+        )
+        {
+            throw std::runtime_error(
+                "Section shared allocation size overflow"
+            );
+        }
 
 
-    check(
-        vkBindBufferMemory(
-            g_device,
-            section.blasBuffer,
-            section.vertexMemory,
-            chunkBase + blasMemoryOffset
-        ),
-        "bind Section BLAS buffer memory failed"
-    );
+        const VkDeviceSize sharedMemoryBytes =
+            blasMemoryOffset +
+            blasRequirements.size;
+
+        const uint32_t sharedMemoryTypeIndex =
+            findMemoryType(
+                g_physicalDevice,
+                commonMemoryTypeBits,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+            );
+
+        VkDeviceSize chunkBase = 0u;
+
+        if(
+            !acquireSectionMemory(
+                sharedMemoryBytes,
+                std::max(
+                    vertexRequirements.alignment,
+                    blasRequirements.alignment
+                ),
+                sharedMemoryTypeIndex,
+                section.vertexMemory,
+                chunkBase,
+                section.sectionMemoryChunkBytes,
+                section.sectionMemorySlab,
+                section.sectionMemoryChunk,
+                sectionPoolChunkWasteLog2()
+            )
+        )
+        {
+            throw SectionMemoryUnavailableError(
+                "acquire Section memory chunk failed"
+            );
+        }
+
+        section.hasSectionMemoryChunk = true;
+        section.hasBlasMemoryChunk = false;
+        section.compactCapable = false;
+        section.blasCompacted = false;
+
+
+        check(
+            vkBindBufferMemory(
+                g_device,
+                section.vertexBuffer,
+                section.vertexMemory,
+                chunkBase
+            ),
+            "bind Section vertex buffer memory failed"
+        );
+
+
+        check(
+            vkBindBufferMemory(
+                g_device,
+                section.blasBuffer,
+                section.vertexMemory,
+                chunkBase + blasMemoryOffset
+            ),
+            "bind Section BLAS buffer memory failed"
+        );
+    }
 
     g_sectionBuildMemMs += sectionBuildPhaseLap();
 
@@ -3351,6 +3496,9 @@ void recordSectionBLASBuild(
         VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
         (section.refitCapable
             ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR
+            : 0) |
+        (section.compactCapable
+            ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR
             : 0);
 
     buildInfo.mode =
@@ -4094,4 +4242,322 @@ void writeSectionRoleSlot(const RTSectionAS& section)
     static_cast<uint32_t*>(
         g_sectionRoleMapped
     )[section.vertexAddressSlot] = role;
+}
+
+namespace
+{
+    constexpr uint32_t kBlasCompactPoolSize = 256u;
+    constexpr uint32_t kMaxBlasCompactionsPerFrame = 16u;
+
+    struct PendingBlasCompactQuery
+    {
+        uint64_t sectionKey = 0u;
+        VkAccelerationStructureKHR origBlas = VK_NULL_HANDLE;
+        VkDeviceSize origBytes = 0u;
+        uint32_t queryIndex = 0u;
+        uint64_t buildFrameSerial = 0u;
+    };
+
+    VkQueryPool s_blasCompactQueryPool = VK_NULL_HANDLE;
+    std::vector<uint32_t> s_freeCompactQueries;
+    std::vector<PendingBlasCompactQuery> s_pendingBlasCompactions;
+    uint64_t s_totalBlasCompacted = 0u;
+    uint64_t s_totalBlasSavedBytes = 0u;
+}
+
+void initBlasCompactionResources()
+{
+    if(s_blasCompactQueryPool != VK_NULL_HANDLE || g_device == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkQueryPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    poolInfo.queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+    poolInfo.queryCount = kBlasCompactPoolSize;
+
+    if(vkCreateQueryPool(g_device, &poolInfo, nullptr, &s_blasCompactQueryPool) != VK_SUCCESS)
+    {
+        s_blasCompactQueryPool = VK_NULL_HANDLE;
+        return;
+    }
+
+    s_freeCompactQueries.clear();
+    s_freeCompactQueries.reserve(kBlasCompactPoolSize);
+    for(uint32_t i = kBlasCompactPoolSize; i > 0u; --i)
+    {
+        s_freeCompactQueries.push_back(i - 1u);
+    }
+    s_pendingBlasCompactions.clear();
+}
+
+void destroyBlasCompactionResources()
+{
+    if(g_device != VK_NULL_HANDLE && s_blasCompactQueryPool != VK_NULL_HANDLE)
+    {
+        vkDestroyQueryPool(g_device, s_blasCompactQueryPool, nullptr);
+    }
+    s_blasCompactQueryPool = VK_NULL_HANDLE;
+    s_freeCompactQueries.clear();
+    s_pendingBlasCompactions.clear();
+    s_totalBlasCompacted = 0u;
+    s_totalBlasSavedBytes = 0u;
+}
+
+void enqueueBlasCompactionQuery(VkCommandBuffer cmd, RTSectionAS& section)
+{
+    if(!section.compactCapable ||
+       section.blasCompacted ||
+       section.blas == VK_NULL_HANDLE ||
+       cmd == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    auto cmdWriteProps = getCmdWriteAccelerationStructuresProperties();
+    if(!cmdWriteProps)
+    {
+        return;
+    }
+
+    initBlasCompactionResources();
+    if(s_blasCompactQueryPool == VK_NULL_HANDLE || s_freeCompactQueries.empty())
+    {
+        return;
+    }
+
+    const uint32_t queryIndex = s_freeCompactQueries.back();
+    s_freeCompactQueries.pop_back();
+
+    vkCmdResetQueryPool(cmd, s_blasCompactQueryPool, queryIndex, 1u);
+    cmdWriteProps(
+        cmd,
+        1u,
+        &section.blas,
+        VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+        s_blasCompactQueryPool,
+        queryIndex
+    );
+
+    s_pendingBlasCompactions.push_back(PendingBlasCompactQuery{
+        section.sectionKey,
+        section.blas,
+        section.blasBytes,
+        queryIndex,
+        g_perfL10FrameSerial
+    });
+}
+
+bool recordPendingBlasCompactions(
+    VkCommandBuffer cmd,
+    std::vector<BlasCompactedAddressRemap>& outRemaps)
+{
+    outRemaps.clear();
+    if(cmd == VK_NULL_HANDLE ||
+       s_blasCompactQueryPool == VK_NULL_HANDLE ||
+       s_pendingBlasCompactions.empty())
+    {
+        return false;
+    }
+
+    auto cmdCopyAS = getCmdCopyAccelerationStructure();
+    auto createAS = getCreateAccelerationStructure();
+    auto getASAddress = getGetAccelerationStructureDeviceAddress();
+    if(!cmdCopyAS || !createAS || !getASAddress)
+    {
+        return false;
+    }
+
+    std::vector<PendingBlasCompactQuery> remaining;
+    remaining.reserve(s_pendingBlasCompactions.size());
+    uint32_t compactedThisFrame = 0u;
+
+    for(size_t i = 0u; i < s_pendingBlasCompactions.size(); ++i)
+    {
+        const PendingBlasCompactQuery& entry = s_pendingBlasCompactions[i];
+        if(g_perfL10FrameSerial < entry.buildFrameSerial + 2u ||
+           compactedThisFrame >= kMaxBlasCompactionsPerFrame)
+        {
+            remaining.push_back(entry);
+            continue;
+        }
+
+        uint64_t compactedSize = 0u;
+        const VkResult queryResult = vkGetQueryPoolResults(
+            g_device,
+            s_blasCompactQueryPool,
+            entry.queryIndex,
+            1u,
+            sizeof(uint64_t),
+            &compactedSize,
+            sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT
+        );
+
+        if(queryResult == VK_NOT_READY)
+        {
+            remaining.push_back(entry);
+            continue;
+        }
+
+        s_freeCompactQueries.push_back(entry.queryIndex);
+        if(queryResult != VK_SUCCESS)
+        {
+            continue;
+        }
+
+        auto secIt = g_sectionBLAS.find(entry.sectionKey);
+        if(secIt == g_sectionBLAS.end())
+        {
+            continue;
+        }
+
+        RTSectionAS& sec = secIt->second;
+        if(sec.blas != entry.origBlas ||
+           sec.blasCompacted ||
+           !sec.hasBlasMemoryChunk)
+        {
+            continue;
+        }
+
+        sec.blasCompacted = true;
+
+        if(compactedSize == 0u ||
+           compactedSize + 4096u >= sec.blasBytes ||
+           compactedSize > (sec.blasBytes * 7u) / 8u)
+        {
+            continue;
+        }
+
+        VkBuffer newBuf = VK_NULL_HANDLE;
+        VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufInfo.size = compactedSize;
+        bufInfo.usage =
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if(vkCreateBuffer(g_device, &bufInfo, nullptr, &newBuf) != VK_SUCCESS)
+        {
+            continue;
+        }
+
+        VkMemoryRequirements memReq{};
+        vkGetBufferMemoryRequirements(g_device, newBuf, &memReq);
+        const uint32_t memType = findMemoryType(
+            g_physicalDevice,
+            memReq.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        );
+
+        VkDeviceMemory newMem = VK_NULL_HANDLE;
+        VkDeviceSize newOffset = 0u;
+        VkDeviceSize newChunkBytes = 0u;
+        uint32_t newSlab = 0u;
+        uint32_t newChunk = 0u;
+        if(!acquireSectionMemory(
+                memReq.size,
+                std::max<VkDeviceSize>(memReq.alignment, 256u),
+                memType,
+                newMem,
+                newOffset,
+                newChunkBytes,
+                newSlab,
+                newChunk,
+                sectionPoolChunkWasteLog2()))
+        {
+            vkDestroyBuffer(g_device, newBuf, nullptr);
+            continue;
+        }
+
+        if(vkBindBufferMemory(g_device, newBuf, newMem, newOffset) != VK_SUCCESS)
+        {
+            releaseSectionMemory(newSlab, newChunk);
+            vkDestroyBuffer(g_device, newBuf, nullptr);
+            continue;
+        }
+
+        VkAccelerationStructureKHR newAs = VK_NULL_HANDLE;
+        VkAccelerationStructureCreateInfoKHR createInfo{
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR
+        };
+        createInfo.buffer = newBuf;
+        createInfo.offset = 0u;
+        createInfo.size = compactedSize;
+        createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        if(createAS(g_device, &createInfo, nullptr, &newAs) != VK_SUCCESS)
+        {
+            releaseSectionMemory(newSlab, newChunk);
+            vkDestroyBuffer(g_device, newBuf, nullptr);
+            continue;
+        }
+
+        VkAccelerationStructureDeviceAddressInfoKHR addrInfo{
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR
+        };
+        addrInfo.accelerationStructure = newAs;
+        const VkDeviceAddress newAddr = getASAddress(g_device, &addrInfo);
+
+        VkCopyAccelerationStructureInfoKHR copyInfo{
+            VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR
+        };
+        copyInfo.src = sec.blas;
+        copyInfo.dst = newAs;
+        copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
+        cmdCopyAS(cmd, &copyInfo);
+
+        RTSectionAS oldBlasOnly{};
+        oldBlasOnly.blas = sec.blas;
+        oldBlasOnly.blasBuffer = sec.blasBuffer;
+        oldBlasOnly.blasAddress = sec.blasAddress;
+        oldBlasOnly.blasBytes = sec.blasBytes;
+        oldBlasOnly.blasMemorySlab = sec.blasMemorySlab;
+        oldBlasOnly.blasMemoryChunk = sec.blasMemoryChunk;
+        oldBlasOnly.blasMemoryChunkBytes = sec.blasMemoryChunkBytes;
+        oldBlasOnly.hasBlasMemoryChunk = sec.hasBlasMemoryChunk;
+        destroySectionAS(oldBlasOnly);
+
+        const VkDeviceAddress oldAddr = sec.blasAddress;
+        sec.blas = newAs;
+        sec.blasBuffer = newBuf;
+        sec.blasAddress = newAddr;
+        sec.blasBytes = compactedSize;
+        sec.blasMemorySlab = newSlab;
+        sec.blasMemoryChunk = newChunk;
+        sec.blasMemoryChunkBytes = newChunkBytes;
+        sec.hasBlasMemoryChunk = true;
+
+        outRemaps.push_back(BlasCompactedAddressRemap{oldAddr, newAddr});
+        ++compactedThisFrame;
+        ++s_totalBlasCompacted;
+        s_totalBlasSavedBytes += (entry.origBytes - compactedSize);
+
+        if(s_totalBlasCompacted == 64u || (s_totalBlasCompacted % 256u) == 0u)
+        {
+            RTLog(
+                "[BLAS COMPACT] total=" + std::to_string(s_totalBlasCompacted) +
+                " savedMB=" + std::to_string(static_cast<double>(s_totalBlasSavedBytes) / (1024.0 * 1024.0))
+            );
+        }
+    }
+
+    s_pendingBlasCompactions.swap(remaining);
+
+    if(!outRemaps.empty())
+    {
+        VkMemoryBarrier compactBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        compactBarrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        compactBarrier.dstAccessMask =
+            VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+            VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            0u, 1u, &compactBarrier, 0u, nullptr, 0u, nullptr
+        );
+        return true;
+    }
+
+    return false;
 }

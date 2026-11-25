@@ -111,12 +111,23 @@ void main()
                 continue;
             }
 
-            vec3 c = max(imageLoad(rrOutputImage, p).rgb, vec3(0.0));
+            vec3 rawC = imageLoad(rrOutputImage, p).rgb;
+            if(any(isnan(rawC)) || any(isinf(rawC)))
+            {
+                continue;
+            }
+            vec3 c = max(rawC, vec3(0.0));
             float luma = dot(c, AE_LUMA_WEIGHTS);
 
             vec2 uv = (vec2(p) + vec2(0.5)) * invSize;
 
-            float depth = textureLod(sceneDepth, uv, 0.0).r;
+            ivec2 depthSize = textureSize(sceneDepth, 0);
+            ivec2 depthCoord = clamp(
+                ivec2(uv * vec2(depthSize)),
+                ivec2(0),
+                max(depthSize - ivec2(1), ivec2(0))
+            );
+            float depth = texelFetch(sceneDepth, depthCoord, 0).r;
             float cloudAlpha = textureLod(cloudResolvedImage, uv, 0.0).a;
 
             float w = meterWeight(uv, depth, cloudAlpha);
@@ -126,17 +137,22 @@ void main()
                 continue;
             }
 
-            // 直方图 bin 是 uint 计数，权重按 1/8 步长量化（0.125 精度）。
-            uint add = max(1u, uint(w * 8.0 + 0.5));
+            // 直方图 bin 是 uint 计数，权重按 1/16 步长量化（避免低权重天空气泡被 max(1u) 放大）。
+            uint add = uint(w * 16.0 + 0.5);
+            if(add == 0u)
+            {
+                continue;
+            }
 
-            float logLuma = log2(max(luma, AE_LUMA_FLOOR));
+            float lumaFloor = max(exp2(ae.logMin), AE_LUMA_FLOOR);
+            float logLuma = log2(max(luma, lumaFloor));
 
             float t = clamp(
                 (logLuma - ae.logMin) / max(ae.logMax - ae.logMin, 1.0e-3),
                 0.0,
                 1.0);
 
-            uint bin = min(uint(t * float(AE_BIN_COUNT)), AE_BIN_COUNT - 1u);
+            uint bin = clamp(uint(t * float(AE_BIN_COUNT)), 0u, AE_BIN_COUNT - 1u);
 
             atomicAdd(tileBins[bin], add);
         }

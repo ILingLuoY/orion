@@ -400,15 +400,45 @@ vec3 traceVptLocalLightVisibility(
         return vec3(1.0);
     }
 
+    // [12] 本地光可见性射线（traceVptLocalLightVisibility 的真实发射点）。
+    perfRayStatAdd(12u, 1u);
+
     #ifndef ORION_K2I_COMPOSE_COMPUTE
+#ifndef ORION_OPAQUE_VIS_FASTPATH
+#define ORION_OPAQUE_VIS_FASTPATH 1
+#endif
+#if ORION_OPAQUE_VIS_FASTPATH
+    {
+        rayQueryEXT localVisQuery;
+        rayQueryInitializeEXT(
+            localVisQuery,
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT,
+            cullMask,
+            origin,
+            0.02,
+            segment / distanceToTarget,
+            rayMaxDistance
+        );
+        if(!rayQueryProceedEXT(localVisQuery))
+        {
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntRayIssued();
+            #endif
+            return (rayQueryGetIntersectionTypeEXT(localVisQuery, true) !=
+                    gl_RayQueryCommittedIntersectionNoneEXT)
+                ? vec3(0.0)
+                : vec3(1.0);
+        }
+        rayQueryTerminateEXT(localVisQuery);
+    }
+#endif
+
     hit.hitDistance = 1.0;
     hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
     hit.parallaxRayTravel = 0.0;
     hit.glassAlpha = (0.0);
     hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
-
-    // [12] 本地光可见性射线（traceVptLocalLightVisibility 的真实发射点）。
-    perfRayStatAdd(12u, 1u);
 
     #ifdef ORION_RT_STAGE_COUNTERS
     rtCntRayIssued();

@@ -1559,9 +1559,9 @@ layout(std430, binding = 80, set = 0) buffer VPTBestLightBuffer
 layout(std430, binding = 99, set = 0) readonly buffer VPTLightGridBuffer
 {
     uvec4 header;
-    uvec4 cellMeta[9216];
-    uint aliasWords[9216 * 32];
-    uvec4 slots[9216 * 32];
+    uvec4 cellMeta[32000];
+    uint aliasWords[32000 * 32];
+    uvec4 slots[32000 * 32];
 } vptLightGridBuffer;
 
 const float VPT_SCREEN_POSITION_EPSILON = 0.35;
@@ -3139,6 +3139,8 @@ float vptLocalLightDistanceAttenuation(float distanceToLight)
         0.025 * distanceToLight * distanceToLight);
 }
 
+#include "vpt_light_grid_common.glsl"
+
 float rand(inout uint state);
 
 // Deterministic base-2 radical inverse for the 96-sample fixed sequence.
@@ -3701,13 +3703,28 @@ vec3 traceVptLocalLightVisibilityCached(
 }
 
 #ifndef VPT_LIGHT_GRID_EXHAUSTIVE_MAX
-#define VPT_LIGHT_GRID_EXHAUSTIVE_MAX 8u
+#define VPT_LIGHT_GRID_EXHAUSTIVE_MAX 12u
+#endif
+#ifndef VPT_LIGHT_GRID_BOUNCE_EXHAUSTIVE_MAX
+#define VPT_LIGHT_GRID_BOUNCE_EXHAUSTIVE_MAX 8u
 #endif
 #ifndef VPT_LIGHT_GRID_PROPOSAL_CAP
-#define VPT_LIGHT_GRID_PROPOSAL_CAP 12u
+#define VPT_LIGHT_GRID_PROPOSAL_CAP 8u
 #endif
 #ifndef VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP
-#define VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP 8u
+#define VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP 6u
+#endif
+#ifndef VPT_LIGHT_GRID_MIS_GRID_PROPOSALS
+#define VPT_LIGHT_GRID_MIS_GRID_PROPOSALS 6u
+#endif
+#ifndef VPT_LIGHT_GRID_MIS_DIR_PROPOSALS
+#define VPT_LIGHT_GRID_MIS_DIR_PROPOSALS 2u
+#endif
+#ifndef VPT_LIGHT_GRID_BOUNCE_MIS_GRID_PROPOSALS
+#define VPT_LIGHT_GRID_BOUNCE_MIS_GRID_PROPOSALS 4u
+#endif
+#ifndef VPT_LIGHT_GRID_BOUNCE_MIS_DIR_PROPOSALS
+#define VPT_LIGHT_GRID_BOUNCE_MIS_DIR_PROPOSALS 2u
 #endif
 #ifndef VPT_LOCAL_BLUE_NOISE_RIS
 #define VPT_LOCAL_BLUE_NOISE_RIS 1
@@ -3728,6 +3745,43 @@ float vptLocalBlueNoise01(uvec2 pixelIdx, uint temporalIdx, uint seedIndex, inou
     const uint word = glassBlueNoise.words[byteIndex >> 2u];
     const uint raw = (word >> ((byteIndex & 3u) * 8u)) & 0xFFu;
     return clamp((float(raw) + rand(rngState)) * (1.0 / 256.0), 0.0, 0.9999999);
+}
+
+float vptEvalDirectoryPdf(
+    ivec3 emitterBlock,
+    uint emission,
+    ivec3 donorASec,
+    float donorAWeight,
+    float donorAInvTotalW,
+    bool donorBValid,
+    ivec3 donorBSec,
+    float donorBInvTotalW)
+{
+    if(emission == 0u)
+    {
+        return 0.0;
+    }
+    ivec3 emitterSec = emitterBlock >> 4;
+    float pdf = 0.0;
+    if(donorAWeight > 0.0 && donorAInvTotalW > 0.0)
+    {
+        ivec3 offA = emitterSec - donorASec;
+        if(all(lessThanEqual(abs(offA), ivec3(2))))
+        {
+            pdf += donorAWeight * float(emission) *
+                vptSourceDirectoryDistWeight(offA) * donorAInvTotalW;
+        }
+    }
+    if(donorBValid && donorAWeight < 1.0 && donorBInvTotalW > 0.0)
+    {
+        ivec3 offB = emitterSec - donorBSec;
+        if(all(lessThanEqual(abs(offB), ivec3(2))))
+        {
+            pdf += (1.0 - donorAWeight) * float(emission) *
+                vptSourceDirectoryDistWeight(offB) * donorBInvTotalW;
+        }
+    }
+    return pdf;
 }
 
 vec3 evaluateVPTRISDirectLightingSingle(
@@ -3767,7 +3821,15 @@ vec3 evaluateVPTRISDirectLightingSingle(
     // =====================================================================
     // ===== DBG_LADDER_C: 单个本地光 RIS 可达 → 纯黄 =====
     if(DBG_LADDER_C) { return vec3(1.0, 1.0, 0.0); }
-    const bool temporalMode = useTemporalReservoir && cam.sparseParams.x >= 0.5;
+#if defined(ORION_K1_PRIMARY) || defined(ORION_K2_DIRECT_SUN_STAGE_A) \
+    || defined(ORION_K2_DIRECT_SUN_STAGE_B) || defined(ORION_K2_INDIRECT_STAGE) \
+    || (defined(SHARC_UPDATE) && SHARC_UPDATE != 0)
+#define VPT_LOCAL_ENABLE_TEMPORAL_RESERVOIR 0
+#else
+#define VPT_LOCAL_ENABLE_TEMPORAL_RESERVOIR 1
+#endif
+    const bool temporalMode = (VPT_LOCAL_ENABLE_TEMPORAL_RESERVOIR != 0)
+        && useTemporalReservoir && cam.sparseParams.x >= 0.5;
 
     // =====================================================
     // 2026-10-03 **消灭明暗分界线（1/3）：目录查找抖动**。
@@ -3784,9 +3846,13 @@ vec3 evaluateVPTRISDirectLightingSingle(
     // =====================================================
     bool useLightGrid = false;
     bool gridEmptyZero = false;
+    bool gridHasResidual = false;
     uint gridCellIdx = 0u;
     uint gridCellCount = 0u;
     float gridCellSumP = 0.0;
+    float gridMinTopP = 0.0;
+    vec3 gridPadMin = vec3(0.0);
+    vec3 gridPadMax = vec3(0.0);
 #if VPT_LOCAL_LIGHT_GRID
     if(!(temporalMode && !shadingActive))
     {
@@ -3800,23 +3866,69 @@ vec3 evaluateVPTRISDirectLightingSingle(
             vec3 gridLookupN = dot(geometricFaceNormal, geometricFaceNormal) > 0.25
                 ? normalize(geometricFaceNormal)
                 : (dot(hitNormal, hitNormal) > 1.0e-8 ? normalize(hitNormal) : vec3(0.0));
-            vec3 cellJitter = (vec3(
-                rand(rngState), rand(rngState), rand(rngState)
-            ) - vec3(0.5)) * 0.25;
-            cellJitter -= gridLookupN * dot(cellJitter, gridLookupN);
-            vec3 gridLookupPos = hitPos + gridLookupN * 0.20 + cellJitter;
+            vec3 basePos = hitPos;
+            vec3 safeOffset = vec3(0.0);
+            if(dot(gridLookupN, gridLookupN) > 0.25)
+            {
+                basePos = hitPos + gridLookupN * 0.25;
+                vec3 upRef = (abs(gridLookupN.y) < 0.9)
+                    ? vec3(0.0, 1.0, 0.0)
+                    : vec3(1.0, 0.0, 0.0);
+                vec3 tangent = normalize(cross(upRef, gridLookupN));
+                vec3 bitangent = cross(gridLookupN, tangent);
+                vec3 rawOffset =
+                    tangent   * ((rand(rngState) - 0.5) * 3.90) +
+                    bitangent * ((rand(rngState) - 0.5) * 3.90) +
+                    gridLookupN * (rand(rngState) * 1.50);
+                safeOffset = clamp(rawOffset, vec3(-1.95), vec3(1.95));
+            }
+            else
+            {
+                safeOffset = (vec3(
+                    rand(rngState), rand(rngState), rand(rngState)
+                ) - vec3(0.5)) * 3.90;
+            }
+
+            vec3 candPos = basePos + safeOffset;
+            vec3 midPos  = basePos + safeOffset * 0.5;
+            ivec3 baseBlk = ivec3(floor(basePos));
+            ivec3 midBlk  = ivec3(floor(midPos));
+            ivec3 endBlk  = ivec3(floor(candPos));
+
+            bool midBlocked = false;
+            if(any(notEqual(midBlk, baseBlk)))
+            {
+                uint midSrc = 0u;
+                midBlocked = vptReadSourceVoxel(midBlk, midSrc) && ((midSrc & 3u) == 1u);
+            }
+            bool endBlocked = midBlocked;
+            if(!endBlocked && any(notEqual(endBlk, midBlk)) && any(notEqual(endBlk, baseBlk)))
+            {
+                uint endSrc = 0u;
+                endBlocked = vptReadSourceVoxel(endBlk, endSrc) && ((endSrc & 3u) == 1u);
+            }
+
+            vec3 gridLookupPos = !endBlocked ? candPos : (!midBlocked ? midPos : basePos);
             ivec3 relCell = ivec3(floor(gridLookupPos / 4.0)) - gridOrigin;
             if(all(greaterThanEqual(relCell, ivec3(0))) &&
-               all(lessThan(relCell, ivec3(24, 16, 24))))
+               all(lessThan(relCell, ivec3(40, 20, 40))))
             {
-                gridCellIdx = uint(relCell.y) * 576u +
-                    uint(relCell.z) * 24u + uint(relCell.x);
+                ivec3 gridCellCoord = gridOrigin + relCell;
+                gridPadMin = vec3(gridCellCoord) * 4.0 - vec3(0.5);
+                gridPadMax = vec3(gridCellCoord) * 4.0 + vec3(4.5);
+                gridCellIdx = uint(relCell.y) * 1600u +
+                    uint(relCell.z) * 40u + uint(relCell.x);
                 uvec4 meta = vptLightGridBuffer.cellMeta[gridCellIdx];
                 gridCellCount = meta.x;
                 gridCellSumP = uintBitsToFloat(meta.y);
+                gridHasResidual = (meta.z != 0u);
+                gridMinTopP = uintBitsToFloat(meta.w);
                 if(gridCellCount == 0u)
                 {
-                    gridEmptyZero = true;
+                    if(!gridHasResidual)
+                    {
+                        gridEmptyZero = true;
+                    }
                 }
                 else if(gridCellCount <= 32u)
                 {
@@ -3827,7 +3939,10 @@ vec3 evaluateVPTRISDirectLightingSingle(
     }
 #endif
 
-    bool hasDirectory = !useLightGrid && !gridEmptyZero && !(temporalMode && !shadingActive);
+    bool hasDirectory =
+        ((!useLightGrid && !gridEmptyZero) ||
+         (useLightGrid && gridHasResidual && !temporalMode)) &&
+        !(temporalMode && !shadingActive);
     ivec3 receiverSection = ivec3(0);
     uint receiverPage = 0u;
     ivec3 directorySection = ivec3(0);
@@ -3838,9 +3953,16 @@ vec3 evaluateVPTRISDirectLightingSingle(
     float borrowDonorBDistanceSquared = 1.0e30;
     if(hasDirectory)
     {
-        const vec3 directoryJitter = vec3(
-            rand(rngState), rand(rngState), rand(rngState)) - vec3(0.5);
-        receiverSection = ivec3(floor((hitPos + directoryJitter * 16.0) / 16.0));
+        if(useLightGrid)
+        {
+            receiverSection = ivec3(floor(hitPos / 16.0));
+        }
+        else
+        {
+            const vec3 directoryJitter = vec3(
+                rand(rngState), rand(rngState), rand(rngState)) - vec3(0.5);
+            receiverSection = ivec3(floor((hitPos + directoryJitter * 16.0) / 16.0));
+        }
         directorySection = receiverSection;
         if(!vliLookupSectionPage(receiverSection, receiverPage))
         {
@@ -4086,23 +4208,75 @@ vec3 evaluateVPTRISDirectLightingSingle(
         }
     }
 
+    float donorAInvTotalW = 0.0;
+    float donorBInvTotalW = 0.0;
+    if(hasDirectory)
+    {
+        donorAInvTotalW =
+            vptSourceDirectoryPagesBuffer.entries[directoryBase].selectionProbability;
+        if(borrowDonorBValid)
+        {
+            uint donorBBase =
+                borrowDonorBPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
+            donorBInvTotalW =
+                vptSourceDirectoryPagesBuffer.entries[donorBBase].selectionProbability;
+        }
+    }
+
     const bool bounceCaller = (!temporalMode && f0.x < 0.0);
-    uint proposalBudget = temporalMode
+    uint baseBudget = temporalMode
         ? min(vptRisProposalCount(), 6u)
         : vptRisProposalCount();
-    if(useLightGrid && !temporalMode)
+    const bool useMisTwoStrategy =
+        useLightGrid &&
+        gridHasResidual &&
+        hasDirectory &&
+        !temporalMode &&
+        (baseBudget >= 2u) &&
+        (donorAInvTotalW > 0.0 || (borrowDonorBValid && donorBInvTotalW > 0.0));
+
+    uint misGridProposals = 0u;
+    uint misDirProposals = 0u;
+    uint proposalBudget = baseBudget;
+    bool gridExhaustive = false;
+    uint loopCount = 0u;
+    float effectiveProposalCount = 1.0;
+
+    if(useMisTwoStrategy)
     {
-        const uint gridCap = bounceCaller
-            ? uint(VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP)
-            : uint(VPT_LIGHT_GRID_PROPOSAL_CAP);
-        proposalBudget = min(proposalBudget, min(gridCellCount, gridCap));
+        uint misGridTarget = bounceCaller
+            ? uint(VPT_LIGHT_GRID_BOUNCE_MIS_GRID_PROPOSALS)
+            : uint(VPT_LIGHT_GRID_MIS_GRID_PROPOSALS);
+        uint misDirTarget = bounceCaller
+            ? uint(VPT_LIGHT_GRID_BOUNCE_MIS_DIR_PROPOSALS)
+            : uint(VPT_LIGHT_GRID_MIS_DIR_PROPOSALS);
+        misDirProposals = min(misDirTarget, max(baseBudget / 2u, 1u));
+        misGridProposals = min(misGridTarget, baseBudget - misDirProposals);
+        loopCount = misGridProposals + misDirProposals;
+        effectiveProposalCount = 1.0;
     }
-    const bool gridExhaustive = useLightGrid &&
-        gridCellCount <= uint(VPT_LIGHT_GRID_EXHAUSTIVE_MAX);
-    const uint loopCount = gridExhaustive ? gridCellCount : proposalBudget;
-    const float effectiveProposalCount = gridExhaustive
-        ? 1.0
-        : max(float(loopCount), 1.0);
+    else
+    {
+        if(useLightGrid && !temporalMode)
+        {
+            const uint exhaustiveMax = bounceCaller
+                ? uint(VPT_LIGHT_GRID_BOUNCE_EXHAUSTIVE_MAX)
+                : uint(VPT_LIGHT_GRID_EXHAUSTIVE_MAX);
+            gridExhaustive = !gridHasResidual && (gridCellCount <= exhaustiveMax);
+            const uint gridCap = bounceCaller
+                ? uint(VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP)
+                : uint(VPT_LIGHT_GRID_PROPOSAL_CAP);
+            proposalBudget = min(proposalBudget, min(gridCellCount, gridCap));
+        }
+        else if(hasDirectory && !temporalMode && !bounceCaller)
+        {
+            proposalBudget = max(proposalBudget, 16u);
+        }
+        loopCount = gridExhaustive ? gridCellCount : proposalBudget;
+        effectiveProposalCount = gridExhaustive
+            ? 1.0
+            : max(float(loopCount), 1.0);
+    }
 
     const bool useBlueNoiseBucket =
         (VPT_LOCAL_BLUE_NOISE_RIS != 0) && useLightGrid && !gridExhaustive && !temporalMode;
@@ -4120,6 +4294,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
 
     if(useLightGrid || hasDirectory)
     {
+        uint gridStrata = useMisTwoStrategy ? max(misGridProposals, 1u) : max(loopCount, 1u);
         for(uint proposalIndex = 0u;
             proposalIndex < loopCount;
             ++proposalIndex)
@@ -4129,13 +4304,17 @@ vec3 evaluateVPTRISDirectLightingSingle(
             uint typeCode = 0u;
             float invSourcePdf = 1.0;
 
-            if(useLightGrid)
+            bool drawFromGrid = useMisTwoStrategy
+                ? (proposalIndex < misGridProposals)
+                : useLightGrid;
+
+            if(drawFromGrid)
             {
                 uint chosenIdx = proposalIndex;
                 if(!gridExhaustive)
                 {
                     float uBucket = useBlueNoiseBucket
-                        ? fract(bnBucketPhase + (float(proposalIndex) + 0.5) / float(loopCount))
+                        ? fract(bnBucketPhase + (float(proposalIndex) + 0.5) / float(gridStrata))
                         : rand(rngState);
                     uint bucket = min(
                         uint(uBucket * float(gridCellCount)),
@@ -4158,9 +4337,28 @@ vec3 evaluateVPTRISDirectLightingSingle(
                     int(packedYMeta & 0xffffu) - 32768,
                     int(slotData.z)
                 );
-                invSourcePdf = gridExhaustive
-                    ? 1.0
-                    : (max(gridCellSumP, pCell) / max(pCell, 1.0e-6));
+                if(useMisTwoStrategy)
+                {
+                    float qG = pCell / max(gridCellSumP, pCell);
+                    float qD = vptEvalDirectoryPdf(
+                        emitterBlock,
+                        emission,
+                        directorySection,
+                        borrowDonorWeightA,
+                        donorAInvTotalW,
+                        borrowDonorBValid,
+                        borrowDonorBSection,
+                        donorBInvTotalW
+                    );
+                    float denom = float(misGridProposals) * qG + float(misDirProposals) * qD;
+                    invSourcePdf = (denom > 1.0e-12) ? (1.0 / denom) : 0.0;
+                }
+                else
+                {
+                    invSourcePdf = gridExhaustive
+                        ? 1.0
+                        : (max(gridCellSumP, pCell) / max(pCell, 1.0e-6));
+                }
             }
             else
             {
@@ -4247,7 +4445,55 @@ vec3 evaluateVPTRISDirectLightingSingle(
                     (float(emission) / float(max(totalEmitterPower, 1u))),
                     1.0e-8
                 );
-                invSourcePdf = 1.0 / proposalPdf;
+                if(useMisTwoStrategy)
+                {
+                    float qD = vptEvalDirectoryPdf(
+                        emitterBlock,
+                        emission,
+                        directorySection,
+                        borrowDonorWeightA,
+                        donorAInvTotalW,
+                        borrowDonorBValid,
+                        borrowDonorBSection,
+                        donorBInvTotalW
+                    );
+                    if(qD <= 0.0)
+                    {
+                        qD = proposalPdf;
+                    }
+                    float qG = 0.0;
+                    if(gridCellSumP > 0.0)
+                    {
+                        float pUnocc = vptGridBaseWeight(
+                            emitterBlock, emission, typeCode, gridPadMin, gridPadMax
+                        );
+                        if(pUnocc >= gridMinTopP * 0.999)
+                        {
+                            uint gridSlotBase = gridCellIdx * 32u;
+                            for(uint gi = 0u; gi < gridCellCount; ++gi)
+                            {
+                                uvec4 gSlot = vptLightGridBuffer.slots[gridSlotBase + gi];
+                                ivec3 gBlk = ivec3(
+                                    int(gSlot.x),
+                                    int(gSlot.y & 0xffffu) - 32768,
+                                    int(gSlot.z)
+                                );
+                                if(all(equal(gBlk, emitterBlock)))
+                                {
+                                    float gP = uintBitsToFloat(gSlot.w);
+                                    qG = gP / max(gridCellSumP, gP);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    float denom = float(misGridProposals) * qG + float(misDirProposals) * qD;
+                    invSourcePdf = (denom > 1.0e-12) ? (1.0 / denom) : 0.0;
+                }
+                else
+                {
+                    invSourcePdf = 1.0 / proposalPdf;
+                }
             }
 
             vec3 emitterCenter = vec3(emitterBlock) + vec3(0.5);
@@ -4308,6 +4554,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
 #endif
     }
 
+#if VPT_LOCAL_ENABLE_TEMPORAL_RESERVOIR
     if(temporalMode)
     {
         return evaluateVPTDirectLightReservoirTail(
@@ -4330,6 +4577,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
             rngState
         );
     }
+#endif
     if(initialW <= 0.0)
     {
         return vec3(0.0);
@@ -4339,6 +4587,15 @@ vec3 evaluateVPTRISDirectLightingSingle(
         waterColumnReceiver, geometricFaceKnown, geometricFaceRecovered,
         selectedSample, selectedEmission, selectedTypeCode,
         selectedContribution))
+    {
+        return vec3(0.0);
+    }
+
+#ifndef ORION_LOCAL_NEE_MIN_CONTRIB
+#define ORION_LOCAL_NEE_MIN_CONTRIB 2.5e-4
+#endif
+    const vec3 unshadowedLocalEst = selectedContribution * initialW;
+    if(max(unshadowedLocalEst.r, max(unshadowedLocalEst.g, unshadowedLocalEst.b)) < ORION_LOCAL_NEE_MIN_CONTRIB)
     {
         return vec3(0.0);
     }
@@ -4680,7 +4937,7 @@ vec3 evaluateDynamicLightRISDirect(
     // 没有这道门的话，全屏每个像素都要跑 1~4 次提案读取 + 距离衰减计算才轮到下面
     // 逐光源的 range 判定把它丢掉。
     // 80 = 48 + 30 + 2 余量（第三人称下相机离玩家最多几格，已含在余量里）。
-    const float DYNAMIC_LIGHT_RECEIVER_GATE = 80.0;
+    const float DYNAMIC_LIGHT_RECEIVER_GATE = 144.0;
     if(receiverCameraDistance > DYNAMIC_LIGHT_RECEIVER_GATE)
     {
         return vec3(0.0);
@@ -4876,6 +5133,9 @@ vec3 evaluateVPTRISDirectLighting(
 #ifndef VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES
 #define VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES 4
 #endif
+#ifndef ORION_TRANSPARENT_RIS_DIST_LOD
+#define ORION_TRANSPARENT_RIS_DIST_LOD 1
+#endif
 
 vec3 evaluateVPTRISDirectLightingMultiSample(
     vec3 hitPos,
@@ -4889,15 +5149,28 @@ vec3 evaluateVPTRISDirectLightingMultiSample(
         (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
     float receiverCameraDistance = length(hitPos - cameraPosition);
 
+#if ORION_TRANSPARENT_RIS_DIST_LOD
+    const float adaptFrameMs = cam.rtSampleParams.w;
+    const float waterAdaptiveScale = (adaptFrameMs > 0.0)
+        ? mix(1.0, 0.40, clamp((adaptFrameMs - 9.5) / 8.5, 0.0, 1.0))
+        : 1.0;
+    const float effectiveDist = receiverCameraDistance / max(waterAdaptiveScale, 0.35);
+    const int risSamples =
+        (effectiveDist < 24.0) ? VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES :
+        ((effectiveDist < 48.0) ? min(VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES, 2) : 1);
+#else
+    const int risSamples = VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES;
+#endif
+
     vec3 voxelDirect = vec3(0.0);
     for(int sampleIndex = 0;
-        sampleIndex < VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES;
+        sampleIndex < risSamples;
         ++sampleIndex)
     {
         voxelDirect += evaluateVPTRISDirectLightingSingle(
             hitPos, hitNormal, hitAlbedo, geometricFaceNormal, false, true, rngState);
     }
-    voxelDirect *= 1.0 / float(VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES);
+    voxelDirect *= 1.0 / float(max(risSamples, 1));
 
     return voxelDirect + evaluateDynamicLightRISDirect(
         hitPos, hitNormal, hitAlbedo, receiverCameraDistance,
@@ -8013,7 +8286,11 @@ vec3 evaluateVPTDirectLightReservoirTail(
     uint qEmission = currentEmission;
     uint qTypeCode = currentTypeCode;
 
-    if(shadingActive && initialW > 0.0 && initialProxyTarget > 0.0 && currentEmission > 0u)
+    if(shadingActive &&
+       initialW > 0.0 &&
+       initialProxyTarget > 0.0 &&
+       currentEmission > 0u &&
+       (initialProxyTarget * initialW) >= ORION_LOCAL_NEE_MIN_CONTRIB)
     {
         vec3 initTrans = vptLocalEmitterSampleTransmittance(hitPos, currentSample);
         if(max(initTrans.r, max(initTrans.g, initTrans.b)) > 0.0)

@@ -468,7 +468,25 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->visQueryAb[0] = (visQueryMask & 0x1u) != 0u ? 1u : 0u;
     ubo->visQueryAb[1] = (visQueryMask & 0x2u) != 0u ? 1u : 0u;
     ubo->visQueryAb[2] = (visQueryMask & 0x4u) != 0u ? 1u : 0u;
-    ubo->visQueryAb[3] = 0u;
+    {
+        static const float secondaryMipBias = []() -> float
+        {
+            const char* raw = std::getenv("ORION_SECONDARY_MIP_BIAS");
+
+            if(raw == nullptr || raw[0] == '\0')
+            {
+                return 0.0f;
+            }
+
+            const float parsed = static_cast<float>(std::atof(raw));
+
+            return parsed < 0.0f ? 0.0f : (parsed > 3.0f ? 3.0f : parsed);
+        }();
+
+        uint32_t biasBits = 0u;
+        std::memcpy(&biasBits, &secondaryMipBias, sizeof(biasBits));
+        ubo->visQueryAb[3] = biasBits;
+    }
 
     // 2026-11-17 P2 跨腿材质复用闸门（ORION_MAT_REUSE_LEGS / ORION_MAT_REUSE_ASSERT）。
     // 2026-11-17 晚已定案：**默认开**（Settings.cpp 的 matReuseLegsEnabled() 在不设
@@ -1469,7 +1487,37 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
             RTLog(publishLog.str());
         }
 
-        if(reloadTexturePublish)
+        bool useRingRotation = false;
+        uint32_t nextRingSlot = g_rtDescriptorRingLiveIndex;
+        VkDescriptorSet targetDescriptorSet = g_rayTracingDescriptorSet;
+        VkDescriptorSet oldDescriptorSet = g_rayTracingDescriptorSet;
+        if(
+            !reloadTexturePublish &&
+            churnTexturePublish &&
+            g_rtDescriptorRingReady &&
+            g_rtDescriptorRingLiveIndex < RT_DESCRIPTOR_RING_SIZE
+        )
+        {
+            const uint32_t candidate =
+                (g_rtDescriptorRingLiveIndex + 1u) % RT_DESCRIPTOR_RING_SIZE;
+            const uint64_t lastUsed = g_rtDescriptorRingLastUsedFrame[candidate];
+            const bool slotSafe =
+                (lastUsed == UINT64_MAX) ||
+                (g_perfL10FrameSerial >= lastUsed + RT_DESCRIPTOR_RING_SAFE_FRAME_GAP);
+            if(
+                candidate != g_rtDescriptorRingLiveIndex &&
+                g_rtDescriptorRingSets[candidate] != VK_NULL_HANDLE &&
+                slotSafe
+            )
+            {
+                useRingRotation = true;
+                nextRingSlot = candidate;
+                targetDescriptorSet = g_rtDescriptorRingSets[candidate];
+            }
+        }
+        g_rtDescriptorRingLastPublishUsedRing = useRingRotation;
+
+        if(!useRingRotation && (reloadTexturePublish || churnTexturePublish))
         {
             PERF_L10_TIME_STALL("atlasPublishDeviceIdle", FGDeviceWaitIdle(g_device));
         }
@@ -1668,13 +1716,19 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
             endSkyWrite.pImageInfo = &endSkyAtlasInfo;
         }
 
+        for(uint32_t i = 0u; i < writeCount; ++i)
+        {
+            writes[i].dstSet = targetDescriptorSet;
+        }
+
         if(logTexturePublish)
         {
             std::stringstream paramLog;
             paramLog
                 << "[RT DESCRIPTOR] publish dstSet=0x"
-                << std::hex << (unsigned long long)g_rayTracingDescriptorSet
-                << std::dec << " writes=" << writeCount;
+                << std::hex << (unsigned long long)targetDescriptorSet
+                << std::dec << " ring=" << (useRingRotation ? 1 : 0)
+                << " writes=" << writeCount;
 
             for(uint32_t i = 0u; i < writeCount; ++i)
             {
@@ -1697,7 +1751,42 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
             RTLogFlushed(paramLog.str());
         }
 
-        vkUpdateDescriptorSets(g_device, writeCount, writes, 0, nullptr);
+        if(useRingRotation)
+        {
+            bool writtenNow[RT_DESCRIPTOR_MAX_BINDINGS] = {};
+            for(uint32_t i = 0u; i < writeCount; ++i)
+            {
+                if(writes[i].dstBinding < RT_DESCRIPTOR_MAX_BINDINGS)
+                {
+                    writtenNow[writes[i].dstBinding] = true;
+                }
+            }
+            VkCopyDescriptorSet copies[RT_DESCRIPTOR_MAX_BINDINGS]{};
+            uint32_t copyCount = 0u;
+            for(uint32_t b = 0u; b < RT_DESCRIPTOR_MAX_BINDINGS; ++b)
+            {
+                const uint32_t count = g_rtDescriptorWrittenBindingCount[b];
+                if(count > 0u && !writtenNow[b])
+                {
+                    copies[copyCount].sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
+                    copies[copyCount].srcSet = oldDescriptorSet;
+                    copies[copyCount].srcBinding = b;
+                    copies[copyCount].srcArrayElement = 0u;
+                    copies[copyCount].dstSet = targetDescriptorSet;
+                    copies[copyCount].dstBinding = b;
+                    copies[copyCount].dstArrayElement = 0u;
+                    copies[copyCount].descriptorCount = count;
+                    ++copyCount;
+                }
+            }
+            g_rayTracingDescriptorSet = targetDescriptorSet;
+            g_rtDescriptorRingLiveIndex = nextRingSlot;
+            vkUpdateDescriptorSets(g_device, writeCount, writes, copyCount, copies);
+        }
+        else
+        {
+            vkUpdateDescriptorSets(g_device, writeCount, writes, 0u, nullptr);
+        }
         if(publishAlbedoAtlas)
         {
             g_atlasDirty = false;
@@ -1748,6 +1837,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
         }
     }
 
+    if(g_rtDescriptorRingReady && g_rtDescriptorRingLiveIndex < RT_DESCRIPTOR_RING_SIZE)
+    {
+        g_rtDescriptorRingLastUsedFrame[g_rtDescriptorRingLiveIndex] = g_perfL10FrameSerial;
+    }
+
     ensureDhTextureDescriptors();
     ensureSunShadowFarDescriptor();
     ensureSunShadowNearDescriptor();
@@ -1784,26 +1878,6 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     {
         CameraUBO* ablateUbo = static_cast<CameraUBO*>(g_cameraUboMapped);
         ablateUbo->perfAblationStage[0] = perfL10AblationStage();
-
-        {
-            static const float secondaryMipBias = []() -> float
-            {
-                const char* raw = std::getenv("ORION_SECONDARY_MIP_BIAS");
-
-                if(raw == nullptr || raw[0] == '\0')
-                {
-                    return 0.0f;
-                }
-
-                const float parsed = static_cast<float>(std::atof(raw));
-
-                return parsed < 0.0f ? 0.0f : (parsed > 3.0f ? 3.0f : parsed);
-            }();
-
-            uint32_t biasBits = 0u;
-            std::memcpy(&biasBits, &secondaryMipBias, sizeof(biasBits));
-            ablateUbo->historyPadding0 = biasBits;
-        }
         ablateUbo->perfAblationStage[1] =
             g_motionDebugView.load();
         ablateUbo->perfAblationStage[2] =
@@ -2968,6 +3042,9 @@ if(!g_dlssGFeatureInitialized)
         g_rrSpecularHitDistanceImage ==
             VK_NULL_HANDLE ||
 
+        g_rrSpecularMotionImage ==
+            VK_NULL_HANDLE ||
+
         g_rrStableRadianceImage ==
             VK_NULL_HANDLE ||
 
@@ -3282,7 +3359,7 @@ if(g_dlssOutputImage == VK_NULL_HANDLE ||
 
 
 
-VkImageMemoryBarrier rrGuideBarriers[5]{};
+VkImageMemoryBarrier rrGuideBarriers[6]{};
 
 uint32_t rrGuideBarrierCount =
     0;
@@ -3356,6 +3433,8 @@ prepareRRGuideForRayGen(
 );
 
 prepareRRGuideForRayGen(g_rrSpecularHitDistanceImage, g_rrSpecularHitDistanceLayout);
+
+prepareRRGuideForRayGen(g_rrSpecularMotionImage, g_rrSpecularMotionLayout);
 }
 
 
@@ -3397,6 +3476,9 @@ if(rrGuideBarrierCount > 0)
         VK_IMAGE_LAYOUT_GENERAL;
 
     g_rrSpecularHitDistanceLayout =
+        VK_IMAGE_LAYOUT_GENERAL;
+
+    g_rrSpecularMotionLayout =
         VK_IMAGE_LAYOUT_GENERAL;
 
     g_rrStableRadianceLayout =
@@ -5229,6 +5311,97 @@ rrTransparencyHint.usage =
             }
         }
 
+        if(g_dlssExposureImage != VK_NULL_HANDLE &&
+           g_dlssExposureLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+        {
+            VkImageMemoryBarrier expInit{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            expInit.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            expInit.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            expInit.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            expInit.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            expInit.image = g_dlssExposureImage;
+            expInit.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            expInit.subresourceRange.levelCount = 1u;
+            expInit.subresourceRange.layerCount = 1u;
+            expInit.srcAccessMask = 0u;
+            expInit.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u, 0u, nullptr, 0u, nullptr, 1u, &expInit);
+
+            VkClearColorValue clearOne{};
+            clearOne.float32[0] = 1.0f;
+            VkImageSubresourceRange clearRange{VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+            vkCmdClearColorImage(
+                cmd, g_dlssExposureImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                &clearOne, 1u, &clearRange);
+
+            expInit.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            expInit.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            expInit.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            expInit.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                0u, 0u, nullptr, 0u, nullptr, 1u, &expInit);
+
+            g_dlssExposureLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+
+        sl::Resource dlssExposure(
+            sl::ResourceType::eTex2d,
+            (void*)g_dlssExposureImage,
+            (void*)g_dlssExposureMemory,
+            (void*)g_dlssExposureView,
+            VK_IMAGE_LAYOUT_GENERAL
+        );
+        dlssExposure.width = 1u;
+        dlssExposure.height = 1u;
+        dlssExposure.nativeFormat = static_cast<uint32_t>(VK_FORMAT_R32_SFLOAT);
+        dlssExposure.mipLevels = 1;
+        dlssExposure.arrayLayers = 1;
+        dlssExposure.flags = 0;
+        dlssExposure.usage =
+            VK_IMAGE_USAGE_STORAGE_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+        sl::Extent exposureExtent{};
+        exposureExtent.left = 0;
+        exposureExtent.top = 0;
+        exposureExtent.width = 1u;
+        exposureExtent.height = 1u;
+
+        sl::ResourceTag dlssExposureTag(
+            &dlssExposure,
+            sl::kBufferTypeExposure,
+            sl::eValidUntilEvaluate,
+            &exposureExtent
+        );
+
+        sl::Resource rrSpecularMotion(
+            sl::ResourceType::eTex2d,
+            (void*)g_rrSpecularMotionImage,
+            (void*)g_rrSpecularMotionMemory,
+            (void*)g_rrSpecularMotionView,
+            VK_IMAGE_LAYOUT_GENERAL
+        );
+        rrSpecularMotion.width = g_rrGBufferWidth;
+        rrSpecularMotion.height = g_rrGBufferHeight;
+        rrSpecularMotion.nativeFormat = static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT);
+        rrSpecularMotion.mipLevels = 1;
+        rrSpecularMotion.arrayLayers = 1;
+        rrSpecularMotion.flags = 0;
+        rrSpecularMotion.usage =
+            VK_IMAGE_USAGE_STORAGE_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
         sl::Extent inputExtent{};
 
         inputExtent.left = 0;
@@ -5239,6 +5412,13 @@ rrTransparencyHint.usage =
 
         inputExtent.height =
             g_rtOutputHeight;
+
+        sl::ResourceTag rrSpecularMotionTag(
+            &rrSpecularMotion,
+            sl::kBufferTypeSpecularMotionVectors,
+            sl::eValidUntilEvaluate,
+            &inputExtent
+        );
 
 
         sl::ResourceTag motionTag(
@@ -5364,17 +5544,38 @@ sl::ResourceTag outputTag(
 
 
 
-        const sl::BaseStructure* inputs[] =
+        const sl::BaseStructure* inputs[12]{};
+        uint32_t inputCount = 0u;
+        inputs[inputCount++] = &inputTag;
+        inputs[inputCount++] = &outputTag;
+        inputs[inputCount++] = &depthTag;
+        inputs[inputCount++] = &motionTag;
+        if(useSR)
         {
-            &inputTag, &outputTag, &depthTag, &motionTag,
-            &rrDiffuseAlbedoTag, &rrSpecularAlbedoTag,
-            &rrNormalRoughnessTag, &rrSpecularHitDistanceTag,
-            &g_dlssViewport,
-            &rrTransparencyHintTag
-        };
-        const uint32_t inputCount = useSR
-            ? 5u
-            : (rrTransparencyHintEnabled() ? 10u : 9u);
+            inputs[inputCount++] = &g_dlssViewport;
+        }
+        else
+        {
+            inputs[inputCount++] = &rrDiffuseAlbedoTag;
+            inputs[inputCount++] = &rrSpecularAlbedoTag;
+            inputs[inputCount++] = &rrNormalRoughnessTag;
+            inputs[inputCount++] = &rrSpecularHitDistanceTag;
+            inputs[inputCount++] = &g_dlssViewport;
+            if(rrTransparencyHintEnabled())
+            {
+                inputs[inputCount++] = &rrTransparencyHintTag;
+            }
+            if(g_dlssExposureImage != VK_NULL_HANDLE &&
+               g_dlssExposureLayout == VK_IMAGE_LAYOUT_GENERAL)
+            {
+                inputs[inputCount++] = &dlssExposureTag;
+            }
+            if(g_rrSpecularMotionImage != VK_NULL_HANDLE &&
+               g_rrSpecularMotionLayout == VK_IMAGE_LAYOUT_GENERAL)
+            {
+                inputs[inputCount++] = &rrSpecularMotionTag;
+            }
+        }
 
 
         sl::CommandBuffer* slCmd =
@@ -5891,13 +6092,16 @@ vkCmdPipelineBarrier(
         aePush.transitionDistance =
             g_aeTransitionEv;
 
-        aePush.pad0 =
-            0;
-
         aePush.enabled =
             g_aeEnabled.load()
                 ? 1
                 : 0;
+
+        aePush.exposureStrength =
+            g_postExposureStrength.load();
+
+        aePush.manualEV =
+            g_cgExposureEV.load();
 
         aePush.displayWhiteScale =
             hdrOutputActive()
@@ -6003,6 +6207,27 @@ vkCmdPipelineBarrier(
             0,
             nullptr
         );
+
+        if(g_dlssExposureImage != VK_NULL_HANDLE &&
+           g_dlssExposureLayout == VK_IMAGE_LAYOUT_GENERAL)
+        {
+            VkImageMemoryBarrier expPostBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            expPostBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            expPostBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            expPostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            expPostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            expPostBarrier.image = g_dlssExposureImage;
+            expPostBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            expPostBarrier.subresourceRange.levelCount = 1u;
+            expPostBarrier.subresourceRange.layerCount = 1u;
+            expPostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            expPostBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                0u, 0u, nullptr, 0u, nullptr, 1u, &expPostBarrier);
+        }
 
 
         // 深度/云 resolve 未就绪时不能派发（binding 2/3 还没有有效视图）。
@@ -6138,6 +6363,8 @@ vkCmdPipelineBarrier(
 
 
 recordBloom(cmd);
+
+bakeAces2Lut3DIfNeeded(cmd);
 
 vkCmdBindPipeline(
     cmd,

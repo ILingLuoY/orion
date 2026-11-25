@@ -1034,9 +1034,13 @@ vec3 tracePrimaryDielectricGlassRadiance(
             pcg_hash(receiverRisState);
             const vec3 receiverGeoNormal =
                 vptGeometricFaceNormalFromRay(hitPosition, travelDirection);
+            const float receiverCameraDist = length(
+                hitPosition - (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz);
+            const int glassRisSamples =
+                (receiverCameraDist < 32.0) ? max(ORION_GLASS_LOCAL_RIS_SAMPLES, 1) : 1;
             vec3 receiverLocalVoxelDirect = vec3(0.0);
             for(int risSampleIdx = 0;
-                risSampleIdx < ORION_GLASS_LOCAL_RIS_SAMPLES;
+                risSampleIdx < glassRisSamples;
                 ++risSampleIdx)
             {
                 receiverLocalVoxelDirect += evaluateVPTRISDirectLightingSingle(
@@ -1049,9 +1053,7 @@ vec3 tracePrimaryDielectricGlassRadiance(
                     receiverRisState);
             }
             receiverLocalVoxelDirect *=
-                1.0 / float(max(ORION_GLASS_LOCAL_RIS_SAMPLES, 1));
-            const float receiverCameraDist = length(
-                hitPosition - (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz);
+                1.0 / float(glassRisSamples);
             vec3 receiverLocalDirect =
                 receiverLocalVoxelDirect +
                 evaluateDynamicLightRISDirect(
@@ -1087,7 +1089,7 @@ vec3 tracePrimaryDielectricGlassRadiance(
         {
             const float receiverGILodDistance =
                 length(hitPosition - cam.viewInverse[3].xyz);
-            if(receiverGILodDistance < 128.0 * perfL10TierScale())
+            if(receiverGILodDistance < 64.0 * perfL10TierScale())
             {
                 const float clampedGiLodDist =
                     min(receiverGILodDistance, 31.0 * perfL10TierScale());
@@ -1154,24 +1156,27 @@ vec3 tracePrimaryDielectricGlassRadiance(
         {
             const float receiverGILodDistance =
                 length(hitPosition - cam.viewInverse[3].xyz);
+            if(receiverGILodDistance < 64.0 * perfL10TierScale())
+            {
 #if GI_GLASS_RECEIVER_INDIRECT
-            receiverRadiance +=
-                tracePrimaryWaterReceiverIndirectReworked(
-                    hitPosition,
-                    receiverNormal,
-                    receiverAlbedo,
-                    receiverGILodDistance,
-                    sunDirection,
-                    false);
+                receiverRadiance +=
+                    tracePrimaryWaterReceiverIndirectReworked(
+                        hitPosition,
+                        receiverNormal,
+                        receiverAlbedo,
+                        receiverGILodDistance,
+                        sunDirection,
+                        false);
 #else
-            receiverRadiance +=
-                tracePrimaryWaterReceiverIndirectReworked(
-                    hitPosition,
-                    receiverNormal,
-                    receiverAlbedo,
-                    receiverGILodDistance,
-                    sunDirection);
+                receiverRadiance +=
+                    tracePrimaryWaterReceiverIndirectReworked(
+                        hitPosition,
+                        receiverNormal,
+                        receiverAlbedo,
+                        receiverGILodDistance,
+                        sunDirection);
 #endif
+            }
         }
 #endif
 #endif

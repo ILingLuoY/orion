@@ -1799,194 +1799,198 @@ if (matId > 0.5 && matId < 2.5) {
 #ifndef WATER_CAUSTIC_FRESNEL_EXIT
 #define WATER_CAUSTIC_FRESNEL_EXIT 1
 #endif
+bool underwaterExit = false;
+bool underwaterTir = false;
+float exitFresnel = 0.0;
+vec3 waterSurfaceSunTransmittance = vec3(0.0);
+float waterSurfaceCloudShadow = 0.0;
+bool hasAboveTransmitted = false;
+int waterLobeCount = 0;
+
+vec3 lobe0Origin = vec3(0.0);
+vec3 lobe0Dir = vec3(0.0, 1.0, 0.0);
+bool lobe0InsideWater = false;
+bool lobe0AllowGi = false;
+bool lobe0SuppressSun = false;
+bool lobe0IsRefl = false;
+
+vec3 lobe1Origin = vec3(0.0);
+vec3 lobe1Dir = vec3(0.0, 1.0, 0.0);
+bool lobe1InsideWater = false;
+bool lobe1AllowGi = false;
+bool lobe1SuppressSun = false;
+bool lobe1IsRefl = false;
+
 #if WATER_UNDERWATER_SNELL_WINDOW
 if(matId > 1.5 && cam.waterSimState.w != 0u)
 {
+    underwaterExit = true;
     // Water -> Air interface viewed from underwater: exact Snell's Window + TIR mirror.
-    // material_resolve already oriented `normal` toward the incoming underwater ray (downward).
     vec3 exitRefrDir = refract(worldDir.xyz, normal, 1.33);
     vec3 exitReflDir = normalize(reflect(worldDir.xyz, normal));
 
     if(dot(exitRefrDir, exitRefrDir) < 1.0e-6)
     {
-        // Total Internal Reflection: pure underwater mirror (50% ray savings vs dual-lobe).
-        WaterTransmissionInfo exitTirInfo;
-        sampleColor = tracePrimaryTransparentRadiance(
-            hitPos + normal * 0.01,
-            exitReflDir,
-            true,
-            sunDir,
-            false,
-            primaryHitDistance,
-            hitPos,
-            true,
-            false,
-            exitTirInfo
-        );
+        underwaterTir = true;
+        waterLobeCount = 1;
+        lobe0Origin = hitPos + normal * 0.01;
+        lobe0Dir = exitReflDir;
+        lobe0InsideWater = true;
+        lobe0AllowGi = false;
+        lobe0SuppressSun = true;
+        lobe0IsRefl = true;
     }
     else
     {
-        // Inside Snell's Window (< 48.6° from vertical): refracted sky/sun/clouds + rim reflection.
         vec3 exitRefrDirN = normalize(exitRefrDir);
         float cosExitAir = clamp(dot(exitRefrDirN, -normal), 0.0, 1.0);
         float efX = 1.0 - cosExitAir;
         float efX2 = efX * efX;
-        float exitFresnel = R0 + (1.0 - R0) * (efX2 * efX2) * efX;
+        exitFresnel = R0 + (1.0 - R0) * (efX2 * efX2) * efX;
 
-        WaterTransmissionInfo exitAirInfo;
-        vec3 transmittedAirRadiance = tracePrimaryTransparentRadiance(
-            hitPos - normal * 0.01,
-            exitRefrDirN,
-            false,
-            sunDir,
-            false,
-            primaryHitDistance,
-            hitPos,
-            false,
-            false,
-            exitAirInfo
-        );
+        waterLobeCount = 1;
+        lobe0Origin = hitPos - normal * 0.01;
+        lobe0Dir = exitRefrDirN;
+        lobe0InsideWater = false;
+        lobe0AllowGi = false;
+        lobe0SuppressSun = false;
+        lobe0IsRefl = false;
 
-        vec3 reflectedUnderwaterRadiance = vec3(0.0);
         if(exitFresnel > 0.03)
         {
-            WaterTransmissionInfo exitReflInfo;
-            reflectedUnderwaterRadiance = tracePrimaryTransparentRadiance(
-                hitPos + normal * 0.01,
-                exitReflDir,
-                true,
-                sunDir,
-                false,
-                primaryHitDistance,
-                hitPos,
-                true,
-                false,
-                exitReflInfo
-            );
+            waterLobeCount = 2;
+            lobe1Origin = hitPos + normal * 0.01;
+            lobe1Dir = exitReflDir;
+            lobe1InsideWater = true;
+            lobe1AllowGi = false;
+            lobe1SuppressSun = true;
+            lobe1IsRefl = true;
         }
-
-        sampleColor = mix(
-            transmittedAirRadiance,
-            reflectedUnderwaterRadiance,
-            exitFresnel
-        );
     }
 }
-else
 #endif
+
+if(!underwaterExit)
 {
-                // 2026-10-22 水面点太阳可见性：一次 trace 同时喂给 GGX 高光
-                // （evaluatePrimaryWaterSunLighting）和下面的镜面天空反射。反射 walker 只在撞到几何时
-                // 才有遮挡，日冕瓣（±8°）能从遮挡物边缘漏进 miss ⇒ 阴影里的
-                // 水面出现太阳色白斑；不可见时给反射射线屏蔽日盘/日冕。
-                vec3 waterSurfaceSunTransmittance = vec3(0.0);
-                bool waterSurfaceSunOccluded = false;
-                if(sunDir.y > 0.0)
-                {
-                    waterSurfaceSunTransmittance =
-                        traceSunTransmittanceThroughWater(
-                            hitPos + sunDir * 0.001,
-                            sunDir
-                        );
+    bool waterSurfaceSunOccluded = false;
+    if(sunDir.y > 0.0)
+    {
+        waterSurfaceSunTransmittance =
+            traceSunTransmittanceThroughWater(
+                hitPos + sunDir * 0.001,
+                sunDir
+            );
 #if WATER_SKY_SUN_OCCLUSION
-                    waterSurfaceSunOccluded =
-                        max(
-                            waterSurfaceSunTransmittance.r,
-                            max(
-                                waterSurfaceSunTransmittance.g,
-                                waterSurfaceSunTransmittance.b
-                            )
-                        ) <= 0.0;
-#endif
-                }
-                float waterSurfaceCloudShadow =
-                    (sunDir.y > 0.02 && !waterSurfaceSunOccluded)
-                        ? c3CloudSunTransmittance(hitPos + sunDir * 0.001, sunDir)
-                        : 0.0;
-
-                // A one-sample Fresnel roulette chooses either sky
-                // reflection or water transmission for a whole pixel.  With
-                // a changing per-frame seed that produces the flashing
-                // triangular sky patches visible at water/block boundaries.
-                // Evaluate the two physical lobes deterministically and
-                // combine them by Fresnel instead.
-                WaterTransmissionInfo reflectedTransmissionInfo;
-                vec3 reflectedRadiance =
-                    tracePrimaryTransparentRadiance(
-                        hitPos +
-                            normal *
-                            0.01,
-                        normalize(
-                            reflect(
-                                worldDir.xyz,
-                                normal
-                            )
-                        ),
-                        false,
-                        sunDir,
-                        false,
-                        primaryHitDistance,
-                        // 相机可见的水面命中点 = 本像素的精确历史键。
-                        hitPos,
-                        // 2026-11-20 Remix 核心对齐：镜面 walker 只负责"环境辐亮度"
-                        // 这一半（Remix：reflection = F × scene）。日盘/日冕由下面
-                        // evaluatePrimaryWaterSunLighting 的 dirac 瓣显式给，
-                        // 若这里再把 rmiss 的日盘 + pow(sunDot,64) 日冕带回来，
-                        // 同一份太阳会被算两遍 —— 掠射时 F≈1，就是近水那片白光。
-                        // 故恒定置 bit 14/15（不再只在被遮挡时屏蔽）。
-                        // 回退：把本实参改回 waterSurfaceSunOccluded。
-                        true,
-                        // 2026-11-16：反射瓣 —— 撞到别的水面走镜面
-                        //（WATER_REFLECTION_LOBE_MIRROR），不折射进水。
-                        true,
-                        reflectedTransmissionInfo
-                    );
-
-                vec3 refrDir =
-                    refract(
-                        worldDir.xyz,
-                        normal,
-                        1.0 / 1.33
-                    );
-
-                if(
-                    dot(
-                        refrDir,
-                        refrDir
-                    ) < 1.0e-6
+        waterSurfaceSunOccluded =
+            max(
+                waterSurfaceSunTransmittance.r,
+                max(
+                    waterSurfaceSunTransmittance.g,
+                    waterSurfaceSunTransmittance.b
                 )
-                {
-                    sampleColor =
-                        reflectedRadiance;
-                }
-                else
-                {
-                    WaterTransmissionInfo transmittedTransmissionInfo;
-                    g_waterEntrySunValid = true;
-                    g_waterEntrySunTransmittance = waterSurfaceSunTransmittance;
-                    g_waterEntryCloudShadow = waterSurfaceCloudShadow;
-                    vec3 transmittedRadiance =
-                        tracePrimaryTransparentRadiance(
-                            hitPos -
-                                normal *
-                                0.01,
-                            refrDir,
-                            true,
-                            sunDir,
-#if WATER_RECEIVER_GI_ADAPTIVE_GATE
-                            (fresnel < 0.88),
-#else
-                            true,
+            ) <= 0.0;
 #endif
-                            primaryHitDistance,
-                            // 相机可见的水面命中点 = 本像素的精确历史键。
-                            hitPos,
-                            false,
-                            // 2026-11-16：透射瓣（行为与旧档逐位一致）。
-                            false,
-                            transmittedTransmissionInfo
-                            );
-                    g_waterEntrySunValid = false;
+    }
+    waterSurfaceCloudShadow =
+        (sunDir.y > 0.02 && !waterSurfaceSunOccluded)
+            ? c3CloudSunTransmittance(hitPos + sunDir * 0.001, sunDir)
+            : 0.0;
+
+    waterLobeCount = 1;
+    lobe0Origin = hitPos + normal * 0.01;
+    lobe0Dir = normalize(reflect(worldDir.xyz, normal));
+    lobe0InsideWater = false;
+    lobe0AllowGi = false;
+    lobe0SuppressSun = true;
+    lobe0IsRefl = true;
+
+    vec3 refrDir =
+        refract(
+            worldDir.xyz,
+            normal,
+            1.0 / 1.33
+        );
+    if(dot(refrDir, refrDir) >= 1.0e-6)
+    {
+        hasAboveTransmitted = true;
+        waterLobeCount = 2;
+        lobe1Origin = hitPos - normal * 0.01;
+        lobe1Dir = refrDir;
+        lobe1InsideWater = true;
+#if WATER_RECEIVER_GI_ADAPTIVE_GATE
+        lobe1AllowGi = (fresnel < 0.88);
+#else
+        lobe1AllowGi = true;
+#endif
+        lobe1SuppressSun = false;
+        lobe1IsRefl = false;
+    }
+}
+
+// Unified single-site water lobe loop (eliminates 5x tracePrimaryTransparentRadiance
+// CPS/SSA blowup in k2sunA/k1 while preserving 100% bit-identical semantics and 0 arrays).
+vec3 lobe0Radiance = vec3(0.0);
+vec3 lobe1Radiance = vec3(0.0);
+WaterTransmissionInfo transmittedTransmissionInfo;
+for(int waterLobe = 0; waterLobe < waterLobeCount; ++waterLobe)
+{
+    vec3 lobeOrigin = (waterLobe == 0) ? lobe0Origin : lobe1Origin;
+    vec3 lobeDir = (waterLobe == 0) ? lobe0Dir : lobe1Dir;
+    bool lobeInsideWater = (waterLobe == 0) ? lobe0InsideWater : lobe1InsideWater;
+    bool lobeAllowGi = (waterLobe == 0) ? lobe0AllowGi : lobe1AllowGi;
+    bool lobeSuppressSun = (waterLobe == 0) ? lobe0SuppressSun : lobe1SuppressSun;
+    bool lobeIsRefl = (waterLobe == 0) ? lobe0IsRefl : lobe1IsRefl;
+    bool setEntrySun = (!underwaterExit && waterLobe == 1);
+    if(setEntrySun)
+    {
+        g_waterEntrySunValid = true;
+        g_waterEntrySunTransmittance = waterSurfaceSunTransmittance;
+        g_waterEntryCloudShadow = waterSurfaceCloudShadow;
+    }
+    WaterTransmissionInfo lobeInfo;
+    vec3 lobeRad = tracePrimaryTransparentRadiance(
+        lobeOrigin,
+        lobeDir,
+        lobeInsideWater,
+        sunDir,
+        lobeAllowGi,
+        primaryHitDistance,
+        hitPos,
+        lobeSuppressSun,
+        lobeIsRefl,
+        lobeInfo
+    );
+    if(setEntrySun)
+    {
+        g_waterEntrySunValid = false;
+    }
+    if(waterLobe == 0)
+    {
+        lobe0Radiance = lobeRad;
+    }
+    else
+    {
+        lobe1Radiance = lobeRad;
+        transmittedTransmissionInfo = lobeInfo;
+    }
+}
+
+if(underwaterExit)
+{
+    sampleColor = underwaterTir
+        ? lobe0Radiance
+        : mix(lobe0Radiance, lobe1Radiance, exitFresnel);
+}
+else
+{
+    vec3 reflectedRadiance = lobe0Radiance;
+    if(!hasAboveTransmitted)
+    {
+        sampleColor = reflectedRadiance;
+    }
+    else
+    {
+        vec3 transmittedRadiance = lobe1Radiance;
 
                     // Below the Fresnel crossover this pixel is primarily
                     // the lit receiver seen through water, so RR must not use
@@ -3282,7 +3286,6 @@ bool prepareDiffuseGI =
 
 if(prepareDiffuseGI)
 {
-#if !SHARC_UPDATE
     vec2 giBn = vec2(
         glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 51u),
         glassBlueNoiseSample(uvec2(pixelCoord), cam.frameCount, 52u)
@@ -3293,20 +3296,6 @@ if(prepareDiffuseGI)
             giBn
         );
     g2bPrimaryMixtureWeight = 1.0;
-#else
-    // LL-P3.2: the primary vertex never guides -- a light-targeted first ray
-    // would land on the emitter and re-add the ReSTIR DI direct term.  Passing
-    // false also takes the same branch (and consumes the same RNG draws) as
-    // LL-P3.1, so nothing about the first GI ray changes here.
-    g2bSampleDiffuseDirectionMIS(
-        hitPos,
-        normal,
-        seed,
-        bounceDir,
-        g2bPrimaryMixtureWeight,
-        false
-    );
-#endif
 }
 else
 {
@@ -3863,7 +3852,41 @@ for (int si = 0;
     // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
     hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
+    bool sunShadowHandledByQuery = false;
+#if ORION_OPAQUE_VIS_FASTPATH
+    if(!sunVisibilityFilterActive)
+    {
+        rayQueryEXT sunVisQuery;
+        rayQueryInitializeEXT(
+            sunVisQuery,
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT,
+            0xff,
+            shadowOrigin,
+            SUN_SHADOW_RAY_TMIN,
+            shadowDir,
+            shadowRayMaxDistance
+        );
+        if(!rayQueryProceedEXT(sunVisQuery))
+        {
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntRayIssued();
+            #endif
+            hit.hitDistance = (rayQueryGetIntersectionTypeEXT(sunVisQuery, true) !=
+                               gl_RayQueryCommittedIntersectionNoneEXT)
+                ? rayQueryGetIntersectionTEXT(sunVisQuery, true)
+                : -1.0;
+            sunShadowHandledByQuery = true;
+        }
+        else
+        {
+            rayQueryTerminateEXT(sunVisQuery);
+        }
+    }
+#endif
 
+    if(!sunShadowHandledByQuery)
+    {
 #ifdef RT_ENABLE_SER
     // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
     if(cam.perfSerAb.y != 0u)
@@ -3906,6 +3929,7 @@ for (int si = 0;
             shadowRayMaxDistance,
             0
         );
+    }
     }
 
 
@@ -5188,14 +5212,19 @@ float localSecondaryLodWeight = 1.0;
 if(localSecSharcTrim)
 {
     const float secScale = perfL10TierScale();
-    if(rtLodDistance < 32.0 * secScale)
+    if(rtLodDistance < 64.0 * secScale)
     {
         runLocalSecondary = true;
     }
-    else if(rtLodDistance < 64.0 * secScale)
+    else if(rtLodDistance < 128.0 * secScale)
     {
         runLocalSecondary = rtLodHalfSample;
         localSecondaryLodWeight = 2.0;
+    }
+    else if(rtLodDistance < 160.0 * secScale)
+    {
+        runLocalSecondary = rtLodQuarterSample;
+        localSecondaryLodWeight = 4.0;
     }
 }
 else
@@ -7422,6 +7451,10 @@ indirectLight +=
     //   有两种原因 —— 哈希插入失败（SharcCommon.h:591-592）**或**缓存重采样命中
     //   （:632，表示"该顶点直接用了缓存值、无需再追"）。缓存变热之后后者会占
     //   大头，所以 lock[10] 高**不代表**网格饱和；判读看 [SHARC STATS] 的说明。
+    // 2026-11-25：纳入同一 1/256 空间哈希抽样门控，消除数万 update 线程的全局单地址原子热点
+    if(((uint(pixelCoord.x) * 73856093u ^
+         uint(pixelCoord.y) * 19349663u ^
+         cam.frameCount * 83492791u) & 255u) == 0u)
     {
         RWStructuredBuffer_uint sharcUpdateCounter =
             RWStructuredBuffer_uint(sharcCacheAddress(3u));
@@ -8034,23 +8067,27 @@ const float sparseRadianceScale = 1.0;
 #ifndef VPT_SPARSE_PRESCALE_CLAMP
 #define VPT_SPARSE_PRESCALE_CLAMP 1
 #endif
-#ifndef VPT_SPARSE_LIT_LUMA_MAX
-// 2026-11-02：16 -> 4。16 对"方块光 + 太阳"的场景太松，草/作物叶簇的 GI 单帧
-// 能冲到 50+，钳不住，那些跳亮样本被 RR 时域保留 ⇒ 叶子持续偏亮。
-#define VPT_SPARSE_LIT_LUMA_MAX 4.0
+#ifndef VPT_DIRECT_PRESCALE_KNEE
+#define VPT_DIRECT_PRESCALE_KNEE 24.0
 #endif
-#ifndef VPT_SPARSE_LIT_LUMA_SOFT_CEIL
-#define VPT_SPARSE_LIT_LUMA_SOFT_CEIL 8.0
+#ifndef VPT_DIRECT_PRESCALE_SOFT_CEIL
+#define VPT_DIRECT_PRESCALE_SOFT_CEIL 64.0
+#endif
+#ifndef VPT_INDIRECT_PRESCALE_KNEE
+#define VPT_INDIRECT_PRESCALE_KNEE 4.0
+#endif
+#ifndef VPT_INDIRECT_PRESCALE_SOFT_CEIL
+#define VPT_INDIRECT_PRESCALE_SOFT_CEIL 12.0
 #endif
 
-// 2026-11-02：不再包含 directLight —— 太阳软影不再稀疏（见上方 RTAO 那段），
-// 它每帧都是满采样的有效值，不该参与 1/rate 补偿，也不该参与"稀疏项"的 firefly 钳制。
-const vec3 sparseLitSumUnscaled =
+const vec3 sparseDirectSumUnscaled =
 #if VPT_SPARSE_SKIP_VISIBILITY
     directLight +
 #endif
     localDirectLight +
-    localSecondaryLight +
+    localSecondaryLight;
+
+const vec3 sparseIndirectSumUnscaled =
     // 2026-10-05 微结构反射遮蔽（#44）：凹槽 texel 的间接反射被凸起遮挡，
     // 按静态深度遮蔽折减（#12 的 GI 扣减同源）。
     glossyReflectionLight * primaryPOMMicroOcclusion +
@@ -8061,32 +8098,45 @@ const vec3 sparseLitSumUnscaled =
     farAmbientSunTerm *
     primaryPOMMicroOcclusion;
 
-float sparsePreScaleGain = 1.0;
+float directPreScaleGain = 1.0;
+float indirectPreScaleGain = 1.0;
 #if VPT_SPARSE_PRESCALE_CLAMP
 if(sparseRadianceScale > 1.0)
 {
-    const float sparseSumLuma = dot(
-        max(sparseLitSumUnscaled, vec3(0.0)),
+    const float directSumLuma = dot(
+        max(sparseDirectSumUnscaled, vec3(0.0)),
         vec3(0.2126, 0.7152, 0.0722));
-    const float sparseLumaMax = float(VPT_SPARSE_LIT_LUMA_MAX);
-    if(sparseSumLuma > sparseLumaMax)
+    const float directKnee = float(VPT_DIRECT_PRESCALE_KNEE);
+    if(directSumLuma > directKnee)
     {
-        const float knee = sparseLumaMax;
-        const float headroom = max(float(VPT_SPARSE_LIT_LUMA_SOFT_CEIL) - knee, 0.5);
-        const float excess = sparseSumLuma - knee;
-        const float compressedLuma = knee + headroom * (excess / (excess + headroom));
-        sparsePreScaleGain = compressedLuma / sparseSumLuma;
+        const float headroom = max(float(VPT_DIRECT_PRESCALE_SOFT_CEIL) - directKnee, 0.5);
+        const float excess = directSumLuma - directKnee;
+        const float compressedLuma = directKnee + headroom * (excess / (excess + headroom));
+        directPreScaleGain = compressedLuma / directSumLuma;
+    }
+
+    const float indirectSumLuma = dot(
+        max(sparseIndirectSumUnscaled, vec3(0.0)),
+        vec3(0.2126, 0.7152, 0.0722));
+    const float indirectKnee = float(VPT_INDIRECT_PRESCALE_KNEE);
+    if(indirectSumLuma > indirectKnee)
+    {
+        const float headroom = max(float(VPT_INDIRECT_PRESCALE_SOFT_CEIL) - indirectKnee, 0.5);
+        const float excess = indirectSumLuma - indirectKnee;
+        const float compressedLuma = indirectKnee + headroom * (excess / (excess + headroom));
+        indirectPreScaleGain = compressedLuma / indirectSumLuma;
     }
 }
 #endif
 
-const float sparseTermScale = sparseRadianceScale * sparsePreScaleGain;
+const float sparseDirectTermScale = sparseRadianceScale * directPreScaleGain;
+const float sparseIndirectTermScale = sparseRadianceScale * indirectPreScaleGain;
 
 // 太阳直射的补偿取决于阴影是否参与稀疏：
 //   SKIP_VISIBILITY=1（非活跃像素跳阴影）⇒ 该项被稀疏，必须乘 1/rate；
 //   SKIP_VISIBILITY=0（阴影满采样）      ⇒ 每帧都是有效值，不乘。
 #if VPT_SPARSE_SKIP_VISIBILITY
-const float sparseSunScale = sparseTermScale;
+const float sparseSunScale = sparseDirectTermScale;
 #else
 const float sparseSunScale = 1.0;
 #endif
@@ -8094,16 +8144,16 @@ const float sparseSunScale = 1.0;
 // 反射项的 1/rate 补偿：只有它真的被稀疏（VPT_SPARSE_GLOSSY=1）时才该乘。
 // 默认（0）反射逐像素满采样，乘了就是整屏镜面偏亮 1/rate 倍。
 #if VPT_SPARSE_GLOSSY
-const float sparseGlossyScale = sparseTermScale;
+const float sparseGlossyScale = sparseIndirectTermScale;
 #else
 const float sparseGlossyScale = 1.0;
 #endif
 
 vec3 litColor =
     directLight * sparseSunScale +
-    localDirectLight * sparseTermScale +
+    localDirectLight * sparseDirectTermScale +
     localExactFaceDirect +
-    localSecondaryLight * sparseTermScale +
+    localSecondaryLight * sparseDirectTermScale +
     waterReflectedSunLight +
     glossyReflectionLight * primaryPOMMicroOcclusion * sparseGlossyScale +
     indirectLight *
@@ -8112,7 +8162,7 @@ vec3 litColor =
     farSlopeOcclusion *
     farAmbientSunTerm *
     primaryPOMMicroOcclusion *
-    sparseTermScale;
+    sparseIndirectTermScale;
 
 // ============================================================================
 // SS_GBUFFER_STORE：2026-11-02 分项 G-buffer（binding 81 / 82）
@@ -8146,7 +8196,7 @@ if(cam.ssHybridParams.x > 0.5 || cam.ssHybridParams.y > 0.5)
         farSlopeOcclusion *
         farAmbientSunTerm *
         primaryPOMMicroOcclusion *
-        sparseTermScale;
+        sparseIndirectTermScale;
 
     const vec3 ssSpecularTerm =
         glossyReflectionLight *

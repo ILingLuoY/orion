@@ -174,6 +174,36 @@ PFN_vkCmdBuildAccelerationStructuresKHR getCmdBuildAccelerationStructures()
         ? &rtxCountedCmdBuildAccelerationStructures
         : nullptr;
 }
+PFN_vkCmdWriteAccelerationStructuresPropertiesKHR getCmdWriteAccelerationStructuresProperties()
+{
+    static VkDevice cachedDevice = VK_NULL_HANDLE;
+    static PFN_vkCmdWriteAccelerationStructuresPropertiesKHR cachedFunction = nullptr;
+    if(cachedDevice != g_device)
+    {
+        cachedDevice = g_device;
+        cachedFunction = g_device
+            ? reinterpret_cast<PFN_vkCmdWriteAccelerationStructuresPropertiesKHR>(
+                vkGetDeviceProcAddr(g_device, "vkCmdWriteAccelerationStructuresPropertiesKHR")
+            )
+            : nullptr;
+    }
+    return cachedFunction;
+}
+PFN_vkCmdCopyAccelerationStructureKHR getCmdCopyAccelerationStructure()
+{
+    static VkDevice cachedDevice = VK_NULL_HANDLE;
+    static PFN_vkCmdCopyAccelerationStructureKHR cachedFunction = nullptr;
+    if(cachedDevice != g_device)
+    {
+        cachedDevice = g_device;
+        cachedFunction = g_device
+            ? reinterpret_cast<PFN_vkCmdCopyAccelerationStructureKHR>(
+                vkGetDeviceProcAddr(g_device, "vkCmdCopyAccelerationStructureKHR")
+            )
+            : nullptr;
+    }
+    return cachedFunction;
+}
 PFN_vkCmdTraceRaysKHR getCmdTraceRays()
 {
     static VkDevice cachedDevice = VK_NULL_HANDLE;

@@ -91,13 +91,13 @@ RT_COUNTERS_FLAGS = (
 )
 COUNTERS_ENABLED = bool(RT_COUNTERS_FLAGS)
 
-# 2026-11-17 P4：miss 路径瘦身编译期开关。缺省不追加宏 ⇒ 着色器走基线写法，
-# 编出的 spv 与基线逐位可比；采集/对照时置 ORION_RMISS_SLIM=1 再跑本脚本。
+# 2026-11-24：默认启用 P4 miss 路径瘦身（跳过未命中光线对 payload.emission 的死写回）；
+# 如需回到旧基线口径，可显式置 ORION_RMISS_SLIM=0 再跑本脚本。
 _RMISS_SLIM_ENV = os.environ.get('ORION_RMISS_SLIM')
 RMISS_SLIM_FLAGS = (
-    ['-DORION_RMISS_SLIM=1']
-    if _RMISS_SLIM_ENV and _RMISS_SLIM_ENV not in ('0', 'f', 'F', '')
-    else []
+    []
+    if _RMISS_SLIM_ENV in ('0', 'f', 'F')
+    else ['-DORION_RMISS_SLIM=1']
 )
 RMISS_SLIM_ENABLED = bool(RMISS_SLIM_FLAGS)
 
@@ -140,6 +140,10 @@ EXTRA_FLAGS = {
     'rt_test_k2i_ser.rgen.spv':
         ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
          '-DORION_K2_INDIRECT_STAGE', '-DRT_ENABLE_SER'],
+    'rt_test_k2i_compose.comp.spv':
+        ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
+         '-DORION_K2_INDIRECT_STAGE', '-DORION_K2_INDIRECT_COMPOSE_ONLY',
+         '-DORION_K2I_COMPOSE_COMPUTE'],
     # 2026-11-12 ④：K2-D 再拆分三腿变体（ORION_K2_SPLIT2=0 回退 ③ 两腿）。
     # SUN = 水+太阳直射/GGX/SSS/RTAO（写 binding 89）；LOC = 局部光/水面反射
     # 太阳/GGX 镜面（load-add 复用 binding 89）。K2-I 不变。
@@ -235,7 +239,11 @@ def full_flags(extra):
 
 
 def build(source, spv, extra):
-    stage = STAGE[os.path.splitext(source)[1]]
+    stage = (
+        'comp'
+        if ('-DORION_K2I_COMPOSE_COMPUTE' in extra or spv.endswith('.comp.spv'))
+        else STAGE[os.path.splitext(source)[1]]
+    )
 
     def command_for(target_env):
         command = [GLSLANG, '-V', '--target-env', target_env, '-S', stage, '-e', 'main']
@@ -279,9 +287,24 @@ def collect_targets():
     # 2) SER 变体：同一份源码 + -DRT_ENABLE_SER。
     add('rt_test.rgen', 'rt_test_ser.rgen.spv', ['-DRT_ENABLE_SER'])
     add('rt_test.rmiss', 'rt_test_ser.rmiss.spv', ['-DRT_ENABLE_SER'])
+    add('rt_test.rmiss', 'rt_test_nocloud.rmiss.spv', ['-DRMISS_SKIP_CLOUDS=1'])
 
-    # 3) SHaRC update 变体：同一份源码 + -DSHARC_UPDATE=1。
-    add('rt_test.rgen', 'rt_test_sharc_update.rgen.spv', ['-DSHARC_UPDATE=1'])
+    # 3) SHaRC update 变体：同一份源码 + -DSHARC_UPDATE=1（走 K2-I 轻量化管线）。
+    add('rt_test.rgen', 'rt_test_sharc_update.rgen.spv', [
+        '-DSHARC_UPDATE=1',
+        '-DORION_K2_TRANSPORT',
+        '-DORION_K2_MATERIAL_INLINE',
+        '-DORION_K2_INDIRECT_STAGE',
+    ])
+
+    # 3.5) 批4b 植物真几何摇摆：foliage split 顶点逐帧位移 compute（无描述符，
+    #      全 push constant；位移后走 foliage BLAS refit）。
+    add('foliage_sway.comp', 'foliage_sway.comp.spv', [])
+    add('vpt_light_grid_build.comp', 'vpt_light_grid_build.comp.spv', [])
+    add('vpt_restir_spatial.comp', 'vpt_restir_spatial.comp.spv', [])
+    add('vpt_sparse_compact.comp', 'vpt_sparse_compact.comp.spv', [])
+    add('vpt_k2loc_compact.comp', 'vpt_k2loc_compact.comp.spv', [])
+    add('aces2_bake_lut.comp', 'aces2_bake_lut.comp.spv', [])
 
     # 4) 半分辨率 GI 变体：同一份源码 + -DGI_HALFRES=1。
     add('rt_test.rgen', 'rt_test_gi_half.rgen.spv', ['-DGI_HALFRES=1'])
@@ -303,6 +326,7 @@ def collect_targets():
                      'rt_test_k2d_ser.rgen.spv',
                      'rt_test_k2i.rgen.spv',
                      'rt_test_k2i_ser.rgen.spv',
+                     'rt_test_k2i_compose.comp.spv',
                      'rt_test_k2sun.rgen.spv',
                      'rt_test_k2sun_ser.rgen.spv',
                      'rt_test_k2loc.rgen.spv',

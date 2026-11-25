@@ -4209,7 +4209,7 @@ void createRRGuideRelaxResources()
         return;
     }
 
-    VkDescriptorSetLayoutBinding bindings[8]{};
+    VkDescriptorSetLayoutBinding bindings[10]{};
     for(uint32_t i = 0u; i < 5u; ++i)
     {
         bindings[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
@@ -4221,16 +4221,20 @@ void createRRGuideRelaxResources()
         VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     bindings[7] = { 7u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
         VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    bindings[8] = { 8u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    bindings[9] = { 9u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     VkDescriptorSetLayoutCreateInfo layoutInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
     };
-    layoutInfo.bindingCount = 8u;
+    layoutInfo.bindingCount = 10u;
     layoutInfo.pBindings = bindings;
     check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
         &g_rrGuideRelaxSetLayout), "rr guide relax set layout failed");
 
     VkDescriptorPoolSize poolSizes[3] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5u },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7u },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u }
     };
@@ -4298,8 +4302,16 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         g_volumetricCloudResolvedView != VK_NULL_HANDLE &&
         g_volumetricCloudDepthView != VK_NULL_HANDLE;
 
+    const bool specMotionEnabled =
+        g_rrSpecularMotionImage != VK_NULL_HANDLE &&
+        g_rrSpecularMotionView != VK_NULL_HANDLE &&
+        g_rrSpecularMotionLayout == VK_IMAGE_LAYOUT_GENERAL &&
+        g_motionImage != VK_NULL_HANDLE &&
+        g_motionView != VK_NULL_HANDLE &&
+        g_motionLayout == VK_IMAGE_LAYOUT_GENERAL;
+
     if(cmd == VK_NULL_HANDLE ||
-       (!relaxEnabled && !farCloudEnabled) ||
+       (!relaxEnabled && !farCloudEnabled && !specMotionEnabled) ||
        g_rrGuideRelaxPipeline == VK_NULL_HANDLE ||
        g_rrGuideRelaxPipelineLayout == VK_NULL_HANDLE ||
        g_rrGuideRelaxDescriptorPool == VK_NULL_HANDLE ||
@@ -4310,10 +4322,12 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
        g_rrNormalRoughnessView == VK_NULL_HANDLE ||
        g_dlssDepthView == VK_NULL_HANDLE ||
        g_rrDiffuseAlbedoView == VK_NULL_HANDLE ||
+       g_rrSpecularHitDistanceImage == VK_NULL_HANDLE ||
+       g_rrSpecularHitDistanceView == VK_NULL_HANDLE ||
+       g_cameraUboBuffer == VK_NULL_HANDLE ||
+       !specMotionEnabled ||
        (farCloudEnabled &&
-        (g_rrSpecularAlbedoView == VK_NULL_HANDLE ||
-         g_rrSpecularHitDistanceView == VK_NULL_HANDLE ||
-         g_cameraUboBuffer == VK_NULL_HANDLE)))
+        g_rrSpecularAlbedoView == VK_NULL_HANDLE))
     {
         return;
     }
@@ -4339,6 +4353,8 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         g_rrGuideRelaxCachedSpecularHitDistance = VK_NULL_HANDLE;
         g_rrGuideRelaxCachedCloudResolved = VK_NULL_HANDLE;
         g_rrGuideRelaxCachedCloudDepth = VK_NULL_HANDLE;
+        g_rrGuideRelaxCachedPrimaryMotion = VK_NULL_HANDLE;
+        g_rrGuideRelaxCachedSpecularMotion = VK_NULL_HANDLE;
         g_rrGuideRelaxCachedCamera = VK_NULL_HANDLE;
         g_rrGuideRelaxCachedGeneration = UINT32_MAX;
     }
@@ -4351,6 +4367,8 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
        g_rrGuideRelaxCachedSpecularHitDistance != g_rrSpecularHitDistanceView ||
        g_rrGuideRelaxCachedCloudResolved != g_volumetricCloudResolvedView ||
        g_rrGuideRelaxCachedCloudDepth != g_volumetricCloudDepthView ||
+       g_rrGuideRelaxCachedPrimaryMotion != g_motionView ||
+       g_rrGuideRelaxCachedSpecularMotion != g_rrSpecularMotionView ||
        g_rrGuideRelaxCachedCamera != g_cameraUboBuffer)
     {
         VkDescriptorImageInfo guideInfos[5]{};
@@ -4382,7 +4400,14 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         cameraInfo.offset = 0u;
         cameraInfo.range = sizeof(CameraUBO);
 
-        VkWriteDescriptorSet writes[8]{};
+        VkDescriptorImageInfo primaryMotionInfo{};
+        primaryMotionInfo.imageView = g_motionView;
+        primaryMotionInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo specularMotionInfo{};
+        specularMotionInfo.imageView = g_rrSpecularMotionView;
+        specularMotionInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[10]{};
         for(uint32_t i = 0u; i < 5u; ++i)
         {
             writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
@@ -4404,6 +4429,12 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
             g_rrGuideRelaxSet, 7u, 0u, 1u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             nullptr, &cameraInfo, nullptr };
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            g_rrGuideRelaxSet, 8u, 0u, 1u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            &primaryMotionInfo, nullptr, nullptr };
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            g_rrGuideRelaxSet, 9u, 0u, 1u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            &specularMotionInfo, nullptr, nullptr };
         vkUpdateDescriptorSets(g_device, writeCount, writes, 0u, nullptr);
 
         g_rrGuideRelaxCachedNormal = g_rrNormalRoughnessView;
@@ -4413,12 +4444,14 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         g_rrGuideRelaxCachedSpecularHitDistance = g_rrSpecularHitDistanceView;
         g_rrGuideRelaxCachedCloudResolved = g_volumetricCloudResolvedView;
         g_rrGuideRelaxCachedCloudDepth = g_volumetricCloudDepthView;
+        g_rrGuideRelaxCachedPrimaryMotion = g_motionView;
+        g_rrGuideRelaxCachedSpecularMotion = g_rrSpecularMotionView;
         g_rrGuideRelaxCachedCamera = g_cameraUboBuffer;
         g_rrGuideRelaxCachedGeneration = g_rrGuideViewGeneration;
     }
 
-    VkImageMemoryBarrier barriers[5]{};
-    for(uint32_t i = 0u; i < 5u; ++i)
+    VkImageMemoryBarrier barriers[7]{};
+    for(uint32_t i = 0u; i < 7u; ++i)
     {
         barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         barriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -4437,10 +4470,12 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
     barriers[2].image = g_rrDiffuseAlbedoImage;
     barriers[3].image = g_rrSpecularHitDistanceImage;
     barriers[4].image = g_rrSpecularAlbedoImage;
+    barriers[5].image = g_motionImage;
+    barriers[6].image = g_rrSpecularMotionImage;
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
-        5u, barriers);
+        7u, barriers);
 
     if(farCloudEnabled)
     {
@@ -4489,7 +4524,7 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         (g_rrGBufferHeight + 15u) / 16u,
         1u);
 
-    for(uint32_t i = 0u; i < 5u; ++i)
+    for(uint32_t i = 0u; i < 7u; ++i)
     {
         barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -4497,7 +4532,7 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0u, 0u, nullptr, 0u, nullptr,
-        5u, barriers);
+        7u, barriers);
 }
 void destroyRRGuideRelaxResources()
 {
@@ -4529,6 +4564,8 @@ void destroyRRGuideRelaxResources()
     g_rrGuideRelaxCachedSpecularHitDistance = VK_NULL_HANDLE;
     g_rrGuideRelaxCachedCloudResolved = VK_NULL_HANDLE;
     g_rrGuideRelaxCachedCloudDepth = VK_NULL_HANDLE;
+    g_rrGuideRelaxCachedPrimaryMotion = VK_NULL_HANDLE;
+    g_rrGuideRelaxCachedSpecularMotion = VK_NULL_HANDLE;
     g_rrGuideRelaxCachedCamera = VK_NULL_HANDLE;
     g_rrGuideRelaxCachedGeneration = UINT32_MAX;
 }

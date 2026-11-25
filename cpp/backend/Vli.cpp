@@ -758,40 +758,101 @@ bool rtDescriptorRingPublish()
 {
     return false;
 }
+#undef vkUpdateDescriptorSets
+void orionTrackedUpdateDescriptorSets(
+    VkDevice device,
+    uint32_t descriptorWriteCount,
+    const VkWriteDescriptorSet* pDescriptorWrites,
+    uint32_t descriptorCopyCount,
+    const VkCopyDescriptorSet* pDescriptorCopies
+)
+{
+    if(g_rayTracingDescriptorSet != VK_NULL_HANDLE && pDescriptorWrites != nullptr)
+    {
+        for(uint32_t i = 0u; i < descriptorWriteCount; ++i)
+        {
+            if(
+                pDescriptorWrites[i].dstSet == g_rayTracingDescriptorSet &&
+                pDescriptorWrites[i].dstBinding < RT_DESCRIPTOR_MAX_BINDINGS
+            )
+            {
+                const uint32_t endElem =
+                    pDescriptorWrites[i].dstArrayElement +
+                    pDescriptorWrites[i].descriptorCount;
+                if(endElem > g_rtDescriptorWrittenBindingCount[pDescriptorWrites[i].dstBinding])
+                {
+                    g_rtDescriptorWrittenBindingCount[pDescriptorWrites[i].dstBinding] = endElem;
+                }
+            }
+        }
+    }
+    vkUpdateDescriptorSets(
+        device,
+        descriptorWriteCount,
+        pDescriptorWrites,
+        descriptorCopyCount,
+        pDescriptorCopies
+    );
+}
+#define vkUpdateDescriptorSets orionTrackedUpdateDescriptorSets
+
 void createRayTracingDescriptorPoolAndSet()
 {
     VkDescriptorPoolSize ps[5] = {
-        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
+        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u * RT_DESCRIPTOR_RING_SIZE },
         // 2026-11-04 A1：+2 = GI 时域历史 binding 86/87（20 → 22，原配额恰好用满）。
         // 2026-11-05 ③：+1 = K2-D/K2-I 直射级交接图 binding 89（22 → 23）。
         // 2026-11-19 rasterLod：+2 = DH LOD 光栅 color/depth binding 96/97
         //（23 → 25；描述符按需写，但池配额按布局的静态绑定数扣减，不补
         // 会在 g_rayTracingDescriptorSet 分配时直接失败）。
         // 2026-11-21 P0-1：+1 = 主命中世界位移旁路槽 binding 98（25 → 26）。
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 28 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 28u * RT_DESCRIPTOR_RING_SIZE },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u * RT_DESCRIPTOR_RING_SIZE },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512u * RT_DESCRIPTOR_RING_SIZE },
         // 2026-11-05 B：+1 = K1/K2 landing SSBO（binding 88，21 → 22）。
         // 2026-11-16：+1 = RT 阶段三计数器 SSBO（binding 93，22 → 23；仅总闸开时写）。
         // 2026-11-24：+1 = K2-I 紧凑间接调度 SSBO binding 100 / k2GiTraceImage binding 92。
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 40 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 40u * RT_DESCRIPTOR_RING_SIZE }
     };
     VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pi.maxSets = 1;
+    pi.maxSets = RT_DESCRIPTOR_RING_SIZE;
     pi.poolSizeCount = 5;
     pi.pPoolSizes = ps;
 
     check(vkCreateDescriptorPool(g_device, &pi, nullptr, &g_rayTracingDescriptorPool), "Failed to create RT descriptor pool");
 
+    std::fill(
+        std::begin(g_rtDescriptorRingLastUsedFrame),
+        std::end(g_rtDescriptorRingLastUsedFrame),
+        UINT64_MAX
+    );
+    std::memset(
+        g_rtDescriptorWrittenBindingCount,
+        0,
+        sizeof(g_rtDescriptorWrittenBindingCount)
+    );
+
+    VkDescriptorSetLayout ringLayouts[RT_DESCRIPTOR_RING_SIZE];
+    for(uint32_t i = 0u; i < RT_DESCRIPTOR_RING_SIZE; ++i)
+    {
+        ringLayouts[i] = g_rayTracingDescriptorSetLayout;
+    }
     VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     ai.descriptorPool = g_rayTracingDescriptorPool;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &g_rayTracingDescriptorSetLayout;
+    ai.descriptorSetCount = RT_DESCRIPTOR_RING_SIZE;
+    ai.pSetLayouts = ringLayouts;
 
-    check(vkAllocateDescriptorSets(g_device, &ai, &g_rayTracingDescriptorSet), "Failed to allocate RT descriptor set");
+    check(vkAllocateDescriptorSets(g_device, &ai, g_rtDescriptorRingSets), "Failed to allocate RT descriptor ring sets");
 
-    // createRtDescriptorRing() 已随 #13 退役（publish 零调用点 + bisect 残留），
-    // 不再调用；空壳与 #if 0 原体留在上方。
+    g_rtDescriptorRingLiveIndex = 0u;
+    g_rayTracingDescriptorSet = g_rtDescriptorRingSets[0];
+    g_rtDescriptorRingReady = true;
+    g_rtDescriptorRingLastPublishUsedRing = false;
+
+    RTLog(
+        std::string("[RT DESCRIPTOR] pool-backed ring ready=1 slots=") +
+        std::to_string(RT_DESCRIPTOR_RING_SIZE)
+    );
 
     VkWriteDescriptorSetAccelerationStructureKHR asi{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
     asi.accelerationStructureCount = 1;
@@ -1720,11 +1781,13 @@ void rebuildVPTSourceDirectoryPageLocked(VLISectionCpuPage& receiver)
             );
             const uint32_t sectionPower = sourcePage.emitterIndexWords.size() > 2u
                 ? sourcePage.emitterIndexWords[2] : 0u;
-            const float dx = std::max(0, std::abs(offsetX) - 1) * 16.0f;
-            const float dy = std::max(0, std::abs(offsetY) - 1) * 16.0f;
-            const float dz = std::max(0, std::abs(offsetZ) - 1) * 16.0f;
-            weights[directoryCount - 1u] = static_cast<double>(sectionPower) /
-                static_cast<double>(1.0f + dx * dx + dy * dy + dz * dz);
+            const float dSec = std::sqrt(
+                static_cast<float>(offsetX * offsetX + offsetY * offsetY + offsetZ * offsetZ)
+            ) * 16.0f;
+            const float effDist = 0.5f * dSec;
+            const float distWeight = 1.0f / (64.0f + effDist * effDist);
+            weights[directoryCount - 1u] =
+                static_cast<double>(sectionPower) * static_cast<double>(distWeight);
         }
     );
 
@@ -1744,6 +1807,7 @@ void rebuildVPTSourceDirectoryPageLocked(VLISectionCpuPage& receiver)
         for(uint32_t i = 0u; i < directoryCount; ++i) totalWeight += weights[i];
         if(totalWeight > 0.0)
         {
+            directory[0].selectionProbability = static_cast<float>(1.0 / totalWeight);
             std::array<double, VPT_SOURCE_DIRECTORY_MAX_SECTIONS> scaled{};
             std::deque<uint32_t> small;
             std::deque<uint32_t> large;
@@ -4803,9 +4867,9 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
     const bool urgentDirty =
         !g_hasPrevCameraInverse ||
         !s_vptLightGridCacheValid ||
-        originX != s_vptLightGridLastOriginX ||
-        originY != s_vptLightGridLastOriginY ||
-        originZ != s_vptLightGridLastOriginZ ||
+        std::abs(originX - s_vptLightGridLastOriginX) >= 2 ||
+        std::abs(originY - s_vptLightGridLastOriginY) >= 2 ||
+        std::abs(originZ - s_vptLightGridLastOriginZ) >= 2 ||
         g_vliNextPage != s_vptLightGridLastLivePages ||
         g_localLightRevision != s_vptLightGridLastLightRev ||
         s_vptLightGridDataEpoch != s_vptLightGridLastEpoch ||

@@ -327,6 +327,7 @@ inline constexpr uint32_t SECTION_REBUILD_FENCE_WAIT_MS = 2u;
 inline constexpr double SECTION_REBUILD_TIME_BUDGET_MS = 5.0;
 inline constexpr double SECTION_REBUILD_TIME_BUDGET_ADAPTIVE_MAX_MS = 12.0;
 inline constexpr double SECTION_REBUILD_TIME_BUDGET_GPU_FRACTION = 0.70;
+inline constexpr double SECTION_CAPTURE_LOCK_BUDGET_MS = 2.0;
 inline constexpr uint64_t SECTION_REBUILD_CONTINUE_FRAMES = 3u;
 
 
@@ -1092,6 +1093,13 @@ struct RTSectionAS
     VkDeviceSize sectionMemoryChunkBytes = 0;
     bool hasSectionMemoryChunk = false;
 
+    uint32_t blasMemorySlab = 0;
+    uint32_t blasMemoryChunk = 0;
+    VkDeviceSize blasMemoryChunkBytes = 0;
+    bool hasBlasMemoryChunk = false;
+    bool compactCapable = false;
+    bool blasCompacted = false;
+
     uint32_t vertexAddressSlot = 0;
     bool hasVertexAddressSlot = false;
 
@@ -1277,7 +1285,7 @@ inline constexpr float AE_DEFAULT_SKY_WEIGHT = 0.25f;
 // 云像素权重（云是场景主要亮源之一，必须参与测光）。
 inline constexpr float AE_DEFAULT_CLOUD_WEIGHT = 1.0f;
 // 线性段→指数段的切换距离（EV）；UE: r.EyeAdaptation.ExponentialTransitionDistance。
-inline constexpr float AE_DEFAULT_TRANSITION_EV = 1.5f;
+inline constexpr float AE_DEFAULT_TRANSITION_EV = 2.0f;
 // 反投影深度 <= 该值视为"没有几何命中"（reversed-Z）。
 inline constexpr float AE_SKY_DEPTH_EPS = 1.0e-6f;
 // 2026-11-23 起**退役**：rr_hdr_encode.comp 改为读 PostPush.exposureStrength
@@ -1302,7 +1310,8 @@ struct AePushConstants
     float displayWhiteScale;
     float transitionDistance;
     int32_t enabled;
-    int32_t pad0;
+    float exposureStrength;
+    float manualEV;
 };
 
 // 必须与 rr_ae_histogram.comp 的 AeHistogramParams 逐字节一致。
@@ -2554,7 +2563,9 @@ struct DynamicLightUpload
 inline constexpr VkDeviceSize DYNAMIC_LIGHT_BUFFER_BYTES = sizeof(DynamicLightUpload);
 
 
-inline constexpr uint32_t RT_DESCRIPTOR_RING_SIZE = 4u;
+inline constexpr uint32_t RT_DESCRIPTOR_RING_SIZE = 6u;
+inline constexpr uint32_t RT_DESCRIPTOR_MAX_BINDINGS = 128u;
+inline constexpr uint64_t RT_DESCRIPTOR_RING_SAFE_FRAME_GAP = 8u;
 // 2026-10-22：gather 的扁平暂存。
 //
 // 原来每页 emplace_back(pageIndex, std::vector) 会为 sourceWords /
@@ -2952,6 +2963,7 @@ void perfL10CpuPhaseEndFrame();
 float waterSimUpdateSeconds();
 bool volumetricCloudV3Requested();
 VkDeviceSize sectionBuildPoolSlotBytes(VkDeviceSize requiredBytes);
+void prewarmVertexStagingPool();
 void destroyPooledSectionBuildBuffers();
 void releaseDeferredSectionBuildResources();
 bool hdrOutputActive();
@@ -3201,6 +3213,7 @@ void mat4Mul(const float a[16], const float b[16], float out[16]);
 bool mat4Invert(const float in[16], float out[16]);
 void createSDRPostPipeline();
 void updateSDRPostDescriptor();
+void bakeAces2Lut3DIfNeeded(VkCommandBuffer cmd);
 void createHDRPostPipeline();
 void createAeStateBuffers();
 void createAutoExposurePipeline();
@@ -3252,6 +3265,8 @@ void VKAPI_PTR rtxCountedCmdBuildAccelerationStructures(
     const VkAccelerationStructureBuildGeometryInfoKHR* buildInfos,
     const VkAccelerationStructureBuildRangeInfoKHR* const* buildRangeInfos);
 PFN_vkCmdBuildAccelerationStructuresKHR getCmdBuildAccelerationStructures();
+PFN_vkCmdWriteAccelerationStructuresPropertiesKHR getCmdWriteAccelerationStructuresProperties();
+PFN_vkCmdCopyAccelerationStructureKHR getCmdCopyAccelerationStructure();
 PFN_vkCmdTraceRaysKHR getCmdTraceRays();
 PFN_vkCmdTraceRaysIndirectKHR getCmdTraceRaysIndirect();
 bool traceRaysIndirectSupported();
@@ -3450,6 +3465,17 @@ void destroyPooledBuffer(
     VkBuffer& buffer,
     OmmBufferBinding& binding);
 void destroySectionMemoryPool();
+void initBlasCompactionResources();
+void destroyBlasCompactionResources();
+void enqueueBlasCompactionQuery(VkCommandBuffer cmd, RTSectionAS& section);
+struct BlasCompactedAddressRemap
+{
+    VkDeviceAddress oldAddress = 0;
+    VkDeviceAddress newAddress = 0;
+};
+bool recordPendingBlasCompactions(
+    VkCommandBuffer cmd,
+    std::vector<BlasCompactedAddressRemap>& outRemaps);
 void destroySectionAS(RTSectionAS& section);
 void retireSectionAS(RTSectionAS& section);
 void parkTlasStorage();
@@ -4690,6 +4716,8 @@ extern VkImageView g_rrGuideRelaxCachedSpecularAlbedo;
 extern VkImageView g_rrGuideRelaxCachedSpecularHitDistance;
 extern VkImageView g_rrGuideRelaxCachedCloudResolved;
 extern VkImageView g_rrGuideRelaxCachedCloudDepth;
+extern VkImageView g_rrGuideRelaxCachedPrimaryMotion;
+extern VkImageView g_rrGuideRelaxCachedSpecularMotion;
 extern VkBuffer g_rrGuideRelaxCachedCamera;
 extern uint32_t g_rrGuideViewGeneration;
 extern uint32_t g_rrGuideRelaxCachedGeneration;
@@ -4888,6 +4916,26 @@ extern VkBuffer
     g_sdrAces2LutBuffer;
 extern VkDeviceMemory
     g_sdrAces2LutMemory;
+extern VkImage
+    g_sdrAces2Lut3DImage;
+extern VkDeviceMemory
+    g_sdrAces2Lut3DMemory;
+extern VkImageView
+    g_sdrAces2Lut3DView;
+extern VkSampler
+    g_sdrAces2Lut3DSampler;
+extern VkDescriptorSetLayout
+    g_aces2BakeDescriptorSetLayout;
+extern VkDescriptorPool
+    g_aces2BakeDescriptorPool;
+extern VkDescriptorSet
+    g_aces2BakeDescriptorSet;
+extern VkPipelineLayout
+    g_aces2BakePipelineLayout;
+extern VkPipeline
+    g_aces2BakePipeline;
+extern bool
+    g_sdrAces2Lut3DBaked;
 extern std::atomic<bool> g_hdrRequested;
 extern std::atomic<bool> g_hdrSurfaceSupported;
 extern VkDescriptorPool  g_hdrEncodeDescriptorPool;
@@ -4983,6 +5031,18 @@ extern VkImage g_rrSpecularHitDistanceImage;
 extern VkDeviceMemory g_rrSpecularHitDistanceMemory;
 extern VkImageView g_rrSpecularHitDistanceView;
 extern VkImageLayout g_rrSpecularHitDistanceLayout;
+
+
+extern VkImage g_rrSpecularMotionImage;
+extern VkDeviceMemory g_rrSpecularMotionMemory;
+extern VkImageView g_rrSpecularMotionView;
+extern VkImageLayout g_rrSpecularMotionLayout;
+
+
+extern VkImage g_dlssExposureImage;
+extern VkDeviceMemory g_dlssExposureMemory;
+extern VkImageView g_dlssExposureView;
+extern VkImageLayout g_dlssExposureLayout;
 
 
 extern VkImage g_rrTransparencyHintImage;
@@ -6069,9 +6129,9 @@ extern VkDeviceSize g_vptBestLightBytes;
 extern uint32_t g_vptBestLightTileColumns;
 extern uint32_t g_vptBestLightTileRows;
 // M3 (ReGIR 4x4x4 GPU Light Grid, binding 99) + M4-B (Spatial Reuse Compute)
-constexpr uint32_t VPT_LIGHT_GRID_DIM_X = 24u;
-constexpr uint32_t VPT_LIGHT_GRID_DIM_Y = 16u;
-constexpr uint32_t VPT_LIGHT_GRID_DIM_Z = 24u;
+constexpr uint32_t VPT_LIGHT_GRID_DIM_X = 40u;
+constexpr uint32_t VPT_LIGHT_GRID_DIM_Y = 20u;
+constexpr uint32_t VPT_LIGHT_GRID_DIM_Z = 40u;
 constexpr uint32_t VPT_LIGHT_GRID_CELLS =
     VPT_LIGHT_GRID_DIM_X * VPT_LIGHT_GRID_DIM_Y * VPT_LIGHT_GRID_DIM_Z;
 constexpr uint32_t VPT_LIGHT_GRID_SLOTS = 32u;
@@ -6366,6 +6426,15 @@ extern VkCommandBuffer g_rtDescriptorRingCmd;
 extern bool g_rtDescriptorRingReady;
 extern bool g_rtDescriptorRingLastPublishUsedRing;
 extern uint32_t g_rtDescriptorRingUsedMask;
+extern uint64_t g_rtDescriptorRingLastUsedFrame[RT_DESCRIPTOR_RING_SIZE];
+extern uint32_t g_rtDescriptorWrittenBindingCount[RT_DESCRIPTOR_MAX_BINDINGS];
+void orionTrackedUpdateDescriptorSets(
+    VkDevice device,
+    uint32_t descriptorWriteCount,
+    const VkWriteDescriptorSet* pDescriptorWrites,
+    uint32_t descriptorCopyCount,
+    const VkCopyDescriptorSet* pDescriptorCopies
+);
 extern size_t g_vliPendingBacklogForLog;
 extern double g_vliMsIndex;
 extern double g_vliMsAlias;
@@ -7018,3 +7087,7 @@ struct VliWorkerHoldProbe
 };
 extern RtxSectionBuildBufferPool g_vertexStagingPool;
 extern RtxSectionBuildBufferPool g_blasScratchPool;
+
+#ifndef ORION_NO_TRACKED_DESCRIPTOR_UPDATE_MACRO
+#define vkUpdateDescriptorSets orionTrackedUpdateDescriptorSets
+#endif

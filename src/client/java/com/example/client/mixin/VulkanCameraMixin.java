@@ -71,8 +71,31 @@ public class VulkanCameraMixin {
     // 2026-11-22 Round 2：升级为 48×48 RGBA8（RGB = BiomeColors.getAverageWaterColor，
     // A = 水体掩码 255/0），静止 ≥250ms 或玩家块/水面变动才重扫上传。
     private static final int WATER_SIM_MASK_EXTENT = 48;
+    private static final int WATER_SIM_MASK_MOVE_MIN_BLOCKS = 2;
+    private static final long WATER_SIM_MASK_MOVE_INTERVAL_NANOS = 100_000_000L;
+    private static final int WATER_SIM_MASK_COARSE_STEP = 4;
+    private static final int WATER_SIM_MASK_TILE_COUNT =
+            WATER_SIM_MASK_EXTENT / WATER_SIM_MASK_COARSE_STEP;
+    private static final int WATER_SIM_MASK_COARSE_GRID =
+            WATER_SIM_MASK_TILE_COUNT + 1;
     private final byte[] waterSimMaskData =
             new byte[WATER_SIM_MASK_EXTENT * WATER_SIM_MASK_EXTENT * 4];
+    private final boolean[] waterSimTileHasWater =
+            new boolean[WATER_SIM_MASK_TILE_COUNT * WATER_SIM_MASK_TILE_COUNT];
+    private final boolean[] waterSimCornerNeeded =
+            new boolean[WATER_SIM_MASK_COARSE_GRID * WATER_SIM_MASK_COARSE_GRID];
+    private final int[] waterSimCoarseR =
+            new int[WATER_SIM_MASK_COARSE_GRID * WATER_SIM_MASK_COARSE_GRID];
+    private final int[] waterSimCoarseG =
+            new int[WATER_SIM_MASK_COARSE_GRID * WATER_SIM_MASK_COARSE_GRID];
+    private final int[] waterSimCoarseB =
+            new int[WATER_SIM_MASK_COARSE_GRID * WATER_SIM_MASK_COARSE_GRID];
+    private final int[] waterSimSmoothR =
+            new int[WATER_SIM_MASK_COARSE_GRID * WATER_SIM_MASK_COARSE_GRID];
+    private final int[] waterSimSmoothG =
+            new int[WATER_SIM_MASK_COARSE_GRID * WATER_SIM_MASK_COARSE_GRID];
+    private final int[] waterSimSmoothB =
+            new int[WATER_SIM_MASK_COARSE_GRID * WATER_SIM_MASK_COARSE_GRID];
     private final BlockPos.MutableBlockPos waterSimMaskCursor =
             new BlockPos.MutableBlockPos();
     private long lastWaterSimMaskUploadNanos = 0L;
@@ -162,13 +185,15 @@ public class VulkanCameraMixin {
     private static final int NEARBY_WATER_RING_UP_BLOCKS = 6;
     private static final int NEARBY_WATER_RING_DOWN_BLOCKS = 16;
     private static final int NEARBY_WATER_PROBE_HALF_EXTENT = 96;
-    private static final int NEARBY_WATER_PROBE_STEP = 8;
+    private static final int NEARBY_WATER_PROBE_STEP = 12;
     private static final int NEARBY_WATER_PROBE_UP_BLOCKS = 8;
     private static final int NEARBY_WATER_PROBE_DOWN_BLOCKS = 32;
     private static final long NEARBY_WATER_PROBE_INTERVAL_NANOS = 250_000_000L;
+    private static final long NEARBY_WATER_PROBE_DRY_INTERVAL_NANOS = 500_000_000L;
     private long lastNearbyWaterProbeNanos = 0L;
     private float cachedNearbyWaterSurfaceY = 0.0f;
     private boolean cachedNearbyWaterValid = false;
+    private boolean cachedNearbyWaterFound = false;
     private final BlockPos.MutableBlockPos nearbyWaterProbeCursor =
             new BlockPos.MutableBlockPos();
     private final BlockPos.MutableBlockPos nearbyWaterClimbCursor =
@@ -224,12 +249,15 @@ public class VulkanCameraMixin {
 
     private float findNearbyWaterSurfaceY(Vec3 playerPosition) {
         long now = System.nanoTime();
-        if (cachedNearbyWaterValid &&
-                now - lastNearbyWaterProbeNanos < NEARBY_WATER_PROBE_INTERVAL_NANOS) {
+        long cooldown = cachedNearbyWaterFound
+                ? NEARBY_WATER_PROBE_INTERVAL_NANOS
+                : NEARBY_WATER_PROBE_DRY_INTERVAL_NANOS;
+        if (cachedNearbyWaterValid && now - lastNearbyWaterProbeNanos < cooldown) {
             return cachedNearbyWaterSurfaceY;
         }
         lastNearbyWaterProbeNanos = now;
         cachedNearbyWaterValid = true;
+        cachedNearbyWaterFound = false;
         // 默认哨兵：没找到水 ⇒ 后端 |playerY - surfaceY| = 1000 > 32 ⇒ 门关。
         cachedNearbyWaterSurfaceY = (float) playerPosition.y - 1000.0f;
 
@@ -245,20 +273,54 @@ public class VulkanCameraMixin {
         if (NEAREST_WATER_SURFACE_PROBE) {
             final float playerY = (float) playerPosition.y;
             final Level level = this.minecraft.level;
+
+            // 时域快路径：沿用上一帧水面的 9 点十字探针（<= 9 次查询），命中同一水域即秒返。
+            if (!Float.isNaN(lastWaterSimMaskSurfaceY)
+                    && Math.abs(lastWaterSimMaskSurfaceY - playerY) <= 32.0f) {
+                final int yHintFloor = (int) Math.floor(lastWaterSimMaskSurfaceY);
+                final int yHintTop = yHintFloor + 1;
+                final int yHintBottom = yHintFloor - 1;
+                final int[] hintOffsets = { 0, -8, 8 };
+                double bestHintScore = Double.MAX_VALUE;
+                float bestHintY = Float.NaN;
+                for (int oz : hintOffsets) {
+                    for (int ox : hintOffsets) {
+                        if (ox != 0 && oz != 0) {
+                            continue;
+                        }
+                        float s = probeColumnWaterSurfaceY(
+                                level, px + ox, pz + oz, yHintTop, yHintBottom, 1, playerY);
+                        if (!Float.isNaN(s) && Math.abs(s - lastWaterSimMaskSurfaceY) <= 0.5f) {
+                            double score = waterCandidateScore(
+                                    ox, oz, s, playerY, lastProbedWaterIsSource);
+                            if (score < bestHintScore) {
+                                bestHintScore = score;
+                                bestHintY = s;
+                            }
+                        }
+                    }
+                }
+                if (!Float.isNaN(bestHintY)) {
+                    cachedNearbyWaterSurfaceY = bestHintY;
+                    cachedNearbyWaterFound = true;
+                    return cachedNearbyWaterSurfaceY;
+                }
+            }
+
             final int yRingTop = py + NEARBY_WATER_RING_UP_BLOCKS;
             final int yRingBottom = py - NEARBY_WATER_RING_DOWN_BLOCKS;
 
-            for (int r = 0; r <= NEARBY_WATER_RING_HALF_EXTENT;
-                    r += (r < 8 ? 1 : NEARBY_WATER_RING_STEP)) {
-                final int step = (r <= 8) ? 1 : NEARBY_WATER_RING_STEP;
+            for (int r = 0; r <= NEARBY_WATER_RING_HALF_EXTENT; r += (r < 12 ? 2 : 4)) {
+                final int step = (r < 12) ? 2 : 4;
                 boolean foundInRing = false;
                 double bestScore = Double.MAX_VALUE;
                 float bestSurfaceY = 0.0f;
 
                 if (r == 0) {
-                    float s = probeColumnWaterSurfaceY(level, px, pz, yRingTop, yRingBottom, 1, playerY);
+                    float s = probeColumnWaterSurfaceY(level, px, pz, yRingTop, yRingBottom, 2, playerY);
                     if (!Float.isNaN(s)) {
                         cachedNearbyWaterSurfaceY = s;
+                        cachedNearbyWaterFound = true;
                         return cachedNearbyWaterSurfaceY;
                     }
                     continue;
@@ -268,7 +330,7 @@ public class VulkanCameraMixin {
                     for (int edge = -1; edge <= 1; edge += 2) {
                         int dz = edge * r;
                         float s = probeColumnWaterSurfaceY(
-                                level, px + dx, pz + dz, yRingTop, yRingBottom, 1, playerY);
+                                level, px + dx, pz + dz, yRingTop, yRingBottom, 2, playerY);
                         if (!Float.isNaN(s)) {
                             double score = waterCandidateScore(
                                     dx, dz, s, playerY, lastProbedWaterIsSource);
@@ -284,7 +346,7 @@ public class VulkanCameraMixin {
                     for (int edge = -1; edge <= 1; edge += 2) {
                         int dx = edge * r;
                         float s = probeColumnWaterSurfaceY(
-                                level, px + dx, pz + dz, yRingTop, yRingBottom, 1, playerY);
+                                level, px + dx, pz + dz, yRingTop, yRingBottom, 2, playerY);
                         if (!Float.isNaN(s)) {
                             double score = waterCandidateScore(
                                     dx, dz, s, playerY, lastProbedWaterIsSource);
@@ -299,6 +361,7 @@ public class VulkanCameraMixin {
 
                 if (foundInRing) {
                     cachedNearbyWaterSurfaceY = bestSurfaceY;
+                    cachedNearbyWaterFound = true;
                     return cachedNearbyWaterSurfaceY;
                 }
             }
@@ -329,6 +392,7 @@ public class VulkanCameraMixin {
             }
             if (foundFar) {
                 cachedNearbyWaterSurfaceY = bestFarSurfaceY;
+                cachedNearbyWaterFound = true;
             }
             return cachedNearbyWaterSurfaceY;
         } else {
@@ -887,15 +951,23 @@ public class VulkanCameraMixin {
         }
 
         final BlockPos playerBlock = BlockPos.containing(player.position());
-        final boolean moved = playerBlock.getX() != lastWaterSimMaskPlayerX ||
-                playerBlock.getZ() != lastWaterSimMaskPlayerZ;
+        final boolean firstMask =
+                lastWaterSimMaskPlayerX == Integer.MIN_VALUE ||
+                lastWaterSimMaskPlayerZ == Integer.MIN_VALUE;
+        final boolean moved =
+                firstMask ||
+                Math.abs((long) playerBlock.getX() - (long) lastWaterSimMaskPlayerX)
+                        >= WATER_SIM_MASK_MOVE_MIN_BLOCKS ||
+                Math.abs((long) playerBlock.getZ() - (long) lastWaterSimMaskPlayerZ)
+                        >= WATER_SIM_MASK_MOVE_MIN_BLOCKS;
         final boolean surfaceChanged =
                 Float.isNaN(lastWaterSimMaskSurfaceY) ||
                 Math.abs(waterSurfaceY - lastWaterSimMaskSurfaceY) > 0.01f;
         final long now = System.nanoTime();
-        final boolean due =
-                now - lastWaterSimMaskUploadNanos >= 1_000_000_000L;
-        if (!due && !moved && !surfaceChanged) {
+        final long elapsed = now - lastWaterSimMaskUploadNanos;
+        final boolean due = elapsed >= 1_000_000_000L;
+        final boolean moveIntervalReady = elapsed >= WATER_SIM_MASK_MOVE_INTERVAL_NANOS;
+        if (!surfaceChanged && !due && !(moved && moveIntervalReady)) {
             return;
         }
         lastWaterSimMaskUploadNanos = now;
@@ -906,20 +978,162 @@ public class VulkanCameraMixin {
         final int originX = playerBlock.getX() - WATER_SIM_MASK_EXTENT / 2;
         final int originZ = playerBlock.getZ() - WATER_SIM_MASK_EXTENT / 2;
         final int probeY = (int) Math.floor(waterSurfaceY - 0.01);
+
+        java.util.Arrays.fill(waterSimTileHasWater, false);
+        boolean anyWater = false;
         for (int dz = 0; dz < WATER_SIM_MASK_EXTENT; ++dz) {
             final int rowBase = dz * WATER_SIM_MASK_EXTENT;
+            final int tzBase = (dz >> 2) * WATER_SIM_MASK_TILE_COUNT;
             for (int dx = 0; dx < WATER_SIM_MASK_EXTENT; ++dx) {
                 waterSimMaskCursor.set(originX + dx, probeY, originZ + dz);
-                final FluidState state = clientLevel.getFluidState(waterSimMaskCursor);
-                final int tintRgb = net.minecraft.client.renderer.BiomeColors.getAverageWaterColor(
-                        clientLevel,
-                        waterSimMaskCursor);
+                final boolean isWater =
+                        clientLevel.getFluidState(waterSimMaskCursor).is(FluidTags.WATER);
                 final int offset = (rowBase + dx) * 4;
-                waterSimMaskData[offset] = (byte) ((tintRgb >> 16) & 0xFF);
-                waterSimMaskData[offset + 1] = (byte) ((tintRgb >> 8) & 0xFF);
-                waterSimMaskData[offset + 2] = (byte) (tintRgb & 0xFF);
-                waterSimMaskData[offset + 3] =
-                        state.is(FluidTags.WATER) ? (byte) 0xFF : (byte) 0x00;
+                waterSimMaskData[offset + 3] = isWater ? (byte) 0xFF : (byte) 0x00;
+                if (isWater) {
+                    waterSimTileHasWater[tzBase + (dx >> 2)] = true;
+                    anyWater = true;
+                }
+            }
+        }
+
+        // 2026-11-25 Batch N: bypass BiomeColors.getAverageWaterColor (which synchronously populates
+        // 16 chunks of BlockTintCache per block moved during flight). Direct getBiome quart-grid
+        // lookup on coarse 4x4 corners around water tiles + 3x3 box smooth keeps vanilla blending.
+        final int fallbackRgb = clientLevel.getBiome(playerBlock).value().getWaterColor();
+        final int fbR = (fallbackRgb >> 16) & 0xFF;
+        final int fbG = (fallbackRgb >> 8) & 0xFF;
+        final int fbB = fallbackRgb & 0xFF;
+
+        if (!anyWater) {
+            final byte rB = (byte) fbR;
+            final byte gB = (byte) fbG;
+            final byte bB = (byte) fbB;
+            final int pixelCount = WATER_SIM_MASK_EXTENT * WATER_SIM_MASK_EXTENT;
+            for (int p = 0; p < pixelCount; ++p) {
+                final int offset = p * 4;
+                waterSimMaskData[offset] = rB;
+                waterSimMaskData[offset + 1] = gB;
+                waterSimMaskData[offset + 2] = bB;
+            }
+            NativeVulkan.updateWaterSimMask(
+                    waterSimMaskData,
+                    WATER_SIM_MASK_EXTENT,
+                    originX,
+                    originZ
+            );
+            return;
+        }
+
+        java.util.Arrays.fill(waterSimCornerNeeded, false);
+        for (int tz = 0; tz < WATER_SIM_MASK_TILE_COUNT; ++tz) {
+            for (int tx = 0; tx < WATER_SIM_MASK_TILE_COUNT; ++tx) {
+                if (!waterSimTileHasWater[tz * WATER_SIM_MASK_TILE_COUNT + tx]) {
+                    continue;
+                }
+                final int minCz = Math.max(0, tz - 1);
+                final int maxCz = Math.min(WATER_SIM_MASK_COARSE_GRID - 1, tz + 2);
+                final int minCx = Math.max(0, tx - 1);
+                final int maxCx = Math.min(WATER_SIM_MASK_COARSE_GRID - 1, tx + 2);
+                for (int cz = minCz; cz <= maxCz; ++cz) {
+                    final int cRow = cz * WATER_SIM_MASK_COARSE_GRID;
+                    for (int cx = minCx; cx <= maxCx; ++cx) {
+                        waterSimCornerNeeded[cRow + cx] = true;
+                    }
+                }
+            }
+        }
+
+        for (int cz = 0; cz < WATER_SIM_MASK_COARSE_GRID; ++cz) {
+            final int cRow = cz * WATER_SIM_MASK_COARSE_GRID;
+            final int wz = originZ + cz * WATER_SIM_MASK_COARSE_STEP;
+            for (int cx = 0; cx < WATER_SIM_MASK_COARSE_GRID; ++cx) {
+                final int idx = cRow + cx;
+                if (waterSimCornerNeeded[idx]) {
+                    waterSimMaskCursor.set(originX + cx * WATER_SIM_MASK_COARSE_STEP, probeY, wz);
+                    final int rgb = clientLevel.getBiome(waterSimMaskCursor).value().getWaterColor();
+                    waterSimCoarseR[idx] = (rgb >> 16) & 0xFF;
+                    waterSimCoarseG[idx] = (rgb >> 8) & 0xFF;
+                    waterSimCoarseB[idx] = rgb & 0xFF;
+                } else {
+                    waterSimCoarseR[idx] = fbR;
+                    waterSimCoarseG[idx] = fbG;
+                    waterSimCoarseB[idx] = fbB;
+                }
+            }
+        }
+
+        for (int cz = 0; cz < WATER_SIM_MASK_COARSE_GRID; ++cz) {
+            final int cRow = cz * WATER_SIM_MASK_COARSE_GRID;
+            for (int cx = 0; cx < WATER_SIM_MASK_COARSE_GRID; ++cx) {
+                final int idx = cRow + cx;
+                if (!waterSimCornerNeeded[idx]) {
+                    waterSimSmoothR[idx] = fbR;
+                    waterSimSmoothG[idx] = fbG;
+                    waterSimSmoothB[idx] = fbB;
+                    continue;
+                }
+                int sumR = 0;
+                int sumG = 0;
+                int sumB = 0;
+                int count = 0;
+                for (int oz = -1; oz <= 1; ++oz) {
+                    final int nz = cz + oz;
+                    if (nz < 0 || nz >= WATER_SIM_MASK_COARSE_GRID) {
+                        continue;
+                    }
+                    final int nRow = nz * WATER_SIM_MASK_COARSE_GRID;
+                    for (int ox = -1; ox <= 1; ++ox) {
+                        final int nx = cx + ox;
+                        if (nx < 0 || nx >= WATER_SIM_MASK_COARSE_GRID) {
+                            continue;
+                        }
+                        final int nIdx = nRow + nx;
+                        sumR += waterSimCoarseR[nIdx];
+                        sumG += waterSimCoarseG[nIdx];
+                        sumB += waterSimCoarseB[nIdx];
+                        ++count;
+                    }
+                }
+                waterSimSmoothR[idx] = (sumR + (count >> 1)) / count;
+                waterSimSmoothG[idx] = (sumG + (count >> 1)) / count;
+                waterSimSmoothB[idx] = (sumB + (count >> 1)) / count;
+            }
+        }
+
+        final byte fbRByte = (byte) fbR;
+        final byte fbGByte = (byte) fbG;
+        final byte fbBByte = (byte) fbB;
+        for (int dz = 0; dz < WATER_SIM_MASK_EXTENT; ++dz) {
+            final int rowBase = dz * WATER_SIM_MASK_EXTENT;
+            final int cz = dz >> 2;
+            final int fz = dz & 3;
+            final int fzInv = 4 - fz;
+            final int cRow0 = cz * WATER_SIM_MASK_COARSE_GRID;
+            final int cRow1 = (cz + 1) * WATER_SIM_MASK_COARSE_GRID;
+            final int tRow = cz * WATER_SIM_MASK_TILE_COUNT;
+            for (int dx = 0; dx < WATER_SIM_MASK_EXTENT; ++dx) {
+                final int offset = (rowBase + dx) * 4;
+                final int cx = dx >> 2;
+                if (!waterSimTileHasWater[tRow + cx]) {
+                    waterSimMaskData[offset] = fbRByte;
+                    waterSimMaskData[offset + 1] = fbGByte;
+                    waterSimMaskData[offset + 2] = fbBByte;
+                    continue;
+                }
+                final int fx = dx & 3;
+                final int fxInv = 4 - fx;
+                final int w00 = fxInv * fzInv;
+                final int w10 = fx * fzInv;
+                final int w01 = fxInv * fz;
+                final int w11 = fx * fz;
+                final int i00 = cRow0 + cx;
+                final int i10 = i00 + 1;
+                final int i01 = cRow1 + cx;
+                final int i11 = i01 + 1;
+                waterSimMaskData[offset] = (byte) ((waterSimSmoothR[i00] * w00 + waterSimSmoothR[i10] * w10 + waterSimSmoothR[i01] * w01 + waterSimSmoothR[i11] * w11 + 8) >> 4);
+                waterSimMaskData[offset + 1] = (byte) ((waterSimSmoothG[i00] * w00 + waterSimSmoothG[i10] * w10 + waterSimSmoothG[i01] * w01 + waterSimSmoothG[i11] * w11 + 8) >> 4);
+                waterSimMaskData[offset + 2] = (byte) ((waterSimSmoothB[i00] * w00 + waterSimSmoothB[i10] * w10 + waterSimSmoothB[i01] * w01 + waterSimSmoothB[i11] * w11 + 8) >> 4);
             }
         }
         NativeVulkan.updateWaterSimMask(

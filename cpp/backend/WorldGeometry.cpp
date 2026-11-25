@@ -494,7 +494,7 @@ bool rebuildWorldGeometry(
                             std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - perfL10RebuildStart
                             ).count();
-                        if(captureElapsedMs >= sectionRebuildTimeBudgetMs())
+                        if(captureElapsedMs >= std::min(sectionRebuildTimeBudgetMs(), SECTION_CAPTURE_LOCK_BUDGET_MS))
                         {
                             break;
                         }
@@ -1365,6 +1365,17 @@ bool rebuildWorldGeometry(
                     const std::chrono::steady_clock::time_point createStart =
                         std::chrono::steady_clock::now();
 
+                    const uint64_t classBits =
+                        classKey & ~SPATIAL_SECTION_KEY_MASK;
+                    const bool dynamicRefitClass =
+                        classBits == SECTION_AS_CLASS_ENTITY ||
+                        classBits == SECTION_AS_CLASS_LOCAL_PLAYER ||
+                        classBits == SECTION_AS_CLASS_PARTICLE ||
+                        classBits == SECTION_AS_CLASS_HAND ||
+                        !vertexMotion.empty();
+                    const bool allowBlasRefit =
+                        sectionBLASRefitEnabled() && dynamicRefitClass;
+
                     const VkDeviceSize scratchSize =
                         createSectionBLAS(
                             newSection,
@@ -1373,7 +1384,7 @@ bool rebuildWorldGeometry(
                             opaqueGeometry,
                             ommInput,
                             vertexMotion,
-                            sectionBLASRefitEnabled()
+                            allowBlasRefit
                         );
 
                     g_sectionASCreateMs +=
@@ -4121,6 +4132,53 @@ bool rebuildWorldGeometry(
             0,
             nullptr
         );
+
+        enqueueBlasCompactionQuery(
+            cmd,
+            *section
+        );
+    }
+
+    std::vector<BlasCompactedAddressRemap> blasCompactedRemaps;
+    if(recordPendingBlasCompactions(cmd, blasCompactedRemaps) &&
+       !blasCompactedRemaps.empty())
+    {
+        for(VkAccelerationStructureInstanceKHR& inst : instances)
+        {
+            for(const BlasCompactedAddressRemap& remap : blasCompactedRemaps)
+            {
+                if(inst.accelerationStructureReference == remap.oldAddress)
+                {
+                    inst.accelerationStructureReference = remap.newAddress;
+                    break;
+                }
+            }
+        }
+        std::sort(
+            instances.begin(),
+            instances.end(),
+            [](const VkAccelerationStructureInstanceKHR& a,
+               const VkAccelerationStructureInstanceKHR& b)
+            {
+                if(a.accelerationStructureReference != b.accelerationStructureReference)
+                {
+                    return a.accelerationStructureReference < b.accelerationStructureReference;
+                }
+                if(a.instanceCustomIndex != b.instanceCustomIndex)
+                {
+                    return a.instanceCustomIndex < b.instanceCustomIndex;
+                }
+                if(a.mask != b.mask)
+                {
+                    return a.mask < b.mask;
+                }
+                return a.instanceShaderBindingTableRecordOffset <
+                       b.instanceShaderBindingTableRecordOffset;
+            }
+        );
+        tlasInstancesUnchanged = false;
+        tlasCanUpdate = false;
+        tlasUpdateRejectReason = "blas compacted";
     }
 
 

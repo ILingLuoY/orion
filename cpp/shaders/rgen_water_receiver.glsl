@@ -348,12 +348,12 @@ float perfL10WaterAdaptiveScale()
     }
 
     const float tightness = clamp(
-        (frameMs - 12.0) / 10.0,
+        (frameMs - 9.5) / 8.5,
         0.0,
         1.0
     );
 
-    return mix(1.0, 0.35, tightness);
+    return mix(1.0, 0.40, tightness);
 }
 
 // =====================================================

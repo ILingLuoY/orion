@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <thread>
 
 namespace
@@ -552,6 +553,9 @@ VkResult OrionCreateRayTracingPipelineTimed(
     VkPipelineCache pipelineCache,
     VkPipeline* pPipelines)
 {
+    static std::mutex s_rtPipelineCompileMutex;
+    std::lock_guard<std::mutex> compileLock(s_rtPipelineCompileMutex);
+
     auto createPipe =
         reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
             vkGetDeviceProcAddr(g_device, "vkCreateRayTracingPipelinesKHR"));

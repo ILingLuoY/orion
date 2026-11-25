@@ -58,6 +58,9 @@ const float FOG_RADIANCE_CLAMP        = 16.0;
 #ifndef FOG_SILHOUETTE_FIX
 #define FOG_SILHOUETTE_FIX 1
 #endif
+#ifndef FOG_INDOOR_OCCLUSION_FIX
+#define FOG_INDOOR_OCCLUSION_FIX 1
+#endif
 
 shared float sCellMinDist[4][4];
 shared float sCellMaxDist[4][4];
@@ -218,15 +221,9 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
     const uint packedBase = localLightGridPackedIndexBase();
 
     // Keep top 4 strongest local lights at this froxel, then shadow-test only those.
-    vec3 bestPos[4];
-    vec3 bestContrib[4];
-    float bestScore[4];
-    for(int i = 0; i < 4; ++i)
-    {
-        bestScore[i] = 0.0;
-        bestPos[i] = vec3(0.0);
-        bestContrib[i] = vec3(0.0);
-    }
+    vec3 bp0 = vec3(0.0), bp1 = vec3(0.0), bp2 = vec3(0.0), bp3 = vec3(0.0);
+    vec3 bc0 = vec3(0.0), bc1 = vec3(0.0), bc2 = vec3(0.0), bc3 = vec3(0.0);
+    float bs0 = 0.0, bs1 = 0.0, bs2 = 0.0, bs3 = 0.0;
 
     int checked = 0;
     for(int dz = minZ; dz <= maxZ && checked < 48; ++dz)
@@ -273,18 +270,16 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
             const float score = dot(contrib, vec3(0.2126, 0.7152, 0.0722));
 
             int worstSlot = 0;
-            for(int s = 1; s < 4; ++s)
+            float worstScore = bs0;
+            if(bs1 < worstScore) { worstScore = bs1; worstSlot = 1; }
+            if(bs2 < worstScore) { worstScore = bs2; worstSlot = 2; }
+            if(bs3 < worstScore) { worstScore = bs3; worstSlot = 3; }
+            if(score > worstScore)
             {
-                if(bestScore[s] < bestScore[worstSlot])
-                {
-                    worstSlot = s;
-                }
-            }
-            if(score > bestScore[worstSlot])
-            {
-                bestScore[worstSlot] = score;
-                bestPos[worstSlot] = light.worldPosEmission.xyz;
-                bestContrib[worstSlot] = contrib;
+                if(worstSlot == 0) { bs0 = score; bp0 = light.worldPosEmission.xyz; bc0 = contrib; }
+                else if(worstSlot == 1) { bs1 = score; bp1 = light.worldPosEmission.xyz; bc1 = contrib; }
+                else if(worstSlot == 2) { bs2 = score; bp2 = light.worldPosEmission.xyz; bc2 = contrib; }
+                else { bs3 = score; bp3 = light.worldPosEmission.xyz; bc3 = contrib; }
             }
         }
     }
@@ -292,30 +287,23 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
     vec3 accum = vec3(0.0);
     int top0 = -1;
     int top1 = -1;
-    for(int i = 0; i < 4; ++i)
-    {
-        if(bestScore[i] <= 1.0e-5)
-        {
-            continue;
-        }
-        if(top0 < 0 || bestScore[i] > bestScore[top0])
-        {
-            top1 = top0;
-            top0 = i;
-        }
-        else if(top1 < 0 || bestScore[i] > bestScore[top1])
-        {
-            top1 = i;
-        }
-    }
+    float top0Score = 0.0;
+    float top1Score = 0.0;
+    if(bs0 > 1.0e-5) { top0 = 0; top0Score = bs0; }
+    if(bs1 > 1.0e-5) { if(top0 < 0 || bs1 > top0Score) { top1 = top0; top1Score = top0Score; top0 = 1; top0Score = bs1; } else { top1 = 1; top1Score = bs1; } }
+    if(bs2 > 1.0e-5) { if(top0 < 0 || bs2 > top0Score) { top1 = top0; top1Score = top0Score; top0 = 2; top0Score = bs2; } else if(top1 < 0 || bs2 > top1Score) { top1 = 2; top1Score = bs2; } }
+    if(bs3 > 1.0e-5) { if(top0 < 0 || bs3 > top0Score) { top1 = top0; top1Score = top0Score; top0 = 3; top0Score = bs3; } else if(top1 < 0 || bs3 > top1Score) { top1 = 3; top1Score = bs3; } }
 
     for(int i = 0; i < 4; ++i)
     {
-        if(bestScore[i] <= 1.0e-5)
+        float bsi = (i == 0) ? bs0 : ((i == 1) ? bs1 : ((i == 2) ? bs2 : bs3));
+        if(bsi <= 1.0e-5)
         {
             continue;
         }
-        const vec3 toLight = bestPos[i] - worldPos;
+        vec3 bpi = (i == 0) ? bp0 : ((i == 1) ? bp1 : ((i == 2) ? bp2 : bp3));
+        vec3 bci = (i == 0) ? bc0 : ((i == 1) ? bc1 : ((i == 2) ? bc2 : bc3));
+        const vec3 toLight = bpi - worldPos;
         const float d = length(toLight);
         if((i == top0 || i == top1) && d < 32.0)
         {
@@ -324,11 +312,11 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
             {
                 vis = fogTraceVisibility(worldPos, toLight / d, d - 0.65);
             }
-            accum += bestContrib[i] * vis;
+            accum += bci * vis;
         }
         else
         {
-            accum += bestContrib[i] * 0.65;
+            accum += bci * 0.65;
         }
     }
 
@@ -367,7 +355,6 @@ void main()
             bool hasSky = false;
 #if FOG_SILHOUETTE_FIX
             uint skyMask = 0u;
-            vec2 tapCenterUvs[16];
             vec2 solidUvSum = vec2(0.0);
             float solidCount = 0.0;
 #else
@@ -388,7 +375,6 @@ void main()
 #if FOG_SILHOUETTE_FIX
                     const vec2 snappedUv = (vec2(dCoord) + 0.5) / vec2(depthSize);
                     const int tapIdx = ty * 4 + tx;
-                    tapCenterUvs[tapIdx] = snappedUv;
 #endif
                     const float d = texelFetch(sceneDepth, dCoord, 0).r;
                     if(d <= 1.0e-5)
@@ -462,7 +448,11 @@ void main()
                             const int dy = iy - (j >> 2);
                             minSolidDist2 = min(minSolidDist2, dx * dx + dy * dy);
                         }
-                        const vec2 delta = tapCenterUvs[i] - centerUv;
+                        const vec2 tapOff = (vec2(float(ix), float(iy)) * (1.0 / 3.0) - 0.5) * 0.94 * tileStep;
+                        const vec2 tapSampleUv = clamp(centerUv + tapOff, vec2(0.0005), vec2(0.9995));
+                        const ivec2 tapCoord = clamp(ivec2(tapSampleUv * vec2(depthSize)), ivec2(0), depthSize - ivec2(1));
+                        const vec2 tapSnappedUv = (vec2(tapCoord) + 0.5) / vec2(depthSize);
+                        const vec2 delta = tapSnappedUv - centerUv;
                         const float centerDist2 = dot(delta, delta);
                         if(bestIdx < 0 ||
                            minSolidDist2 > bestSolidDist2 ||
@@ -471,11 +461,8 @@ void main()
                             bestIdx = i;
                             bestSolidDist2 = minSolidDist2;
                             bestCenterDist2 = centerDist2;
+                            farUv = tapSnappedUv;
                         }
-                    }
-                    if(bestIdx >= 0)
-                    {
-                        farUv = tapCenterUvs[bestIdx];
                     }
                 }
                 if(solidCount > 0.5)
@@ -702,10 +689,26 @@ void main()
             }
 
             // 2) Sky Ambient In-Scattering: isotropic when occluded so forward Mie sun lobe never leaks through walls.
+            float localSkyOpenness = skyOpenness;
+#if FOG_INDOOR_OCCLUSION_FIX
+#if FOG_SILHOUETTE_FIX
+            const bool sampleVisibleFromCam = !occludedFromCamera;
+#else
+            const bool sampleVisibleFromCam = !sampleBehindDepth;
+#endif
+            if(sampleVisibleFromCam && geomVis < 0.5 && localSkyOpenness > 0.20 && dist < 24.0)
+            {
+                const float roofVis = fogTraceVisibility(fogPos, vec3(0.0, 1.0, 0.0), 18.0);
+                if(roofVis < 0.5)
+                {
+                    localSkyOpenness = min(localSkyOpenness, 0.12);
+                }
+            }
+#endif
             const float dayAmt = smoothstep(-0.08, 0.22, sunElevation);
             const vec3 baseSkyAmbient = mix(vec3(0.035, 0.050, 0.105), vec3(0.36, 0.48, 0.70), dayAmt);
             const float skyAmbientMix = clamp(cam.fogExtrasParams.z * 0.72, 0.0, 0.72) *
-                skyOpenness * mix(0.35, 1.0, geomVis);
+                localSkyOpenness * mix(0.35, 1.0, geomVis);
             vec3 skyAmbient = baseSkyAmbient;
             if(skyAmbientMix > 0.001)
             {
@@ -730,7 +733,11 @@ void main()
                     const vec3 dirSkyInscatter = clearSkyInscatter(
                         horizonDir, sunElevation, lightDir, directColor, skyScale,
                         weatherFactor, vec3(1.0));
+#if FOG_INDOOR_OCCLUSION_FIX
+                    atmInscatter = mix(isoSkyInscatter, dirSkyInscatter, sunVis * localSkyOpenness);
+#else
                     atmInscatter = mix(isoSkyInscatter, dirSkyInscatter, sunVis);
+#endif
                 }
                 skyAmbient = mix(baseSkyAmbient, min(atmInscatter * 0.28, vec3(1.2)), skyAmbientMix);
             }
@@ -739,7 +746,7 @@ void main()
             skyAmbient = mix(skyAmbient, vec3(ambLuma) * vec3(0.86, 0.90, 0.95), rain * 0.65);
 
             // Cave attenuation: outdoors = 1.0, deep underground = 0.10.
-            const float effectiveOpenness = max(skyOpenness, geomVis * 0.25);
+            const float effectiveOpenness = max(localSkyOpenness, geomVis * 0.25);
             const float caveAmbientGate = mix(0.10, 1.0, effectiveOpenness);
             inScatter += skyAmbient * (ambientStrength * 0.48 * caveAmbientGate * hazeSigmaS);
         }

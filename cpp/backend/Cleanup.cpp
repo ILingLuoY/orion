@@ -91,6 +91,14 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
         );
 
 
+        destroyHistoryImage(
+            g_rrSpecularMotionImage,
+            g_rrSpecularMotionMemory,
+            g_rrSpecularMotionView,
+            g_rrSpecularMotionLayout
+        );
+
+
         if(g_glassBlueNoiseBuffer)
         {
             vkDestroyBuffer(g_device, g_glassBlueNoiseBuffer, nullptr);
@@ -453,6 +461,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
 
         g_sectionBLAS.clear();
 
+        destroyBlasCompactionResources();
         destroySectionMemoryPool();
 
         if(g_blas&&fn) fn(g_device,g_blas,nullptr);
@@ -548,6 +557,49 @@ destroySharcUpdatePipeline();
             g_sdrPostDescriptorSetLayout =
                 VK_NULL_HANDLE;
         }
+
+        if(g_aces2BakePipeline)
+        {
+            vkDestroyPipeline(g_device, g_aces2BakePipeline, nullptr);
+            g_aces2BakePipeline = VK_NULL_HANDLE;
+        }
+        if(g_aces2BakePipelineLayout)
+        {
+            vkDestroyPipelineLayout(g_device, g_aces2BakePipelineLayout, nullptr);
+            g_aces2BakePipelineLayout = VK_NULL_HANDLE;
+        }
+        if(g_aces2BakeDescriptorPool)
+        {
+            vkDestroyDescriptorPool(g_device, g_aces2BakeDescriptorPool, nullptr);
+            g_aces2BakeDescriptorPool = VK_NULL_HANDLE;
+            g_aces2BakeDescriptorSet = VK_NULL_HANDLE;
+        }
+        if(g_aces2BakeDescriptorSetLayout)
+        {
+            vkDestroyDescriptorSetLayout(g_device, g_aces2BakeDescriptorSetLayout, nullptr);
+            g_aces2BakeDescriptorSetLayout = VK_NULL_HANDLE;
+        }
+        if(g_sdrAces2Lut3DSampler)
+        {
+            vkDestroySampler(g_device, g_sdrAces2Lut3DSampler, nullptr);
+            g_sdrAces2Lut3DSampler = VK_NULL_HANDLE;
+        }
+        if(g_sdrAces2Lut3DView)
+        {
+            vkDestroyImageView(g_device, g_sdrAces2Lut3DView, nullptr);
+            g_sdrAces2Lut3DView = VK_NULL_HANDLE;
+        }
+        if(g_sdrAces2Lut3DImage)
+        {
+            vkDestroyImage(g_device, g_sdrAces2Lut3DImage, nullptr);
+            g_sdrAces2Lut3DImage = VK_NULL_HANDLE;
+        }
+        if(g_sdrAces2Lut3DMemory)
+        {
+            vkFreeMemory(g_device, g_sdrAces2Lut3DMemory, nullptr);
+            g_sdrAces2Lut3DMemory = VK_NULL_HANDLE;
+        }
+        g_sdrAces2Lut3DBaked = false;
 
         if(g_sdrAces2LutBuffer)
         {
@@ -731,6 +783,13 @@ destroySharcUpdatePipeline();
                 VK_NULL_HANDLE;
         }
 
+        destroyHistoryImage(
+            g_dlssExposureImage,
+            g_dlssExposureMemory,
+            g_dlssExposureView,
+            g_dlssExposureLayout
+        );
+
 
         if(g_fgUIAlphaPipeline != VK_NULL_HANDLE)
         {
@@ -829,6 +888,8 @@ destroySharcUpdatePipeline();
     memset(g_rtDescriptorRingSets,0,sizeof(g_rtDescriptorRingSets));
     memset(g_rtDescriptorRingFences,0,sizeof(g_rtDescriptorRingFences));
     memset(g_rtDescriptorRingFencePending,0,sizeof(g_rtDescriptorRingFencePending));
+    for(uint32_t i=0u;i<RT_DESCRIPTOR_RING_SIZE;++i){g_rtDescriptorRingLastUsedFrame[i]=UINT64_MAX;}
+    memset(g_rtDescriptorWrittenBindingCount,0,sizeof(g_rtDescriptorWrittenBindingCount));
     g_tlasScratchBuffer=VK_NULL_HANDLE;g_tlasScratchMemory=VK_NULL_HANDLE;g_tlasScratchCapacity=0;g_tlasAsSize=0;g_tlasInstancesCapacity=0;g_tlasInstanceCount=0;g_tlasInstanceBuffer=VK_NULL_HANDLE;g_tlasInstanceMemory=VK_NULL_HANDLE;g_tlasBuffer=VK_NULL_HANDLE;g_tlasMemory=VK_NULL_HANDLE;
     g_tlasInstancesBuffer=VK_NULL_HANDLE;g_tlasInstancesMemory=VK_NULL_HANDLE;g_tlasInstancesAddress=0;
     g_tlasDescriptorHandle=VK_NULL_HANDLE;

@@ -152,8 +152,14 @@ public class GameRendererMixin {
      * HUD 隐藏 / 旁观）"的帧。注意粒子层不在这里收，它仍在
      * {@code LevelRendererMixin} 的 render RETURN。</p>
      */
+    @Inject(method = "renderLevel", at = @At("HEAD"))
+    private void rtx$frameBudgetRenderLevelHead(CallbackInfo ci) {
+        FrameBudget.beginRenderLevel();
+    }
+
     @Inject(method = "renderLevel", at = @At("RETURN"))
     private void rtx$finishEntityFrameFallback(CallbackInfo ci) {
+        FrameBudget.endRenderLevel();
         EntityRtCapture.finishEntityFrame();
     }
 

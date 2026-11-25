@@ -1300,16 +1300,23 @@ float pbrLod =
 //   未设时写 0.0f（位模式 0）⇒ 与改动前逐位相同。
 // =====================================================
 const float secondaryMipBias =
-    uintBitsToFloat(cam.historyPadding0);
+    uintBitsToFloat(cam.visQueryAb.w);
+
+const bool isDiffuseGiRay =
+    (payload.state & (1u << 19u)) != 0u;
+const float effectiveSecondaryMipBias =
+    isDiffuseGiRay
+        ? max(secondaryMipBias, 1.0)
+        : secondaryMipBias;
 
 if(
-    secondaryMipBias > 0.0 &&
+    effectiveSecondaryMipBias > 0.0 &&
     getRayPurpose(payload.state) != RT_PURPOSE_PRIMARY_SKY
 )
 {
     pbrLod =
         min(
-            pbrLod + secondaryMipBias,
+            pbrLod + effectiveSecondaryMipBias,
             pbrMaxLod
         );
 }
@@ -1352,8 +1359,9 @@ if(cam.perfBandParams.w > 0.5 && hitT > cam.perfBandParams.w)
 
 pbrLod = min(pbrLod + matTexFarMipBias, pbrMaxLod);
 
-// albedo 原本恒 lod 0（精确纹素），只吃本坡道；同样夹在 pbrMaxLod。
-const float matTexAlbedoLod = min(matTexFarMipBias, pbrMaxLod);
+// albedo 原本恒 lod 0（精确纹素），只吃远场坡道与漫反射 GI Mip 偏置；同样夹在 pbrMaxLod。
+const float giAlbedoMipBias = isDiffuseGiRay ? effectiveSecondaryMipBias : 0.0;
+const float matTexAlbedoLod = min(max(matTexFarMipBias, giAlbedoMipBias), pbrMaxLod);
 
 // =====================================================
 // POM eligibility
@@ -1633,6 +1641,7 @@ bool hasNormalData = hasPBRNormalData;
 vec3 worldNormal =
     geoNormal;
 
+float matNormalTiltSq = 0.0;
 
 // LabPBR stores only normal XY.
 // Z must be reconstructed.
@@ -1640,6 +1649,8 @@ if (hasNormalData)
 {
     vec2 normalXY =
         normalSample.rg * 2.0 - 1.0;
+
+    matNormalTiltSq = dot(normalXY, normalXY);
 
     if(
         isPOMEligibleMaterial
@@ -1876,6 +1887,20 @@ float roughness =
             perceptualSmoothness,
             2.0
         );
+
+#ifndef ORION_SPECULAR_AA
+#define ORION_SPECULAR_AA 1
+#endif
+#if ORION_SPECULAR_AA
+if(cam.perfAblationStage.x != 24u &&
+   hasNormalData &&
+   !isWaterMaterial &&
+   pbrLod > 0.25)
+{
+    float aaVar = min(0.18, matNormalTiltSq * clamp((pbrLod - 0.25) * 0.14, 0.0, 0.36));
+    roughness = sqrt(clamp(roughness * roughness + aaVar, 0.0, 1.0));
+}
+#endif
 
 
 // G : preserve exact LabPBR F0 / metal encoding.

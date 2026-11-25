@@ -494,6 +494,8 @@ VkImageView g_rrGuideRelaxCachedSpecularAlbedo = VK_NULL_HANDLE;
 VkImageView g_rrGuideRelaxCachedSpecularHitDistance = VK_NULL_HANDLE;
 VkImageView g_rrGuideRelaxCachedCloudResolved = VK_NULL_HANDLE;
 VkImageView g_rrGuideRelaxCachedCloudDepth = VK_NULL_HANDLE;
+VkImageView g_rrGuideRelaxCachedPrimaryMotion = VK_NULL_HANDLE;
+VkImageView g_rrGuideRelaxCachedSpecularMotion = VK_NULL_HANDLE;
 VkBuffer g_rrGuideRelaxCachedCamera = VK_NULL_HANDLE;
 uint32_t g_rrGuideViewGeneration = 0u;
 uint32_t g_rrGuideRelaxCachedGeneration = 0u;
@@ -714,6 +716,36 @@ VkBuffer
 VkDeviceMemory
     g_sdrAces2LutMemory =
         VK_NULL_HANDLE;
+VkImage
+    g_sdrAces2Lut3DImage =
+        VK_NULL_HANDLE;
+VkDeviceMemory
+    g_sdrAces2Lut3DMemory =
+        VK_NULL_HANDLE;
+VkImageView
+    g_sdrAces2Lut3DView =
+        VK_NULL_HANDLE;
+VkSampler
+    g_sdrAces2Lut3DSampler =
+        VK_NULL_HANDLE;
+VkDescriptorSetLayout
+    g_aces2BakeDescriptorSetLayout =
+        VK_NULL_HANDLE;
+VkDescriptorPool
+    g_aces2BakeDescriptorPool =
+        VK_NULL_HANDLE;
+VkDescriptorSet
+    g_aces2BakeDescriptorSet =
+        VK_NULL_HANDLE;
+VkPipelineLayout
+    g_aces2BakePipelineLayout =
+        VK_NULL_HANDLE;
+VkPipeline
+    g_aces2BakePipeline =
+        VK_NULL_HANDLE;
+bool
+    g_sdrAces2Lut3DBaked =
+        false;
 std::atomic<bool> g_hdrRequested{false};
 std::atomic<bool> g_hdrSurfaceSupported{false};
 VkDescriptorPool  g_hdrEncodeDescriptorPool  = VK_NULL_HANDLE;
@@ -744,9 +776,9 @@ std::atomic<float> g_aeCompensationEV{0.0f};
 // Rollback: set kAE_EXTENDED_MIN_EV = false.
 static constexpr bool kAE_EXTENDED_MIN_EV = true;
 float g_aeMinEV = kAE_EXTENDED_MIN_EV ? -5.5f : -4.0f;
-float g_aeMaxEV = 1.0f;
-float g_aeAdaptUpRate = 1.5f;
-float g_aeAdaptDownRate = 3.0f;
+float g_aeMaxEV = 2.2f;
+float g_aeAdaptUpRate = 1.1f;
+float g_aeAdaptDownRate = 2.0f;
 float g_aeTrimLow = aeEnvFloat("ORION_AE_TRIM_LOW", 0.15f);
 float g_aeTrimHigh = aeEnvFloat("ORION_AE_TRIM_HIGH", 0.90f);
 
@@ -844,6 +876,20 @@ VkImage g_rrSpecularHitDistanceImage = VK_NULL_HANDLE;
 VkDeviceMemory g_rrSpecularHitDistanceMemory = VK_NULL_HANDLE;
 VkImageView g_rrSpecularHitDistanceView = VK_NULL_HANDLE;
 VkImageLayout g_rrSpecularHitDistanceLayout =
+    VK_IMAGE_LAYOUT_UNDEFINED;
+
+
+VkImage g_rrSpecularMotionImage = VK_NULL_HANDLE;
+VkDeviceMemory g_rrSpecularMotionMemory = VK_NULL_HANDLE;
+VkImageView g_rrSpecularMotionView = VK_NULL_HANDLE;
+VkImageLayout g_rrSpecularMotionLayout =
+    VK_IMAGE_LAYOUT_UNDEFINED;
+
+
+VkImage g_dlssExposureImage = VK_NULL_HANDLE;
+VkDeviceMemory g_dlssExposureMemory = VK_NULL_HANDLE;
+VkImageView g_dlssExposureView = VK_NULL_HANDLE;
+VkImageLayout g_dlssExposureLayout =
     VK_IMAGE_LAYOUT_UNDEFINED;
 
 
@@ -2166,6 +2212,10 @@ VkCommandBuffer g_rtDescriptorRingCmd = VK_NULL_HANDLE;
 bool g_rtDescriptorRingReady = false;
 bool g_rtDescriptorRingLastPublishUsedRing = false;
 uint32_t g_rtDescriptorRingUsedMask = 0u;
+uint64_t g_rtDescriptorRingLastUsedFrame[RT_DESCRIPTOR_RING_SIZE] = {
+    UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX
+};
+uint32_t g_rtDescriptorWrittenBindingCount[RT_DESCRIPTOR_MAX_BINDINGS] = {};
 size_t g_vliPendingBacklogForLog = 0u;
 double g_vliMsIndex = 0.0;
 double g_vliMsAlias = 0.0;

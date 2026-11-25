@@ -543,7 +543,11 @@ public class SectionCompilerMixin {
                     } catch (Throwable t) {
                         t.printStackTrace();
                     }
-                    scJniNanos += System.nanoTime() - scTJni;
+                    final long scOneJni = System.nanoTime() - scTJni;
+                    scJniNanos += scOneJni;
+                    if (NativeVulkan.rtActive) {
+                        com.example.client.FrameBudget.recordUploadChunk(scOneJni);
+                    }
 
                     if (SectionUploadDedup.enabled() && vertexCount > 0) {
                         SectionUploadDedup.record(

@@ -127,6 +127,35 @@ public final class FrameBudget {
         submitEntitiesStartNanos = 0L;
     }
 
+    private static double lastCaptureHeadMs;
+    private static double lastRecordFrameMs;
+    private static long renderLevelStartNanos;
+    private static long renderLevelEndNanos;
+    private static long lastLevelRenderStartNanos;
+    private static long levelRenderEndNanos;
+    private static long lastSpikeGcTimeMs;
+    private static long lastSpikeGcCount;
+    private static final java.util.concurrent.atomic.AtomicLong UPLOAD_CALLS =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong UPLOAD_NANOS =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong UPLOAD_MAX_NANOS =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    public static void recordUploadChunk(long nanos) {
+        UPLOAD_CALLS.incrementAndGet();
+        UPLOAD_NANOS.addAndGet(nanos);
+        UPLOAD_MAX_NANOS.accumulateAndGet(nanos, Math::max);
+    }
+
+    public static void beginRenderLevel() {
+        renderLevelStartNanos = System.nanoTime();
+    }
+
+    public static void endRenderLevel() {
+        renderLevelEndNanos = System.nanoTime();
+    }
+
     /** 2026-11-09：HEAD 注入块起点。 */
     public static void beginCaptureHead() {
         captureHeadStartNanos = System.nanoTime();
@@ -138,6 +167,7 @@ public final class FrameBudget {
         if (captureHeadStartNanos != 0L) {
             final double ms =
                     (System.nanoTime() - captureHeadStartNanos) / 1_000_000.0;
+            lastCaptureHeadMs = ms;
             sumCaptureHeadMs += ms;
             if (ms > maxCaptureHeadMs) {
                 maxCaptureHeadMs = ms;
@@ -161,6 +191,7 @@ public final class FrameBudget {
         if (recordFrameStartNanos != 0L) {
             final double ms =
                     (System.nanoTime() - recordFrameStartNanos) / 1_000_000.0;
+            lastRecordFrameMs = ms;
             sumRecordFrameMs += ms;
             if (ms > maxRecordFrameMs) {
                 maxRecordFrameMs = ms;
@@ -479,6 +510,13 @@ public final class FrameBudget {
         }
 
         lastHeadNanos = now;
+        lastCaptureHeadMs = 0.0;
+        lastRecordFrameMs = 0.0;
+        lastLevelRenderMs = 0.0;
+        renderLevelStartNanos = 0L;
+        renderLevelEndNanos = 0L;
+        lastLevelRenderStartNanos = 0L;
+        levelRenderEndNanos = 0L;
     }
 
     /** GameRenderer.render() 出口：记下本帧 render() 自身的耗时。 */
@@ -490,6 +528,55 @@ public final class FrameBudget {
         final long now = System.nanoTime();
         lastRenderMs = (now - lastHeadNanos) / 1_000_000.0;
         renderTailNanos = now;
+
+        if (lastRenderMs >= 25.0) {
+            final double preRL = renderLevelStartNanos > 0L
+                    ? (renderLevelStartNanos - lastHeadNanos) / 1_000_000.0
+                    : 0.0;
+            final double rlPreLv = (renderLevelStartNanos > 0L && lastLevelRenderStartNanos > 0L)
+                    ? (lastLevelRenderStartNanos - renderLevelStartNanos) / 1_000_000.0
+                    : 0.0;
+            final double rlPostLv = (levelRenderEndNanos > 0L && renderLevelEndNanos > 0L)
+                    ? (renderLevelEndNanos - levelRenderEndNanos) / 1_000_000.0
+                    : 0.0;
+            final double postRLGui = renderLevelEndNanos > 0L
+                    ? (now - renderLevelEndNanos) / 1_000_000.0
+                    : 0.0;
+
+            final long upN = UPLOAD_CALLS.getAndSet(0L);
+            final long upNs = UPLOAD_NANOS.getAndSet(0L);
+            final long upMaxNs = UPLOAD_MAX_NANOS.getAndSet(0L);
+
+            long gcTimeMs = 0L;
+            long gcCount = 0L;
+            for (java.lang.management.GarbageCollectorMXBean bean
+                    : java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()) {
+                final long t = bean.getCollectionTime();
+                final long c = bean.getCollectionCount();
+                if (t >= 0L) gcTimeMs += t;
+                if (c >= 0L) gcCount += c;
+            }
+            final long spikeGcMs = gcTimeMs - lastSpikeGcTimeMs;
+            final long spikeGcN = gcCount - lastSpikeGcCount;
+            lastSpikeGcTimeMs = gcTimeMs;
+            lastSpikeGcCount = gcCount;
+
+            System.out.println(
+                    "[RENDER SPIKE] total=" + round(lastRenderMs)
+                            + "ms | preRL=" + round(preRL)
+                            + " rlPreLv=" + round(rlPreLv)
+                            + " lv=" + round(lastLevelRenderMs)
+                            + "(cap=" + round(lastCaptureHeadMs) + ")"
+                            + " rlPostLv=" + round(rlPostLv)
+                            + "(rec=" + round(lastRecordFrameMs) + ")"
+                            + " postRL_gui=" + round(postRLGui)
+                            + " | upN=" + upN
+                            + " upMs=" + round(upNs / 1_000_000.0)
+                            + " upMax=" + round(upMaxNs / 1_000_000.0)
+                            + " | gcMs=" + spikeGcMs
+                            + " gcN=" + spikeGcN
+            );
+        }
     }
 
     /**
@@ -550,14 +637,17 @@ public final class FrameBudget {
     /** 2026-11-09：LevelRenderer.render HEAD。纯读时钟，不改任何行为。 */
     public static void beginLevelRender() {
         levelRenderStartNanos = System.nanoTime();
+        lastLevelRenderStartNanos = levelRenderStartNanos;
         levelAllocBase = allocatedBytes();
     }
 
     /** 2026-11-09：LevelRenderer.render RETURN。 */
     public static void endLevelRender() {
+        final long now = System.nanoTime();
+        levelRenderEndNanos = now;
         if (levelRenderStartNanos != 0L) {
             final double ms =
-                    (System.nanoTime() - levelRenderStartNanos) / 1_000_000.0;
+                    (now - levelRenderStartNanos) / 1_000_000.0;
             lastLevelRenderMs = ms;
             sumLevelRenderMs += ms;
             if (ms > maxLevelRenderMs) {

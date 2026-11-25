@@ -470,11 +470,202 @@ void ensureSdrAces2LutBuffer()
     std::memcpy(mapped, &kAces2LutData, sizeof(Aces2LutGpuData));
     vkUnmapMemory(g_device, g_sdrAces2LutMemory);
 }
+
+void ensureSdrAces2Lut3DResources()
+{
+    ensureSdrAces2LutBuffer();
+
+    if(g_sdrAces2Lut3DImage != VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    constexpr uint32_t kAces2LutDim = 65u;
+
+    VkImageCreateInfo imageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    imageInfo.imageType = VK_IMAGE_TYPE_3D;
+    imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    imageInfo.extent = { kAces2LutDim, kAces2LutDim, kAces2LutDim };
+    imageInfo.mipLevels = 1u;
+    imageInfo.arrayLayers = 1u;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    check(
+        vkCreateImage(g_device, &imageInfo, nullptr, &g_sdrAces2Lut3DImage),
+        "create ACES2 3D LUT image failed"
+    );
+
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(g_device, g_sdrAces2Lut3DImage, &memReq);
+
+    VkMemoryAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    allocInfo.allocationSize = memReq.size;
+    allocInfo.memoryTypeIndex = findMemoryType(
+        g_physicalDevice,
+        memReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    );
+    check(
+        vkAllocateMemory(g_device, &allocInfo, nullptr, &g_sdrAces2Lut3DMemory),
+        "allocate ACES2 3D LUT memory failed"
+    );
+    check(
+        vkBindImageMemory(g_device, g_sdrAces2Lut3DImage, g_sdrAces2Lut3DMemory, 0u),
+        "bind ACES2 3D LUT memory failed"
+    );
+
+    VkImageViewCreateInfo viewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    viewInfo.image = g_sdrAces2Lut3DImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1u;
+    viewInfo.subresourceRange.layerCount = 1u;
+    check(
+        vkCreateImageView(g_device, &viewInfo, nullptr, &g_sdrAces2Lut3DView),
+        "create ACES2 3D LUT view failed"
+    );
+
+    VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    check(
+        vkCreateSampler(g_device, &samplerInfo, nullptr, &g_sdrAces2Lut3DSampler),
+        "create ACES2 3D LUT sampler failed"
+    );
+
+    VkDescriptorSetLayoutBinding bakeBindings[2]{};
+    bakeBindings[0].binding = 0u;
+    bakeBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bakeBindings[0].descriptorCount = 1u;
+    bakeBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    bakeBindings[1].binding = 1u;
+    bakeBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bakeBindings[1].descriptorCount = 1u;
+    bakeBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo bakeLayoutInfo{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    };
+    bakeLayoutInfo.bindingCount = 2u;
+    bakeLayoutInfo.pBindings = bakeBindings;
+    check(
+        vkCreateDescriptorSetLayout(
+            g_device, &bakeLayoutInfo, nullptr, &g_aces2BakeDescriptorSetLayout),
+        "create ACES2 bake descriptor layout failed"
+    );
+
+    VkDescriptorPoolSize bakePoolSizes[2]{};
+    bakePoolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bakePoolSizes[0].descriptorCount = 1u;
+    bakePoolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bakePoolSizes[1].descriptorCount = 1u;
+
+    VkDescriptorPoolCreateInfo bakePoolInfo{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    };
+    bakePoolInfo.maxSets = 1u;
+    bakePoolInfo.poolSizeCount = 2u;
+    bakePoolInfo.pPoolSizes = bakePoolSizes;
+    check(
+        vkCreateDescriptorPool(
+            g_device, &bakePoolInfo, nullptr, &g_aces2BakeDescriptorPool),
+        "create ACES2 bake descriptor pool failed"
+    );
+
+    VkDescriptorSetAllocateInfo bakeAllocInfo{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    };
+    bakeAllocInfo.descriptorPool = g_aces2BakeDescriptorPool;
+    bakeAllocInfo.descriptorSetCount = 1u;
+    bakeAllocInfo.pSetLayouts = &g_aces2BakeDescriptorSetLayout;
+    check(
+        vkAllocateDescriptorSets(g_device, &bakeAllocInfo, &g_aces2BakeDescriptorSet),
+        "allocate ACES2 bake descriptor set failed"
+    );
+
+    VkDescriptorImageInfo bakeImageInfo{};
+    bakeImageInfo.imageView = g_sdrAces2Lut3DView;
+    bakeImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorBufferInfo bakeSsboInfo{};
+    bakeSsboInfo.buffer = g_sdrAces2LutBuffer;
+    bakeSsboInfo.offset = 0u;
+    bakeSsboInfo.range = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet bakeWrites[2]{};
+    bakeWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    bakeWrites[0].dstSet = g_aces2BakeDescriptorSet;
+    bakeWrites[0].dstBinding = 0u;
+    bakeWrites[0].descriptorCount = 1u;
+    bakeWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bakeWrites[0].pImageInfo = &bakeImageInfo;
+
+    bakeWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    bakeWrites[1].dstSet = g_aces2BakeDescriptorSet;
+    bakeWrites[1].dstBinding = 1u;
+    bakeWrites[1].descriptorCount = 1u;
+    bakeWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bakeWrites[1].pBufferInfo = &bakeSsboInfo;
+
+    vkUpdateDescriptorSets(g_device, 2u, bakeWrites, 0u, nullptr);
+
+    VkPipelineLayoutCreateInfo bakePipeLayoutInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    };
+    bakePipeLayoutInfo.setLayoutCount = 1u;
+    bakePipeLayoutInfo.pSetLayouts = &g_aces2BakeDescriptorSetLayout;
+    check(
+        vkCreatePipelineLayout(
+            g_device, &bakePipeLayoutInfo, nullptr, &g_aces2BakePipelineLayout),
+        "create ACES2 bake pipeline layout failed"
+    );
+
+    auto bakeCode = loadSpv("shaders/aces2_bake_lut.comp.spv");
+    VkShaderModule bakeModule = createShaderModule(g_device, bakeCode);
+
+    VkPipelineShaderStageCreateInfo bakeStage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    };
+    bakeStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    bakeStage.module = bakeModule;
+    bakeStage.pName = "main";
+
+    VkComputePipelineCreateInfo bakePipeInfo{
+        VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+    };
+    bakePipeInfo.stage = bakeStage;
+    bakePipeInfo.layout = g_aces2BakePipelineLayout;
+
+    VkResult bakeResult = vkCreateComputePipelines(
+        g_device,
+        getSharedPipelineCache(),
+        1u,
+        &bakePipeInfo,
+        nullptr,
+        &g_aces2BakePipeline
+    );
+    vkDestroyShaderModule(g_device, bakeModule, nullptr);
+    check(bakeResult, "create ACES2 bake compute pipeline failed");
+
+    g_sdrAces2Lut3DBaked = false;
+}
 } // namespace
 
 void createSDRPostPipeline()
 {
-    ensureSdrAces2LutBuffer();
+    ensureSdrAces2Lut3DResources();
 
     VkDescriptorSetLayoutBinding bindings[4]{};
 
@@ -522,7 +713,7 @@ void createSDRPostPipeline()
     };
 
     bindings[3].binding = 3;
-    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
@@ -558,14 +749,14 @@ void createSDRPostPipeline()
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 
     poolSizes[1].descriptorCount =
-        2;
+        1;
 
 
     poolSizes[2].type =
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 
     poolSizes[2].descriptorCount =
-        1;
+        2;
 
 
     VkDescriptorPoolCreateInfo poolInfo{
@@ -716,6 +907,70 @@ void createSDRPostPipeline()
 
     fflush(stderr);
 }
+
+void bakeAces2Lut3DIfNeeded(VkCommandBuffer cmd)
+{
+    if(g_sdrAces2Lut3DBaked ||
+       g_aces2BakePipeline == VK_NULL_HANDLE ||
+       g_sdrAces2Lut3DImage == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkImageSubresourceRange range{};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel = 0u;
+    range.levelCount = 1u;
+    range.baseArrayLayer = 0u;
+    range.layerCount = 1u;
+
+    VkImageMemoryBarrier toGeneral{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    toGeneral.srcAccessMask = 0u;
+    toGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toGeneral.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toGeneral.image = g_sdrAces2Lut3DImage;
+    toGeneral.subresourceRange = range;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toGeneral
+    );
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_aces2BakePipeline);
+    vkCmdBindDescriptorSets(
+        cmd,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_aces2BakePipelineLayout,
+        0u, 1u, &g_aces2BakeDescriptorSet,
+        0u, nullptr
+    );
+    vkCmdDispatch(cmd, (65u + 3u) / 4u, (65u + 3u) / 4u, (65u + 3u) / 4u);
+
+    VkImageMemoryBarrier toShaderRead{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    toShaderRead.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    toShaderRead.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toShaderRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toShaderRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toShaderRead.image = g_sdrAces2Lut3DImage;
+    toShaderRead.subresourceRange = range;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toShaderRead
+    );
+
+    g_sdrAces2Lut3DBaked = true;
+    fprintf(stderr, "[ACES2-LUT] baked 65x65x65 RGBA16F 3D Shaper LUT on GPU\n");
+    fflush(stderr);
+}
+
 void updateSDRPostDescriptor()
 {
     if(
@@ -802,19 +1057,20 @@ void updateSDRPostDescriptor()
     }
 
 
-    VkDescriptorBufferInfo aces2LutInfo{};
-    aces2LutInfo.buffer = g_sdrAces2LutBuffer;
-    aces2LutInfo.offset = 0;
-    aces2LutInfo.range = VK_WHOLE_SIZE;
+    VkDescriptorImageInfo aces2Lut3DInfo{};
+    aces2Lut3DInfo.sampler = g_sdrAces2Lut3DSampler;
+    aces2Lut3DInfo.imageView = g_sdrAces2Lut3DView;
+    aces2Lut3DInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    if(g_sdrAces2LutBuffer != VK_NULL_HANDLE)
+    if(g_sdrAces2Lut3DView != VK_NULL_HANDLE &&
+       g_sdrAces2Lut3DSampler != VK_NULL_HANDLE)
     {
         writes[writeCount].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[writeCount].dstSet = g_sdrPostDescriptorSet;
         writes[writeCount].dstBinding = 3;
         writes[writeCount].descriptorCount = 1;
-        writes[writeCount].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[writeCount].pBufferInfo = &aces2LutInfo;
+        writes[writeCount].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[writeCount].pImageInfo = &aces2Lut3DInfo;
         ++writeCount;
     }
 
@@ -1113,6 +1369,19 @@ void createAeStateBuffers()
         g_aeStateCpu =
             static_cast<float*>(stateMapped);
     }
+
+    if(g_dlssExposureImage == VK_NULL_HANDLE)
+    {
+        createRRGuideImage(
+            1u,
+            1u,
+            VK_FORMAT_R32_SFLOAT,
+            g_dlssExposureImage,
+            g_dlssExposureMemory,
+            g_dlssExposureView,
+            g_dlssExposureLayout
+        );
+    }
 }
 void createAutoExposurePipeline()
 {
@@ -1356,7 +1625,7 @@ void createAutoExposurePipeline()
 
 
 
-    VkDescriptorSetLayoutBinding adaptBindings[2]{};
+    VkDescriptorSetLayoutBinding adaptBindings[3]{};
 
     adaptBindings[0].binding =
         0;
@@ -1384,12 +1653,25 @@ void createAutoExposurePipeline()
         VK_SHADER_STAGE_COMPUTE_BIT;
 
 
+    adaptBindings[2].binding =
+        2;
+
+    adaptBindings[2].descriptorType =
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
+    adaptBindings[2].descriptorCount =
+        1;
+
+    adaptBindings[2].stageFlags =
+        VK_SHADER_STAGE_COMPUTE_BIT;
+
+
     VkDescriptorSetLayoutCreateInfo adaptLayoutInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
     };
 
     adaptLayoutInfo.bindingCount =
-        2;
+        3;
 
     adaptLayoutInfo.pBindings =
         adaptBindings;
@@ -1405,13 +1687,19 @@ void createAutoExposurePipeline()
     );
 
 
-    VkDescriptorPoolSize adaptPoolSizes[1]{};
+    VkDescriptorPoolSize adaptPoolSizes[2]{};
 
     adaptPoolSizes[0].type =
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 
     adaptPoolSizes[0].descriptorCount =
         2;
+
+    adaptPoolSizes[1].type =
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
+    adaptPoolSizes[1].descriptorCount =
+        1;
 
 
     VkDescriptorPoolCreateInfo adaptPoolInfo{
@@ -1422,7 +1710,7 @@ void createAutoExposurePipeline()
         1;
 
     adaptPoolInfo.poolSizeCount =
-        1;
+        2;
 
     adaptPoolInfo.pPoolSizes =
         adaptPoolSizes;
@@ -1486,7 +1774,16 @@ void createAutoExposurePipeline()
             VK_WHOLE_SIZE;
 
 
-        VkWriteDescriptorSet adaptWrites[2]{};
+        VkDescriptorImageInfo exposureInfo{};
+
+        exposureInfo.imageView =
+            g_dlssExposureView;
+
+        exposureInfo.imageLayout =
+            VK_IMAGE_LAYOUT_GENERAL;
+
+
+        VkWriteDescriptorSet adaptWrites[3]{};
 
         adaptWrites[0].sType =
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1526,9 +1823,28 @@ void createAutoExposurePipeline()
             &stateInfo;
 
 
+        adaptWrites[2].sType =
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+
+        adaptWrites[2].dstSet =
+            g_aeAdaptSet;
+
+        adaptWrites[2].dstBinding =
+            2;
+
+        adaptWrites[2].descriptorCount =
+            1;
+
+        adaptWrites[2].descriptorType =
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
+        adaptWrites[2].pImageInfo =
+            &exposureInfo;
+
+
         vkUpdateDescriptorSets(
             g_device,
-            2,
+            g_dlssExposureView != VK_NULL_HANDLE ? 3u : 2u,
             adaptWrites,
             0,
             nullptr

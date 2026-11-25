@@ -391,26 +391,19 @@ float evaluateBurleyDiffuseAngular(
         LdotH;
 
 
+    float nl = 1.0 - NdotL;
+    float nl2 = nl * nl;
     float lightScatter =
         1.0 +
-        (
-            f90 - 1.0
-        ) *
-        pow(
-            1.0 - NdotL,
-            5.0
-        );
+        (f90 - 1.0) *
+        ((nl2 * nl2) * nl);
 
-
+    float nv = 1.0 - NdotV;
+    float nv2 = nv * nv;
     float viewScatter =
         1.0 +
-        (
-            f90 - 1.0
-        ) *
-        pow(
-            1.0 - NdotV,
-            5.0
-        );
+        (f90 - 1.0) *
+        ((nv2 * nv2) * nv);
 
 
     return
@@ -579,6 +572,19 @@ float geometrySmith(
 
     return
         ggxV * ggxL;
+}
+
+float visibilitySmithGGXCorrelated(
+    float NdotV,
+    float NdotL,
+    float roughness
+)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float ggxV = NdotL * sqrt(NdotV * NdotV * (1.0 - a2) + a2);
+    float ggxL = NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2);
+    return 0.5 / max(ggxV + ggxL, 1.0e-5);
 }
 
 // =====================================================
@@ -822,12 +828,23 @@ BsdfTerms evalBSDFTerms(
     float D =
         distributionGGX(N, H, roughness);
 
+#ifndef BSDF_HEIGHT_CORRELATED_SMITH
+#define BSDF_HEIGHT_CORRELATED_SMITH 1
+#endif
+#if BSDF_HEIGHT_CORRELATED_SMITH
+    float visTerm =
+        visibilitySmithGGXCorrelated(NdotV, NdotL, roughness);
+
+    vec3 specular =
+        D * visTerm * F;
+#else
     float G =
         geometrySmith(N, V, L, roughness);
 
     vec3 specular =
         (D * G * F) /
         max(4.0 * NdotV * NdotL, 1.0e-4);
+#endif
 
     if(multiscatter)
     {

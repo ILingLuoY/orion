@@ -37,6 +37,9 @@ buffer AeState
     float cloudWhite;
 };
 
+layout(binding = 2, set = 0, r32f)
+writeonly uniform image2D dlssExposureImage;
+
 layout(push_constant) uniform AeParams
 {
     float dtSec;
@@ -52,7 +55,8 @@ layout(push_constant) uniform AeParams
     float displayWhiteScale;
     float transitionDistance;
     int enabled;
-    int pad0;
+    float exposureStrength;
+    float manualEV;
 } ae;
 
 const uint AE_BIN_COUNT = 256u;
@@ -71,10 +75,13 @@ void clearBins()
     }
 }
 
-// 每次退出都必须发布，否则云端/白点会拿着已经过期的白点继续工作。
+// 每次退出都必须发布，否则云端/白点/DLSS-RR 会拿着已经过期的曝光继续工作。
 void publishCloudWhite()
 {
     cloudWhite = exp2(-currentEV) * ae.displayWhiteScale;
+    float activeEV = (ae.enabled != 0) ? (currentEV * ae.exposureStrength) : 0.0;
+    float dlssExp = clamp(exp2(activeEV + ae.manualEV), 1.0 / 64.0, 64.0);
+    imageStore(dlssExposureImage, ivec2(0, 0), vec4(dlssExp, 0.0, 0.0, 0.0));
 }
 
 void main()
@@ -130,10 +137,13 @@ void main()
 
         cum += c;
 
-        if(cum > lowCut && prevCum < highCut)
+        uint overlapStart = max(prevCum, lowCut);
+        uint overlapEnd = min(cum, highCut);
+        if(overlapEnd > overlapStart)
         {
-            weighted += binCenter(i) * float(c);
-            used += c;
+            uint take = overlapEnd - overlapStart;
+            weighted += binCenter(i) * float(take);
+            used += take;
         }
 
         bins[i] = 0u;
@@ -150,6 +160,10 @@ void main()
     }
 
     float avgLogLum = weighted / float(used);
+    if(isnan(avgLogLum) || isinf(avgLogLum))
+    {
+        avgLogLum = ae.keyEV - currentEV;
+    }
 
     float target = clamp(ae.keyEV - avgLogLum, ae.minEV, ae.maxEV);
 
@@ -159,9 +173,9 @@ void main()
     float step = max(rate, 0.0) * max(ae.dtSec, 0.0);
     float transition = max(ae.transitionDistance, 0.05);
 
-    if(abs(delta) <= 1.0e-3)
+    if(abs(delta) <= 0.015)
     {
-        currentEV = target;
+        // 死区内保持 currentEV，抑制轻微噪点引起的曝光呼吸抖动
     }
     else if(abs(delta) >= transition)
     {

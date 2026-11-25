@@ -37,6 +37,9 @@ layout(push_constant) uniform FogFroxelPush
 #ifndef FOG_SILHOUETTE_FIX
 #define FOG_SILHOUETTE_FIX 1
 #endif
+#ifndef FOG_INDOOR_OCCLUSION_FIX
+#define FOG_INDOOR_OCCLUSION_FIX 1
+#endif
 
 // Calibrated so UI density 1.0 = subtle depth haze, 2.5 = rich mist, 5+ = thick fog.
 const float FOG_HAZE_EXTINCTION_UNIT = 0.0028;
@@ -71,40 +74,44 @@ void fogSampleHemisphereTerrain(
         ? (1.0 - smoothstep(0.0, TERRAIN_HEIGHT_OUTSIDE_FADE_BLOCKS, centerOut))
         : 0.0;
 
-    const vec2 offsets[8] = vec2[8](
-        vec2( 6.0,  6.0), vec2(-6.0,  6.0), vec2( 6.0, -6.0), vec2(-6.0, -6.0),
-        vec2(20.0,  0.0), vec2(-20.0, 0.0), vec2( 0.0, 20.0), vec2( 0.0,-20.0)
-    );
-    const float weights[8] = float[8](
-        0.11, 0.11, 0.11, 0.11,
-        0.10, 0.10, 0.10, 0.10
-    );
-    const float allowances[8] = float[8](
-        3.0, 3.0, 3.0, 3.0,
-        7.0, 7.0, 7.0, 7.0
-    );
-
     float groundSum = 0.0;
     float openSum = 0.0;
     float wSum = 0.0;
+#if FOG_INDOOR_OCCLUSION_FIX
+    float centerOpen = 1.0;
+#endif
 
     if(centerValid)
     {
         groundSum += centerH * 0.16;
         openSum += smoothstep(-4.0, 2.0, worldPos.y - centerH) * 0.16;
         wSum += 0.16;
+#if FOG_INDOOR_OCCLUSION_FIX
+        centerOpen = smoothstep(-3.5, 1.0, worldPos.y - centerH);
+#endif
     }
 
     for(int i = 0; i < 8; ++i)
     {
+        vec2 tapOffset =
+            (i == 0) ? vec2( 6.0,  6.0) :
+            (i == 1) ? vec2(-6.0,  6.0) :
+            (i == 2) ? vec2( 6.0, -6.0) :
+            (i == 3) ? vec2(-6.0, -6.0) :
+            (i == 4) ? vec2(20.0,  0.0) :
+            (i == 5) ? vec2(-20.0, 0.0) :
+            (i == 6) ? vec2( 0.0, 20.0) :
+                       vec2( 0.0,-20.0);
+        float tapWeight = (i < 4) ? 0.11 : 0.10;
+        float tapAllowance = (i < 4) ? 3.0 : 7.0;
         float tapOut = 0.0;
-        const float h = terrainGroundHeight(worldPos.xz + offsets[i], tapOut);
+        const float h = terrainGroundHeight(worldPos.xz + tapOffset, tapOut);
         if(tapOut <= TERRAIN_HEIGHT_OUTSIDE_FADE_BLOCKS && h > TERRAIN_HEIGHT_EMPTY * 0.5)
         {
             const float tapFade = 1.0 - smoothstep(0.0, TERRAIN_HEIGHT_OUTSIDE_FADE_BLOCKS, tapOut);
-            const float w = weights[i] * tapFade;
+            const float w = tapWeight * tapFade;
             groundSum += h * w;
-            openSum += smoothstep(-4.0, 3.5, worldPos.y - (h - allowances[i])) * w;
+            openSum += smoothstep(-4.0, 3.5, worldPos.y - (h - tapAllowance)) * w;
             wSum += w;
         }
     }
@@ -117,7 +124,13 @@ void fogSampleHemisphereTerrain(
             rawGroundY = smoothGroundY;
             groundValidWeight = clamp(wSum, 0.0, 1.0);
         }
-        const float rawOpen = openSum / wSum;
+        float rawOpen = openSum / wSum;
+#if FOG_INDOOR_OCCLUSION_FIX
+        if(centerValid)
+        {
+            rawOpen = min(rawOpen, mix(0.22, 1.0, centerOpen));
+        }
+#endif
         hemiSkyOpenness = mix(1.0, rawOpen, groundValidWeight);
     }
     else
@@ -159,7 +172,6 @@ void main()
             bool hasSky = false;
 #if FOG_SILHOUETTE_FIX
             uint skyMask = 0u;
-            vec2 tapCenterUvs[16];
 #endif
 
             for(int ty = 0; ty < 4; ++ty)
@@ -176,7 +188,6 @@ void main()
 #if FOG_SILHOUETTE_FIX
                     const vec2 snappedUv = (vec2(dCoord) + 0.5) / vec2(depthSize);
                     const int tapIdx = ty * 4 + tx;
-                    tapCenterUvs[tapIdx] = snappedUv;
 #endif
                     const float d = texelFetch(sceneDepth, dCoord, 0).r;
                     if(d <= 1.0e-5)
@@ -237,7 +248,11 @@ void main()
                             const int dy = iy - (j >> 2);
                             minSolidDist2 = min(minSolidDist2, dx * dx + dy * dy);
                         }
-                        const vec2 delta = tapCenterUvs[i] - centerUv;
+                        const vec2 tapOff = (vec2(float(ix), float(iy)) * (1.0 / 3.0) - 0.5) * 0.94 * tileStep;
+                        const vec2 tapSampleUv = clamp(centerUv + tapOff, vec2(0.0005), vec2(0.9995));
+                        const ivec2 tapCoord = clamp(ivec2(tapSampleUv * vec2(depthSize)), ivec2(0), depthSize - ivec2(1));
+                        const vec2 tapSnappedUv = (vec2(tapCoord) + 0.5) / vec2(depthSize);
+                        const vec2 delta = tapSnappedUv - centerUv;
                         const float centerDist2 = dot(delta, delta);
                         if(bestIdx < 0 ||
                            minSolidDist2 > bestSolidDist2 ||
@@ -246,11 +261,8 @@ void main()
                             bestIdx = i;
                             bestSolidDist2 = minSolidDist2;
                             bestCenterDist2 = centerDist2;
+                            farUv = tapSnappedUv;
                         }
-                    }
-                    if(bestIdx >= 0)
-                    {
-                        farUv = tapCenterUvs[bestIdx];
                     }
                 }
             }

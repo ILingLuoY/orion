@@ -1,0 +1,479 @@
+#version 460
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0, rgba16f) writeonly uniform image3D aces2Lut3DOut;
+
+layout(std430, set = 0, binding = 1) readonly buffer Aces2LutBuffer
+{
+    vec4 reachGammaCusp[362];
+    float hues[362];
+} aces2Lut;
+
+const float ACES2_REF_LUMINANCE = 100.0;
+const float ACES2_CONE_OFFSET = 2.713000000e+01f;
+const float ACES2_J_SCALE = 1.000000000e+02f;
+const float ACES2_FOCUS_GAIN_BLEND = 3.000000000e-01f;
+const float ACES2_CUSP_MID_BLEND = 1.300000000e+00f;
+const float ACES2_SMOOTH_CUSPS = 1.200000000e-01f;
+const float ACES2_COMPRESSION_THRESHOLD = 7.500000000e-01f;
+const float ACES2_LIMIT_J_MAX = 1.000000000e+02f;
+const float ACES2_MODEL_GAMMA_INV = 8.794641436e-01f;
+const float ACES2_MID_J = 3.409653482e+01f;
+const float ACES2_FOCUS_DIST = 1.350000000e+00f;
+const float ACES2_LOWER_HULL_GAMMA_INV = 8.771929825e-01f;
+const float ACES2_SAT = 1.300000000e+00f;
+const float ACES2_SAT_THR = 5.000000000e-03f;
+const float ACES2_COMPR = 2.400000000e+00f;
+const float ACES2_CHROMA_COMPRESS_SCALE = 1.000053063e+00f;
+const float ACES2_WHITE_SCALE = 1.000000000e+00f;
+const float ACES2_TS_N_R = 1.000000000e+02f;
+const float ACES2_TS_G = 1.150000000e+00f;
+const float ACES2_TS_T1 = 4.000000000e-02f;
+const float ACES2_TS_S2 = 9.198582542e-01f;
+const float ACES2_TS_M2 = 1.047103762e+00f;
+const float ACES2_TS_FORWARD_LIMIT = 1.024000000e+03f;
+
+const mat3 ACES2_IN_RGB_TO_CAM16C = mat3(vec3(4.451810084e-01f, 1.237341065e-01f, 1.170072553e-02f), vec3(3.496492545e-01f, 6.136436165e-01f, 2.806079158e-02f), vec3(-1.129735296e-03f, 5.632280451e-02f, 7.539390104e-01f));
+const mat3 ACES2_IN_CAM16C_TO_RGB = mat3(vec3(2.667054454e+00f, -5.358118761e-01f, -2.144890573e-02f), vec3(-1.525058944e+00f, 1.941581083e+00f, -4.859545068e-02f), vec3(1.179255365e-01f, -1.458481599e-01f, 1.329965404e+00f));
+const mat3 ACES2_IN_CONE_TO_AAB = mat3(vec3(2.025881034e+01f, 1.548000000e+04f, 1.720000000e+03f), vec3(1.012940517e+01f, -1.688727273e+04f, 1.720000000e+03f), vec3(5.064702585e-01f, 1.407272727e+03f, -3.440000000e+03f));
+const mat3 ACES2_IN_AAB_TO_CONE = mat3(vec3(3.236802625e-02f, 3.236802625e-02f, 3.236802625e-02f), vec3(2.076576402e-05f, -4.102504600e-05f, -1.012964099e-05f), vec3(1.326062093e-05f, -1.201743772e-05f, -2.900760828e-04f));
+const float ACES2_FL_N = 7.937005275e-03f;
+const float ACES2_CZ = 1.137056021e+00f;
+const float ACES2_INV_CZ = 8.794641436e-01f;
+const float ACES2_AW_J = 3.236802625e-02f;
+const float ACES2_INV_AW_J = 3.089468577e+01f;
+
+const mat3 ACES2_LIM_RGB_TO_CAM16C = mat3(vec3(2.234057960e-01f, 1.081934406e-01f, 2.046919760e-02f), vec3(4.513326926e-01f, 5.474739197e-01f, 1.081809701e-01f), vec3(1.189620390e-01f, 1.380331672e-01f, 6.650503599e-01f));
+const mat3 ACES2_LIM_CAM16C_TO_RGB = mat3(vec3(7.450485164e+00f, -1.475067089e+00f, 1.062887270e-02f), vec3(-6.130183289e+00f, 3.118357198e+00f, -3.185728276e-01f), vec3(-6.038082804e-02f, -3.833690610e-01f, 1.567865002e+00f));
+const mat3 ACES2_LIM_CONE_TO_AAB = mat3(vec3(2.025881034e+01f, 1.548000000e+04f, 1.720000000e+03f), vec3(1.012940517e+01f, -1.688727273e+04f, 1.720000000e+03f), vec3(5.064702585e-01f, 1.407272727e+03f, -3.440000000e+03f));
+const mat3 ACES2_LIM_AAB_TO_CONE = mat3(vec3(3.236802625e-02f, 3.236802625e-02f, 3.236802625e-02f), vec3(2.076576402e-05f, -4.102504600e-05f, -1.012964099e-05f), vec3(1.326062093e-05f, -1.201743772e-05f, -2.900760828e-04f));
+
+const mat3 ACES2_SRGB_TO_AP0 = mat3(vec3(4.329305201e-01f, 8.941313710e-02f, 1.916171307e-02f), vec3(3.753843595e-01f, 8.165330211e-01f, 1.181520660e-01f), vec3(1.893780579e-01f, 1.030219928e-01f, 9.422169143e-01f));
+const mat3 ACES2_AP0_TO_AP1 = mat3(vec3(1.451439316e+00f, -7.655377340e-02f, 8.316148426e-03f), vec3(-2.365107469e-01f, 1.176229700e+00f, -6.032449791e-03f), vec3(-2.149285693e-01f, -9.967592644e-02f, 9.977163014e-01f));
+const mat3 ACES2_AP1_TO_AP0 = mat3(vec3(6.954522414e-01f, 4.479456337e-02f, -5.525882558e-03f), vec3(1.406786965e-01f, 8.596711185e-01f, 4.025210306e-03f), vec3(1.638690622e-01f, 9.553431817e-02f, 1.001500672e+00f));
+const mat3 ACES2_LIMIT_TO_DISPLAY = mat3(vec3(1.000000000e+00f, 2.602085214e-18f, 3.469446952e-18f), vec3(5.551115123e-17f, 1.000000000e+00f, 0.000000000e+00f), vec3(0.000000000e+00f, 6.938893904e-18f, 1.000000000e+00f));
+
+float a2Copysign(float x, float y)
+{
+    return (y < 0.0) ? -abs(x) : abs(x);
+}
+
+float a2WrapTo360(float hue)
+{
+    float y = mod(hue, 360.0);
+    if (y < 0.0)
+    {
+        y = y + 360.0;
+    }
+    return y;
+}
+
+int a2HuePos(float hue, int tableSize)
+{
+    return int(a2WrapTo360(hue) / 360.0 * float(tableSize));
+}
+
+float a2Lerp(float a, float b, float t)
+{
+    return a + t * (b - a);
+}
+
+// Post-adaptation cone response compression（Hellwig 2022）
+float a2ConeFwd(float v)
+{
+    float a = abs(v);
+    float f = pow(a, 0.42);
+    return a2Copysign(f / (ACES2_CONE_OFFSET + f), v);
+}
+
+float a2ConeInv(float v)
+{
+    float a = min(abs(v), 0.99);
+    float f = (ACES2_CONE_OFFSET * a) / (1.0 - a);
+    return a2Copysign(pow(f, 1.0 / 0.42), v);
+}
+
+float a2AchromaticNToJ(float a)
+{
+    return ACES2_J_SCALE * pow(a, ACES2_CZ);
+}
+
+float a2JToAchromaticN(float j)
+{
+    return pow(j * (1.0 / ACES2_J_SCALE), ACES2_INV_CZ);
+}
+
+float a2JToY(float j)
+{
+    float ra = ACES2_AW_J * a2JToAchromaticN(abs(j));
+    return a2ConeInv(ra) / ACES2_FL_N;
+}
+
+float a2YToJ(float y)
+{
+    float ra = a2ConeFwd(abs(y) * ACES2_FL_N);
+    float j = a2AchromaticNToJ(ra * ACES2_INV_AW_J);
+    return a2Copysign(j, y);
+}
+
+vec3 a2RgbToAab(vec3 rgb, mat3 rgbToCam16c, mat3 coneToAab)
+{
+    vec3 m = rgbToCam16c * rgb;
+    vec3 a = vec3(a2ConeFwd(m.x), a2ConeFwd(m.y), a2ConeFwd(m.z));
+    return coneToAab * a;
+}
+
+vec3 a2AabToRgb(vec3 aab, mat3 aabToCone, mat3 cam16cToRgb)
+{
+    vec3 a = aabToCone * aab;
+    vec3 m = vec3(a2ConeInv(a.x), a2ConeInv(a.y), a2ConeInv(a.z));
+    return cam16cToRgb * m;
+}
+
+vec3 a2AabToJmh(vec3 aab)
+{
+    if (aab.x <= 0.0)
+    {
+        return vec3(0.0);
+    }
+    float j = a2AchromaticNToJ(aab.x);
+    float m = length(aab.yz);
+    float h = a2WrapTo360(degrees(atan(aab.z, aab.y)));
+    return vec3(j, m, h);
+}
+
+vec3 a2JmhToAab(vec3 jmh)
+{
+    float hr = radians(jmh.z);
+    return vec3(a2JToAchromaticN(jmh.x),
+                jmh.y * cos(hr),
+                jmh.y * sin(hr));
+}
+
+// Tonescale.ctl: tonescale_fwd（输出为 cd/m^2）
+float a2TonescaleFwd(float x)
+{
+    float f = ACES2_TS_M2 * pow(max(0.0, x) / (x + ACES2_TS_S2), ACES2_TS_G);
+    float h = max(0.0, f * f / (f + ACES2_TS_T1));
+    return h * ACES2_TS_N_R;
+}
+
+// OutputTransform.ctl: chroma_compress_norm
+float a2ChromaCompressNorm(float h)
+{
+    float hr = radians(h);
+    float a = cos(hr);
+    float b = sin(hr);
+    float cosHr2 = a * a - b * b;
+    float sinHr2 = 2.0 * a * b;
+    float cosHr3 = 4.0 * a * a * a - 3.0 * a;
+    float sinHr3 = 3.0 * b - 4.0 * b * b * b;
+
+    float m = 11.34072 * a
+            + 16.46899 * cosHr2
+            + 7.88380 * cosHr3
+            + 14.66441 * b
+            - 6.37224 * sinHr2
+            + 9.19364 * sinHr3
+            + 77.12896;
+    return m * ACES2_CHROMA_COMPRESS_SCALE;
+}
+
+// OutputTransform.ctl: reach_M_from_table
+float a2ReachMFromTable(float h)
+{
+    int base = a2HuePos(h, 360);
+    float t = h - float(base);
+    int iLo = base + 1;
+    return mix(aces2Lut.reachGammaCusp[iLo].x, aces2Lut.reachGammaCusp[iLo + 1].x, t);
+}
+
+// OutputTransform.ctl: toe（逆用与正用同一个函数，CTL 里靠 invert 分支）
+float a2Toe(float x, float limit, float k1In, float k2In)
+{
+    if (x > limit)
+    {
+        return x;
+    }
+    float k2 = max(k2In, 0.001);
+    float k1 = sqrt(k1In * k1In + k2 * k2);
+    float k3 = (limit + k1) / (limit + k2);
+
+    float minusB = k3 * x - k1;
+    float minusC = k2 * k3 * x;
+    return 0.5 * (minusB + sqrt(max(minusB * minusB + 4.0 * minusC, 0.0)));
+}
+
+// OutputTransform.ctl: chroma_compress_fwd
+vec3 a2ChromaCompressFwd(vec3 jmh, float tonemappedJ)
+{
+    float j = jmh.x;
+    float m = jmh.y;
+    float h = jmh.z;
+
+    float mCompr = m;
+
+    if (m != 0.0)
+    {
+        float nJ = tonemappedJ / ACES2_LIMIT_J_MAX;
+        float snJ = max(0.0, 1.0 - nJ);
+        float mNorm = a2ChromaCompressNorm(h);
+        float limit = pow(nJ, ACES2_MODEL_GAMMA_INV) * a2ReachMFromTable(h) / mNorm;
+
+        float toeLimit = limit - 0.001;
+        float toeSnJSat = snJ * ACES2_SAT;
+        float toeSqrtNJSatThr = sqrt(nJ * nJ + ACES2_SAT_THR);
+        float toeNJCompr = nJ * ACES2_COMPR;
+
+        mCompr = m * pow(tonemappedJ / j, ACES2_MODEL_GAMMA_INV);
+        mCompr = mCompr / mNorm;
+        mCompr = limit - a2Toe(limit - mCompr, toeLimit, toeSnJSat, toeSqrtNJSatThr);
+        mCompr = a2Toe(mCompr, limit, toeNJCompr, snJ);
+        mCompr = mCompr * mNorm;
+    }
+
+    return vec3(tonemappedJ, mCompr, h);
+}
+
+// OutputTransform.ctl: compute_focus_J / get_focus_gain / solve_J_intersect /
+// compute_compression_vector_slope / smin_scaled /
+// estimate_line_and_boundary_intersection_M / remap_M
+float a2ComputeFocusJ(float cuspJ)
+{
+    return a2Lerp(cuspJ, ACES2_MID_J,
+                  min(1.0, ACES2_CUSP_MID_BLEND - (cuspJ / ACES2_LIMIT_J_MAX)));
+}
+
+float a2GetFocusGain(float j, float analyticalThreshold)
+{
+    float gain = ACES2_LIMIT_J_MAX * ACES2_FOCUS_DIST;
+    if (j > analyticalThreshold)
+    {
+        float adj = log((ACES2_LIMIT_J_MAX - analyticalThreshold)
+                        / max(0.0001, ACES2_LIMIT_J_MAX - j)) / log(10.0);
+        adj = adj * adj + 1.0;
+        gain = gain * adj;
+    }
+    return gain;
+}
+
+float a2SolveJIntersect(float j, float m, float focusJ, float slopeGain)
+{
+    float mScaled = m / slopeGain;
+    float a = mScaled / focusJ;
+
+    if (j < focusJ)
+    {
+        float b = 1.0 - mScaled;
+        float c = -j;
+        float det = b * b - 4.0 * a * c;
+        float root = sqrt(max(det, 0.0));
+        return (-2.0 * c) / (b + root);
+    }
+    else
+    {
+        float b = -(1.0 + mScaled + ACES2_LIMIT_J_MAX * a);
+        float c = ACES2_LIMIT_J_MAX * mScaled + j;
+        float det = b * b - 4.0 * a * c;
+        float root = sqrt(max(det, 0.0));
+        return (-2.0 * c) / (b - root);
+    }
+}
+
+float a2CompressionVectorSlope(float intersectJ, float focusJ, float slopeGain)
+{
+    float directionScalar = (intersectJ < focusJ)
+        ? intersectJ
+        : (ACES2_LIMIT_J_MAX - intersectJ);
+    return directionScalar * (intersectJ - focusJ) / (focusJ * slopeGain);
+}
+
+float a2SminScaled(float a, float b, float scaleReference)
+{
+    float sScaled = ACES2_SMOOTH_CUSPS * scaleReference;
+    float h = max(sScaled - abs(a - b), 0.0) / sScaled;
+    return min(a, b) - h * h * h * sScaled * (1.0 / 6.0);
+}
+
+float a2EstimateLineBoundaryM(float jAxisIntersect, float slope, float invGamma,
+                              float jMax, float mMax, float jIntersectionReference)
+{
+    float normalisedJ = jAxisIntersect / jIntersectionReference;
+    float shiftedIntersection = jIntersectionReference * pow(normalisedJ, invGamma);
+    float denom = jMax - slope * mMax;
+    return (denom == 0.0) ? 0.0 : shiftedIntersection * mMax / denom;
+}
+
+float a2GamutBoundaryM(vec2 jmCusp, float gammaTopInv, float gammaBottomInv,
+                       float jIntersectSource, float slope, float jIntersectCusp)
+{
+    float mBoundaryLower = a2EstimateLineBoundaryM(
+        jIntersectSource, slope, gammaBottomInv,
+        jmCusp.x, jmCusp.y, jIntersectCusp);
+
+    float fJIntersectCusp = ACES2_LIMIT_J_MAX - jIntersectCusp;
+    float fJIntersectSource = ACES2_LIMIT_J_MAX - jIntersectSource;
+    float fJmCuspJ = ACES2_LIMIT_J_MAX - jmCusp.x;
+    float mBoundaryUpper = a2EstimateLineBoundaryM(
+        fJIntersectSource, -slope, gammaTopInv,
+        fJmCuspJ, jmCusp.y, fJIntersectCusp);
+
+    return a2SminScaled(mBoundaryLower, mBoundaryUpper, jmCusp.y);
+}
+
+float a2RemapM(float m, float gamutBoundaryM, float reachBoundaryM)
+{
+    float boundaryRatio = gamutBoundaryM / reachBoundaryM;
+    float proportion = max(boundaryRatio, ACES2_COMPRESSION_THRESHOLD);
+    float threshold = proportion * gamutBoundaryM;
+
+    if (m <= threshold || proportion >= 1.0)
+    {
+        return m;
+    }
+
+    float mOffset = m - threshold;
+    float gamutOffset = gamutBoundaryM - threshold;
+    float reachOffset = reachBoundaryM - threshold;
+
+    float scale = reachOffset / ((reachOffset / gamutOffset) - 1.0);
+    float nd = mOffset / scale;
+
+    return threshold + scale * nd / (1.0 + nd);
+}
+
+// OutputTransform.ctl: cusp_from_table / lookup_hue_interval 的索引区间
+int a2HueInterval(float h)
+{
+    int lowI = 0;
+    int highI = 361;
+    int i = a2HuePos(h, 360) + 1;
+
+    for (int guard = 0; guard < 16; ++guard)
+    {
+        if (lowI + 1 >= highI)
+        {
+            break;
+        }
+        if (h > aces2Lut.hues[i])
+        {
+            lowI = i;
+        }
+        else
+        {
+            highI = i;
+        }
+        i = (lowI + highI) / 2;
+    }
+    return max(1, highI);
+}
+
+vec2 a2CuspFromTable(float h, int iHi)
+{
+    vec2 lo = aces2Lut.reachGammaCusp[iHi - 1].zw;
+    vec2 hi = aces2Lut.reachGammaCusp[iHi].zw;
+    float hLo = aces2Lut.hues[iHi - 1];
+    float hHi = aces2Lut.hues[iHi];
+    float t = (hHi != hLo) ? (h - hLo) / (hHi - hLo) : 0.0;
+    return vec2(a2Lerp(lo.x, hi.x, t), a2Lerp(lo.y, hi.y, t));
+}
+
+// OutputTransform.ctl: gamut_compress_fwd（含 compress_gamut 的展开）
+vec3 a2GamutCompressFwd(vec3 jmh)
+{
+    float j = jmh.x;
+    float m = jmh.y;
+    float h = jmh.z;
+
+    if (j <= 0.0)
+    {
+        return vec3(0.0, 0.0, h);
+    }
+    if (m < 0.0 || j > ACES2_LIMIT_J_MAX)
+    {
+        return vec3(j, 0.0, h);
+    }
+
+    int iHi = a2HueInterval(h);
+    vec2 cusp = a2CuspFromTable(h, iHi);
+    float t = h - aces2Lut.hues[iHi - 1];
+    float gammaTopInv = a2Lerp(aces2Lut.reachGammaCusp[iHi - 1].y,
+                               aces2Lut.reachGammaCusp[iHi].y, t);
+    float focusJ = a2ComputeFocusJ(cusp.x);
+    float analyticalThreshold = a2Lerp(cusp.x, ACES2_LIMIT_J_MAX, ACES2_FOCUS_GAIN_BLEND);
+
+    float slopeGain = a2GetFocusGain(j, analyticalThreshold);
+    float jIntersectSource = a2SolveJIntersect(j, m, focusJ, slopeGain);
+    float gamutSlope = a2CompressionVectorSlope(jIntersectSource, focusJ, slopeGain);
+    float jIntersectCusp = a2SolveJIntersect(cusp.x, cusp.y, focusJ, slopeGain);
+
+    float gamutBoundaryM = a2GamutBoundaryM(
+        cusp, gammaTopInv, ACES2_LOWER_HULL_GAMMA_INV,
+        jIntersectSource, gamutSlope, jIntersectCusp);
+
+    if (gamutBoundaryM <= 0.0)
+    {
+        return vec3(j, 0.0, h);
+    }
+
+    float reachMaxM = a2ReachMFromTable(h);
+    float reachBoundaryM = a2EstimateLineBoundaryM(
+        jIntersectSource, gamutSlope, ACES2_MODEL_GAMMA_INV,
+        ACES2_LIMIT_J_MAX, reachMaxM, ACES2_LIMIT_J_MAX);
+
+    float remappedM = a2RemapM(m, gamutBoundaryM, reachBoundaryM);
+    return vec3(jIntersectSource + remappedM * gamutSlope, remappedM, h);
+}
+
+// OutputTransform.ctl: clamp_AP0_to_AP1
+vec3 a2ClampAp0ToAp1(vec3 aces)
+{
+    vec3 ap1 = ACES2_AP0_TO_AP1 * aces;
+    vec3 ap1Clamped = clamp(ap1, vec3(0.0), vec3(ACES2_TS_FORWARD_LIMIT));
+    return ACES2_AP1_TO_AP0 * ap1Clamped;
+}
+
+// 预设 main() 的前半段：线性 sRGB(D65) → AP0 → outputTransform_fwd →
+// clamp 到峰值 → （scale_white = false，跳过）→ limiting→display 矩阵。
+vec3 aces2DisplayLinear(vec3 linearSrgb)
+{
+    vec3 aces = ACES2_SRGB_TO_AP0 * linearSrgb;
+    aces = a2ClampAp0ToAp1(aces);
+
+    vec3 jmh = a2AabToJmh(a2RgbToAab(aces, ACES2_IN_RGB_TO_CAM16C, ACES2_IN_CONE_TO_AAB));
+
+    float linear = a2JToY(jmh.x) / ACES2_REF_LUMINANCE;
+    float tonemappedY = a2TonescaleFwd(linear);
+    float jTs = a2YToJ(tonemappedY);
+    jmh = a2ChromaCompressFwd(jmh, jTs);
+
+    jmh = a2GamutCompressFwd(jmh);
+
+    vec3 rgb = a2AabToRgb(a2JmhToAab(jmh), ACES2_LIM_AAB_TO_CONE, ACES2_LIM_CAM16C_TO_RGB);
+    rgb = clamp(rgb, vec3(0.0), vec3(1.0));
+    rgb = rgb * ACES2_WHITE_SCALE;
+    return ACES2_LIMIT_TO_DISPLAY * rgb;
+}
+
+const int ACES2_LUT_SIZE = 65;
+const float ACES2_SHAPER_K = 256.0;
+// log2(1.0 + 1024.0 * 256.0)
+const float ACES2_SHAPER_LOG2_DENOM = 18.000005503399316;
+
+void main()
+{
+    ivec3 gid = ivec3(gl_GlobalInvocationID.xyz);
+    if (gid.x >= ACES2_LUT_SIZE || gid.y >= ACES2_LUT_SIZE || gid.z >= ACES2_LUT_SIZE)
+    {
+        return;
+    }
+
+    vec3 u = vec3(gid) * (1.0 / float(ACES2_LUT_SIZE - 1));
+    vec3 linearSrgb = (exp2(u * ACES2_SHAPER_LOG2_DENOM) - vec3(1.0)) * (1.0 / ACES2_SHAPER_K);
+    vec3 displayLinear = aces2DisplayLinear(linearSrgb);
+    displayLinear = mix(displayLinear, vec3(0.0), isnan(displayLinear));
+    displayLinear = mix(displayLinear, vec3(0.0), isinf(displayLinear));
+    displayLinear = clamp(displayLinear, vec3(0.0), vec3(1.0));
+    imageStore(aces2Lut3DOut, gid, vec4(sqrt(displayLinear), 1.0));
+}
