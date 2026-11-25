@@ -51,6 +51,7 @@
 		"ModelFeatureRendererMixin",
 		"RenderTypeFeatureRendererMixin",
 		"GameRendererMixin",
+		"HudVignetteMixin",
 		"LivingEntityRendererMixin",
 		"RenderTypeAccessor",
 		"RenderSetupAccessor",

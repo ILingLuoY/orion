@@ -1195,6 +1195,7 @@ PFN_slDLSSGGetState
 std::atomic<int> g_rrMode{1};
 std::atomic<int> g_upscalerMode{0};
 std::atomic<int> g_srMode{2};
+std::atomic<int> g_customUpscalePercent{0};
 std::atomic<float>
     g_noDirectLightAmbient{0.10f};
 std::atomic<float>

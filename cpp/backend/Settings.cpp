@@ -273,7 +273,7 @@ bool glossyStepLodEnabled()
     static const bool cached = []()
     {
         const char* raw = std::getenv("ORION_GLOSSY_STEP_LOD");
-        return raw != nullptr && raw[0] != '\0' && raw[0] == '1';
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
     }();
 
     return cached;

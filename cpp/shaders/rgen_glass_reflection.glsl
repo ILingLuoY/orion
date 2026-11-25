@@ -29,7 +29,10 @@ vec3 traceGlassSceneReflectionOneRay(
     vec3 reflectionDirection =
         normalize(reflect(-V, N));
 
-    const int MAX_GLASS_REFLECT_STEPS = 3;
+    const float glassReflCamDist =
+        length(glassSurfacePosition - cam.viewInverse[3].xyz);
+    const int maxGlassReflectSteps =
+        (glassReflCamDist < 24.0) ? 3 : ((glassReflCamDist < 64.0) ? 2 : 1);
 
     vec3 currentOrigin =
         glassSurfacePosition + N * 0.002 + reflectionDirection * 0.001;
@@ -41,7 +44,7 @@ vec3 traceGlassSceneReflectionOneRay(
     bool appliedTranslucentTint = false;
     bool reachedTerminus = false;
 
-    for(int step = 0; step < MAX_GLASS_REFLECT_STEPS; ++step)
+    for(int step = 0; step < maxGlassReflectSteps; ++step)
     {
         hit.hitDistance = 1.0;
         hit.albedoPacked = packAlbedoUnorm(vec3(1.0));

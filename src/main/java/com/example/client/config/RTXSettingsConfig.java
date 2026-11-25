@@ -91,11 +91,15 @@ public final class RTXSettingsConfig {
     public static final int RR_MODE_ULTRA_PERFORMANCE = 4;
     public static final int UPSCALER_MODE_RR = 0;
     public static final int UPSCALER_MODE_SR = 1;
+    public static final int CUSTOM_UPSCALE_OFF = 0;
+    public static final int CUSTOM_UPSCALE_MIN = 33;
+    public static final int CUSTOM_UPSCALE_MAX = 100;
 
     private static int rrMode =
             RR_MODE_PERFORMANCE;
     private static int upscalerMode = UPSCALER_MODE_RR;
     private static int srMode = RR_MODE_PERFORMANCE;
+    private static int customUpscalePercent = CUSTOM_UPSCALE_OFF;
 
 
     private static float noDirectLightAmbient =
@@ -2270,6 +2274,20 @@ public final class RTXSettingsConfig {
         return rrMode;
     }
 
+    public static synchronized int getCustomUpscalePercent() {
+        return customUpscalePercent;
+    }
+
+    public static synchronized void setCustomUpscalePercent(int percent) {
+        final int normalized = percent <= 0
+                ? CUSTOM_UPSCALE_OFF
+                : Math.max(CUSTOM_UPSCALE_MIN, Math.min(CUSTOM_UPSCALE_MAX, percent));
+        if (customUpscalePercent != normalized) {
+            customUpscalePercent = normalized;
+            markDirty();
+        }
+    }
+
     public static synchronized int getUpscalerMode() { return upscalerMode; }
     public static synchronized void setUpscalerMode(int mode) {
         if(mode < 0 || mode > 1) throw new IllegalArgumentException("Invalid upscaler mode: " + mode);
@@ -3176,6 +3194,7 @@ public final class RTXSettingsConfig {
                     RR_MODE_PERFORMANCE;
             upscalerMode = UPSCALER_MODE_RR;
             srMode = RR_MODE_PERFORMANCE;
+            customUpscalePercent = CUSTOM_UPSCALE_OFF;
 
             noDirectLightAmbient =
                     0.0001f;
@@ -3253,6 +3272,7 @@ public final class RTXSettingsConfig {
                         RR_MODE_PERFORMANCE;
                 upscalerMode = UPSCALER_MODE_RR;
                 srMode = RR_MODE_PERFORMANCE;
+                customUpscalePercent = CUSTOM_UPSCALE_OFF;
 
                 noDirectLightAmbient =
                         0.0001f;
@@ -3405,6 +3425,9 @@ public final class RTXSettingsConfig {
                     ? data.upscalerMode : UPSCALER_MODE_RR;
             srMode = data.srMode != null && data.srMode >= 0 && data.srMode <= 4
                     ? data.srMode : RR_MODE_PERFORMANCE;
+            customUpscalePercent = (data.customUpscalePercent == null || data.customUpscalePercent <= 0)
+                    ? CUSTOM_UPSCALE_OFF
+                    : Math.max(CUSTOM_UPSCALE_MIN, Math.min(CUSTOM_UPSCALE_MAX, data.customUpscalePercent));
 
 
             if(Float.isFinite(
@@ -4107,6 +4130,7 @@ public final class RTXSettingsConfig {
                     RR_MODE_PERFORMANCE;
             upscalerMode = UPSCALER_MODE_RR;
             srMode = RR_MODE_PERFORMANCE;
+            customUpscalePercent = CUSTOM_UPSCALE_OFF;
 
             noDirectLightAmbient =
                     0.0001f;
@@ -4280,6 +4304,7 @@ public final class RTXSettingsConfig {
                     rrMode;
             data.upscalerMode = upscalerMode;
             data.srMode = srMode;
+            data.customUpscalePercent = customUpscalePercent;
 
             data.noDirectLightAmbient =
                     noDirectLightAmbient;
@@ -4692,6 +4717,7 @@ public final class RTXSettingsConfig {
                 RR_MODE_PERFORMANCE;
         Integer upscalerMode;
         Integer srMode;
+        Integer customUpscalePercent;
 
         float noDirectLightAmbient =
                 0.01f;

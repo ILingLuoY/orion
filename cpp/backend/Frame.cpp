@@ -2464,6 +2464,15 @@ sl::DLSSDOptions rrOptions{};
 sl::DLSSOptions srOptions{};
 
 
+    const int customUpscalePct = g_customUpscalePercent.load();
+    auto dlssModeForCustomPercent = [](int pct) -> sl::DLSSMode {
+        if(pct >= 99) return sl::DLSSMode::eDLAA;
+        if(pct >= 63) return sl::DLSSMode::eMaxQuality;
+        if(pct >= 54) return sl::DLSSMode::eBalanced;
+        if(pct >= 42) return sl::DLSSMode::eMaxPerformance;
+        return sl::DLSSMode::eUltraPerformance;
+    };
+
     const int rrMode = g_rrMode.load();
     switch(rrMode)
     {
@@ -2516,6 +2525,11 @@ sl::DLSSOptions srOptions{};
         }
     }
 
+    if(customUpscalePct >= 33 && customUpscalePct <= 100)
+    {
+        rrOptions.mode = dlssModeForCustomPercent(customUpscalePct);
+    }
+
 
 rrOptions.outputWidth =
     outputWidth;
@@ -2555,11 +2569,13 @@ rrOptions.sharpness =
     0.0f;
 
 const int srMode = g_srMode.load();
-srOptions.mode = srMode == 0 ? sl::DLSSMode::eMaxPerformance :
-                 srMode == 1 ? sl::DLSSMode::eBalanced :
-                 srMode == 3 ? sl::DLSSMode::eDLAA :
-                 srMode == 4 ? sl::DLSSMode::eUltraPerformance :
-                 sl::DLSSMode::eMaxQuality;
+srOptions.mode = (customUpscalePct >= 33 && customUpscalePct <= 100)
+                 ? dlssModeForCustomPercent(customUpscalePct)
+                 : (srMode == 0 ? sl::DLSSMode::eMaxPerformance :
+                    srMode == 1 ? sl::DLSSMode::eBalanced :
+                    srMode == 3 ? sl::DLSSMode::eDLAA :
+                    srMode == 4 ? sl::DLSSMode::eUltraPerformance :
+                    sl::DLSSMode::eMaxQuality);
 srOptions.outputWidth = outputWidth;
 srOptions.outputHeight = outputHeight;
 srOptions.colorBuffersHDR = sl::Boolean::eTrue;
@@ -2575,6 +2591,7 @@ static bool hasCachedRROptimalSettings = false;
 static uint32_t cachedRROutputWidth = 0u;
 static uint32_t cachedRROutputHeight = 0u;
 static int cachedRRMode = -1;
+static int cachedRRCustomPct = -1;
 static VkDevice cachedRRDevice = VK_NULL_HANDLE;
 static PFN_slDLSSDGetOptimalSettings cachedRROptimalFunction = nullptr;
 static sl::DLSSDOptimalSettings cachedRROptimal{};
@@ -2588,6 +2605,7 @@ const bool rrOptimalCacheMiss =
     cachedRROutputWidth != outputWidth ||
     cachedRROutputHeight != outputHeight ||
     cachedRRMode != rrMode ||
+    cachedRRCustomPct != customUpscalePct ||
     cachedRRDevice != g_device ||
     cachedRROptimalFunction != g_slDLSSDGetOptimalSettings;
 
@@ -2599,6 +2617,7 @@ if(canQueryRROptimal && rrOptimalCacheMiss)
     cachedRROutputWidth = outputWidth;
     cachedRROutputHeight = outputHeight;
     cachedRRMode = rrMode;
+    cachedRRCustomPct = customUpscalePct;
     cachedRRDevice = g_device;
     cachedRROptimalFunction = g_slDLSSDGetOptimalSettings;
     hasCachedRROptimalSettings = true;
@@ -2649,13 +2668,15 @@ static bool hasCachedSROptimalSettings = false;
 static uint32_t cachedSROutputWidth = 0u;
 static uint32_t cachedSROutputHeight = 0u;
 static int cachedSRMode = -1;
+static int cachedSRCustomPct = -1;
 static VkDevice cachedSRDevice = VK_NULL_HANDLE;
 static PFN_slDLSSGetOptimalSettings cachedSROptimalFunction = nullptr;
 static sl::DLSSOptimalSettings cachedSROptimal{};
 static sl::Result cachedSROptimalResult = sl::Result::eErrorFeatureNotSupported;
 const bool canQuerySROptimal = useSR && g_dlssReady && g_slDLSSGetOptimalSettings;
 const bool srOptimalCacheMiss = !hasCachedSROptimalSettings || cachedSROutputWidth != outputWidth ||
-    cachedSROutputHeight != outputHeight || cachedSRMode != srMode || cachedSRDevice != g_device ||
+    cachedSROutputHeight != outputHeight || cachedSRMode != srMode ||
+    cachedSRCustomPct != customUpscalePct || cachedSRDevice != g_device ||
     cachedSROptimalFunction != g_slDLSSGetOptimalSettings;
 if(canQuerySROptimal && srOptimalCacheMiss)
 {
@@ -2664,6 +2685,7 @@ if(canQuerySROptimal && srOptimalCacheMiss)
     cachedSROutputWidth = outputWidth;
     cachedSROutputHeight = outputHeight;
     cachedSRMode = srMode;
+    cachedSRCustomPct = customUpscalePct;
     cachedSRDevice = g_device;
     cachedSROptimalFunction = g_slDLSSGetOptimalSettings;
     hasCachedSROptimalSettings = true;
@@ -2931,13 +2953,50 @@ if(!g_dlssGFeatureInitialized)
     }
 
 
-    const uint32_t renderWidth = useSR
+    uint32_t renderWidth = useSR
         ? cachedSROptimal.optimalRenderWidth
         : rrOptimal.optimalRenderWidth;
 
-    const uint32_t renderHeight = useSR
+    uint32_t renderHeight = useSR
         ? cachedSROptimal.optimalRenderHeight
         : rrOptimal.optimalRenderHeight;
+
+    if(customUpscalePct >= 33 && customUpscalePct <= 100)
+    {
+        const uint32_t minW = useSR ? cachedSROptimal.renderWidthMin : rrOptimal.renderWidthMin;
+        const uint32_t maxW = useSR ? cachedSROptimal.renderWidthMax : rrOptimal.renderWidthMax;
+        const uint32_t minH = useSR ? cachedSROptimal.renderHeightMin : rrOptimal.renderHeightMin;
+        const uint32_t maxH = useSR ? cachedSROptimal.renderHeightMax : rrOptimal.renderHeightMax;
+        uint32_t customW = static_cast<uint32_t>(std::max<long>(
+            1L,
+            std::lround(static_cast<double>(outputWidth) * (static_cast<double>(customUpscalePct) / 100.0))
+        ));
+        uint32_t customH = static_cast<uint32_t>(std::max<long>(
+            1L,
+            std::lround(static_cast<double>(outputHeight) * (static_cast<double>(customUpscalePct) / 100.0))
+        ));
+        if(customW < outputWidth && customW > 2u) { customW &= ~1u; }
+        if(customH < outputHeight && customH > 2u) { customH &= ~1u; }
+        if(minW > 0u && maxW >= minW)
+        {
+            customW = std::clamp(customW, minW, maxW);
+        }
+        else
+        {
+            customW = std::clamp(customW, 64u, outputWidth);
+        }
+        if(minH > 0u && maxH >= minH)
+        {
+            customH = std::clamp(customH, minH, maxH);
+        }
+        else
+        {
+            customH = std::clamp(customH, 64u, outputHeight);
+        }
+        renderWidth = customW;
+        renderHeight = customH;
+    }
+
     static bool rr53Printed =
     false;
 
@@ -2958,12 +3017,14 @@ if(!g_dlssGFeatureInitialized)
 
 
     {
-        static int sizingMirrorKey = -1;
-        const int sizingMirrorKeyNow =
-            (useSR ? 1 : 0) * 1000000 +
-            g_rrMode.load() * 10000 +
-            g_srMode.load() * 100 +
-            static_cast<int>(renderWidth / 32u);
+        static uint64_t sizingMirrorKey = UINT64_MAX;
+        const uint64_t sizingMirrorKeyNow =
+            (static_cast<uint64_t>(useSR ? 1 : 0) << 48) |
+            (static_cast<uint64_t>(customUpscalePct & 0xFF) << 40) |
+            (static_cast<uint64_t>(g_rrMode.load() & 0xF) << 36) |
+            (static_cast<uint64_t>(g_srMode.load() & 0xF) << 32) |
+            (static_cast<uint64_t>(renderWidth & 0xFFFF) << 16) |
+            static_cast<uint64_t>(renderHeight & 0xFFFF);
         if(sizingMirrorKeyNow != sizingMirrorKey)
         {
             sizingMirrorKey = sizingMirrorKeyNow;
@@ -2972,6 +3033,7 @@ if(!g_dlssGFeatureInitialized)
                          << " path=" << (useSR ? "SR" : "RR")
                          << " rrMode=" << g_rrMode.load()
                          << " srMode=" << g_srMode.load()
+                         << " customPct=" << customUpscalePct
                          << " render=" << renderWidth << "x" << renderHeight
                          << " output=" << outputWidth << "x" << outputHeight
                          << " rrOptimal=" << rrOptimal.optimalRenderWidth
@@ -4890,8 +4952,11 @@ if(dlssLayoutBarrierCount > 0)
 
         static uint32_t lastResetOutputWidth = 0u;
         static uint32_t lastResetOutputHeight = 0u;
+        static uint32_t lastResetRenderWidth = 0u;
+        static uint32_t lastResetRenderHeight = 0u;
         static int lastResetUpscalerMode = -1;
         static int lastResetRRMode = -1;
+        static int lastResetCustomUpscalePct = -1;
         static int lastResetMvOutput = -1;
 
         const int resetUpscalerMode = g_upscalerMode.load();
@@ -4901,14 +4966,20 @@ if(dlssLayoutBarrierCount > 0)
         const bool resetByShapeChange =
             lastResetOutputWidth != outputWidth ||
             lastResetOutputHeight != outputHeight ||
+            lastResetRenderWidth != renderWidth ||
+            lastResetRenderHeight != renderHeight ||
             lastResetUpscalerMode != resetUpscalerMode ||
             lastResetRRMode != resetRRMode ||
+            lastResetCustomUpscalePct != customUpscalePct ||
             lastResetMvOutput != resetMvOutput;
 
         lastResetOutputWidth = outputWidth;
         lastResetOutputHeight = outputHeight;
+        lastResetRenderWidth = renderWidth;
+        lastResetRenderHeight = renderHeight;
         lastResetUpscalerMode = resetUpscalerMode;
         lastResetRRMode = resetRRMode;
+        lastResetCustomUpscalePct = customUpscalePct;
         lastResetMvOutput = resetMvOutput;
 
         if(resetByShapeChange)

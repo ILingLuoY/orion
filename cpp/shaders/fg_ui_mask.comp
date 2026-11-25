@@ -68,17 +68,14 @@ void main()
         ).rgb;
 
 
-    bvec3 changed =
-        notEqual(
-            finalColor,
-            hudlessColor
-        );
+    vec3 diff = abs(finalColor - hudlessColor);
+    float maxDiff = max(diff.r, max(diff.g, diff.b));
 
-
-    float alpha =
-        any(changed)
-            ? 1.0
-            : 0.0;
+    // 2026-11-25 Batch P: Ignore subtle <= 3/255 full-screen overlays or 8-bit
+    // quantization differences so they never freeze DLSS Frame Generation across
+    // large screen regions, while crisp HUD/text/crosshair/hand (>= 10/255) keep
+    // full 1.0 static UI protection.
+    float alpha = smoothstep(3.0 / 255.0, 10.0 / 255.0, maxDiff);
 
 
     imageStore(

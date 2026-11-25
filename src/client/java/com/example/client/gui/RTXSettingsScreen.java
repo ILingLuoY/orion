@@ -26,6 +26,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private int pendingReflexMode;
 
     private int pendingRRMode;
+    private int pendingCustomUpscalePercent;
 
     private int pendingGiBounces;
     private int pendingAoNearSamples;
@@ -461,6 +462,8 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.pendingRRMode =
                 RTXSettingsConfig.getRRMode();
+        this.pendingCustomUpscalePercent =
+                RTXSettingsConfig.getCustomUpscalePercent();
 
         this.pendingGiBounces =
                 RTXSettingsConfig.getPerformanceSettings().giBounces();
@@ -1015,7 +1018,41 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                                 (button, mode) -> this.pendingRRMode = mode
                         );
 
+        AbstractSliderButton customUpscaleSlider =
+                new AbstractSliderButton(
+                        0,
+                        0,
+                        310,
+                        20,
+                        Component.empty(),
+                        customUpscaleToSlider(this.pendingCustomUpscalePercent)
+                ) {
+                    {
+                        this.updateMessage();
+                    }
+
+                    @Override
+                    protected void updateMessage() {
+                        final int pct =
+                                customUpscaleFromSlider(this.value);
+                        this.setMessage(Component.literal(
+                                pct <= 0
+                                        ? "自定义超分: 跟随档位"
+                                        : "自定义超分: " + pct + "%"
+                        ));
+                    }
+
+                    @Override
+                    protected void applyValue() {
+                        final int pct =
+                                customUpscaleFromSlider(this.value);
+                        this.value = customUpscaleToSlider(pct);
+                        RTXSettingsScreen.this.pendingCustomUpscalePercent = pct;
+                    }
+                };
+
         this.addOptionRow(rrQualityButton);
+        this.addOptionRow(customUpscaleSlider);
         this.flushOptionRow();
 
         CycleButton<Integer> giBouncesButton =
@@ -2818,6 +2855,17 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 false;
         }
 
+        if(!NativeVulkan.isLoaded() ||
+                NativeVulkan.setCustomUpscalePercent(
+                        this.pendingCustomUpscalePercent)) {
+            RTXSettingsConfig.setCustomUpscalePercent(
+                    this.pendingCustomUpscalePercent);
+        } else {
+            this.pendingCustomUpscalePercent =
+                    NativeVulkan.getCustomUpscalePercent();
+            allApplied = false;
+        }
+
         final boolean upscalerApplied =
                 !NativeVulkan.isLoaded() ||
                         NativeVulkan.setUpscalerMode(RTXSettingsConfig.UPSCALER_MODE_RR);
@@ -3945,6 +3993,24 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         );
 
         RTXSettingsConfig.flush();
+    }
+
+    private static double customUpscaleToSlider(int percent) {
+        if (percent <= 0) {
+            return 0.0;
+        }
+        final int clamped = Math.max(
+                RTXSettingsConfig.CUSTOM_UPSCALE_MIN,
+                Math.min(RTXSettingsConfig.CUSTOM_UPSCALE_MAX, percent));
+        return (double) (clamped - 32) / 68.0;
+    }
+
+    private static int customUpscaleFromSlider(double sliderValue) {
+        final int idx = (int) Math.round(sliderValue * 68.0);
+        if (idx <= 0) {
+            return RTXSettingsConfig.CUSTOM_UPSCALE_OFF;
+        }
+        return Math.min(RTXSettingsConfig.CUSTOM_UPSCALE_MAX, 32 + idx);
     }
 
     private static Component qualityLabel(int mode) {

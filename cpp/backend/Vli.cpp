@@ -14,6 +14,7 @@ static uint64_t s_vliHistActualClears = 0u;
 static uint64_t s_vptLightGridDataEpoch = 1u;
 static uint64_t s_vptLightGridGeoEpoch = 1u;
 static bool s_vptLightGridCacheValid = false;
+static uint32_t s_vptLightGridSplitPhase = 0u;
 static int32_t s_vptLightGridLastOriginX = 0;
 static int32_t s_vptLightGridLastOriginY = 0;
 static int32_t s_vptLightGridLastOriginZ = 0;
@@ -3211,6 +3212,7 @@ void clearVLISections()
     g_vliNeedsInitialClear = true;
     ++s_vptLightGridDataEpoch;
     s_vptLightGridCacheValid = false;
+    s_vptLightGridSplitPhase = 0u;
 }
 void eraseVLITableSlot(uint32_t eraseSlot)
 {
@@ -3778,9 +3780,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
                sectionZ,
                incoming,
                emitterIndexWords,
-               emitterAliasWords
+               emitterAliasWords,
+               &s_deferredVptNeighborhoodPages
            ))
         {
+            s_hasDeferredVptNeighborhoodPages.store(true, std::memory_order_release);
             return;
         }
 
@@ -4739,6 +4743,7 @@ void destroyVPTLightGridResources()
     s_vptLightGridBoundSet = VK_NULL_HANDLE;
     g_vptRestirSpatialActiveFrame = false;
     s_vptLightGridCacheValid = false;
+    s_vptLightGridSplitPhase = 0u;
     ++s_vptLightGridDataEpoch;
 }
 
@@ -4854,7 +4859,6 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
     if(s_vptLightGridBoundSet != g_rayTracingDescriptorSet)
     {
         updateVPTLightGridDescriptor();
-        s_vptLightGridCacheValid = false;
     }
 
     const int32_t originX = static_cast<int32_t>(std::floor(g_prevCameraViewInverse[12] / 4.0f)) -
@@ -4864,44 +4868,79 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
     const int32_t originZ = static_cast<int32_t>(std::floor(g_prevCameraViewInverse[14] / 4.0f)) -
                             static_cast<int32_t>(VPT_LIGHT_GRID_DIM_Z / 2u);
     const float rangeScale = g_localLightMaxDistance.load(std::memory_order_relaxed);
-    const bool urgentDirty =
+    const bool hardUrgent =
         !g_hasPrevCameraInverse ||
         !s_vptLightGridCacheValid ||
         std::abs(originX - s_vptLightGridLastOriginX) >= 2 ||
         std::abs(originY - s_vptLightGridLastOriginY) >= 2 ||
         std::abs(originZ - s_vptLightGridLastOriginZ) >= 2 ||
+        rangeScale != s_vptLightGridLastRangeScale;
+    const bool streamDirty =
         g_vliNextPage != s_vptLightGridLastLivePages ||
         g_localLightRevision != s_vptLightGridLastLightRev ||
-        s_vptLightGridDataEpoch != s_vptLightGridLastEpoch ||
-        rangeScale != s_vptLightGridLastRangeScale;
+        s_vptLightGridDataEpoch != s_vptLightGridLastEpoch;
     const bool geoDirty =
         (s_vptLightGridGeoEpoch != s_vptLightGridLastGeoEpoch);
-    if(!urgentDirty && !geoDirty)
+    if(!hardUrgent && s_vptLightGridSplitPhase == 0u && !streamDirty && !geoDirty)
     {
         return;
     }
+
     const auto now = std::chrono::steady_clock::now();
-    if(!urgentDirty && geoDirty && s_vptLightGridHasLastBuildTime)
+    if(!hardUrgent && s_vptLightGridSplitPhase == 0u && s_vptLightGridHasLastBuildTime)
     {
         const double elapsedMs = std::chrono::duration<double, std::milli>(
             now - s_vptLightGridLastBuildTime
         ).count();
-        if(elapsedMs < 250.0)
+        if(streamDirty && elapsedMs < 50.0)
+        {
+            return;
+        }
+        if(!streamDirty && geoDirty && elapsedMs < 250.0)
         {
             return;
         }
     }
-    s_vptLightGridCacheValid = g_hasPrevCameraInverse;
-    s_vptLightGridLastOriginX = originX;
-    s_vptLightGridLastOriginY = originY;
-    s_vptLightGridLastOriginZ = originZ;
-    s_vptLightGridLastLivePages = g_vliNextPage;
-    s_vptLightGridLastLightRev = g_localLightRevision;
-    s_vptLightGridLastEpoch = s_vptLightGridDataEpoch;
-    s_vptLightGridLastGeoEpoch = s_vptLightGridGeoEpoch;
-    s_vptLightGridLastRangeScale = rangeScale;
-    s_vptLightGridHasLastBuildTime = true;
-    s_vptLightGridLastBuildTime = now;
+
+    uint32_t sliceMode = 0u;
+    uint32_t dispatchGroups = VPT_LIGHT_GRID_CELLS;
+    if(hardUrgent)
+    {
+        sliceMode = 0u;
+        dispatchGroups = VPT_LIGHT_GRID_CELLS;
+        s_vptLightGridSplitPhase = 0u;
+        s_vptLightGridCacheValid = g_hasPrevCameraInverse;
+        s_vptLightGridLastOriginX = originX;
+        s_vptLightGridLastOriginY = originY;
+        s_vptLightGridLastOriginZ = originZ;
+        s_vptLightGridLastLivePages = g_vliNextPage;
+        s_vptLightGridLastLightRev = g_localLightRevision;
+        s_vptLightGridLastEpoch = s_vptLightGridDataEpoch;
+        s_vptLightGridLastGeoEpoch = s_vptLightGridGeoEpoch;
+        s_vptLightGridLastRangeScale = rangeScale;
+        s_vptLightGridHasLastBuildTime = true;
+        s_vptLightGridLastBuildTime = now;
+    }
+    else if(s_vptLightGridSplitPhase == 0u)
+    {
+        sliceMode = 1u;
+        dispatchGroups = (VPT_LIGHT_GRID_CELLS + 1u) / 2u;
+        s_vptLightGridSplitPhase = 1u;
+        s_vptLightGridHasLastBuildTime = true;
+        s_vptLightGridLastBuildTime = now;
+    }
+    else
+    {
+        sliceMode = 2u;
+        dispatchGroups = VPT_LIGHT_GRID_CELLS / 2u;
+        s_vptLightGridSplitPhase = 0u;
+        s_vptLightGridLastLivePages = g_vliNextPage;
+        s_vptLightGridLastLightRev = g_localLightRevision;
+        s_vptLightGridLastEpoch = s_vptLightGridDataEpoch;
+        s_vptLightGridLastGeoEpoch = s_vptLightGridGeoEpoch;
+        s_vptLightGridHasLastBuildTime = true;
+        s_vptLightGridLastBuildTime = now;
+    }
 
     VkMemoryBarrier preBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     preBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -4935,7 +4974,7 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
         VPT_LIGHT_GRID_DIM_X,
         VPT_LIGHT_GRID_DIM_Y,
         VPT_LIGHT_GRID_DIM_Z,
-        g_vliNextPage
+        (g_vliNextPage & 0x3FFFFFFFu) | ((sliceMode & 3u) << 30u)
     };
     vkCmdPushConstants(
         cmd,
@@ -4945,7 +4984,7 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
         sizeof(push),
         push
     );
-    vkCmdDispatch(cmd, VPT_LIGHT_GRID_CELLS, 1u, 1u);
+    vkCmdDispatch(cmd, dispatchGroups, 1u, 1u);
 
     VkMemoryBarrier postBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     postBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

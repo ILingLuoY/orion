@@ -586,7 +586,15 @@ vec3 tracePrimaryDielectricGlassRadiance(
     float currentIor = entryIor;
 #endif
 
-    for(int slabStep = 0; slabStep <= VPT_GLASS_MAX_INTERFACES; ++slabStep)
+    const float glassCamDist = length(glassSurfacePosition - cam.viewInverse[3].xyz);
+    const int effectiveGlassMaxInterfaces =
+        (glassCamDist < 24.0)
+            ? VPT_GLASS_MAX_INTERFACES
+            : ((glassCamDist < 64.0)
+                ? min(VPT_GLASS_MAX_INTERFACES, 4)
+                : min(VPT_GLASS_MAX_INTERFACES, 2));
+
+    for(int slabStep = 0; slabStep <= effectiveGlassMaxInterfaces; ++slabStep)
     {
         // 当前板面：第一轮用入射面（已在函数入口算过 F），后续轮次用循环里遇到的
         // 新玻璃面重新算。这里先把"离开当前板"的位移做掉。

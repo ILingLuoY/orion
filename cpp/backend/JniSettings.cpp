@@ -2407,6 +2407,33 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setSR
     return JNI_TRUE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCustomUpscalePercent(
+    JNIEnv*, jclass, jint percent)
+{
+    const int requested = static_cast<int>(percent);
+    if(requested != 0 && (requested < 33 || requested > 100))
+    {
+        return JNI_FALSE;
+    }
+    const int oldVal = g_customUpscalePercent.exchange(requested);
+    if(oldVal != requested)
+    {
+        RTLog(
+            "[RR SETTINGS] customUpscalePercent " +
+            std::to_string(oldVal) +
+            " -> " +
+            std::to_string(requested)
+        );
+    }
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_getCustomUpscalePercent(
+    JNIEnv*, jclass)
+{
+    return static_cast<jint>(g_customUpscalePercent.load());
+}
+
 
 extern "C"
 JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setPerformanceSettingsNative(

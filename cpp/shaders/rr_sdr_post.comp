@@ -69,6 +69,18 @@ uniform sampler3D aces2Lut3D;
 // 注意：与旧实现不同，这里**不做**内建 gamma —— 统一由最后的 gamma 阶段处理
 //（默认 2.2 时与旧的内建 1/2.2 逐位一致）。
 // ---------------------------------------------------------------------------
+vec3 sdrTriangularDither(uvec2 pixel)
+{
+    const vec2 pf = vec2(pixel);
+    const float r0 = fract(52.9829189 * fract(dot(pf, vec2(0.06711056, 0.00583715))));
+    const float r1 = fract(52.9829189 * fract(dot(pf + vec2(17.0, 31.0), vec2(0.06711056, 0.00583715))));
+    const float g0 = fract(52.9829189 * fract(dot(pf + vec2(5.0, 11.0), vec2(0.06711056, 0.00583715))));
+    const float g1 = fract(52.9829189 * fract(dot(pf + vec2(23.0, 41.0), vec2(0.06711056, 0.00583715))));
+    const float b0 = fract(52.9829189 * fract(dot(pf + vec2(13.0, 7.0), vec2(0.06711056, 0.00583715))));
+    const float b1 = fract(52.9829189 * fract(dot(pf + vec2(37.0, 19.0), vec2(0.06711056, 0.00583715))));
+    return vec3(r0 - r1, g0 - g1, b0 - b1) * (0.5 / 255.0);
+}
+
 vec3 uchimura(vec3 x)
 {
     const float P = 1.0;
@@ -452,6 +464,7 @@ void main()
             displayColor *= (1.0 - postPush.vignette * falloff);
         }
 
+        displayColor += sdrTriangularDither(uvec2(p));
         displayColor = clamp(displayColor, vec3(0.0), vec3(1.0));
     }
 

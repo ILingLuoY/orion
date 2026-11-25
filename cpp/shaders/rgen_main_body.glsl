@@ -5994,6 +5994,11 @@ int giBounceLimit =
     {
         giBounceLimit = min(giBounceLimit, 1);
     }
+#else
+    if(sharcQueryActive() && rtLodDistance > 32.0)
+    {
+        giBounceLimit = min(giBounceLimit, 1);
+    }
 #endif
 #endif
 
@@ -8087,10 +8092,16 @@ const vec3 sparseDirectSumUnscaled =
     localDirectLight +
     localSecondaryLight;
 
+const float primarySpecularOcclusion = computeSpecularOcclusion(
+    max(dot(normal, V), 0.0),
+    rtaoFactor,
+    roughness
+);
+
 const vec3 sparseIndirectSumUnscaled =
     // 2026-10-05 微结构反射遮蔽（#44）：凹槽 texel 的间接反射被凸起遮挡，
     // 按静态深度遮蔽折减（#12 的 GI 扣减同源）。
-    glossyReflectionLight * primaryPOMMicroOcclusion +
+    glossyReflectionLight * primaryPOMMicroOcclusion * primarySpecularOcclusion +
     indirectLight *
     1.8 *
     rtaoFactor *
@@ -8155,7 +8166,7 @@ vec3 litColor =
     localExactFaceDirect +
     localSecondaryLight * sparseDirectTermScale +
     waterReflectedSunLight +
-    glossyReflectionLight * primaryPOMMicroOcclusion * sparseGlossyScale +
+    glossyReflectionLight * primaryPOMMicroOcclusion * primarySpecularOcclusion * sparseGlossyScale +
     indirectLight *
     1.8 *
     rtaoFactor *
@@ -8201,6 +8212,7 @@ if(cam.ssHybridParams.x > 0.5 || cam.ssHybridParams.y > 0.5)
     const vec3 ssSpecularTerm =
         glossyReflectionLight *
         primaryPOMMicroOcclusion *
+        primarySpecularOcclusion *
         sparseGlossyScale;
 
     imageStore(
@@ -8247,7 +8259,7 @@ if(cam.perfAblationStage.w == 1u)
             ),
             dot(
                 waterReflectedSunLight +
-                    glossyReflectionLight * primaryPOMMicroOcclusion +
+                    glossyReflectionLight * primaryPOMMicroOcclusion * primarySpecularOcclusion +
                     indirectLight *
                         1.8 *
                         rtaoFactor *

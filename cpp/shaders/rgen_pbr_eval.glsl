@@ -587,6 +587,20 @@ float visibilitySmithGGXCorrelated(
     return 0.5 / max(ggxV + ggxL, 1.0e-5);
 }
 
+// 2026-11-25 Batch O: Lagarde/Frostbite analytical specular occlusion from RTAO.
+float computeSpecularOcclusion(
+    float NdotV,
+    float ao,
+    float roughness
+)
+{
+    return clamp(
+        pow(max(NdotV + ao, 1.0e-4), exp2(-16.0 * roughness - 1.0)) - 1.0 + ao,
+        0.0,
+        1.0
+    );
+}
+
 // =====================================================
 // 2026-10-16 多散射能量补偿（Kulla-Conty 近似，免 LUT）
 //

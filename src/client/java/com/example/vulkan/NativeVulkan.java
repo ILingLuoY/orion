@@ -1768,6 +1768,18 @@ public final class NativeVulkan {
             );
         }
 
+        final int savedCustomUpscalePercent =
+                RTXSettingsConfig.getCustomUpscalePercent();
+        try {
+            if (setCustomUpscalePercent(savedCustomUpscalePercent)) {
+                System.out.println(
+                        "[RTX CONFIG] Restored customUpscalePercent="
+                                + savedCustomUpscalePercent
+                );
+            }
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+
         final float savedAmbient =
                 RTXSettingsConfig.getNoDirectLightAmbient();
 
@@ -2414,6 +2426,8 @@ public final class NativeVulkan {
 
     public static native boolean setUpscalerMode(int mode);
     public static native boolean setSRMode(int mode);
+    public static native boolean setCustomUpscalePercent(int percent);
+    public static native int getCustomUpscalePercent();
 
 
     public static native boolean beginStreamlineFrame();

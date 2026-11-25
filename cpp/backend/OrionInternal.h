@@ -5316,6 +5316,7 @@ extern PFN_slDLSSGGetState
 extern std::atomic<int> g_rrMode;
 extern std::atomic<int> g_upscalerMode;
 extern std::atomic<int> g_srMode;
+extern std::atomic<int> g_customUpscalePercent;
 extern std::atomic<float>
     g_noDirectLightAmbient;
 extern std::atomic<float>

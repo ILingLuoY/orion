@@ -264,7 +264,11 @@ shared float s_pCell[64];
 
 void main()
 {
-    uint cellIdx = gl_WorkGroupID.x;
+    uint sliceMode = gridParams.w >> 30u;
+    uint livePageCount = gridParams.w & 0x3FFFFFFFu;
+    uint cellIdx = (sliceMode == 0u)
+        ? gl_WorkGroupID.x
+        : (gl_WorkGroupID.x * 2u + (sliceMode - 1u));
     uint lane = gl_LocalInvocationID.x;
     uint dimX = max(gridParams.x, 1u);
     uint dimY = max(gridParams.y, 1u);
@@ -280,7 +284,6 @@ void main()
         int(dimY / 2u),
         int(dimZ / 2u)
     );
-    uint livePageCount = gridParams.w;
 
     if(cellIdx == 0u && lane == 0u)
     {
