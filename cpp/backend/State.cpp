@@ -1777,6 +1777,7 @@ float g_dynamicCaptureCameraZ = 0.0f;
 bool g_entityFrameOpen = false;
 bool g_particleFrameOpen = false;
 std::atomic<bool> g_entityRebuildRequested{false};
+std::atomic<bool> g_handRebuildRequested{false};
 // 2026-11-12 实例化第 2 步：mesh key → N 组 3×4 行主序实例矩阵（见 OrionInternal.h）
 std::unordered_map<uint64_t, std::vector<float>> g_entityMeshInstances;
 uint64_t g_lastDynamicRTASUpdateFrame = UINT64_MAX;

@@ -237,8 +237,7 @@ void updateDynamicLightDescriptor()
 {
     ensureDynamicLightBuffer();
 
-    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
-       g_dynamicLightBuffer == VK_NULL_HANDLE)
+    if(g_dynamicLightBuffer == VK_NULL_HANDLE)
     {
         return;
     }
@@ -248,14 +247,35 @@ void updateDynamicLightDescriptor()
     info.offset = 0;
     info.range = VK_WHOLE_SIZE;
 
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = g_rayTracingDescriptorSet;
-    write.dstBinding = 61u;
-    write.descriptorCount = 1u;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.pBufferInfo = &info;
+    VkWriteDescriptorSet writes[2]{};
+    uint32_t writeCount = 0u;
 
-    vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+    if(g_rayTracingDescriptorSet != VK_NULL_HANDLE)
+    {
+        writes[writeCount].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[writeCount].dstSet = g_rayTracingDescriptorSet;
+        writes[writeCount].dstBinding = 61u;
+        writes[writeCount].descriptorCount = 1u;
+        writes[writeCount].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[writeCount].pBufferInfo = &info;
+        ++writeCount;
+    }
+
+    if(g_volumetricCloudRenderSet != VK_NULL_HANDLE)
+    {
+        writes[writeCount].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[writeCount].dstSet = g_volumetricCloudRenderSet;
+        writes[writeCount].dstBinding = 30u;
+        writes[writeCount].descriptorCount = 1u;
+        writes[writeCount].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[writeCount].pBufferInfo = &info;
+        ++writeCount;
+    }
+
+    if(writeCount > 0u)
+    {
+        vkUpdateDescriptorSets(g_device, writeCount, writes, 0u, nullptr);
+    }
 }
 
 // 每帧在相机 UBO 之后、任何消费者之前录制（与相机的 vkCmdUpdateBuffer 同一窗口）。

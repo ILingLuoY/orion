@@ -64,7 +64,7 @@ vec3 tracePrimarySimpleGlassRadiance(
             straightDirection,
             10000.0,
             secondaryTraverseFlags(),
-            0xefu,
+            0xcfu,
             0u
         );
     }
@@ -77,7 +77,7 @@ vec3 tracePrimarySimpleGlassRadiance(
         traceRayEXT(
             topLevelAS,
             secondaryTraverseFlags(),
-            0xefu,
+            0xcfu,
             0,
             0,
             0,
@@ -218,7 +218,7 @@ bool glassMirrorPathIsClear(
     traceRayEXT(
         topLevelAS,
         gl_RayFlagsNoneEXT,
-        0xefu,
+        0xcfu,
         0,
         0,
         0,
@@ -769,7 +769,7 @@ vec3 tracePrimaryDielectricGlassRadiance(
         traceRayEXT(
             topLevelAS,
             gl_RayFlagsNoneEXT,
-            0xefu,
+            0xcfu,
             0,
             0,
             0,

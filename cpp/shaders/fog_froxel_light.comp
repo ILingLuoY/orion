@@ -47,6 +47,12 @@ layout(push_constant) uniform FogFroxelPush
 #include "clear_sky_aerial.glsl"
 #include "local_light_grid_common.glsl"
 
+layout(std430, binding = 30, set = 0) readonly buffer FogDynamicLightBuffer
+{
+    uvec4 header;
+    LocalLightGPU lights[];
+} fogDynamicLights;
+
 const float FOG_HAZE_ALBEDO           = 0.90;
 const float FOG_SHAFT_EXTINCTION_FRAC = 0.12;
 const float FOG_SUN_RAY_MAX_DIST      = 256.0;
@@ -197,7 +203,7 @@ float fogSampleCloudShadow(vec3 worldPos, vec3 cameraPos, vec3 lightDir)
     return mix(shaped, 1.0, edgeFade);
 }
 
-// Local lights scattering (torches, lanterns, lava) when VolReSTIR is disabled.
+// Local lights scattering (torches, lanterns, lava) + moving dynamic lights when VolReSTIR is disabled.
 vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
 {
     const float localStrength = clamp(cam.fogExtrasParams.x, 0.0, 4.0);
@@ -206,53 +212,104 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
         return vec3(0.0);
     }
     const uint totalLights = fogLightBuffer.header.x;
-    if(totalLights == 0u)
+    const uint dynamicCount = min(fogDynamicLights.header.x, 32u);
+    const float dynUser = uintBitsToFloat(fogDynamicLights.header.y) - 1.0;
+    const float dynamicIntensity = (dynUser >= 0.0 && dynUser <= 16.0) ? dynUser : 1.0;
+    const bool hasDynamicLights = (dynamicCount > 0u && dynamicIntensity > 0.001);
+    if(totalLights == 0u && !hasDynamicLights)
     {
         return vec3(0.0);
     }
-
-    const ivec3 baseCell = localLightGridCellCoord(worldPos);
-    const int minX = localLightGridNeighborMinOffset(worldPos.x);
-    const int maxX = localLightGridNeighborMaxOffset(worldPos.x);
-    const int minY = localLightGridNeighborMinOffset(worldPos.y);
-    const int maxY = localLightGridNeighborMaxOffset(worldPos.y);
-    const int minZ = localLightGridNeighborMinOffset(worldPos.z);
-    const int maxZ = localLightGridNeighborMaxOffset(worldPos.z);
-    const uint packedBase = localLightGridPackedIndexBase();
 
     // Keep top 4 strongest local lights at this froxel, then shadow-test only those.
     vec3 bp0 = vec3(0.0), bp1 = vec3(0.0), bp2 = vec3(0.0), bp3 = vec3(0.0);
     vec3 bc0 = vec3(0.0), bc1 = vec3(0.0), bc2 = vec3(0.0), bc3 = vec3(0.0);
     float bs0 = 0.0, bs1 = 0.0, bs2 = 0.0, bs3 = 0.0;
 
-    int checked = 0;
-    for(int dz = minZ; dz <= maxZ && checked < 48; ++dz)
-    for(int dy = minY; dy <= maxY && checked < 48; ++dy)
-    for(int dx = minX; dx <= maxX && checked < 48; ++dx)
+    if(totalLights > 0u)
     {
-        uint firstIdx = 0u;
-        uint count = 0u;
-        if(!localLightGridLookupCell(baseCell + ivec3(dx, dy, dz), firstIdx, count))
+        const ivec3 baseCell = localLightGridCellCoord(worldPos);
+        const int minX = localLightGridNeighborMinOffset(worldPos.x);
+        const int maxX = localLightGridNeighborMaxOffset(worldPos.x);
+        const int minY = localLightGridNeighborMinOffset(worldPos.y);
+        const int maxY = localLightGridNeighborMaxOffset(worldPos.y);
+        const int minZ = localLightGridNeighborMinOffset(worldPos.z);
+        const int maxZ = localLightGridNeighborMaxOffset(worldPos.z);
+        const uint packedBase = localLightGridPackedIndexBase();
+
+        int checked = 0;
+        for(int dz = minZ; dz <= maxZ && checked < 48; ++dz)
+        for(int dy = minY; dy <= maxY && checked < 48; ++dy)
+        for(int dx = minX; dx <= maxX && checked < 48; ++dx)
         {
-            continue;
-        }
-        const uint limit = min(count, 24u);
-        for(uint k = 0u; k < limit && checked < 48; ++k)
-        {
-            ++checked;
-            const uint lightIdx = fogLightGrid.words[packedBase + firstIdx + k];
-            if(lightIdx >= totalLights)
+            uint firstIdx = 0u;
+            uint count = 0u;
+            if(!localLightGridLookupCell(baseCell + ivec3(dx, dy, dz), firstIdx, count))
             {
                 continue;
             }
-            const LocalLightGPU light = fogLightBuffer.lights[lightIdx];
-            const float emission = light.worldPosEmission.w;
+            const uint limit = min(count, 24u);
+            for(uint k = 0u; k < limit && checked < 48; ++k)
+            {
+                ++checked;
+                const uint lightIdx = fogLightGrid.words[packedBase + firstIdx + k];
+                if(lightIdx >= totalLights)
+                {
+                    continue;
+                }
+                const LocalLightGPU light = fogLightBuffer.lights[lightIdx];
+                const float emission = light.worldPosEmission.w;
+                if(emission <= 0.01)
+                {
+                    continue;
+                }
+                const uint typeCode = light.meta.x;
+                const vec3 toLight = light.worldPosEmission.xyz - worldPos;
+                const float dist2 = dot(toLight, toLight);
+                const float range = vptLocalLightRange(typeCode, emission);
+                if(dist2 >= range * range)
+                {
+                    continue;
+                }
+                const float d = sqrt(max(dist2, 0.25));
+                const float rangeFade = vptLocalLightRangeFade(d, typeCode, emission);
+                const float atten = rangeFade / (dist2 + 1.5);
+                const vec3 lightColor = localLightProfileColor(typeCode);
+                const float lumens = localLightProfileBrightness(typeCode, emission);
+                const float cosL = dot(viewDir, toLight / d);
+                const float phaseL = fogPhaseHaze(cosL, 0.35);
+                const vec3 contrib = lightColor * (lumens * LOCAL_LIGHT_ENERGY_SCALE * atten * phaseL);
+                const float score = dot(contrib, vec3(0.2126, 0.7152, 0.0722));
+
+                int worstSlot = 0;
+                float worstScore = bs0;
+                if(bs1 < worstScore) { worstScore = bs1; worstSlot = 1; }
+                if(bs2 < worstScore) { worstScore = bs2; worstSlot = 2; }
+                if(bs3 < worstScore) { worstScore = bs3; worstSlot = 3; }
+                if(score > worstScore)
+                {
+                    if(worstSlot == 0) { bs0 = score; bp0 = light.worldPosEmission.xyz; bc0 = contrib; }
+                    else if(worstSlot == 1) { bs1 = score; bp1 = light.worldPosEmission.xyz; bc1 = contrib; }
+                    else if(worstSlot == 2) { bs2 = score; bp2 = light.worldPosEmission.xyz; bc2 = contrib; }
+                    else { bs3 = score; bp3 = light.worldPosEmission.xyz; bc3 = contrib; }
+                }
+            }
+        }
+    }
+
+    if(hasDynamicLights)
+    {
+        for(uint di = 0u; di < dynamicCount; ++di)
+        {
+            const LocalLightGPU dlight = fogDynamicLights.lights[di];
+            const float emission = dlight.worldPosEmission.w;
             if(emission <= 0.01)
             {
                 continue;
             }
-            const uint typeCode = light.meta.x;
-            const vec3 toLight = light.worldPosEmission.xyz - worldPos;
+            const uint typeCode = dlight.meta.x;
+            const uint packedRgb = dlight.meta.y;
+            const vec3 toLight = dlight.worldPosEmission.xyz - worldPos;
             const float dist2 = dot(toLight, toLight);
             const float range = vptLocalLightRange(typeCode, emission);
             if(dist2 >= range * range)
@@ -262,8 +319,14 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
             const float d = sqrt(max(dist2, 0.25));
             const float rangeFade = vptLocalLightRangeFade(d, typeCode, emission);
             const float atten = rangeFade / (dist2 + 1.5);
-            const vec3 lightColor = localLightProfileColor(typeCode);
-            const float lumens = localLightProfileBrightness(typeCode, emission);
+            const vec3 lightColor = (packedRgb != 0u)
+                ? vec3(
+                    float((packedRgb >> 16u) & 255u),
+                    float((packedRgb >> 8u) & 255u),
+                    float(packedRgb & 255u)
+                  ) * (1.0 / 255.0)
+                : localLightProfileColor(typeCode);
+            const float lumens = localLightProfileBrightness(typeCode, emission) * dynamicIntensity;
             const float cosL = dot(viewDir, toLight / d);
             const float phaseL = fogPhaseHaze(cosL, 0.35);
             const vec3 contrib = lightColor * (lumens * LOCAL_LIGHT_ENERGY_SCALE * atten * phaseL);
@@ -276,10 +339,10 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
             if(bs3 < worstScore) { worstScore = bs3; worstSlot = 3; }
             if(score > worstScore)
             {
-                if(worstSlot == 0) { bs0 = score; bp0 = light.worldPosEmission.xyz; bc0 = contrib; }
-                else if(worstSlot == 1) { bs1 = score; bp1 = light.worldPosEmission.xyz; bc1 = contrib; }
-                else if(worstSlot == 2) { bs2 = score; bp2 = light.worldPosEmission.xyz; bc2 = contrib; }
-                else { bs3 = score; bp3 = light.worldPosEmission.xyz; bc3 = contrib; }
+                if(worstSlot == 0) { bs0 = score; bp0 = dlight.worldPosEmission.xyz; bc0 = contrib; }
+                else if(worstSlot == 1) { bs1 = score; bp1 = dlight.worldPosEmission.xyz; bc1 = contrib; }
+                else if(worstSlot == 2) { bs2 = score; bp2 = dlight.worldPosEmission.xyz; bc2 = contrib; }
+                else { bs3 = score; bp3 = dlight.worldPosEmission.xyz; bc3 = contrib; }
             }
         }
     }

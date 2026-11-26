@@ -1141,6 +1141,7 @@ inline constexpr uint32_t SECTION_VERTEX_ADDRESS_SLOT_LIMIT = 1u << 18;
 inline constexpr uint32_t SECTION_ROLE_TERRAIN  = 0u;
 inline constexpr uint32_t SECTION_ROLE_VOXY_LOD = 1u;
 inline constexpr uint32_t SECTION_ROLE_DH_FAR   = 2u;
+inline constexpr uint32_t SECTION_ROLE_HAND     = 3u;
 
 // =====================================================
 // Per-chunk-column near-field coverage bitmap (binding 20)
@@ -1863,16 +1864,12 @@ inline constexpr uint64_t SECTION_AS_CLASS_WATER  = 4ull << 60ull;
 inline constexpr uint64_t SECTION_AS_CLASS_ENTITY = 5ull << 60ull;
 inline constexpr uint64_t SECTION_AS_CLASS_LOCAL_PLAYER = 6ull << 60ull;
 inline constexpr uint64_t SECTION_AS_CLASS_PARTICLE = 7ull << 60ull;
-// 2026-11-03：第一人称手部（手臂 + 手持物）独立成层。
-//
-// 它需要一对互相矛盾的可见性：**主相机要看得见**（不然手上什么都没有），
-// 但**次级射线必须打不到**（不然会在世界里投出一截手臂影子 —— 而 viewmodel
-// 本来就不参与世界阴影，且它的坐标是相机相对的，影子会随视角乱飘）。
-// 现有的位组合不出来：0xff 两者都可见、0x02 主相机不可见、0xfb 两者都可见。
-// 所以新开一位 0x04：
-//   instance.mask = 0x04
-//   主相机射线   0x01 -> 0x05   （0x01 | 0x04）
-//   所有次级射线 0xff -> 0xfb   （0xff & ~0x04）
+// 2026-11-26：第一人称手部（手臂 + 手持物）独立成层，使用专属 bit 5 (0x20)：
+//   instance.mask = 0x20
+//   主相机射线   0x01 -> 0x21   （0x01 | 0x20）
+//   所有次级射线 0xef -> 0xcf   （0xef & ~0x20）
+//   动态移动光   0xed -> 0xcd   （0xed & ~0x20）
+// （注意 bit 2 = 0x04 已被 ALPHA 排除位与 DH LOD 占用，不能复用于手部。）
 inline constexpr uint64_t SECTION_AS_CLASS_HAND = 8ull << 60ull;
 // 2026-11-26 (Batch V, Feature 4): Split leaf triangles out of SECTION_AS_CLASS_OMM so leaves
 // keep real OMM cutouts for regular RT rays while emitting a paired solid-cube TLAS instance (0x10)
@@ -1896,6 +1893,7 @@ struct SectionGeometrySplit
     std::vector<Vertex> entity;
     std::vector<Vertex> localPlayer;
     std::vector<Vertex> particle;
+    std::vector<Vertex> hand;
     OmmCutoutInput ommInput;
     bool hasOmmInput = false;
     OmmCutoutInput ommLeavesInput;
@@ -1904,6 +1902,7 @@ struct SectionGeometrySplit
     std::vector<float> entityMotion;
     std::vector<float> localPlayerMotion;
     std::vector<float> particleMotion;
+    std::vector<float> handMotion;
 
     std::vector<SectionVertex> opaquePacked;
     std::vector<SectionVertex> ommCutoutPacked;
@@ -1935,10 +1934,12 @@ struct CaptureArenaSegment
     std::span<const Vertex> entity;
     std::span<const Vertex> localPlayer;
     std::span<const Vertex> particle;
+    std::span<const Vertex> hand;
 
     std::span<const float> entityMotion;
     std::span<const float> localPlayerMotion;
     std::span<const float> particleMotion;
+    std::span<const float> handMotion;
 
     std::span<const SectionVertex> opaquePacked;
     std::span<const SectionVertex> ommCutoutPacked;
@@ -1960,14 +1961,15 @@ struct CaptureArenaSegment
             water.empty() &&
             entity.empty() &&
             localPlayer.empty() &&
-            particle.empty();
+            particle.empty() &&
+            hand.empty();
     }
 
     size_t vertexCount() const
     {
         return opaque.size() + ommCutout.size() + ommLeaves.size() +
             alpha.size() + water.size() + entity.size() +
-            localPlayer.size() + particle.size();
+            localPlayer.size() + particle.size() + hand.size();
     }
 };
 
@@ -5981,6 +5983,7 @@ extern float g_dynamicCaptureCameraZ;
 extern bool g_entityFrameOpen;
 extern bool g_particleFrameOpen;
 extern std::atomic<bool> g_entityRebuildRequested;
+extern std::atomic<bool> g_handRebuildRequested;
 
 // =====================================================
 // 2026-11-12 实例化第 2 步：**每实例变换**。

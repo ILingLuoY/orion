@@ -114,7 +114,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 currentDir,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 step
             );
         }
@@ -128,7 +128,7 @@ const float WATER_EXTINCTION_DISTANCE =
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 0,
                 0,
                 0,
@@ -518,7 +518,7 @@ float eta =
             waterSunRoofQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xefu,
+            0xcfu,
             currentOrigin + currentDir * 0.02,
             0.02,
             currentDir,

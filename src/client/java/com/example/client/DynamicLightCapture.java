@@ -9,14 +9,19 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.AbstractClientPlayer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.item.PrimedTnt;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
 import org.lwjgl.system.MemoryUtil;
 
 /**
@@ -78,8 +83,22 @@ public final class DynamicLightCapture
             Map.entry("glow_item_frame", new int[] {8, rgb(255, 209, 122)})
     );
 
-    private static final Map<String, Integer> ITEM_LIGHT_EMISSION = Map.of(
-            "lava_bucket", 15
+    private static final Map<String, Integer> ITEM_LIGHT_EMISSION = Map.ofEntries(
+            Map.entry("lava_bucket", 15),
+            Map.entry("nether_star", 14),
+            Map.entry("end_crystal", 14),
+            Map.entry("blaze_rod", 12),
+            Map.entry("fire_charge", 12),
+            Map.entry("glowstone_dust", 10),
+            Map.entry("prismarine_crystals", 10),
+            Map.entry("glow_berries", 10),
+            Map.entry("heart_of_the_sea", 10),
+            Map.entry("glow_ink_sac", 9),
+            Map.entry("blaze_powder", 8),
+            Map.entry("magma_cream", 8),
+            Map.entry("spectral_arrow", 8),
+            Map.entry("breeze_rod", 8),
+            Map.entry("totem_of_undying", 6)
     );
 
     private static final ByteBuffer records =
@@ -99,6 +118,7 @@ public final class DynamicLightCapture
     private static final class Candidate
     {
         int id;
+        double distSq;
         double x;
         double y;
         double z;
@@ -180,37 +200,44 @@ public final class DynamicLightCapture
             return 0;
         }
 
-        collectHeldLights(minecraft);
-        collectEntityLights(minecraft);
+        final float partialTick = minecraft.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+        collectHeldLights(minecraft, partialTick);
+        collectEntityLights(minecraft, partialTick);
 
+        if(candidates.size() > MAX_LIGHTS)
+        {
+            candidates.sort(Comparator.comparingDouble(candidate -> candidate.distSq));
+            candidates.subList(MAX_LIGHTS, candidates.size()).clear();
+        }
         candidates.sort(Comparator.comparingInt(candidate -> candidate.id));
 
-        return Math.min(candidates.size(), MAX_LIGHTS);
+        return candidates.size();
     }
 
-    private static void collectHeldLights(Minecraft minecraft)
+    private static void collectHeldLights(Minecraft minecraft, float partialTick)
     {
-        final int playerId = minecraft.player.getId();
-
         addHeldLight(
                 minecraft,
                 minecraft.player.getMainHandItem(),
-                playerId,
-                true
+                Integer.MIN_VALUE,
+                true,
+                partialTick
         );
         addHeldLight(
                 minecraft,
                 minecraft.player.getOffhandItem(),
-                playerId,
-                false
+                Integer.MIN_VALUE + 1,
+                false,
+                partialTick
         );
     }
 
     private static void addHeldLight(
             Minecraft minecraft,
             ItemStack stack,
-            int playerId,
-            boolean mainHand)
+            int lightId,
+            boolean mainHand,
+            float partialTick)
     {
         final int emission = emissionOfStack(stack);
 
@@ -219,26 +246,57 @@ public final class DynamicLightCapture
             return;
         }
 
-        final var eye = minecraft.player.getEyePosition(1.0F);
-        final var look = minecraft.player.getLookAngle();
-        final double side = mainHand ? 0.35 : -0.35;
+        final Vec3 eye = minecraft.player.getEyePosition(partialTick);
+        final Vec3 look = minecraft.player.getViewVector(partialTick);
+        final double horizLen = Math.hypot(look.x, look.z);
+        final double rightX;
+        final double rightZ;
+        if(horizLen > 1.0e-4)
+        {
+            // look x up(0,1,0) = (-look.z, 0, look.x)
+            rightX = -look.z / horizLen;
+            rightZ = look.x / horizLen;
+        }
+        else
+        {
+            rightX = 1.0;
+            rightZ = 0.0;
+        }
+        final double side = mainHand ? 0.32 : -0.32;
+        final double offsetX = look.x * 0.38 + rightX * side;
+        final double offsetY = look.y * 0.38 - 0.18;
+        final double offsetZ = look.z * 0.38 + rightZ * side;
+
+        double targetX = eye.x + offsetX;
+        double targetY = eye.y + offsetY;
+        double targetZ = eye.z + offsetZ;
+
+        final BlockPos probePos = BlockPos.containing(targetX, targetY, targetZ);
+        if(minecraft.level.getBlockState(probePos).isSolidRender())
+        {
+            targetX = eye.x + offsetX * 0.22;
+            targetY = eye.y + offsetY * 0.22;
+            targetZ = eye.z + offsetZ * 0.22;
+        }
 
         final Candidate candidate = new Candidate();
-        candidate.id = playerId;
-        candidate.x = eye.x + look.x * 0.35 + look.z * side * 0.4;
-        candidate.y = eye.y + look.y * 0.35 - 0.25;
-        candidate.z = eye.z + look.z * 0.35 - look.x * side * 0.4;
+        candidate.id = lightId;
+        candidate.distSq = -1.0;
+        candidate.x = targetX;
+        candidate.y = targetY;
+        candidate.z = targetZ;
         candidate.emission = emission;
         candidate.packedRgb = heldLightColor(stack);
 
         candidates.add(candidate);
     }
 
-    private static void collectEntityLights(Minecraft minecraft)
+    private static void collectEntityLights(Minecraft minecraft, float partialTick)
     {
-        final double playerX = minecraft.player.getX();
-        final double playerY = minecraft.player.getY();
-        final double playerZ = minecraft.player.getZ();
+        final Vec3 playerPos = minecraft.player.getPosition(partialTick);
+        final double playerX = playerPos.x;
+        final double playerY = playerPos.y;
+        final double playerZ = playerPos.z;
 
         for(Entity entity : minecraft.level.entitiesForRendering())
         {
@@ -247,31 +305,107 @@ public final class DynamicLightCapture
                 continue;
             }
 
+            final Vec3 pos = entity.getPosition(partialTick);
+            final double dx = pos.x - playerX;
+            final double dy = pos.y - playerY;
+            final double dz = pos.z - playerZ;
+            final double distSq = dx * dx + dy * dy + dz * dz;
+
+            if(distSq > MAX_DISTANCE * MAX_DISTANCE)
+            {
+                continue;
+            }
+
+            final double lightX = pos.x;
+            final double lightY = pos.y + Math.max(entity.getBbHeight() * 0.5, 0.2);
+            final double lightZ = pos.z;
+
+            if(entity instanceof ItemEntity itemEntity)
+            {
+                final ItemStack stack = itemEntity.getItem();
+                final int emission = emissionOfStack(stack);
+                if(emission > 0)
+                {
+                    final Candidate candidate = new Candidate();
+                    candidate.id = entity.getId();
+                    candidate.distSq = distSq;
+                    candidate.x = lightX;
+                    candidate.y = lightY;
+                    candidate.z = lightZ;
+                    candidate.emission = emission;
+                    candidate.packedRgb = heldLightColor(stack);
+                    candidates.add(candidate);
+                }
+                continue;
+            }
+
+            if(entity instanceof AbstractClientPlayer otherPlayer)
+            {
+                ItemStack stack = otherPlayer.getMainHandItem();
+                int emission = emissionOfStack(stack);
+                if(emission <= 0)
+                {
+                    stack = otherPlayer.getOffhandItem();
+                    emission = emissionOfStack(stack);
+                }
+                if(emission > 0)
+                {
+                    final Candidate candidate = new Candidate();
+                    candidate.id = entity.getId();
+                    candidate.distSq = distSq;
+                    candidate.x = lightX;
+                    candidate.y = pos.y + otherPlayer.getBbHeight() * 0.72;
+                    candidate.z = lightZ;
+                    candidate.emission = emission;
+                    candidate.packedRgb = heldLightColor(stack);
+                    candidates.add(candidate);
+                    continue;
+                }
+            }
+
+            if(entity instanceof PrimedTnt tnt)
+            {
+                final int fuse = tnt.getFuse();
+                final int pulse = ((fuse / 5) & 1) == 0 ? 13 : 9;
+                final Candidate candidate = new Candidate();
+                candidate.id = entity.getId();
+                candidate.distSq = distSq;
+                candidate.x = lightX;
+                candidate.y = lightY;
+                candidate.z = lightZ;
+                candidate.emission = pulse;
+                candidate.packedRgb = rgb(255, 166, 76);
+                candidates.add(candidate);
+                continue;
+            }
+
             final int[] light = ENTITY_LIGHTS.get(pathOf(entity.getType()));
-
-            if(light == null)
+            if(light != null)
             {
+                final Candidate candidate = new Candidate();
+                candidate.id = entity.getId();
+                candidate.distSq = distSq;
+                candidate.x = lightX;
+                candidate.y = lightY;
+                candidate.z = lightZ;
+                candidate.emission = light[0];
+                candidate.packedRgb = light[1];
+                candidates.add(candidate);
                 continue;
             }
 
-            final double dx = entity.getX() - playerX;
-            final double dy = entity.getY() - playerY;
-            final double dz = entity.getZ() - playerZ;
-
-            if(dx * dx + dy * dy + dz * dz > MAX_DISTANCE * MAX_DISTANCE)
+            if(entity.isOnFire())
             {
-                continue;
+                final Candidate candidate = new Candidate();
+                candidate.id = entity.getId();
+                candidate.distSq = distSq;
+                candidate.x = lightX;
+                candidate.y = lightY;
+                candidate.z = lightZ;
+                candidate.emission = 12;
+                candidate.packedRgb = rgb(255, 132, 42);
+                candidates.add(candidate);
             }
-
-            final Candidate candidate = new Candidate();
-            candidate.id = entity.getId();
-            candidate.x = entity.getX();
-            candidate.y = entity.getY() + entity.getBbHeight() * 0.5;
-            candidate.z = entity.getZ();
-            candidate.emission = light[0];
-            candidate.packedRgb = light[1];
-
-            candidates.add(candidate);
         }
     }
 
@@ -305,17 +439,41 @@ public final class DynamicLightCapture
 
         if(!(item instanceof BlockItem blockItem))
         {
+            final String path = pathOf(item);
+            if("nether_star".equals(path))
+            {
+                return rgb(245, 248, 255);
+            }
+            if("end_crystal".equals(path))
+            {
+                return rgb(255, 140, 242);
+            }
+            if("prismarine_crystals".equals(path) || "heart_of_the_sea".equals(path) || "glow_ink_sac".equals(path))
+            {
+                return rgb(128, 232, 240);
+            }
+            if("breeze_rod".equals(path))
+            {
+                return rgb(168, 218, 255);
+            }
+            if("spectral_arrow".equals(path))
+            {
+                return rgb(255, 224, 118);
+            }
+            if("totem_of_undying".equals(path))
+            {
+                return rgb(255, 214, 96);
+            }
+            if("glow_berries".equals(path) || "glowstone_dust".equals(path))
+            {
+                return rgb(255, 204, 108);
+            }
             return rgb(255, 140, 46);
         }
 
         final Block block = blockItem.getBlock();
+        final String path = pathOf(item);
 
-        if(block == Blocks.TORCH || block == Blocks.WALL_TORCH ||
-                block == Blocks.LANTERN || block == Blocks.CAMPFIRE ||
-                block == Blocks.FIRE)
-        {
-            return rgb(255, 140, 51);
-        }
         if(block == Blocks.SOUL_TORCH || block == Blocks.SOUL_WALL_TORCH ||
                 block == Blocks.SOUL_LANTERN || block == Blocks.SOUL_CAMPFIRE ||
                 block == Blocks.SOUL_FIRE)
@@ -326,9 +484,51 @@ public final class DynamicLightCapture
         {
             return rgb(255, 31, 15);
         }
-        if(block == Blocks.LAVA)
+        if(block == Blocks.REDSTONE_LAMP)
+        {
+            return rgb(255, 194, 112);
+        }
+        if(block == Blocks.LAVA || block == Blocks.MAGMA_BLOCK)
         {
             return rgb(255, 69, 13);
+        }
+        if(block == Blocks.SEA_LANTERN || block == Blocks.CONDUIT || block == Blocks.SEA_PICKLE)
+        {
+            return rgb(168, 240, 245);
+        }
+        if(block == Blocks.END_ROD || block == Blocks.BEACON)
+        {
+            return rgb(245, 244, 255);
+        }
+        if(block == Blocks.CRYING_OBSIDIAN || block == Blocks.RESPAWN_ANCHOR || path.contains("amethyst"))
+        {
+            return rgb(196, 98, 255);
+        }
+        if(block == Blocks.OCHRE_FROGLIGHT)
+        {
+            return rgb(255, 228, 156);
+        }
+        if(block == Blocks.VERDANT_FROGLIGHT)
+        {
+            return rgb(164, 255, 198);
+        }
+        if(block == Blocks.PEARLESCENT_FROGLIGHT)
+        {
+            return rgb(255, 192, 240);
+        }
+        if(path.contains("copper_torch") || path.contains("copper_lantern") || path.contains("copper_bulb"))
+        {
+            return rgb(120, 240, 178);
+        }
+        if(block == Blocks.TORCH || block == Blocks.WALL_TORCH ||
+                block == Blocks.LANTERN || block == Blocks.CAMPFIRE ||
+                block == Blocks.FIRE)
+        {
+            return rgb(255, 140, 51);
+        }
+        if(block == Blocks.GLOWSTONE || block == Blocks.SHROOMLIGHT || block == Blocks.JACK_O_LANTERN)
+        {
+            return rgb(255, 209, 122);
         }
         return rgb(255, 209, 122);
     }

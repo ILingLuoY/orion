@@ -353,6 +353,8 @@ float rrDeltaCrossedFlag =
 // =====================================================
 bool rrParticlePixel =
     false;
+bool primaryHandPixel =
+    false;
 
 #if RR_STABLE_GLASS_RADIANCE
 // Analytic pane radiance for this pixel (mirror lobe + solar gloss), handed to
@@ -491,7 +493,7 @@ if(cam.perfSerAb.y != 0u)
         worldDir.xyz,
         10000.0,
         gl_RayFlagsCullBackFacingTrianglesEXT,
-        0x01,
+        0x21u,
         s,
         k1PrimarySbtOffset
     );
@@ -505,7 +507,7 @@ else
     traceRayEXT(
         topLevelAS,
     gl_RayFlagsCullBackFacingTrianglesEXT,
-        0x01,
+        0x21u,
         k1PrimarySbtOffset, 0, 0,
         origin.xyz,
         0.001,
@@ -562,6 +564,9 @@ if(s == 0)
 //（与上面 prevOffset 的注释同一约束）。消费者：循环外的 TransparencyHint 写入。
 rrParticlePixel =
     (payload.state & RT_STATE_PARTICLE_BIT) != 0u;
+primaryHandPixel =
+    (payload.state & RT_STATE_HAND_BIT) != 0u;
+g_secondaryCullMask = primaryHandPixel ? 0xcdu : 0xcfu;
 
 // =====================================================
 // DH 的"我们侧"判据（09-23 第三次定案）：**只有 miss 算远场**
@@ -716,6 +721,9 @@ primaryViewDirectionForWater = worldDir.xyz;
     // 重算 —— 粒子位由 material_resolve 的 makeHitState 置位。
     rrParticlePixel =
         (payload.state & RT_STATE_PARTICLE_BIT) != 0u;
+    primaryHandPixel =
+        (payload.state & RT_STATE_HAND_BIT) != 0u;
+    g_secondaryCullMask = primaryHandPixel ? 0xcdu : 0xcfu;
 
     // 主变体在 #ifndef 段声明 primaryHitDistance；K2 在这里自己声明。
     float primaryHitDistance = payload.hitDistance;
@@ -1779,7 +1787,7 @@ if (matId > 0.5 && matId < 2.5) {
                             ((SER_PROBE_SECONDARY_FLAGS != 0) ||
                                 perfL10SerProbeSecondaryFlags())
                                 ? secondaryTraverseFlags() : gl_RayFlagsNoneEXT,
-                            0xefu,
+                            0xcfu,
                             0,
                             0,
                             0,
@@ -1801,7 +1809,7 @@ if (matId > 0.5 && matId < 2.5) {
                             rrWaterReflectionDir,
                             10000.0,
                             secondaryTraverseFlags(),
-                            0xefu,
+                            0xcfu,
                             s
                         );
                     }
@@ -1814,7 +1822,7 @@ if (matId > 0.5 && matId < 2.5) {
                         traceRayEXT(
                             topLevelAS,
                             secondaryTraverseFlags(),
-                            0xefu,
+                            0xcfu,
                             0,
                             0,
                             0,
@@ -3151,7 +3159,7 @@ for(
             aoVisQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xefu,
+            g_secondaryCullMask,
             hitPos + aoDir * 0.001,
             0.01,
             aoDir,
@@ -3208,7 +3216,7 @@ for(
 
             gl_RayFlagsTerminateOnFirstHitEXT,
 
-            0xefu,
+            g_secondaryCullMask,
             0,
             0,
             0,
@@ -3945,7 +3953,7 @@ for (int si = 0;
             sunVisQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xefu,
+            g_secondaryCullMask,
             shadowOrigin,
             SUN_SHADOW_RAY_TMIN,
             shadowDir,
@@ -3984,7 +3992,7 @@ for (int si = 0;
             (sunVisibilityFilterActive
                 ? 0u
                 : gl_RayFlagsSkipClosestHitShaderEXT),
-            0xefu,
+            g_secondaryCullMask,
             si
         );
     }
@@ -4000,7 +4008,7 @@ for (int si = 0;
             (sunVisibilityFilterActive
                 ? 0u
                 : gl_RayFlagsSkipClosestHitShaderEXT),
-            0xefu,
+            g_secondaryCullMask,
             0,
             0,
             0,
@@ -5045,7 +5053,7 @@ if(matId > 0.2 && matId < 0.45)
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT |
             gl_RayFlagsSkipClosestHitShaderEXT,
-            0xefu,
+            g_secondaryCullMask,
             0,
             0,
             0,
@@ -6512,13 +6520,13 @@ while(
                         #ifdef ORION_RT_STAGE_COUNTERS
                         rtCntRayIssued();
                         #endif
-                        traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xefu, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                        traceRayEXT(topLevelAS, secondaryTraverseFlags(), g_secondaryCullMask, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
                     }
 #else
                     #ifdef ORION_RT_STAGE_COUNTERS
                     rtCntRayIssued();
                     #endif
-                    traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xefu, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                    traceRayEXT(topLevelAS, secondaryTraverseFlags(), g_secondaryCullMask, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
 #endif
                     }
 
@@ -9387,7 +9395,7 @@ if ((cam.dhFarFieldParams.x > 0.5 || dhFarModeRequested == 14
                     traceRayEXT(
                         topLevelAS,
                         secondaryTraverseFlags(),
-                        0xefu,
+                        g_secondaryCullMask,
                         0,
                         0,
                         0,

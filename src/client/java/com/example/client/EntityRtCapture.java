@@ -311,6 +311,7 @@ public final class EntityRtCapture {
         bannerPatternLayerRanks.clear();
         frameOwnerRecords.clear();
         frameHistoryOrdinals.clear();
+        handBatchOrdinals.clear();
         // 上一帧若在某条短格式顶点中途结束（异常/取消），残留的 pending 会串到本帧的批次里。
         cancelShortVertex();
 
@@ -996,13 +997,8 @@ public final class EntityRtCapture {
         ++modelSubmitCount;
         if (activeBatch.get() != null) throw new IllegalStateException("Nested entity model capture");
         Identifier texture = resolveSampler0(submit.renderType());
-        if (handPhase) {
-            if (!handTextureSubstituted) {
-                handTextureSubstituted = true;
-                System.out.println("[RTX-HAND] texture probe: original="
-                        + texture + " -> substituted with blocks atlas");
-            }
-            texture = BLOCKS_ATLAS_TEXTURE;
+        if (isEnchantedGlintTexture(texture)) {
+            return;
         }
         if (localPlayerProxy && isLocalPlayerBodyTexture(submit, texture)) {
             int textureSlot = MAX_TEXTURE_SLOTS;
@@ -1017,9 +1013,7 @@ public final class EntityRtCapture {
             return;
         }
         int textureSlot = slotFor(texture);
-        // 第一人称手部（手臂 + 手持物）的 state 是 Unit.INSTANCE，不是 AvatarRenderState，
-        // 所以这里不能按 state 类型过滤，只能按"第一人称"这个相机状态判断。
-        final boolean handBatch = isFirstPersonHandState(submit);
+        final boolean handBatch = !localPlayerProxy && isFirstPersonHandState(submit);
         if (handBatch) {
             handDiagLog("SLOT-PATH", submit, texture, textureSlot);
         }
@@ -1160,14 +1154,25 @@ public final class EntityRtCapture {
     }
 
     /**
-     * 2026-11-03：第一人称手部批次的判据。26.3 的手臂/手持物走
-     * {@code submitModelPart}，state 是 {@code Unit.INSTANCE}（不是 AvatarRenderState），
-     * 所以只能按类名判。
+     * 2026-11-26：第一人称手部与手持特殊模型批次的判据。
+     * 只要在 {@code renderItemInHand} 窗口内且处于第一人称，不论 state 是手臂的
+     * {@code Unit.INSTANCE} 还是手持盾牌/箱子/旗帜/三叉戟等特殊模型状态，都归入
+     * 第一人称手部 RT 层。
      */
     private static boolean isFirstPersonHandState(ModelFeatureRenderer.Submit<?> submit) {
-        if (!handCaptureWindow || !Minecraft.getInstance().options.getCameraType().isFirstPerson()) return false;
-        final Object state = submit.state();
-        return state != null && "Unit".equals(state.getClass().getSimpleName());
+        if (!handCaptureWindow || !Minecraft.getInstance().options.getCameraType().isFirstPerson()) {
+            return false;
+        }
+        return submit != null;
+    }
+
+    /** 过滤独立附魔闪光层贴图，避免与手持物品/装备本体共面冲突或渲染成纯紫块。 */
+    private static boolean isEnchantedGlintTexture(Identifier texture) {
+        if (texture == null) {
+            return false;
+        }
+        final String path = texture.getPath();
+        return path.contains("enchanted_glint");
     }
 
     /** 取小数部分并夹到 [0,1)：末地门合成 UV 用（顶点在整数角点上，见 captureVertex）。 */
@@ -1193,27 +1198,71 @@ public final class EntityRtCapture {
     };
 
     // =====================================================
-    // 2026-11-03 手部 MV：上一帧的相机状态。
+    // 2026-11-26 手部光追变换与无鬼影 MV：完整的相机视图/逆矩阵状态。
     //
-    // 手部几何是"相机相对"的（GameRenderer.renderItemInHand 已把
-    // viewRotationMatrix.invert() 乘进 PoseStack），所以它每帧的世界位置变化
-    // 完全由相机状态决定：
-    //     p_prev = R_prev·R_cur⁻¹·p_cur + (pos_prev − R_prev·R_cur⁻¹·pos_cur)
-    // 这两个 setter 每帧各调一次（VulkanCameraMixin:300-303），所以在写入本帧值
-    // 之前把旧值存下来，就得到干净的上一帧。
+    // GameRenderer.renderItemInHand 传给 Feature 的顶点带有：
+    //   p_raw = viewRotationMatrix^-1 * M_bob * p_handLocal
+    //   1) 用未含 bob 的 viewRotationMatrix 拉回视图空间（抵消多余 bob，防止叠加两次）；
+    //   2) 按 tan(worldFov/2)/tan(hudFov/2) 做 FOV 透视匹配，并按 HAND_DEPTH_SCALE
+    //      缩放到玩家碰撞箱内（0.25× ≈ 0.05..0.22 格），彻底防止贴墙穿模；
+    //   3) 用含 bob 的 handCurViewInv 3x3 旋转回世界朝向（相对本帧 RT 相机原点）；
+    //   4) uploadBatch 用 R_eff_cur^T 恢复视图空间坐标并与跨帧历史 p_view_prev 比对，
+    //      再用 R_eff_prev 算得精确相机相对位移 p_rel_prev - p_rel_cur，消除转动视角鬼影。
     // =====================================================
-    private static final float[] prevHandRotation = new float[] {
+    private static final float[] handCurViewRot = new float[] {
             1.0f, 0.0f, 0.0f, 0.0f,
             0.0f, 1.0f, 0.0f, 0.0f,
             0.0f, 0.0f, 1.0f, 0.0f,
             0.0f, 0.0f, 0.0f, 1.0f
     };
-    private static final float[] handMotionMatrix = new float[9];
+    private static final float[] handCurViewInv = new float[] {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f
+    };
+    private static final float[] handPrevViewInv = new float[] {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f
+    };
+    private static final float HAND_DEPTH_SCALE = resolveHandDepthScale();
+
+    private static float resolveHandDepthScale() {
+        String raw = System.getProperty("orion.handDepthScale");
+        if (raw == null) raw = System.getenv("ORION_HAND_DEPTH_SCALE");
+        if (raw != null) {
+            try {
+                float parsed = Float.parseFloat(raw.trim());
+                if (Float.isFinite(parsed) && parsed >= 0.05f && parsed <= 1.0f) {
+                    return parsed;
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0.25f;
+    }
+
+    private static float handWorldFovDeg = 70.0f;
+    private static float handHudFovDeg = 70.0f;
+    private static float handFovScaleXY = 1.0f;
+    private static boolean handCameraStateValid;
+    private static boolean prevCameraRotationValid;
+    private static boolean cameraRotationSeen;
     private static float prevCameraWorldX;
     private static float prevCameraWorldY;
     private static float prevCameraWorldZ;
-    private static boolean prevCameraRotationValid;
-    private static boolean cameraRotationSeen;
+
+    private static final class HandViewHistory {
+        private int frame = Integer.MIN_VALUE;
+        private float[] viewPositions;
+    }
+
+    private static final java.util.HashMap<Long, HandViewHistory> handVertexHistories =
+            new java.util.HashMap<>();
+    private static final java.util.HashMap<Integer, Integer> handBatchOrdinals =
+            new java.util.HashMap<>();
 
     /** A/B 开关：-DORION_HAND_CAMERA_MV=0 关掉手部相机相对 MV。 */
     private static final boolean HAND_CAMERA_MV = resolveHandCameraMv();
@@ -1246,9 +1295,42 @@ public final class EntityRtCapture {
 
     public static void setHandRotation(float[] columnMajor) {
         if (columnMajor == null || columnMajor.length < 16) return;
-        System.arraycopy(handRotation, 0, prevHandRotation, 0, 16);
         System.arraycopy(columnMajor, 0, handRotation, 0, 16);
-        prevCameraRotationValid = cameraRotationSeen;
+    }
+
+    public static void setHandCameraState(
+            float[] curViewRotColMajor,
+            float[] curViewInvColMajor,
+            float worldFovDeg,
+            float hudFovDeg) {
+        if (curViewRotColMajor == null || curViewRotColMajor.length < 16
+                || curViewInvColMajor == null || curViewInvColMajor.length < 16) {
+            return;
+        }
+        System.arraycopy(handCurViewInv, 0, handPrevViewInv, 0, 16);
+        System.arraycopy(curViewRotColMajor, 0, handCurViewRot, 0, 16);
+        System.arraycopy(curViewInvColMajor, 0, handCurViewInv, 0, 16);
+
+        prevCameraWorldX = cameraWorldX;
+        prevCameraWorldY = cameraWorldY;
+        prevCameraWorldZ = cameraWorldZ;
+        cameraWorldX = curViewInvColMajor[12];
+        cameraWorldY = curViewInvColMajor[13];
+        cameraWorldZ = curViewInvColMajor[14];
+
+        float clampedWorldFov = (Float.isFinite(worldFovDeg) && worldFovDeg >= 10.0f && worldFovDeg <= 150.0f)
+                ? worldFovDeg : 70.0f;
+        float clampedHudFov = (Float.isFinite(hudFovDeg) && hudFovDeg >= 10.0f && hudFovDeg <= 150.0f)
+                ? hudFovDeg : 70.0f;
+        handWorldFovDeg = clampedWorldFov;
+        handHudFovDeg = clampedHudFov;
+        double tanWorld = Math.tan(Math.toRadians(clampedWorldFov) * 0.5);
+        double tanHud = Math.tan(Math.toRadians(clampedHudFov) * 0.5);
+        float scaleXY = tanHud > 1.0e-5 ? (float) (tanWorld / tanHud) : 1.0f;
+        handFovScaleXY = Math.max(0.35f, Math.min(2.5f, scaleXY));
+
+        prevCameraRotationValid = handCameraStateValid && cameraRotationSeen;
+        handCameraStateValid = true;
         cameraRotationSeen = true;
     }
 
@@ -1385,51 +1467,16 @@ public final class EntityRtCapture {
             }
         }
         // =====================================================
-        // 2026-11-03：第一人称手部（手臂 + 手持物）的运动矢量。
+        // 2026-11-26：第一人称手部（手臂 + 手持物）逐顶点相机+动画 MV。
         //
-        // resolveBatchMotion 对手臂直接 return（它的 state 是 Unit，不是
-        // EntityRenderState），手持物走 custom 路径压根不调那个函数 ⇒ 两条路径
-        // 都拿不到 motion ⇒ MV 恒为 0。
-        //
-        // 而手部是"相机相对"的：转视角/走动时它的世界位置每帧都在变。MV=0 等于告诉
-        // DLSS"这个表面相对世界静止"，DLSS 于是按相机运动去重投影它 —— 但手明明
-        // 没跟着动，重投影落到错误位置，表现为闪动 + 鬼影。
-        //
-        // 这里用相机矩阵直接构造 poseDelta（3×4 行主序，p_prev = M·p_cur + t）：
-        //     M = R_prev·R_cur⁻¹      t = pos_prev − M·pos_cur
-        // handRotation 存的是相机旋转的**逆**（column-major），所以 R = (R⁻¹)ᵀ，
-        // 即 R_ij = inv[i*4+j]。
-        // A/B：-DORION_HAND_CAMERA_MV=0 关闭。
+        // 先用 R_eff_cur^T 把相机相对世界朝向坐标还原到视图空间 p_view_cur，
+        // 若上一帧同槽位同序号批次存在视图空间历史则取 p_view_prev（捕捉挥手、
+        // 转头惯性 xBob/yBob、走路摇晃、拉弓/吃东西等动画），否则取 p_view_cur；
+        // 再用 R_eff_prev 转回上一帧相机相对世界朝向，写出 p_rel_prev - p_rel_cur。
+        // 若相机纯平移且相对位移为 0，则写入 +1.0e-6f 哨兵触发 rchit 补 Δcam。
         // =====================================================
-        if (HAND_CAMERA_MV && batch.diagHand && !batch.hasPoseDelta
-                && prevCameraRotationValid) {
-            final float[] hp = prevHandRotation;
-            final float[] hc = handRotation;
-            final float[] m = handMotionMatrix;
-            for (int i = 0; i < 3; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < 3; ++k) {
-                        sum += hp[k * 4 + i] * hc[k * 4 + j];
-                    }
-                    m[i * 3 + j] = sum;
-                }
-            }
-            batch.poseDelta[0] = m[0];
-            batch.poseDelta[1] = m[1];
-            batch.poseDelta[2] = m[2];
-            batch.poseDelta[3] = 0.0f;
-            batch.poseDelta[4] = m[3];
-            batch.poseDelta[5] = m[4];
-            batch.poseDelta[6] = m[5];
-            batch.poseDelta[7] = 0.0f;
-            batch.poseDelta[8] = m[6];
-            batch.poseDelta[9] = m[7];
-            batch.poseDelta[10] = m[8];
-            batch.poseDelta[11] = 0.0f;
-            batch.hasPoseDelta = true;
-        }
         final boolean handCameraMoved = HAND_CAMERA_MV && batch.diagHand
+                && handCameraStateValid
                 && prevCameraRotationValid
                 && (Math.abs(prevCameraWorldX - cameraWorldX) > 1.0e-6f
                         || Math.abs(prevCameraWorldY - cameraWorldY) > 1.0e-6f
@@ -1438,7 +1485,87 @@ public final class EntityRtCapture {
         long motionPointer = 0L;
         final long motionStartNanos =
                 com.example.client.LevelPhaseProbe.enabled() ? System.nanoTime() : 0L;
-        if (batch.vertexCount > 0) {
+        if (batch.vertexCount > 0 && batch.diagHand && HAND_CAMERA_MV && handCameraStateValid) {
+            final int motionFloats = batch.vertexCount * 3;
+            final int slotKey = batch.textureSlot;
+            final int ordinal = handBatchOrdinals.getOrDefault(slotKey, 0);
+            handBatchOrdinals.put(slotKey, ordinal + 1);
+            final long historyKey = (((long) slotKey) << 32) | (ordinal & 0xFFFFFFFFL);
+
+            HandViewHistory histEntry = handVertexHistories.get(historyKey);
+            final boolean hasPrevView = prevCameraRotationValid
+                    && histEntry != null
+                    && histEntry.frame == entityMotionFrame - 1
+                    && histEntry.viewPositions != null
+                    && histEntry.viewPositions.length == motionFloats;
+            final float[] prevViewArr = hasPrevView ? histEntry.viewPositions : null;
+            final float[] nextViewArr = (histEntry != null
+                    && histEntry.viewPositions != null
+                    && histEntry.viewPositions.length == motionFloats)
+                    ? histEntry.viewPositions
+                    : new float[motionFloats];
+
+            final ByteBuffer positions = batch.buffer;
+            final float[] hc = handCurViewInv;
+            final float[] hp = handPrevViewInv;
+            final ByteBuffer motion = prevCameraRotationValid ? batch.motionScratchFor(motionFloats) : null;
+            boolean anyMotion = false;
+
+            for (int vertex = 0; vertex < batch.vertexCount; ++vertex) {
+                final int offset = vertex * BYTES_PER_VERTEX;
+                final float px = positions.getFloat(offset);
+                final float py = positions.getFloat(offset + 4);
+                final float pz = positions.getFloat(offset + 8);
+
+                // p_view_cur = R_eff_cur^T * p_rel_cur
+                final float vx = hc[0] * px + hc[1] * py + hc[2] * pz;
+                final float vy = hc[4] * px + hc[5] * py + hc[6] * pz;
+                final float vz = hc[8] * px + hc[9] * py + hc[10] * pz;
+
+                final int mIdx = vertex * 3;
+                final float pvx = prevViewArr != null ? prevViewArr[mIdx] : vx;
+                final float pvy = prevViewArr != null ? prevViewArr[mIdx + 1] : vy;
+                final float pvz = prevViewArr != null ? prevViewArr[mIdx + 2] : vz;
+
+                nextViewArr[mIdx] = vx;
+                nextViewArr[mIdx + 1] = vy;
+                nextViewArr[mIdx + 2] = vz;
+
+                if (motion != null) {
+                    // p_rel_prev = R_eff_prev * p_view_prev
+                    final float prevRelX = hp[0] * pvx + hp[4] * pvy + hp[8] * pvz;
+                    final float prevRelY = hp[1] * pvx + hp[5] * pvy + hp[9] * pvz;
+                    final float prevRelZ = hp[2] * pvx + hp[6] * pvy + hp[10] * pvz;
+
+                    float mx = prevRelX - px;
+                    final float my = prevRelY - py;
+                    final float mz = prevRelZ - pz;
+                    if (handCameraMoved
+                            && Math.abs(mx) < 1.0e-6f
+                            && Math.abs(my) < 1.0e-6f
+                            && Math.abs(mz) < 1.0e-6f) {
+                        mx = 1.0e-6f;
+                    }
+                    anyMotion |= mx != 0.0F || my != 0.0F || mz != 0.0F;
+                    motion.putFloat(mx).putFloat(my).putFloat(mz);
+                }
+            }
+
+            if (histEntry == null) {
+                if (handVertexHistories.size() >= 256) {
+                    handVertexHistories.clear();
+                }
+                histEntry = new HandViewHistory();
+                handVertexHistories.put(historyKey, histEntry);
+            }
+            histEntry.viewPositions = nextViewArr;
+            histEntry.frame = entityMotionFrame;
+
+            if (motion != null && anyMotion) {
+                motion.flip();
+                motionPointer = MemoryUtil.memAddress(motion);
+            }
+        } else if (batch.vertexCount > 0) {
             final int motionFloats = batch.vertexCount * 3;
             final boolean useVertexHistory = batch.vertexHistoryIsPreviousFrame(motionFloats);
             final float[] positionStore = batch.vertexHistoryPositions(motionFloats);
@@ -1466,9 +1593,6 @@ public final class EntityRtCapture {
                             mx = delta[0] * px + delta[1] * py + delta[2] * pz + delta[3] - px;
                             my = delta[4] * px + delta[5] * py + delta[6] * pz + delta[7] - py;
                             mz = delta[8] * px + delta[9] * py + delta[10] * pz + delta[11] - pz;
-                            if (handCameraMoved && mx == 0.0F && my == 0.0F && mz == 0.0F) {
-                                mx = 1.0e-7F;
-                            }
                         }
                         anyMotion |= mx != 0.0F || my != 0.0F || mz != 0.0F;
                         motion.putFloat(mx).putFloat(my).putFloat(mz);
@@ -1755,22 +1879,21 @@ public final class EntityRtCapture {
         ActiveBatch batch = currentCaptureBatch();
         if (batch == null) return;
         ++capturedVertexCount;
-        if (handPhase && handTransformMode != 0) {
-            final float rx;
-            final float ry;
-            final float rz;
-            if (handTransformMode == 1) {
-                rx = handRotation[0] * x + handRotation[4] * y + handRotation[8] * z;
-                ry = handRotation[1] * x + handRotation[5] * y + handRotation[9] * z;
-                rz = handRotation[2] * x + handRotation[6] * y + handRotation[10] * z;
-            } else {
-                rx = handRotation[0] * x + handRotation[1] * y + handRotation[2] * z;
-                ry = handRotation[4] * x + handRotation[5] * y + handRotation[6] * z;
-                rz = handRotation[8] * x + handRotation[9] * y + handRotation[10] * z;
-            }
-            x = rx;
-            y = ry;
-            z = rz;
+        if (batch.diagHand && handCameraStateValid) {
+            final float[] vr = handCurViewRot;
+            final float[] vi = handCurViewInv;
+            // 1) 用未含 bob 的 viewRotationMatrix 拉回视图空间（剔除 renderItemInHand 内的 bob）
+            final float viewX = vr[0] * x + vr[4] * y + vr[8] * z;
+            final float viewY = vr[1] * x + vr[5] * y + vr[9] * z;
+            final float viewZ = vr[2] * x + vr[6] * y + vr[10] * z;
+            // 2) FOV 透视校正 + 防穿墙深度缩放
+            final float scaledX = viewX * handFovScaleXY * HAND_DEPTH_SCALE;
+            final float scaledY = viewY * handFovScaleXY * HAND_DEPTH_SCALE;
+            final float scaledZ = viewZ * HAND_DEPTH_SCALE;
+            // 3) 用含 bob 的有效相机逆矩阵旋转回世界朝向（相对于本帧 RT 相机原点）
+            x = vi[0] * scaledX + vi[4] * scaledY + vi[8] * scaledZ;
+            y = vi[1] * scaledX + vi[5] * scaledY + vi[9] * scaledZ;
+            z = vi[2] * scaledX + vi[6] * scaledY + vi[10] * scaledZ;
         }
         if (batch.projectiveUv) {
             final float wx = x + cameraWorldX;
@@ -1780,15 +1903,14 @@ public final class EntityRtCapture {
             v = fract01(wz * 0.25f + wy * 0.125f);
         }
         final int incomingColor = color;
-        if (batch.projectiveUv || handPhase) {
+        if (batch.projectiveUv) {
             color = 0xFFFFFFFF;
         }
-        if ((batch.projectiveUv || handPhase) && !vertexColorLogged) {
+        if (batch.projectiveUv && !vertexColorLogged) {
             vertexColorLogged = true;
             System.out.println("[RTX-VCOLOR] incoming color=0x"
                     + Integer.toHexString(incomingColor)
-                    + " -> forced white; hand=" + handPhase
-                    + " portal=" + batch.projectiveUv
+                    + " -> forced white; portal=" + batch.projectiveUv
                     + " slot=" + batch.textureSlot);
         }
         // =====================================================
@@ -2517,7 +2639,7 @@ public final class EntityRtCapture {
      * 未命中返回 false（正常转换，等 RETURN 时登记）。
      */
     public static boolean beginGroup(final long key) {
-        if (!GROUP_CACHE_ENABLED) {
+        if (!GROUP_CACHE_ENABLED || handCaptureWindow) {
             skipGroupCapture = false;
             pendingGroupEntry = null;
             return false;
@@ -2843,14 +2965,23 @@ public final class EntityRtCapture {
         GpuSampler sampler = texture.getSampler();
         if (view instanceof VulkanGpuTextureView vulkanView
                 && sampler instanceof VulkanGpuSampler vulkanSampler) {
-            publishTextureHandle(slot, vulkanView.vkImageView(), vulkanSampler.vkSampler());
-        } else if (isDiagnosticFrame()) {
-            // 2026-11-04 诊断：纹理槽绑定失败 ⇒ shader 采样返回 0 ⇒
-            // cutout 把每个纹素都当透明丢掉 ⇒ 几何"消失"（旗帜图案正是这种表现：
-            // 底色在、图案完全不见，也不遮挡）。只打印失败，不刷屏。
-            System.err.println("[RTX-TEX] publish failed slot=" + slot
-                    + " texture=" + textureId
-                    + " view=" + view + " sampler=" + sampler);
+            final long imageView = vulkanView.vkImageView();
+            final long vkSampler = vulkanSampler.vkSampler();
+            if (imageView != 0L && vkSampler != 0L) {
+                publishTextureHandle(slot, imageView, vkSampler);
+            } else {
+                slotTexturePublished[slot - 1] = false;
+            }
+        } else {
+            slotTexturePublished[slot - 1] = false;
+            if (isDiagnosticFrame()) {
+                // 2026-11-04 诊断：纹理槽绑定失败 ⇒ shader 采样返回 0 ⇒
+                // cutout 把每个纹素都当透明丢掉 ⇒ 几何"消失"（旗帜图案正是这种表现：
+                // 底色在、图案完全不见，也不遮挡）。只打印失败，不刷屏。
+                System.err.println("[RTX-TEX] publish failed slot=" + slot
+                        + " texture=" + textureId
+                        + " view=" + view + " sampler=" + sampler);
+            }
         }
         publishEntityPbrTexture(slot, textureId);
     }
@@ -3017,6 +3148,10 @@ public final class EntityRtCapture {
             customDiagLog("drop:no_texture", typeName, null);
             return;
         }
+        if (isEnchantedGlintTexture(texture)) {
+            customDiagLog("drop:enchanted_glint", typeName, texture);
+            return;
+        }
         int textureSlot = slotFor(texture);
         if (textureSlot == 0) {
             customDiagLog("drop:no_slot", typeName, texture);
@@ -3116,7 +3251,9 @@ public final class EntityRtCapture {
             return false;
         }
         final String path = texture.getPath();
-        return path.startsWith("map/") || path.contains("map_decorations");
+        return path.startsWith("map/")
+                || path.contains("map_decorations")
+                || path.contains("map_background");
     }
 
     /** RenderType 的构造名（26.3 字段 {@code name}，经 {@code RenderTypeAccessor} 读）。 */
@@ -3484,8 +3621,16 @@ public final class EntityRtCapture {
                     .putFloat(pendingQuadVertices[offset + 4]);
             buffer.putFloat(((color >>> 16) & 0xFF) / 255.0f).putFloat(((color >>> 8) & 0xFF) / 255.0f);
             buffer.putFloat((color & 0xFF) / 255.0f).putFloat(((color >>> 24) & 0xFF) / 255.0f);
+            final float pad1;
+            if (diagHand) {
+                pad1 = emissive ? 3.0f : 2.0f;
+            } else if (localPlayerProxy) {
+                pad1 = 1.0f;
+            } else {
+                pad1 = emissive ? -1.0f : 0.0f;
+            }
             buffer.putFloat(0.0f)
-                    .putFloat(localPlayerProxy ? 1.0f : emissive ? -1.0f : 0.0f)
+                    .putFloat(pad1)
                     .putFloat(encodedTextureSlot());
             ++vertexCount;
             final float px = pendingQuadVertices[offset];

@@ -75,7 +75,7 @@ public class GameRendererMixin {
      */
     @Inject(method = "renderItemInHand", at = @At("HEAD"))
     private void rtx$armRtInjectionBeforeHand(CallbackInfo ci) {
-        if (HAND_RT_ENABLED) {
+        if (isHandRtActive()) {
             // 旧行为：给手单独开一个实体帧窗口，手几何进 RT，再取消光栅手。
             EntityRtCapture.beginEarlyFrame();
             EntityRtCapture.beginHandCaptureWindow();
@@ -86,7 +86,7 @@ public class GameRendererMixin {
             // 不参与光追，画面里的手就是原版光栅手。
             // 注意不能在这里再调 beginEarlyFrame()，那会重新开窗把手收进去。
             EntityRtCapture.finishEntityFrame();
-            if (!rasterHandRestoredLogged) {
+            if (NativeVulkan.rtActive && !HAND_RT_ENABLED && !rasterHandRestoredLogged) {
                 rasterHandRestoredLogged = true;
                 System.out.println("[RTX-HAND] hand restored to raster; RT hand capture"
                         + " disabled (-Dorion.handRt=1 to re-enable)");
@@ -175,32 +175,32 @@ public class GameRendererMixin {
             )
     )
     private void rtx$skipRasterHand(RenderPass renderPass, FeatureRenderDispatcher.PreparedFrame frame) {
-        if (!HAND_RT_ENABLED) {
-            // 默认路径：手走原版光栅（RT 手已关闭，见 resolveHandRtEnabled）。
+        if (!isHandRtActive() || !NativeVulkan.rtInjectedToMainTarget) {
+            // 回退路径：原版模式 / 非 RT 设备 / RT 未注入 / -Dorion.handRt=0 时，走原版光栅手。
             FeatureRenderDispatcher.renderAllFeatures(renderPass, frame);
             return;
         }
         if (!rasterHandSkipLogged) {
             rasterHandSkipLogged = true;
             System.out.println("[RTX-HAND] raster hand skipped; RT hand is the visible one"
-                    + " (-Dorion.handRt=1)");
+                    + " (-Dorion.handRt=0 to revert)");
         }
     }
 
     private static boolean rasterHandSkipLogged;
     private static boolean rasterHandRestoredLogged;
 
+    private static boolean isHandRtActive() {
+        return HAND_RT_ENABLED && NativeVulkan.rtActive && NativeVulkan.isLoaded();
+    }
+
     
 
     /**
-     * 2026-11-16：默认改为 {@code false} —— 第一人称手/手持物退出光追，回到原版光栅。
+     * 2026-11-26：默认改为 {@code true} —— 第一人称手/手持物退出原版光栅，走光追渲染。
      *
-     * <p>为什么不是"只取消光栅手"：RT 手和光栅手画在同一屏幕位置，只能二选一。
-     * 之前默认 RT 手，但 RT 侧的相机相对 MV / 投射 UV / 顶点色都被特殊处理过，
-     * 手臂与手持物的观感与整体不一致，所以默认交回光栅。</p>
-     *
-     * <p>需要对比时仍可 {@code -Dorion.handRt=1}（或环境变量 {@code ORION_HAND_RT=1}）
-     * 切回 RT 手，这条路径的捕获/上膛逻辑一并保留。</p>
+     * <p>需要回退对照时可设 {@code -Dorion.handRt=0}（或环境变量 {@code ORION_HAND_RT=0}）
+     * 切回原版光栅手。</p>
      */
     private static final boolean HAND_RT_ENABLED = resolveHandRtEnabled();
 
@@ -209,8 +209,8 @@ public class GameRendererMixin {
         if (raw == null) {
             raw = System.getenv("ORION_HAND_RT");
         }
-        // 只有显式写 "1" 才启用；未设置 = 关闭（与旧版本"默认开启"相反）。
-        return raw != null && "1".equalsIgnoreCase(raw.trim());
+        // 默认开启；只有显式写 "0" 才关闭回退光栅。
+        return raw == null || !"0".equalsIgnoreCase(raw.trim());
     }
 
     private static boolean rtSeamLogged;

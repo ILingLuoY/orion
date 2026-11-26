@@ -1207,6 +1207,15 @@ void geometryCaptureSectionLocked(
         {
             geometryAppendSectionVertices(split.localPlayer, layerEntry.second, 5);
         }
+        else if(layerEntry.first == HAND_RT_LAYER_KEY)
+        {
+            geometryAppendSectionVertices(split.hand, layerEntry.second, 7);
+            geometryAppendSectionMotion(
+                split.handMotion,
+                layerMotion,
+                layerEntry.second.size()
+            );
+        }
         else if(isEntityRtLayerKey(layerEntry.first))
         {
             geometryAppendSectionVertices(split.entity, layerEntry.second, 4);
@@ -1611,6 +1620,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         captureArenaPlanPiece(split.localPlayer, totalBytes);
     const size_t particleOffset =
         captureArenaPlanPiece(split.particle, totalBytes);
+    const size_t handOffset =
+        captureArenaPlanPiece(split.hand, totalBytes);
 
     const size_t entityMotionOffset =
         captureArenaPlanPiece(split.entityMotion, totalBytes);
@@ -1618,6 +1629,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         captureArenaPlanPiece(split.localPlayerMotion, totalBytes);
     const size_t particleMotionOffset =
         captureArenaPlanPiece(split.particleMotion, totalBytes);
+    const size_t handMotionOffset =
+        captureArenaPlanPiece(split.handMotion, totalBytes);
 
     const size_t opaquePackedOffset =
         captureArenaPlanPiece(split.opaquePacked, totalBytes);
@@ -1649,6 +1662,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         split.localPlayer, base, localPlayerOffset, segment.localPlayer);
     captureArenaCopyPiece(
         split.particle, base, particleOffset, segment.particle);
+    captureArenaCopyPiece(
+        split.hand, base, handOffset, segment.hand);
 
     captureArenaCopyPiece(
         split.entityMotion, base, entityMotionOffset, segment.entityMotion);
@@ -1659,6 +1674,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         segment.localPlayerMotion);
     captureArenaCopyPiece(
         split.particleMotion, base, particleMotionOffset, segment.particleMotion);
+    captureArenaCopyPiece(
+        split.handMotion, base, handMotionOffset, segment.handMotion);
 
     captureArenaCopyPiece(
         split.opaquePacked, base, opaquePackedOffset, segment.opaquePacked);
@@ -1814,7 +1831,8 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
         split.water.capacity() != 0u ||
         split.entity.capacity() != 0u ||
         split.localPlayer.capacity() != 0u ||
-        split.particle.capacity() != 0u;
+        split.particle.capacity() != 0u ||
+        split.hand.capacity() != 0u;
 
     if(!hasCapacity)
     {
@@ -1830,9 +1848,11 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
     split.entity.clear();
     split.localPlayer.clear();
     split.particle.clear();
+    split.hand.clear();
     split.entityMotion.clear();
     split.localPlayerMotion.clear();
     split.particleMotion.clear();
+    split.handMotion.clear();
     split.opaquePacked.clear();
     split.ommCutoutPacked.clear();
     split.ommLeavesPacked.clear();
@@ -3340,6 +3360,11 @@ uint32_t sectionRoleOf(const RTSectionAS& section)
     // （geometryCaptureSectionLocked 跳 DH 键）结构性保证：DH 键的 BLAS
     // 根本不会被创建，writeSectionRoleSlot 因此不会被 DH 节调用，本函数
     // 不会遇到 DH 键。旗标关闭时行为与改前逐位一致（本注释不改变行为）。
+    if((section.sectionKey & ~SPATIAL_SECTION_KEY_MASK) == SECTION_AS_CLASS_HAND)
+    {
+        return SECTION_ROLE_HAND;
+    }
+
     const bool lodSpatialKey =
         (section.sectionKey & VOXY_LOD_RESERVED_Y) == VOXY_LOD_RESERVED_Y;
 

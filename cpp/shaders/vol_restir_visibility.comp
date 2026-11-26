@@ -75,7 +75,7 @@ void main()
     rayQueryEXT rayQuery;
     rayQueryInitializeEXT(rayQuery, sceneTlas,
         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-        0xFFu,
+        0xDFu,
         froxelCenter + rayDirection * originBias, tMin,
         rayDirection, tMax);
 

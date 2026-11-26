@@ -211,6 +211,7 @@ void serTraceRay(
     serTraceRayOffset(origin, tMin, direction, tMax, rayFlags, cullMask, hint, 0u);
 }
 
+// g_secondaryCullMask 在 rt_test.rgen 顶部全局声明，供本地光 NEE 与次级光线共用。
 // Entry point of the diffuse-GI bounce.  Kept as a named wrapper so the call
 // site and its measured behaviour stay recognisable; the body is now the shared
 // funnel, so GI cannot drift away from the other paths.
@@ -222,7 +223,7 @@ void traceDiffuseSer(vec3 origin, vec3 direction, uint bouncePhase)
         direction,
         perfGiTraceMaxDistance(10000.0),
         secondaryTraverseFlags(),
-        0xefu,
+        g_secondaryCullMask,
         bouncePhase
     );
 }
@@ -294,6 +295,9 @@ const uint RT_STATE_NO_SUN_GLOW_BIT    = 1u << 15u;
 //（isParticleMaterial，makeHitState 之后），消费者 rrParticlePixel（主射线读取，
 // 喂 RR TransparencyHint 治粒子残影）。与 rt_test.rchit 同名同值。
 const uint RT_STATE_PARTICLE_BIT       = 1u << 16u;
+// 2026-11-26：第一人称手部命中标记，bit 20 —— 用于在发射阴影/GI/局部光/光泽次级光线时
+// 屏蔽 0x02（LOCAL_PLAYER 代理头壳），避免近距缩小手部陷入头壳内部导致全黑。
+const uint RT_STATE_HAND_BIT           = 1u << 20u;
 
 // =====================================================
 // 2026-10-25 A/B：GI 射线跳过 POM（bit 17）

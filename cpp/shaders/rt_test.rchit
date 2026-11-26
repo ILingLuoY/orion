@@ -33,6 +33,7 @@ const uint RT_STATE_CLEAR_GLASS_BIT    = 1u << 12u;
 // material_resolve.glsl（isParticleMaterial，makeHitState 之后）；消费者：
 // rgen 的 RR TransparencyHint（粒子像素降低 RR 历史信任，治残影）。
 const uint RT_STATE_PARTICLE_BIT       = 1u << 16u;
+const uint RT_STATE_HAND_BIT           = 1u << 20u;
 
 // 2026-10-25 A/B：GI 射线跳过 POM（与 rt_test.rgen 的常量必须逐位一致）。
 const uint RT_STATE_GI_NO_POM_BIT      = 1u << 17u;
@@ -265,8 +266,8 @@ layout(binding = 36, set = 0) uniform sampler2D entityAtlases[128];
 // "同一 Identifier 加 _n/_s" 查找），C++ 侧与 binding 36 同构：每槽一个 view。
 // 没有贴图的槽由 C++ 填中性 1×1 兜底（normal=(0,0,0,1)、specular=(0,0,0,1)），
 // 于是下面的内容判据自动判"无贴图"而不需要额外的标志位。
-layout(binding = 63, set = 0) uniform sampler2D entityNormalAtlases[64];
-layout(binding = 64, set = 0) uniform sampler2D entitySpecularAtlases[64];
+layout(binding = 63, set = 0) uniform sampler2D entityNormalAtlases[128];
+layout(binding = 64, set = 0) uniform sampler2D entitySpecularAtlases[128];
 layout(binding = 37, set = 0) uniform sampler2D particleAtlases[3];
 layout(binding = 40, set = 0) uniform sampler2D rainStreakAtlas;
 layout(binding = 45, set = 0) uniform sampler2D voxyLodAtlas;

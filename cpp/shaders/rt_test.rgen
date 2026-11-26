@@ -1247,6 +1247,11 @@ uint secondaryTraverseFlags()
 }
 #endif
 
+// 当前像素发射次级可见性/GI/反射光线时使用的实例掩码：
+// 普通表面为 0xcfu（含 LOCAL_PLAYER 0x02，不含 HAND 0x20 与 SOLID_LEAVES 0x10）；
+// 第一人称手部像素切为 0xcdu（同时屏蔽 LOCAL_PLAYER 0x02，避免手在玩家头壳内部自遮挡）。
+uint g_secondaryCullMask = 0xcfu;
+
 // Binding 34 (the old 256x256 wavefront-area caustic map) is deliberately no
 // longer declared here.  Water caustics are analytic now; see
 // evaluatePrimaryWaterReceiverCaustics below.  That map was anchored to a
@@ -4694,7 +4699,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
             receiverOrigin,
             selectedSample,
             targetVoxelEntryDistance,
-            0xefu
+            g_secondaryCullMask
         )
         : vptTraceGlassTransmissionToEmitter(
             receiverOrigin,
@@ -4875,7 +4880,7 @@ const float DYNAMIC_LIGHT_VISIBILITY_SHORTEN = 0.6;
 // 要让那时也放行，需要给"本地玩家实体"单独一个 mask 位（native 按实体打标），留待需要时。
 //
 // 回退：改成 0xffu 即逐位回到改动前（包含"自己的模型挡自己的光"）。
-const uint DYNAMIC_LIGHT_CULL_MASK = 0xedu;
+const uint DYNAMIC_LIGHT_CULL_MASK = 0xcdu;
 
 // 颜色：优先用记录里带的**任意 RGB**（meta.y 的 8/8/8）；为 0 时回退到既有调色板
 // （vliDecodeEmitterColor）—— 于是"只给 typeCode"的记录仍然有效，两条路在火把上的
@@ -8128,7 +8133,7 @@ vec3 vptLocalEmitterSampleTransmittance(
             receiverOrigin,
             selectedSample,
             targetVoxelEntryDistance,
-            0xefu
+            g_secondaryCullMask
         )
         : vptTraceGlassTransmissionToEmitter(
             receiverOrigin,

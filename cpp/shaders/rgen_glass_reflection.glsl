@@ -66,7 +66,7 @@ vec3 traceGlassSceneReflectionOneRay(
                 currentDirection,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 0u
             );
         }
@@ -79,7 +79,7 @@ vec3 traceGlassSceneReflectionOneRay(
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 0,
                 0,
                 0,

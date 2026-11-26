@@ -1895,7 +1895,7 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
     }
 
     // Bindings 0..29 (30 entries total). Binding 29 = equirect sky LUT (g_skyScatteringView).
-    VkDescriptorSetLayoutBinding renderBindings[30]{};
+    VkDescriptorSetLayoutBinding renderBindings[31]{};
     renderBindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
         VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     renderBindings[1] = { 1u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
@@ -1960,10 +1960,13 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
     // 29 = equirect sky scattering LUT (real Bruneton/Hillaire sky for cloud ambient & aerial perspective)
     renderBindings[29] = { 29u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
         VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    // 30 = dynamic moving lights SSBO (binding 61 in RT set)
+    renderBindings[30] = { 30u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     VkDescriptorSetLayoutCreateInfo renderLayoutInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
     };
-    renderLayoutInfo.bindingCount = 30u;
+    renderLayoutInfo.bindingCount = 31u;
     renderLayoutInfo.pBindings = renderBindings;
     check(vkCreateDescriptorSetLayout(g_device, &renderLayoutInfo, nullptr,
         &g_volumetricCloudRenderSetLayout), "volumetric cloud render set layout failed");
@@ -2227,6 +2230,11 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
     VkDescriptorBufferInfo aeStateInfo{};
     aeStateInfo.buffer = g_aeStateBuffer;
     aeStateInfo.range = VK_WHOLE_SIZE;
+    ensureDynamicLightBuffer();
+    VkDescriptorBufferInfo fogDynamicLightInfo{};
+    fogDynamicLightInfo.buffer = g_dynamicLightBuffer;
+    fogDynamicLightInfo.offset = 0u;
+    fogDynamicLightInfo.range = VK_WHOLE_SIZE;
     VkDescriptorBufferInfo fogLightListInfo{};
     fogLightListInfo.buffer = g_localLightGpuBuffer;
     fogLightListInfo.offset = 0u;
@@ -2375,6 +2383,12 @@ void createVolumetricCloudResources(uint32_t width, uint32_t height)
     writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
         g_volumetricCloudRenderSet, 29u, 0u, 1u,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &skyLutInfo, nullptr, nullptr };
+    if(fogDynamicLightInfo.buffer != VK_NULL_HANDLE)
+    {
+        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+            g_volumetricCloudRenderSet, 30u, 0u, 1u,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &fogDynamicLightInfo, nullptr };
+    }
     if(fogLightListInfo.buffer != VK_NULL_HANDLE &&
        fogLightGridInfo.buffer != VK_NULL_HANDLE)
     {

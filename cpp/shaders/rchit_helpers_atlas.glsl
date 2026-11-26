@@ -158,7 +158,7 @@ void sampleEntityPbr(
 )
 {
 #if ORION_ATLAS_DYNAMIC_INDEX
-    if(textureSlot == 0u || textureSlot > 64u)
+    if(textureSlot == 0u || textureSlot > 128u)
     {
         normalTexel = vec4(0.0, 0.0, 0.0, 1.0);
         specularTexel = vec4(0.0, 0.0, 0.0, 1.0);

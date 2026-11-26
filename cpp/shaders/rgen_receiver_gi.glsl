@@ -60,7 +60,7 @@ vec3 traceTransparentLowCostGI(
             giDirection,
             10000.0,
             secondaryTraverseFlags(),
-            0xefu,
+            g_secondaryCullMask,
             0u
         );
     }
@@ -73,7 +73,7 @@ vec3 traceTransparentLowCostGI(
         traceRayEXT(
             topLevelAS,
             secondaryTraverseFlags(),
-            0xefu,
+            g_secondaryCullMask,
             0,
             0,
             0,

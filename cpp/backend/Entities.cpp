@@ -208,8 +208,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadEntityBatch(
         : nullptr;
 
     // pad1 编码批次归属（Java 侧 EntityRtCapture.emit 写入）：
-    //   0.0 = 普通实体 / -1.0 = 自发光 / +1.0 = 本地玩家代理 / +2.0 = 第一人称手部
+    //   0.0 = 普通实体 / -1.0 = 自发光 / +1.0 = 本地玩家代理 / +2.0 = 第一人称手部 / +3.0 = 第一人称自发光手部
     const bool handBatch = source[0].pad1 > 1.5f;
+    const bool handEmissive = source[0].pad1 > 2.5f;
     const bool localPlayerProxy = !handBatch && source[0].pad1 > 0.5f;
     std::vector<Vertex>& target = handBatch
         ? g_handFrameVertices
@@ -233,6 +234,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadEntityBatch(
         vertex.y += g_dynamicCaptureCameraY;
         vertex.z += g_dynamicCaptureCameraZ;
         vertex.materialId = 0.0f;
+        if(handBatch)
+        {
+            vertex.pad1 = handEmissive ? -1.0f : 0.0f;
+        }
         const float incomingPad2 = source[index].pad2;
         const float classFraction =
             incomingPad2 > 0.0f
@@ -593,6 +598,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
             g_localPlayerFrameVertices.size(),
             localPlayerChanged
         );
+    const bool handMotionReset =
+        publishDynamicLayerMotion(
+            HAND_RT_LAYER_KEY,
+            g_handFrameMotion,
+            g_handFrameVertices.size(),
+            handChanged
+        );
 
     const bool changed =
         bucketChanged ||
@@ -600,7 +612,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
         localPlayerChanged ||
         handChanged ||
         entityMotionReset ||
-        localPlayerMotionReset;
+        localPlayerMotionReset ||
+        handMotionReset;
 
     if(
         !changed &&
@@ -674,9 +687,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
 
     bool requestRebuild =
         requestDynamicRTASRebuild(entityChanged || entityMotionReset);
-    if(handChanged)
+    if(handChanged || handMotionReset)
     {
         requestRebuild = true;
+        g_handRebuildRequested.store(true, std::memory_order_release);
     }
     if(localPlayerChanged || localPlayerMotionReset)
     {

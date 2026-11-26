@@ -897,6 +897,10 @@ bool isRtWeatherRain =
             getRayPurpose(payload.state), RT_HIT_OPAQUE,
             RT_WATER_NONE, false, false, 0u
         );
+        if(instanceRole == LOD_ROLE_HAND)
+        {
+            payload.state |= RT_STATE_HAND_BIT;
+        }
         // Materials: a metal takes its F0 from the albedo, exactly like the block
         // path's LabPBR decode does for codes >= 230, so the armour texture's own
         // colour tints the reflection (grey iron, yellow gold, orange copper).
@@ -2261,6 +2265,10 @@ else
 if(isParticleMaterial)
 {
     payload.state |= RT_STATE_PARTICLE_BIT;
+}
+if(instanceRole == LOD_ROLE_HAND)
+{
+    payload.state |= RT_STATE_HAND_BIT;
 }
 
 // =====================================================

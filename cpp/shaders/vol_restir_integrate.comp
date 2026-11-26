@@ -141,7 +141,7 @@ bool volRestirNeeVisible(vec3 froxelCenter, vec3 lightPosition, float distanceTo
     rayQueryEXT rayQuery;
     rayQueryInitializeEXT(rayQuery, sceneTlas,
         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-        0xFFu,
+        0xDFu,
         froxelCenter + rayDirection * originBias, tMin,
         rayDirection, tMax);
 
@@ -271,7 +271,7 @@ void main()
                 plainQuery,
                 sceneTlas,
                 0u,
-                0xFFu,
+                0xDFu,
                 camPos,
                 0.05,
                 asDir,

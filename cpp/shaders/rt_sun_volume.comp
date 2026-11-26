@@ -87,7 +87,7 @@ void main()
         query,
         sceneTlas,
         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-        0xFFu,
+        0xDFu,
         worldPos,
         0.05,
         sunDir,

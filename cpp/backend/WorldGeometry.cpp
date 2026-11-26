@@ -345,7 +345,7 @@ bool rebuildWorldGeometry(
             std::unordered_map<uint64_t, size_t> updateIndices;
             updateIndices.reserve(selectedCount + 1u);
 
-            if(entityDirty && (adoptedCount + selectedCount) > 0u)
+            if(entityDirty)
             {
                 // 2026-11-07g：这里不 take，推迟到真正捕获前（见下方捕获循环）。
                 // 否则"选 key"阶段就把池掏空，捕获线程唤醒即 miss。
@@ -1369,12 +1369,13 @@ bool rebuildWorldGeometry(
 
                     const uint64_t classBits =
                         classKey & ~SPATIAL_SECTION_KEY_MASK;
+                    const bool isHandClass = classBits == SECTION_AS_CLASS_HAND;
                     const bool dynamicRefitClass =
-                        classBits == SECTION_AS_CLASS_ENTITY ||
-                        classBits == SECTION_AS_CLASS_LOCAL_PLAYER ||
-                        classBits == SECTION_AS_CLASS_PARTICLE ||
-                        classBits == SECTION_AS_CLASS_HAND ||
-                        !vertexMotion.empty();
+                        !isHandClass && (
+                            classBits == SECTION_AS_CLASS_ENTITY ||
+                            classBits == SECTION_AS_CLASS_LOCAL_PLAYER ||
+                            classBits == SECTION_AS_CLASS_PARTICLE ||
+                            !vertexMotion.empty());
                     const bool allowBlasRefit =
                         sectionBLASRefitEnabled() && dynamicRefitClass;
 
@@ -1500,7 +1501,8 @@ bool rebuildWorldGeometry(
            update.second.water.empty() &&
            update.second.entity.empty() &&
            update.second.localPlayer.empty() &&
-           update.second.particle.empty())
+           update.second.particle.empty() &&
+           update.second.hand.empty())
         {
             ++removedSectionCount;
         }
@@ -1515,7 +1517,7 @@ bool rebuildWorldGeometry(
             std::span<const SectionVertex> packed;
         };
 
-        constexpr size_t RT_GEOMETRY_CLASS_COUNT = 8u;
+        constexpr size_t RT_GEOMETRY_CLASS_COUNT = 9u;
 
         const RtGeometryClassPlan geometryClassPlan[RT_GEOMETRY_CLASS_COUNT] =
         {
@@ -1544,7 +1546,10 @@ bool rebuildWorldGeometry(
               update.second.localPlayerMotion, {} },
             { spatialSectionKey | SECTION_AS_CLASS_PARTICLE,
               update.second.particle, false, nullptr,
-              update.second.particleMotion, {} }
+              update.second.particleMotion, {} },
+            { spatialSectionKey | SECTION_AS_CLASS_HAND,
+              update.second.hand, false, nullptr,
+              update.second.handMotion, {} }
         };
 
         bool sectionAbortedMidway = false;
@@ -3290,12 +3295,12 @@ bool rebuildWorldGeometry(
                 instance.mask = 0x02;
             }
 
-            // 2026-11-03：第一人称手部（见 SECTION_AS_CLASS_HAND 的说明）。
-            // 0x04 = 只被主相机射线（0x05）命中，所有次级射线（0xfb）都排除它
-            // ⇒ 手能看见、但不在世界里投影。
+            // 2026-11-26：第一人称手部（见 SECTION_AS_CLASS_HAND 的说明）。
+            // 0x20 = 只被主相机射线（0x21）命中，所有次级射线（0xcf）与动态光（0xcd）都排除它
+            // ⇒ 手能看见、但不在世界里投影或遮光。
             if(geometryClass == SECTION_AS_CLASS_HAND)
             {
-                instance.mask = 0x04;
+                instance.mask = 0x20u;
             }
 
             if(geometryClass == SECTION_AS_CLASS_PARTICLE)
@@ -3303,7 +3308,7 @@ bool rebuildWorldGeometry(
                 instance.mask = 0xf7;
             }
 
-            if(primaryMaskCull)
+            if(primaryMaskCull && geometryClass != SECTION_AS_CLASS_HAND)
             {
                 instance.mask &= 0xfeu;
                 s_cullPrimaryMaskedCount += 1;
@@ -3311,7 +3316,11 @@ bool rebuildWorldGeometry(
 
             // 2026-11-26 (Batch V, Feature 4): Reserve bit 4 (0x10) exclusively for the paired
             // solid-cube leaves instance used by volumetric light / fog queries.
-            instance.mask &= static_cast<uint8_t>(~0x10u);
+            // Reserve bit 5 (0x20) exclusively for SECTION_AS_CLASS_HAND.
+            if(geometryClass != SECTION_AS_CLASS_HAND)
+            {
+                instance.mask &= static_cast<uint8_t>(~0x30u);
+            }
 
             if(geometryClass == SECTION_AS_CLASS_OPAQUE)
             {
@@ -3325,7 +3334,7 @@ bool rebuildWorldGeometry(
             }
             else if(geometryClass == SECTION_AS_CLASS_OMM_LEAVES)
             {
-                instance.mask = primaryMaskCull ? 0xe6u : 0xe7u;
+                instance.mask = primaryMaskCull ? 0xc6u : 0xc7u;
                 instance.instanceShaderBindingTableRecordOffset =
                     section.hasOpacityMicromap ? SBT_RECORD_OMM : SBT_RECORD_ALPHA;
             }
@@ -3523,6 +3532,7 @@ bool rebuildWorldGeometry(
 
     bool tlasInstancesUnchanged =
         tlasHandleAtEntry != VK_NULL_HANDLE &&
+        sectionsNeedingBuild.empty() &&
         s_tlasInstancesShadow.size() == instances.size() &&
         (instances.empty() ||
          std::memcmp(
@@ -4002,6 +4012,41 @@ bool rebuildWorldGeometry(
         "begin Section AS command buffer failed"
     );
 
+
+    bool anyPendingRefit = false;
+    for(const RTSectionAS* section : sectionsNeedingBuild)
+    {
+        if(section != nullptr && section->pendingRefit)
+        {
+            anyPendingRefit = true;
+            break;
+        }
+    }
+    if(anyPendingRefit)
+    {
+        VkMemoryBarrier refitWarBarrier{
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER
+        };
+        refitWarBarrier.srcAccessMask =
+            VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+            VK_ACCESS_SHADER_READ_BIT;
+        refitWarBarrier.dstAccessMask =
+            VK_ACCESS_TRANSFER_WRITE_BIT |
+            VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_TRANSFER_BIT |
+                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            0,
+            1,
+            &refitWarBarrier,
+            0,
+            nullptr,
+            0,
+            nullptr
+        );
+    }
 
     if(!pendingUploads.empty())
     {

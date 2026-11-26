@@ -327,7 +327,7 @@ for(
                 currentDirection,
                 glossyRayMaxDistance,
                 secondaryTraverseFlags(),
-                0xefu,
+                g_secondaryCullMask,
                 pathStep
             );
         }
@@ -340,7 +340,7 @@ for(
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xefu,
+                g_secondaryCullMask,
                 0,
                 0,
                 0,
@@ -1183,7 +1183,7 @@ float traceWaterReflectedSun(
             waterHitQuery,
             topLevelAS,
             gl_RayFlagsNoneEXT,
-            0xefu,
+            0xcfu,
             receiverPos + toWaterDir * 0.001,
             0.02,
             toWaterDir,
@@ -1286,7 +1286,7 @@ float traceWaterReflectedSun(
             glossSunVisQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xefu,
+            0xcfu,
             waterHitPos + sunDirection * 0.001,
             0.02,
             sunDirection,
