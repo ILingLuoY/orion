@@ -39,9 +39,9 @@ const float SUN_SHADOW_BIAS_NEAR = 0.06;
 
 const float SUN_SHADOW_ORIGIN_BIAS = 0.02;
 
-// 0x08u hits opaque blocks, OMM foliage, and DH far LODs while excluding
-// first-person hand (0x04), local player (0x02), and particles (0xF7).
-const uint SUN_SHADOW_CULL_MASK = 0x08u;
+// 0x18u hits opaque blocks, OMM foliage, DH far LODs (0x08), and solid-cube leaves (0x10)
+// while excluding first-person hand (0x04), local player (0x02), and particles (0xF7).
+const uint SUN_SHADOW_CULL_MASK = 0x18u;
 
 // 光的方向：与两个体积 pass 的 sunDirection() 同一个公式（同一个
 // cam.historyParams.w），并且同样在太阳落到地平线以下后翻到月亮方向。

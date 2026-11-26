@@ -709,6 +709,25 @@ void pbrDownsampleLevelBySprite(
     }
 }
 
+// LabPBR 1.3 `_s.a` encodes 0 and 255 as non-emissive; unifying 0 -> 255 prevents
+// BC7 lossy mixed-alpha modes and mip-downsample gradients from pulling cutout
+// plant edges down across the 255 -> 254 (0% -> 100%) emission cliff.
+static bool s_pbrUploadIsSpecular = false;
+
+static size_t sanitizeSpecularAlphaZero(uint8_t* rgba, size_t pixelCount)
+{
+    size_t fixed = 0u;
+    for (size_t i = 0u; i < pixelCount; ++i)
+    {
+        if (rgba[i * 4u + 3u] == 0u)
+        {
+            rgba[i * 4u + 3u] = 255u;
+            ++fixed;
+        }
+    }
+    return fixed;
+}
+
 // 按 sprite 生成 mip 链并上传（RGBA8）。失败时清掉半成品，由调用方决定回退。
 void uploadPbrSpriteMippedToVRAM(
     void* pixels, uint32_t width, uint32_t height,
@@ -777,9 +796,12 @@ void uploadPbrSpriteMippedToVRAM(
     const uint8_t* sourceBytes = static_cast<const uint8_t*>(pixels);
     const size_t mip0Bytes = size_t(width) * size_t(height) * 4u;
 
-    std::memcpy(stagingBytes + offsets[0], sourceBytes, mip0Bytes);
-
     std::vector<uint8_t> prev(sourceBytes, sourceBytes + mip0Bytes);
+    if (s_pbrUploadIsSpecular)
+    {
+        sanitizeSpecularAlphaZero(prev.data(), size_t(width) * size_t(height));
+    }
+    std::memcpy(stagingBytes + offsets[0], prev.data(), mip0Bytes);
     std::vector<uint8_t> cur;
     std::vector<uint8_t> written;
 
@@ -1085,12 +1107,18 @@ void pbrEncodeBc7BlockRows(
     const uint8_t* rgba, uint32_t width, uint32_t height,
     uint32_t blocksX, uint8_t* dst,
     const bc7enc_compress_block_params& params,
-    uint32_t blockRow0, uint32_t blockRow1)
+    uint32_t blockRow0, uint32_t blockRow1,
+    bool isSpecular)
 {
     uint8_t block[64];
 
     bc7enc_compress_block_params opaqueParams = params;
     opaqueParams.m_mode_mask = 1u << 1u;
+
+    // Specular mixed-alpha blocks (emissive + non-emissive): force BC7 Mode 5 so
+    // 8-bit alpha endpoints and 2-bit alpha indices stay decoupled from RGB.
+    bc7enc_compress_block_params specularAlphaParams = params;
+    specularAlphaParams.m_mode_mask = 1u << 5u;
 
     for (uint32_t by = blockRow0; by < blockRow1; ++by)
     {
@@ -1132,10 +1160,13 @@ void pbrEncodeBc7BlockRows(
                 }
             }
 
+            const bc7enc_compress_block_params* blockParams =
+                opaqueAlpha ? &opaqueParams : (isSpecular ? &specularAlphaParams : &params);
+
             bc7enc_compress_block(
                 dst + (size_t(by) * blocksX + bx) * 16u,
                 block,
-                opaqueAlpha ? &opaqueParams : &params);
+                blockParams);
         }
     }
 }
@@ -1151,7 +1182,8 @@ void pbrEncodeBc7BlockRows(
 // 线程创建开销相对每级几十毫秒的编码可忽略。
 void pbrEncodeBc7Level(
     const uint8_t* rgba, uint32_t width, uint32_t height,
-    uint8_t* dst, const bc7enc_compress_block_params& params)
+    uint8_t* dst, const bc7enc_compress_block_params& params,
+    bool isSpecular)
 {
     const uint32_t blocksX = (width + 3u) / 4u;
     const uint32_t blocksY = (height + 3u) / 4u;
@@ -1169,7 +1201,7 @@ void pbrEncodeBc7Level(
     if (threads <= 1u)
     {
         pbrEncodeBc7BlockRows(
-            rgba, width, height, blocksX, dst, params, 0u, blocksY);
+            rgba, width, height, blocksX, dst, params, 0u, blocksY, isSpecular);
         return;
     }
 
@@ -1189,7 +1221,7 @@ void pbrEncodeBc7Level(
         }
 
         workers.emplace_back(
-            [rgba, width, height, blocksX, dst, &params, row0, row1]()
+            [rgba, width, height, blocksX, dst, &params, row0, row1, isSpecular]()
             {
                 // 2026-10-31：BC7 编码是渲染线程上的阻塞工作，分片线程与它并行
                 // 时若同优先级抢核，最慢分片反而被拖长（整体耗时由最慢分片决定）。
@@ -1197,7 +1229,7 @@ void pbrEncodeBc7Level(
                     GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
                 pbrEncodeBc7BlockRows(
-                    rgba, width, height, blocksX, dst, params, row0, row1);
+                    rgba, width, height, blocksX, dst, params, row0, row1, isSpecular);
             });
     }
 
@@ -1312,12 +1344,21 @@ void uploadPbrBc7SpriteMipped(
         const uint8_t* sourceBytes = static_cast<const uint8_t*>(pixels);
         const size_t mip0Bytes = size_t(width) * size_t(height) * 4u;
 
+        const bool isSpecular = s_pbrUploadIsSpecular;
         std::vector<uint8_t> prev(sourceBytes, sourceBytes + mip0Bytes);
+        if (isSpecular)
+        {
+            const size_t sanitized = sanitizeSpecularAlphaZero(prev.data(), size_t(width) * size_t(height));
+            if (sanitized > 0u)
+            {
+                RTLog("[PBR SPECULAR] sanitized A==0->255 pixels=" + std::to_string(sanitized));
+            }
+        }
         std::vector<uint8_t> cur;
         std::vector<uint8_t> written;
 
         pbrEncodeBc7Level(
-            prev.data(), width, height, stagingBytes + offsets[0], params);
+            prev.data(), width, height, stagingBytes + offsets[0], params, isSpecular);
 
         for (uint32_t l = 1u; l < mipLevels; ++l)
         {
@@ -1330,7 +1371,7 @@ void uploadPbrBc7SpriteMipped(
                 prev.data(), std::max(1u, width >> (l - 1u)), std::max(1u, height >> (l - 1u)),
                 cur.data(), lw, lh, l, written);
 
-            pbrEncodeBc7Level(cur.data(), lw, lh, stagingBytes + offsets[l], params);
+            pbrEncodeBc7Level(cur.data(), lw, lh, stagingBytes + offsets[l], params, isSpecular);
             prev.swap(cur);
         }
 
@@ -1602,6 +1643,10 @@ void uploadTextureToVRAM(void* pixels, uint32_t width, uint32_t height, VkImage&
     }
 
     std::memcpy(stagingMapped, pixels, static_cast<size_t>(imageSize));
+    if (s_pbrUploadIsSpecular)
+    {
+        sanitizeSpecularAlphaZero(static_cast<uint8_t*>(stagingMapped), size_t(width) * size_t(height));
+    }
 
     VkBuffer stagingBuffer = g_textureUploadStaging;
 
@@ -1976,11 +2021,14 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadPBRAtlases(
 
         void* normalPixels = reinterpret_cast<void*>(normalPtr);
         void* specularPixels = reinterpret_cast<void*>(specularPtr);
+        s_pbrUploadIsSpecular = false;
         g_pbrBc7AllowForNextUpload = pbrBc7PartEnabled(true);
         uploadTextureToVRAM(normalPixels, static_cast<uint32_t>(width), static_cast<uint32_t>(height), g_normalAtlasImage, g_normalAtlasMemory, g_normalAtlasView);
 
+        s_pbrUploadIsSpecular = true;
         g_pbrBc7AllowForNextUpload = pbrBc7PartEnabled(false);
         uploadTextureToVRAM(specularPixels, static_cast<uint32_t>(width), static_cast<uint32_t>(height), g_specularAtlasImage, g_specularAtlasMemory, g_specularAtlasView);
+        s_pbrUploadIsSpecular = false;
 
         g_pbrAtlasesDirty = true;
 

@@ -66,7 +66,7 @@ vec3 traceGlassSceneReflectionOneRay(
                 currentDirection,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 0u
             );
         }
@@ -79,7 +79,7 @@ vec3 traceGlassSceneReflectionOneRay(
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 0,
                 0,
                 0,
@@ -152,7 +152,7 @@ vec3 traceGlassSceneReflectionOneRay(
                         hitPomSelfShadow,
                         sunDirection
                     ) +
-                    (GI_GLASS_REFLECTION_LEGACY != 0
+                    ((GI_GLASS_REFLECTION_LEGACY != 0 && glassReflCamDist < 32.0)
                         ? evaluateVPTExactFaceDirectLighting(
                             hitPos,
                             hitNormal,

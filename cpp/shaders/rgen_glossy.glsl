@@ -1,3 +1,22 @@
+#ifndef ORION_K2I_COMPOSE_COMPUTE
+#ifndef ORION_SECTION_VERTEX_ADDR_BUFFER_DEFINED
+#define ORION_SECTION_VERTEX_ADDR_BUFFER_DEFINED
+layout(std430, binding = 21, set = 0) readonly buffer SectionVertexAddressBuffer {
+    uvec4 vertexAddresses[];
+} sectionVertexAddressBuffer;
+#endif
+
+layout(buffer_reference, scalar) readonly buffer GlossyVertexPos {
+    float x, y, z;
+};
+
+vec3 glossyLoadVertexPos(uint64_t baseAddr, uint stride, uint vertexIndex)
+{
+    GlossyVertexPos p = GlossyVertexPos(baseAddr + uint64_t(vertexIndex) * uint64_t(stride));
+    return vec3(p.x, p.y, p.z);
+}
+#endif
+
 // ============================================================================
 // 2026-11-10：glossy 反射链的俄罗斯轮盘 + 层数 LOD
 //
@@ -308,7 +327,7 @@ for(
                 currentDirection,
                 glossyRayMaxDistance,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 pathStep
             );
         }
@@ -321,7 +340,7 @@ for(
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 0,
                 0,
                 0,
@@ -1145,130 +1164,120 @@ float traceWaterReflectedSun(
 
 
     // =================================================
-    // Receiver -> Water
+    // Receiver -> Water (2026-11-26 Batch V2: inline rayQueryEXT fast-path)
     // =================================================
-    hit.hitDistance =
-        1.0;
-
-    hit.state = makeTraceState(RT_PURPOSE_CLASSIFY);
-
 #if WATER_REFLECT_SUN_OPT_V1
     const float waterReflectMaxDist = 64.0;
 #else
     const float waterReflectMaxDist = 10000.0;
 #endif
 
-#ifdef RT_ENABLE_SER
-    // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
-    if(cam.perfSerAb.z != 0u)
+    vec3 waterHitPos = receiverPos;
+#ifndef ORION_K2I_COMPOSE_COMPUTE
     {
-        serTraceRay(
-            // 2026-10-23：偏移改沿射线；沿法线会在方块边缘漏光（复盘见 :3037）
-            receiverPos + toWaterDir * 0.001,
-            0.02,
-            toWaterDir,
-            waterReflectMaxDist,
-            secondaryTraverseFlags(),
-            0xff,
-            0u
-        );
-    }
-    else
-#endif
-    {
+        rayQueryEXT waterHitQuery;
         #ifdef ORION_RT_STAGE_COUNTERS
         rtCntRayIssued();
         #endif
-        traceRayEXT(
+        rayQueryInitializeEXT(
+            waterHitQuery,
             topLevelAS,
-            secondaryTraverseFlags(),
-            0xff,
-            0,
-            0,
-            0,
+            gl_RayFlagsNoneEXT,
+            0xefu,
             receiverPos + toWaterDir * 0.001,
             0.02,
             toWaterDir,
-            waterReflectMaxDist,
-            0
+            waterReflectMaxDist
         );
-    }
+        int waterGuard = 0;
+        while(rayQueryProceedEXT(waterHitQuery) && ++waterGuard < 32)
+        {
+            if(rayQueryGetIntersectionTypeEXT(waterHitQuery, false) ==
+               gl_RayQueryCandidateIntersectionTriangleEXT)
+            {
+                const uint candSbtOff =
+                    rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(
+                        waterHitQuery, false);
+                if(candSbtOff == 3u || candSbtOff == 0u || candSbtOff == 1u)
+                {
+                    rayQueryConfirmIntersectionEXT(waterHitQuery);
+                }
+            }
+        }
+        if(rayQueryGetIntersectionTypeEXT(waterHitQuery, true) ==
+           gl_RayQueryCommittedIntersectionNoneEXT)
+        {
+            return 0.0;
+        }
+        if(rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(
+               waterHitQuery, true) != 3u)
+        {
+            return 0.0;
+        }
 
+        const uint instanceIdx =
+            uint(rayQueryGetIntersectionInstanceCustomIndexEXT(waterHitQuery, true)) +
+            uint(rayQueryGetIntersectionGeometryIndexEXT(waterHitQuery, true));
+        const uvec4 sectionAddressEntry =
+            sectionVertexAddressBuffer.vertexAddresses[instanceIdx];
+        const uint64_t rawAddr = packUint2x32(sectionAddressEntry.xy);
+        if(rawAddr == 0ul)
+        {
+            return 0.0;
+        }
 
-    // No water intersection.
-    if(payload.hitDistance < 0.0)
-    {
-        return 0.0;
-    }
+        const bool indexedQuads = (sectionAddressEntry.w & 1u) != 0u;
+        const uint sectionStride = sectionAddressEntry.w & ~1u;
+        const uint primitiveId =
+            uint(rayQueryGetIntersectionPrimitiveIndexEXT(waterHitQuery, true));
+        uint i0;
+        uint i1;
+        uint i2;
+        if(indexedQuads)
+        {
+            const uint quadBase = (primitiveId >> 1u) * 4u;
+            i0 = quadBase;
+            if((primitiveId & 1u) == 0u)
+            {
+                i1 = quadBase + 1u;
+                i2 = quadBase + 2u;
+            }
+            else
+            {
+                i1 = quadBase + 2u;
+                i2 = quadBase + 3u;
+            }
+        }
+        else
+        {
+            i0 = primitiveId * 3u;
+            i1 = i0 + 1u;
+            i2 = i0 + 2u;
+        }
 
+        const vec3 p0 = glossyLoadVertexPos(rawAddr, sectionStride, i0);
+        const vec3 p1 = glossyLoadVertexPos(rawAddr, sectionStride, i1);
+        const vec3 p2 = glossyLoadVertexPos(rawAddr, sectionStride, i2);
+        vec3 geoNormal = cross(p1 - p0, p2 - p0);
+        const float nLen2 = dot(geoNormal, geoNormal);
+        if(nLen2 <= 1.0e-12)
+        {
+            return 0.0;
+        }
+        geoNormal *= inversesqrt(nLen2);
 
-    float waterMaterialId =
-        getLegacyMaterialId(payload.state);
+        // Require Air -> Water horizontal top-facing surface.
+        if(geoNormal.y <= 0.5 || dot(geoNormal, toWaterDir) >= 0.0)
+        {
+            return 0.0;
+        }
 
-    // First intersection must actually be water.
-    if(waterMaterialId <= 0.5)
-    {
-        return 0.0;
-    }
+        const float waterHitT = rayQueryGetIntersectionTEXT(waterHitQuery, true);
+        waterHitPos = receiverPos + toWaterDir * (0.001 + waterHitT);
 
-
-    // We only want the Air -> Water top-facing surface.
-    //
-    // materialId:
-    //     1 = Air -> Water
-    //     2 = Water -> Air
-    if(waterMaterialId > 1.5)
-    {
-        return 0.0;
-    }
-
-
-    vec3 waterHitPos =
-        receiverPos +
-        toWaterDir * 0.001 +
-        toWaterDir *
-        payload.hitDistance;
-
-    vec3 waterHitNormal =
-        normalize(
-            payload.normal
-        );
-
-
-    // Reject vertical water sides.
-    // Current explicit solution is for the horizontal
-    // water surface only.
-    if(
-        dot(
-            waterHitNormal,
-            WATER_PLANE_NORMAL
-        ) < 0.5
-    )
-    {
-        return 0.0;
-    }
-
-
-    // =================================================
-    // Water -> Sun visibility
-    //
-    // The reflection only exists if this exact water point
-    // is actually exposed to the sun.
-    // =================================================
-    hit.hitDistance =
-        1.0;
-
-    hit.state = makeTraceState(RT_PURPOSE_VISIBILITY_ONLY);
-
-#if RTAO_VISIBILITY_EARLYOUT
-    // 2026-11-16：水面太阳可见性的 inline ray query 可选臂（ORION_VIS_QUERY bit1，
-    // cam.visQueryAb.y）。默认 0 = 走下方既有 traceRayEXT，逐位旧行为。
-    // 同一 TLAS / cullMask 0xff / tmin 0.02 / 同方向同射程；query 旗标只用
-    // TerminateOnFirstHit（不带 SkipClosestHitShader，理由见 AO 臂注释）。未命中写
-    // -1.0，与 rt_test.rmiss 对 purpose 3 的写入值一致（调用方按 hitDistance >= 0.0
-    // 判被遮挡；负值 = 水面暴露给太阳）。
-    if(cam.visQueryAb.y != 0u)
-    {
+        // =================================================
+        // Water -> Sun visibility (inline rayQueryEXT)
+        // =================================================
         rayQueryEXT glossSunVisQuery;
         #ifdef ORION_RT_STAGE_COUNTERS
         rtCntRayIssued();
@@ -1277,81 +1286,36 @@ float traceWaterReflectedSun(
             glossSunVisQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xff,
+            0xefu,
             waterHitPos + sunDirection * 0.001,
             0.02,
             sunDirection,
             10000.0
         );
-
         int glossSunVisGuard = 0;
-        // 防死循环上限（参照 volumetric_fog.glsl 的 proceedGuard）。
-        // 2026-11-16 修正：committed 交点必须在查询终止后读，不能在循环体里判
-        // （TerminateOnFirstHit 命中即终止，循环体可能一次都不进 ⇒ 恒判未命中 ⇒
-        // 水面永远被当成晒着太阳）。
         while(rayQueryProceedEXT(glossSunVisQuery) && ++glossSunVisGuard < 32)
         {
             if(rayQueryGetIntersectionTypeEXT(glossSunVisQuery, false) ==
                gl_RayQueryCandidateIntersectionTriangleEXT)
             {
-                rayQueryConfirmIntersectionEXT(glossSunVisQuery);
+                const uint candSbtOff =
+                    rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(
+                        glossSunVisQuery, false);
+                if(candSbtOff != 2u && candSbtOff != 3u)
+                {
+                    rayQueryConfirmIntersectionEXT(glossSunVisQuery);
+                }
             }
         }
         if(rayQueryGetIntersectionTypeEXT(glossSunVisQuery, true) !=
-            gl_RayQueryCommittedIntersectionNoneEXT)
+           gl_RayQueryCommittedIntersectionNoneEXT)
         {
-            hit.hitDistance = rayQueryGetIntersectionTEXT(glossSunVisQuery, true);
-        }
-        else
-        {
-            hit.hitDistance = -1.0;
+            return 0.0;
         }
     }
-    else
+#else
+    return 0.0;
 #endif
-#ifdef RT_ENABLE_SER
-    // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
-    if(cam.perfSerAb.y != 0u)
-    {
-        serTraceRay(
-            waterHitPos + sunDirection * 0.001,
-            0.02,
-            sunDirection,
-            10000.0,
-            gl_RayFlagsTerminateOnFirstHitEXT |
-            gl_RayFlagsSkipClosestHitShaderEXT,
-            0xff,
-            0u
-        );
-    }
-    else
-#endif
-    {
-        #ifdef ORION_RT_STAGE_COUNTERS
-        rtCntRayIssued();
-        #endif
-        traceRayEXT(
-            topLevelAS,
-            gl_RayFlagsTerminateOnFirstHitEXT |
-            gl_RayFlagsSkipClosestHitShaderEXT,
-            0xff,
-            0,
-            0,
-            0,
-            waterHitPos + sunDirection * 0.001,
-            0.02,
-            sunDirection,
-            10000.0,
-            0
-        );
-    }
-
-
-    // Something blocks the sun above the water.
-    if(hit.hitDistance >= 0.0)
-    {
-        return 0.0;
-    }
 
 
     // =================================================

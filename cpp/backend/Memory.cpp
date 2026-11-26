@@ -218,6 +218,123 @@ void createBuffer(VkDevice d,VkPhysicalDevice pd,VkDeviceSize size,VkBufferUsage
     }
 }
 
+void uploadDeviceLocalBufferOnce(
+    const void* srcData,
+    VkDeviceSize size,
+    VkBufferUsageFlags usage,
+    VkBuffer& dstBuffer,
+    VkDeviceMemory& dstMemory
+)
+{
+    if(size == 0u)
+    {
+        return;
+    }
+
+    createBuffer(
+        g_device,
+        g_physicalDevice,
+        size,
+        usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        dstBuffer,
+        dstMemory,
+        false
+    );
+
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    const bool useFillZero = (srcData == nullptr) && ((size % 4u) == 0u);
+    if(!useFillZero)
+    {
+        createBuffer(
+            g_device,
+            g_physicalDevice,
+            size,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            stagingBuffer,
+            stagingMemory,
+            true
+        );
+
+        void* mapped = nullptr;
+        check(
+            vkMapMemory(g_device, stagingMemory, 0u, size, 0u, &mapped),
+            "map one-shot device-local staging buffer failed"
+        );
+        if(srcData != nullptr)
+        {
+            std::memcpy(mapped, srcData, static_cast<size_t>(size));
+        }
+        else
+        {
+            std::memset(mapped, 0, static_cast<size_t>(size));
+        }
+        vkUnmapMemory(g_device, stagingMemory);
+    }
+
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = g_rtCommandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1u;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    check(
+        vkAllocateCommandBuffers(g_device, &allocInfo, &cmd),
+        "allocate one-shot upload command buffer failed"
+    );
+
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(cmd, &beginInfo), "begin one-shot upload failed");
+
+    if(useFillZero)
+    {
+        vkCmdFillBuffer(cmd, dstBuffer, 0u, size, 0u);
+    }
+    else
+    {
+        VkBufferCopy copyRegion{};
+        copyRegion.size = size;
+        vkCmdCopyBuffer(cmd, stagingBuffer, dstBuffer, 1u, &copyRegion);
+    }
+
+    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = dstBuffer;
+    barrier.offset = 0u;
+    barrier.size = size;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u, 0u, nullptr, 1u, &barrier, 0u, nullptr
+    );
+
+    check(vkEndCommandBuffer(cmd), "end one-shot upload failed");
+
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1u;
+    submitInfo.pCommandBuffers = &cmd;
+    check(vkQueueSubmit(g_queue, 1u, &submitInfo, VK_NULL_HANDLE), "submit one-shot upload failed");
+    check(vkQueueWaitIdle(g_queue), "wait one-shot upload failed");
+
+    vkFreeCommandBuffers(g_device, g_rtCommandPool, 1u, &cmd);
+    if(stagingBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, stagingBuffer, nullptr);
+    }
+    if(stagingMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, stagingMemory, nullptr);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2026-10-04 TLAS 视锥剔除的数学件。viewInverse / projInverse 是 JOML 列主序
 // （m[col*4+row]，CAMPROBE 处 m[12..14]=相机位置的判读同口径）。
@@ -368,7 +485,7 @@ void createCameraUBO() {
         g_physicalDevice,
         sizeof(CameraUBO),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         g_cameraUboBuffer,
         g_cameraUboMemory
     );

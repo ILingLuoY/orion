@@ -683,68 +683,29 @@ bool sameVertexPayloadParallel(
     const uint8_t* const pb = reinterpret_cast<const uint8_t*>(b.data());
     const size_t totalBytes = a.size() * sizeof(Vertex);
 
-    constexpr size_t kSerialLimit = 4u << 20;
-    if(totalBytes < kSerialLimit)
+    if(totalBytes >= 16384u)
     {
-        return std::memcmp(pa, pb, totalBytes) == 0;
-    }
-
-    constexpr size_t kProbeBytes = 256u << 10;
-    if(std::memcmp(pa, pb, kProbeBytes) != 0)
-    {
-        return false;
-    }
-
-    constexpr size_t kParts = 4u;
-    const size_t remaining = totalBytes - kProbeBytes;
-    const size_t chunkBytes =
-        ((remaining / kParts) + 63u) & ~static_cast<size_t>(63u);
-
-    std::atomic<bool> differs{false};
-
-    const auto compareRange = [pa, pb, &differs](size_t begin, size_t end)
-    {
-        constexpr size_t kStepBytes = 1u << 20;
-
-        for(size_t offset = begin; offset < end; offset += kStepBytes)
+        constexpr size_t kProbeBytes = 4096u;
+        if(std::memcmp(pa, pb, kProbeBytes) != 0)
         {
-            if(differs.load(std::memory_order_relaxed))
-            {
-                return;
-            }
-
-            const size_t length = std::min(kStepBytes, end - offset);
-
-            if(std::memcmp(pa + offset, pb + offset, length) != 0)
-            {
-                differs.store(true, std::memory_order_relaxed);
-                return;
-            }
+            return false;
         }
-    };
-
-    std::thread workers[kParts - 1u];
-
-    for(size_t partIndex = 0u; partIndex + 1u < kParts; ++partIndex)
-    {
-        const size_t partBegin =
-            std::min(kProbeBytes + partIndex * chunkBytes, totalBytes);
-        const size_t partEnd =
-            std::min(partBegin + chunkBytes, totalBytes);
-
-        workers[partIndex] = std::thread(compareRange, partBegin, partEnd);
+        const size_t midOffset =
+            ((totalBytes / 2u) - (kProbeBytes / 2u)) & ~static_cast<size_t>(63u);
+        if(std::memcmp(pa + midOffset, pb + midOffset, kProbeBytes) != 0)
+        {
+            return false;
+        }
+        if(std::memcmp(
+               pa + (totalBytes - kProbeBytes),
+               pb + (totalBytes - kProbeBytes),
+               kProbeBytes) != 0)
+        {
+            return false;
+        }
     }
 
-    compareRange(
-        std::min(kProbeBytes + (kParts - 1u) * chunkBytes, totalBytes),
-        totalBytes);
-
-    for(std::thread& worker : workers)
-    {
-        worker.join();
-    }
-
-    return !differs.load(std::memory_order_relaxed);
+    return std::memcmp(pa, pb, totalBytes) == 0;
 }
 int32_t rtSignExtendBits(uint64_t raw, uint32_t bits)
 {
@@ -1176,6 +1137,7 @@ void packSectionSplitBucketsLocked(
 
     packOne(SECTION_AS_CLASS_OPAQUE, split.opaque, split.opaquePacked);
     packOne(SECTION_AS_CLASS_OMM, split.ommCutout, split.ommCutoutPacked);
+    packOne(SECTION_AS_CLASS_OMM_LEAVES, split.ommLeaves, split.ommLeavesPacked);
     packOne(SECTION_AS_CLASS_ALPHA, split.alpha, split.alphaPacked);
     packOne(SECTION_AS_CLASS_WATER, split.water, split.waterPacked);
 }
@@ -1275,22 +1237,128 @@ void geometryCaptureSectionLocked(
         }
         else if(layerId == 1u)
         {
+            const std::vector<Vertex>& layer = layerEntry.second;
             auto ommIt = g_cutoutOmmInputs.find(layerEntry.first);
             const bool validOmm =
                 g_ommNativeEnabled &&
                 ommIt != g_cutoutOmmInputs.end() &&
                 ommIt->second.subdivisionLevel == 4u &&
                 ommIt->second.knownMicroTriangleCount > 0u &&
-                ommIt->second.triangleCount == layerEntry.second.size() / 3u;
-            if(validOmm)
+                ommIt->second.triangleCount == layer.size() / 3u;
+
+            size_t leafVertexCount = 0u;
+            for(size_t v = 0u; v + 2u < layer.size(); v += 3u)
             {
-                geometryAppendSectionVertices(split.ommCutout, layerEntry.second, 3);
-                split.ommInput = ommIt->second;
-                split.hasOmmInput = true;
+                if(std::fabs(layer[v].materialId - 0.26f) < 0.005f)
+                {
+                    leafVertexCount += 3u;
+                }
+            }
+
+            if(leafVertexCount == 0u)
+            {
+                if(validOmm)
+                {
+                    geometryAppendSectionVertices(split.ommCutout, layer, 3);
+                    split.ommInput = ommIt->second;
+                    split.hasOmmInput = true;
+                }
+                else
+                {
+                    geometryAppendSectionVertices(split.alpha, layer, 1);
+                }
             }
             else
             {
-                geometryAppendSectionVertices(split.alpha, layerEntry.second, 1);
+                constexpr uint32_t kOmmBytesPerTri = 64u;
+                const size_t triCount = layer.size() / 3u;
+                const size_t leafTriCount = leafVertexCount / 3u;
+                const size_t nonLeafTriCount = triCount - leafTriCount;
+                const size_t nonLeafVertCount = nonLeafTriCount * 3u;
+
+                split.ommLeaves.reserve(split.ommLeaves.size() + leafVertexCount);
+                if(validOmm)
+                {
+                    split.ommCutout.reserve(split.ommCutout.size() + nonLeafVertCount);
+                    split.ommInput.data.reserve(nonLeafTriCount * kOmmBytesPerTri);
+                    split.ommLeavesInput.data.reserve(leafTriCount * kOmmBytesPerTri);
+                }
+                else
+                {
+                    split.alpha.reserve(split.alpha.size() + nonLeafVertCount);
+                }
+
+                uint32_t cutoutTris = 0u;
+                uint32_t leafTris = 0u;
+                for(size_t tri = 0u; tri < triCount; ++tri)
+                {
+                    const size_t base = tri * 3u;
+                    const bool isLeafTri = std::fabs(layer[base].materialId - 0.26f) < 0.005f;
+                    if(isLeafTri)
+                    {
+                        split.ommLeaves.insert(
+                            split.ommLeaves.end(),
+                            layer.begin() + base,
+                            layer.begin() + base + 3u
+                        );
+                        if(validOmm)
+                        {
+                            const size_t ommOff = tri * kOmmBytesPerTri;
+                            split.ommLeavesInput.data.insert(
+                                split.ommLeavesInput.data.end(),
+                                ommIt->second.data.begin() + ommOff,
+                                ommIt->second.data.begin() + ommOff + kOmmBytesPerTri
+                            );
+                            ++leafTris;
+                        }
+                    }
+                    else
+                    {
+                        std::vector<Vertex>& dst = validOmm ? split.ommCutout : split.alpha;
+                        dst.insert(
+                            dst.end(),
+                            layer.begin() + base,
+                            layer.begin() + base + 3u
+                        );
+                        if(validOmm)
+                        {
+                            const size_t ommOff = tri * kOmmBytesPerTri;
+                            split.ommInput.data.insert(
+                                split.ommInput.data.end(),
+                                ommIt->second.data.begin() + ommOff,
+                                ommIt->second.data.begin() + ommOff + kOmmBytesPerTri
+                            );
+                            ++cutoutTris;
+                        }
+                    }
+                }
+
+                if(validOmm)
+                {
+                    if(cutoutTris > 0u)
+                    {
+                        split.ommInput.triangleCount = cutoutTris;
+                        split.ommInput.subdivisionLevel = 4u;
+                        split.ommInput.knownMicroTriangleCount = cutoutTris * 256u;
+                        split.hasOmmInput = true;
+                    }
+                    else
+                    {
+                        split.ommInput.data.clear();
+                        split.ommInput.triangleCount = 0u;
+                        split.ommInput.subdivisionLevel = 0u;
+                        split.ommInput.knownMicroTriangleCount = 0u;
+                        split.hasOmmInput = false;
+                    }
+
+                    if(leafTris > 0u)
+                    {
+                        split.ommLeavesInput.triangleCount = leafTris;
+                        split.ommLeavesInput.subdivisionLevel = 4u;
+                        split.ommLeavesInput.knownMicroTriangleCount = leafTris * 256u;
+                        split.hasOmmLeavesInput = true;
+                    }
+                }
             }
         }
         else if(layerId == 3u)
@@ -1522,6 +1590,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
     segment.arenaEpoch = g_captureArenaEpoch;
     segment.ommInput = split.ommInput;
     segment.hasOmmInput = split.hasOmmInput;
+    segment.ommLeavesInput = split.ommLeavesInput;
+    segment.hasOmmLeavesInput = split.hasOmmLeavesInput;
 
     size_t totalBytes = 0u;
 
@@ -1529,6 +1599,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         captureArenaPlanPiece(split.opaque, totalBytes);
     const size_t ommOffset =
         captureArenaPlanPiece(split.ommCutout, totalBytes);
+    const size_t ommLeavesOffset =
+        captureArenaPlanPiece(split.ommLeaves, totalBytes);
     const size_t alphaOffset =
         captureArenaPlanPiece(split.alpha, totalBytes);
     const size_t waterOffset =
@@ -1551,6 +1623,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         captureArenaPlanPiece(split.opaquePacked, totalBytes);
     const size_t ommPackedOffset =
         captureArenaPlanPiece(split.ommCutoutPacked, totalBytes);
+    const size_t ommLeavesPackedOffset =
+        captureArenaPlanPiece(split.ommLeavesPacked, totalBytes);
     const size_t alphaPackedOffset =
         captureArenaPlanPiece(split.alphaPacked, totalBytes);
     const size_t waterPackedOffset =
@@ -1567,6 +1641,7 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
 
     captureArenaCopyPiece(split.opaque, base, opaqueOffset, segment.opaque);
     captureArenaCopyPiece(split.ommCutout, base, ommOffset, segment.ommCutout);
+    captureArenaCopyPiece(split.ommLeaves, base, ommLeavesOffset, segment.ommLeaves);
     captureArenaCopyPiece(split.alpha, base, alphaOffset, segment.alpha);
     captureArenaCopyPiece(split.water, base, waterOffset, segment.water);
     captureArenaCopyPiece(split.entity, base, entityOffset, segment.entity);
@@ -1589,6 +1664,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         split.opaquePacked, base, opaquePackedOffset, segment.opaquePacked);
     captureArenaCopyPiece(
         split.ommCutoutPacked, base, ommPackedOffset, segment.ommCutoutPacked);
+    captureArenaCopyPiece(
+        split.ommLeavesPacked, base, ommLeavesPackedOffset, segment.ommLeavesPacked);
     captureArenaCopyPiece(
         split.alphaPacked, base, alphaPackedOffset, segment.alphaPacked);
     captureArenaCopyPiece(
@@ -1654,6 +1731,7 @@ size_t sectionSplitPoolScore(const SectionGeometrySplit& split)
 {
     return split.opaque.capacity() +
         split.ommCutout.capacity() +
+        split.ommLeaves.capacity() +
         split.alpha.capacity() +
         split.water.capacity() +
         split.entity.capacity() +
@@ -1731,6 +1809,7 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
     const bool hasCapacity =
         split.opaque.capacity() != 0u ||
         split.ommCutout.capacity() != 0u ||
+        split.ommLeaves.capacity() != 0u ||
         split.alpha.capacity() != 0u ||
         split.water.capacity() != 0u ||
         split.entity.capacity() != 0u ||
@@ -1745,6 +1824,7 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
 
     split.opaque.clear();
     split.ommCutout.clear();
+    split.ommLeaves.clear();
     split.alpha.clear();
     split.water.clear();
     split.entity.clear();
@@ -1755,10 +1835,13 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
     split.particleMotion.clear();
     split.opaquePacked.clear();
     split.ommCutoutPacked.clear();
+    split.ommLeavesPacked.clear();
     split.alphaPacked.clear();
     split.waterPacked.clear();
     split.hasOmmInput = false;
     split.ommInput = OmmCutoutInput{};
+    split.hasOmmLeavesInput = false;
+    split.ommLeavesInput = OmmCutoutInput{};
 
     std::lock_guard<std::mutex> lock(g_sectionSplitPoolMutex);
 
@@ -2161,6 +2244,7 @@ void geometryCaptureWorkerLoop()
                         slowestCaptureVertices =
                             update.split.opaque.size() +
                             update.split.ommCutout.size() +
+                            update.split.ommLeaves.size() +
                             update.split.alpha.size() +
                             update.split.water.size() +
                             update.split.entity.size() +
@@ -2879,6 +2963,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
             {
                 quadVerts[v].materialId =
                     0.25f;
+            }
+            else if(materialMarker == 26u)
+            {
+                quadVerts[v].materialId =
+                    0.26f;
             }
             else if(materialMarker == 24u)
             {

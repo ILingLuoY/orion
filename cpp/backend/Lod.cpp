@@ -1090,6 +1090,7 @@ void rebuildLodCoverage(
         static_cast<size_t>(g_lodCoverageWordCount) * sizeof(uint32_t);
 
     std::memset(g_lodCoverageMapped, 0, coverageBytes);
+    markLodCoverageDirty();
 
     LodCoverageHeader* header =
         static_cast<LodCoverageHeader*>(g_lodCoverageMapped);

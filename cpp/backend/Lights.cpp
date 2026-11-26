@@ -228,8 +228,7 @@ void ensureDynamicLightBuffer()
         g_physicalDevice,
         DYNAMIC_LIGHT_BUFFER_BYTES,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         g_dynamicLightBuffer,
         g_dynamicLightMemory
     );
@@ -295,7 +294,8 @@ void recordDynamicLightUpload(VkCommandBuffer cmd)
     barrier.size = DYNAMIC_LIGHT_BUFFER_BYTES;
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0u, 0u, nullptr, 1u,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u, 0u, nullptr, 1u,
         &barrier, 0u, nullptr);
 
     g_dynamicLightsDirty = false;

@@ -150,7 +150,7 @@
   "waterFftChoppiness": 1.6,
   "waterFftTilePeriod": 65.0,
   "waterFftDetail": 0.0,
-  "postTonemapMode": 6,
+  "postTonemapMode": 0,
   "postExposureStrength": 0.5,
   "postContrast": 1.0,
   "postSaturation": 1.1,
@@ -212,7 +212,7 @@
     0.0,
     45.0,
     0.0,
-    1.0,
+    -0.01,
     0.0,
     0.0,
     0.6,
@@ -343,5 +343,6 @@
   "fogTintR": 1.0,
   "fogTintG": 1.0,
   "fogTintB": 1.0,
-  "cloudTemporalMode": 2
+  "cloudTemporalMode": 2,
+  "customUpscalePercent": 0
 }

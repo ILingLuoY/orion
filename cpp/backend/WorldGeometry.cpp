@@ -713,7 +713,8 @@ bool rebuildWorldGeometry(
                     it->second.sectionKey & ~SPATIAL_SECTION_KEY_MASK;
 
                 if(classBits != SECTION_AS_CLASS_OPAQUE &&
-                   classBits != SECTION_AS_CLASS_OMM)
+                   classBits != SECTION_AS_CLASS_OMM &&
+                   classBits != SECTION_AS_CLASS_OMM_LEAVES)
                 {
                     continue;
                 }
@@ -762,7 +763,8 @@ bool rebuildWorldGeometry(
                     asEntry.sectionKey & ~SPATIAL_SECTION_KEY_MASK;
 
                 if(classBits != SECTION_AS_CLASS_OPAQUE &&
-                   classBits != SECTION_AS_CLASS_OMM)
+                   classBits != SECTION_AS_CLASS_OMM &&
+                   classBits != SECTION_AS_CLASS_OMM_LEAVES)
                 {
                     continue;
                 }
@@ -1493,6 +1495,7 @@ bool rebuildWorldGeometry(
 
         if(update.second.opaque.empty() &&
            update.second.ommCutout.empty() &&
+           update.second.ommLeaves.empty() &&
            update.second.alpha.empty() &&
            update.second.water.empty() &&
            update.second.entity.empty() &&
@@ -1512,7 +1515,7 @@ bool rebuildWorldGeometry(
             std::span<const SectionVertex> packed;
         };
 
-        constexpr size_t RT_GEOMETRY_CLASS_COUNT = 7u;
+        constexpr size_t RT_GEOMETRY_CLASS_COUNT = 8u;
 
         const RtGeometryClassPlan geometryClassPlan[RT_GEOMETRY_CLASS_COUNT] =
         {
@@ -1523,6 +1526,10 @@ bool rebuildWorldGeometry(
               update.second.ommCutout, false,
               update.second.hasOmmInput ? &update.second.ommInput : nullptr,
               {}, update.second.ommCutoutPacked },
+            { spatialSectionKey | SECTION_AS_CLASS_OMM_LEAVES,
+              update.second.ommLeaves, false,
+              update.second.hasOmmLeavesInput ? &update.second.ommLeavesInput : nullptr,
+              {}, update.second.ommLeavesPacked },
             { spatialSectionKey | SECTION_AS_CLASS_ALPHA,
               update.second.alpha, false, nullptr, {},
               update.second.alphaPacked },
@@ -1570,8 +1577,10 @@ bool rebuildWorldGeometry(
             // 见上方 ommMsThisFrame 声明处注释；ORION_OMM_MS_PER_FRAME 可调
             // （默认 3.0，0 = 不限）。
             if(plan.ommInput != nullptr &&
-               (plan.classKey & ~SPATIAL_SECTION_KEY_MASK) ==
-                   SECTION_AS_CLASS_OMM)
+               ((plan.classKey & ~SPATIAL_SECTION_KEY_MASK) ==
+                    SECTION_AS_CLASS_OMM ||
+                (plan.classKey & ~SPATIAL_SECTION_KEY_MASK) ==
+                    SECTION_AS_CLASS_OMM_LEAVES))
             {
                 // 2026-11-13：见 ommMsThisFrame 声明处注释。预算按「本帧累计
                 // OMM 耗时」而非段数。
@@ -3300,6 +3309,10 @@ bool rebuildWorldGeometry(
                 s_cullPrimaryMaskedCount += 1;
             }
 
+            // 2026-11-26 (Batch V, Feature 4): Reserve bit 4 (0x10) exclusively for the paired
+            // solid-cube leaves instance used by volumetric light / fog queries.
+            instance.mask &= static_cast<uint8_t>(~0x10u);
+
             if(geometryClass == SECTION_AS_CLASS_OPAQUE)
             {
                 instance.instanceShaderBindingTableRecordOffset =
@@ -3309,6 +3322,12 @@ bool rebuildWorldGeometry(
             {
                 instance.instanceShaderBindingTableRecordOffset =
                     SBT_RECORD_OMM;
+            }
+            else if(geometryClass == SECTION_AS_CLASS_OMM_LEAVES)
+            {
+                instance.mask = primaryMaskCull ? 0xe6u : 0xe7u;
+                instance.instanceShaderBindingTableRecordOffset =
+                    section.hasOpacityMicromap ? SBT_RECORD_OMM : SBT_RECORD_ALPHA;
             }
             else if(geometryClass == SECTION_AS_CLASS_WATER)
             {
@@ -3355,8 +3374,11 @@ bool rebuildWorldGeometry(
                 (!opaqueGeometry && !ommGeometry) ||
                 (kTLAS_LOD_FORCE_NO_OPAQUE && lodSpatialKey);
 
+            const bool ommLeafCutout =
+                (geometryClass == SECTION_AS_CLASS_OMM_LEAVES) && ommGeometry;
+
             instance.flags =
-                (geometryClass == SECTION_AS_CLASS_OMM
+                ((geometryClass == SECTION_AS_CLASS_OMM || ommLeafCutout)
                     ? 0u
                     : VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR) |
                 (
@@ -3367,6 +3389,23 @@ bool rebuildWorldGeometry(
 
             instance.accelerationStructureReference =
                 section.blasAddress;
+
+            if(geometryClass == SECTION_AS_CLASS_OMM_LEAVES)
+            {
+                instances.push_back(instance);
+                VkAccelerationStructureInstanceKHR solidLeavesInstance = instance;
+                solidLeavesInstance.mask = 0x10u;
+                solidLeavesInstance.instanceShaderBindingTableRecordOffset =
+                    SBT_RECORD_OPAQUE;
+                solidLeavesInstance.flags =
+                    VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR |
+                    VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR |
+                    (section.hasOpacityMicromap
+                        ? VK_GEOMETRY_INSTANCE_DISABLE_OPACITY_MICROMAPS_EXT
+                        : 0u);
+                instances.push_back(solidLeavesInstance);
+                continue;
+            }
 
 
             // 2026-11-12 实例化第 2 步：该 mesh 若登记了 N 组变换，就发 N 个实例

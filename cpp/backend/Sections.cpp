@@ -2755,6 +2755,7 @@ bool sectionUsesPackedVertices(
 
     if(geometryClass != SECTION_AS_CLASS_OPAQUE &&
        geometryClass != SECTION_AS_CLASS_OMM &&
+       geometryClass != SECTION_AS_CLASS_OMM_LEAVES &&
        geometryClass != SECTION_AS_CLASS_ALPHA &&
        geometryClass != SECTION_AS_CLASS_WATER)
     {
@@ -3046,6 +3047,9 @@ VkDeviceSize createSectionBLAS(
 
     buildInfo.flags =
         VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+        (section.hasOpacityMicromap
+            ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_EXT
+            : 0) |
         (refitCapable
             ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR
             : 0) |
@@ -3494,6 +3498,9 @@ void recordSectionBLASBuild(
 
     buildInfo.flags =
         VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+        (section.hasOpacityMicromap
+            ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_EXT
+            : 0) |
         (section.refitCapable
             ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR
             : 0) |
@@ -3588,20 +3595,60 @@ void recordSectionBLASBuild(
 }
 
 
+namespace
+{
+    uint32_t s_sectionVertexAddressDirtyMin = 0xFFFFFFFFu;
+    uint32_t s_sectionVertexAddressDirtyMax = 0u;
+    uint32_t s_sectionRoleDirtyMin = 0xFFFFFFFFu;
+    uint32_t s_sectionRoleDirtyMax = 0u;
+    bool s_lodCoverageDirty = false;
+}
+
+void markLodCoverageDirty()
+{
+    s_lodCoverageDirty = true;
+}
+
 void destroySectionVertexAddressBuffer()
 {
     if(
         g_sectionVertexAddressMapped != nullptr &&
-        g_sectionVertexAddressMemory != VK_NULL_HANDLE
+        g_sectionVertexAddressStagingMemory != VK_NULL_HANDLE
     )
     {
         vkUnmapMemory(
             g_device,
-            g_sectionVertexAddressMemory
+            g_sectionVertexAddressStagingMemory
         );
 
         g_sectionVertexAddressMapped =
             nullptr;
+    }
+
+
+    if(g_sectionVertexAddressStagingBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(
+            g_device,
+            g_sectionVertexAddressStagingBuffer,
+            nullptr
+        );
+
+        g_sectionVertexAddressStagingBuffer =
+            VK_NULL_HANDLE;
+    }
+
+
+    if(g_sectionVertexAddressStagingMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(
+            g_device,
+            g_sectionVertexAddressStagingMemory,
+            nullptr
+        );
+
+        g_sectionVertexAddressStagingMemory =
+            VK_NULL_HANDLE;
     }
 
 
@@ -3638,14 +3685,38 @@ void destroySectionVertexAddressBuffer()
     // 2026-11-15：槽位表重建 ⇒ 存活位图必须一起清空（见文件头槽位竞态说明）。
     g_sectionSlotLiveBits.clear();
 
-    if(g_sectionRoleMapped != nullptr && g_sectionRoleMemory != VK_NULL_HANDLE)
+    if(g_sectionRoleMapped != nullptr && g_sectionRoleStagingMemory != VK_NULL_HANDLE)
     {
         vkUnmapMemory(
             g_device,
-            g_sectionRoleMemory
+            g_sectionRoleStagingMemory
         );
 
         g_sectionRoleMapped = nullptr;
+    }
+
+
+    if(g_sectionRoleStagingBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(
+            g_device,
+            g_sectionRoleStagingBuffer,
+            nullptr
+        );
+
+        g_sectionRoleStagingBuffer = VK_NULL_HANDLE;
+    }
+
+
+    if(g_sectionRoleStagingMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(
+            g_device,
+            g_sectionRoleStagingMemory,
+            nullptr
+        );
+
+        g_sectionRoleStagingMemory = VK_NULL_HANDLE;
     }
 
 
@@ -3673,14 +3744,38 @@ void destroySectionVertexAddressBuffer()
     }
 
 
-    if(g_lodCoverageMapped != nullptr && g_lodCoverageMemory != VK_NULL_HANDLE)
+    if(g_lodCoverageMapped != nullptr && g_lodCoverageStagingMemory != VK_NULL_HANDLE)
     {
         vkUnmapMemory(
             g_device,
-            g_lodCoverageMemory
+            g_lodCoverageStagingMemory
         );
 
         g_lodCoverageMapped = nullptr;
+    }
+
+
+    if(g_lodCoverageStagingBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(
+            g_device,
+            g_lodCoverageStagingBuffer,
+            nullptr
+        );
+
+        g_lodCoverageStagingBuffer = VK_NULL_HANDLE;
+    }
+
+
+    if(g_lodCoverageStagingMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(
+            g_device,
+            g_lodCoverageStagingMemory,
+            nullptr
+        );
+
+        g_lodCoverageStagingMemory = VK_NULL_HANDLE;
     }
 
 
@@ -3709,6 +3804,12 @@ void destroySectionVertexAddressBuffer()
 
 
     g_lodCoverageWordCount = 0;
+
+    s_sectionVertexAddressDirtyMin = 0xFFFFFFFFu;
+    s_sectionVertexAddressDirtyMax = 0u;
+    s_sectionRoleDirtyMin = 0xFFFFFFFFu;
+    s_sectionRoleDirtyMax = 0u;
+    s_lodCoverageDirty = false;
 }
 
 
@@ -3829,11 +3930,22 @@ void createSectionVertexAddressTable()
         g_device,
         g_physicalDevice,
         tableBytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         g_sectionVertexAddressBuffer,
         g_sectionVertexAddressMemory
+    );
+
+    createBuffer(
+        g_device,
+        g_physicalDevice,
+        tableBytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        g_sectionVertexAddressStagingBuffer,
+        g_sectionVertexAddressStagingMemory,
+        true
     );
 
 
@@ -3842,7 +3954,7 @@ void createSectionVertexAddressTable()
     check(
         vkMapMemory(
             g_device,
-            g_sectionVertexAddressMemory,
+            g_sectionVertexAddressStagingMemory,
             0,
             tableBytes,
             0,
@@ -3853,6 +3965,12 @@ void createSectionVertexAddressTable()
 
     g_sectionVertexAddressMapped =
         mapped;
+
+    std::memset(
+        g_sectionVertexAddressMapped,
+        0,
+        static_cast<size_t>(tableBytes)
+    );
 
 
     g_sectionVertexAddressCapacity =
@@ -3876,6 +3994,8 @@ void createSectionVertexAddressTable()
     static_cast<GPUSectionVertexAddress*>(
         g_sectionVertexAddressMapped
     )[0] = placeholder;
+    s_sectionVertexAddressDirtyMin = 0u;
+    s_sectionVertexAddressDirtyMax = SECTION_VERTEX_ADDRESS_SLOT_LIMIT;
 
 
     constexpr VkDeviceSize roleBytes =
@@ -3888,11 +4008,22 @@ void createSectionVertexAddressTable()
         g_device,
         g_physicalDevice,
         roleBytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         g_sectionRoleBuffer,
         g_sectionRoleMemory
+    );
+
+    createBuffer(
+        g_device,
+        g_physicalDevice,
+        roleBytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        g_sectionRoleStagingBuffer,
+        g_sectionRoleStagingMemory,
+        true
     );
 
 
@@ -3901,7 +4032,7 @@ void createSectionVertexAddressTable()
     check(
         vkMapMemory(
             g_device,
-            g_sectionRoleMemory,
+            g_sectionRoleStagingMemory,
             0,
             roleBytes,
             0,
@@ -3917,6 +4048,8 @@ void createSectionVertexAddressTable()
         0,
         static_cast<size_t>(roleBytes)
     );
+    s_sectionRoleDirtyMin = 0u;
+    s_sectionRoleDirtyMax = SECTION_VERTEX_ADDRESS_SLOT_LIMIT;
 
 
     g_lodCoverageWordCount =
@@ -3934,11 +4067,22 @@ void createSectionVertexAddressTable()
         g_device,
         g_physicalDevice,
         coverageBytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         g_lodCoverageBuffer,
         g_lodCoverageMemory
+    );
+
+    createBuffer(
+        g_device,
+        g_physicalDevice,
+        coverageBytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        g_lodCoverageStagingBuffer,
+        g_lodCoverageStagingMemory,
+        true
     );
 
 
@@ -3947,7 +4091,7 @@ void createSectionVertexAddressTable()
     check(
         vkMapMemory(
             g_device,
-            g_lodCoverageMemory,
+            g_lodCoverageStagingMemory,
             0,
             coverageBytes,
             0,
@@ -3965,6 +4109,7 @@ void createSectionVertexAddressTable()
         0,
         static_cast<size_t>(coverageBytes)
     );
+    s_lodCoverageDirty = true;
 
 
     updateSectionVertexAddressDescriptor();
@@ -4019,6 +4164,15 @@ void writeSectionVertexAddressSlot(
     static_cast<GPUSectionVertexAddress*>(
         g_sectionVertexAddressMapped
     )[section.vertexAddressSlot] = entry;
+
+    if(section.vertexAddressSlot < s_sectionVertexAddressDirtyMin)
+    {
+        s_sectionVertexAddressDirtyMin = section.vertexAddressSlot;
+    }
+    if(section.vertexAddressSlot + 1u > s_sectionVertexAddressDirtyMax)
+    {
+        s_sectionVertexAddressDirtyMax = section.vertexAddressSlot + 1u;
+    }
 }
 
 
@@ -4242,6 +4396,129 @@ void writeSectionRoleSlot(const RTSectionAS& section)
     static_cast<uint32_t*>(
         g_sectionRoleMapped
     )[section.vertexAddressSlot] = role;
+
+    if(section.vertexAddressSlot < s_sectionRoleDirtyMin)
+    {
+        s_sectionRoleDirtyMin = section.vertexAddressSlot;
+    }
+    if(section.vertexAddressSlot + 1u > s_sectionRoleDirtyMax)
+    {
+        s_sectionRoleDirtyMax = section.vertexAddressSlot + 1u;
+    }
+}
+
+void recordSectionTablesSync(VkCommandBuffer cmd)
+{
+    if(cmd == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkBufferMemoryBarrier barriers[3]{};
+    uint32_t barrierCount = 0u;
+
+    auto addBarrier = [&](VkBuffer buf, VkDeviceSize offset, VkDeviceSize size)
+    {
+        VkBufferMemoryBarrier& b = barriers[barrierCount++];
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = buf;
+        b.offset = offset;
+        b.size = size;
+    };
+
+    if(s_sectionVertexAddressDirtyMin < s_sectionVertexAddressDirtyMax &&
+       g_sectionVertexAddressStagingBuffer != VK_NULL_HANDLE &&
+       g_sectionVertexAddressBuffer != VK_NULL_HANDLE &&
+       g_sectionVertexAddressCapacity > 0u)
+    {
+        const uint32_t clampedMax = std::min<uint32_t>(
+            s_sectionVertexAddressDirtyMax,
+            static_cast<uint32_t>(g_sectionVertexAddressCapacity));
+        if(s_sectionVertexAddressDirtyMin < clampedMax)
+        {
+            const VkDeviceSize off =
+                static_cast<VkDeviceSize>(s_sectionVertexAddressDirtyMin) *
+                sizeof(GPUSectionVertexAddress);
+            const VkDeviceSize len =
+                static_cast<VkDeviceSize>(clampedMax - s_sectionVertexAddressDirtyMin) *
+                sizeof(GPUSectionVertexAddress);
+            const VkBufferCopy region{off, off, len};
+            vkCmdCopyBuffer(
+                cmd,
+                g_sectionVertexAddressStagingBuffer,
+                g_sectionVertexAddressBuffer,
+                1u,
+                &region);
+            addBarrier(g_sectionVertexAddressBuffer, off, len);
+        }
+        s_sectionVertexAddressDirtyMin = 0xFFFFFFFFu;
+        s_sectionVertexAddressDirtyMax = 0u;
+    }
+
+    if(s_sectionRoleDirtyMin < s_sectionRoleDirtyMax &&
+       g_sectionRoleStagingBuffer != VK_NULL_HANDLE &&
+       g_sectionRoleBuffer != VK_NULL_HANDLE &&
+       g_sectionVertexAddressCapacity > 0u)
+    {
+        const uint32_t clampedMax = std::min<uint32_t>(
+            s_sectionRoleDirtyMax,
+            static_cast<uint32_t>(g_sectionVertexAddressCapacity));
+        if(s_sectionRoleDirtyMin < clampedMax)
+        {
+            const VkDeviceSize off =
+                static_cast<VkDeviceSize>(s_sectionRoleDirtyMin) *
+                sizeof(uint32_t);
+            const VkDeviceSize len =
+                static_cast<VkDeviceSize>(clampedMax - s_sectionRoleDirtyMin) *
+                sizeof(uint32_t);
+            const VkBufferCopy region{off, off, len};
+            vkCmdCopyBuffer(
+                cmd,
+                g_sectionRoleStagingBuffer,
+                g_sectionRoleBuffer,
+                1u,
+                &region);
+            addBarrier(g_sectionRoleBuffer, off, len);
+        }
+        s_sectionRoleDirtyMin = 0xFFFFFFFFu;
+        s_sectionRoleDirtyMax = 0u;
+    }
+
+    if(s_lodCoverageDirty &&
+       g_lodCoverageStagingBuffer != VK_NULL_HANDLE &&
+       g_lodCoverageBuffer != VK_NULL_HANDLE &&
+       g_lodCoverageWordCount > 0u)
+    {
+        const VkDeviceSize coverageBytes =
+            static_cast<VkDeviceSize>(sizeof(LodCoverageHeader)) +
+            static_cast<VkDeviceSize>(g_lodCoverageWordCount) * sizeof(uint32_t);
+        const VkBufferCopy region{0u, 0u, coverageBytes};
+        vkCmdCopyBuffer(
+            cmd,
+            g_lodCoverageStagingBuffer,
+            g_lodCoverageBuffer,
+            1u,
+            &region);
+        addBarrier(g_lodCoverageBuffer, 0u, coverageBytes);
+        s_lodCoverageDirty = false;
+    }
+
+    if(barrierCount > 0u)
+    {
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u,
+            0u, nullptr,
+            barrierCount, barriers,
+            0u, nullptr);
+    }
 }
 
 namespace

@@ -138,26 +138,12 @@ void createGlassBlueNoiseBuffer()
         }
     }
 
-    createBuffer(
-        g_device,
-        g_physicalDevice,
+    uploadDeviceLocalBufferOnce(
+        data.data(),
         static_cast<VkDeviceSize>(kBlueNoiseBytes),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
         g_glassBlueNoiseBuffer,
-        g_glassBlueNoiseMemory,
-        true);
-
-    void* mapped = nullptr;
-    check(
-        vkMapMemory(
-            g_device, g_glassBlueNoiseMemory, 0u,
-            static_cast<VkDeviceSize>(kBlueNoiseBytes), 0u, &mapped),
-        "map blue noise buffer failed");
-
-    std::memcpy(mapped, data.data(), kBlueNoiseBytes);
-    vkUnmapMemory(g_device, g_glassBlueNoiseMemory);
+        g_glassBlueNoiseMemory);
 
     g_glassBlueNoiseReady = true;
 

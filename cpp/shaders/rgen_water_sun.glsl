@@ -114,7 +114,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 currentDir,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 step
             );
         }
@@ -128,7 +128,7 @@ const float WATER_EXTINCTION_DISTANCE =
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 0,
                 0,
                 0,
@@ -501,14 +501,52 @@ float eta =
             );
     }
 
-    // 2026-11-15：步数耗尽语义。旧行为一律 return 0（视作被挡）——远档
-    // （着色点超出"太阳透射距离"）只走 1 步：水底 march 穿出水面即耗尽
-    // ⇒ 远处水底直射太阳/焦散整片消失，透射观感随设置跳变。现在：最后
-    // 一步已完成 Water->Air 出射（人在空中）⇒ 剩余是明确的天空直线，
-    // 近档的下一 trace 要么 miss（返回同一 transmittance）要么进入新
-    // 界面 ⇒ 单水柱场景近档/远档逐位一致，透射与设置解耦。仍在水中/
-    // 玻璃内耗尽 ⇒ 维持旧的保守 0。
-    return exitedToAir ? transmittance : vec3(0.0);
+    // 2026-11-15：步数耗尽语义。
+    // 2026-11-26 (Batch V, Bug 2): When exitedToAir is true after marching out of water,
+    // check whether a cave roof or solid block occludes the sun above the exit point.
+    if(!exitedToAir)
+    {
+        return vec3(0.0);
+    }
+#ifndef ORION_K2I_COMPOSE_COMPUTE
+    {
+        rayQueryEXT waterSunRoofQuery;
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
+        rayQueryInitializeEXT(
+            waterSunRoofQuery,
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT,
+            0xefu,
+            currentOrigin + currentDir * 0.02,
+            0.02,
+            currentDir,
+            256.0
+        );
+        int waterSunRoofGuard = 0;
+        while(rayQueryProceedEXT(waterSunRoofQuery) && ++waterSunRoofGuard < 32)
+        {
+            if(rayQueryGetIntersectionTypeEXT(waterSunRoofQuery, false) ==
+               gl_RayQueryCandidateIntersectionTriangleEXT)
+            {
+                const uint candSbtOff =
+                    rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(
+                        waterSunRoofQuery, false);
+                if(candSbtOff != 2u && candSbtOff != 3u)
+                {
+                    rayQueryConfirmIntersectionEXT(waterSunRoofQuery);
+                }
+            }
+        }
+        if(rayQueryGetIntersectionTypeEXT(waterSunRoofQuery, true) !=
+           gl_RayQueryCommittedIntersectionNoneEXT)
+        {
+            return vec3(0.0);
+        }
+    }
+#endif
+    return transmittance;
 }
 const float PI =
     3.14159265359;

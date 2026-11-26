@@ -16,7 +16,11 @@
 // 可编译稳定路径回到 B① 内联块（rgen_k2_material_inline.glsl，由
 // gen_k2_block_inline.py 从 rchit 前言生成），编译期旗标 ORION_K2_MATERIAL_INLINE
 // 选择；不加旗标保持 callable 路径（D1 调试用，现行部署的 rt_test_k2.rgen.spv）。
-#ifdef ORION_K2_MATERIAL_INLINE
+#if defined(ORION_K2_CONSUMER_MAT_REUSE_ONLY)
+// 消费者腿（K2-SUNB / K2-LOC / K2-I）只从 binding 94（MatReuseSSBO）读 K2-SUNA / K2-SUN
+// 解析好的材质快照，编译期整段剥离 ~2500 行 rgen_k2_material_inline / material_resolve
+// 树以压缩 SPV 体积、I-Cache 抖动与寄存器溢出。
+#elif defined(ORION_K2_MATERIAL_INLINE)
 #include "rgen_k2_material_inline.glsl"
 #else
 #include "material_callable.glsl"

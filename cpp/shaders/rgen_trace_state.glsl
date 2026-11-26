@@ -49,14 +49,15 @@ layout(std430, binding = 19, set = 0) readonly buffer SerLodRoles {
 #define SER_ROLE_TERRAIN 0u
 #define SER_ROLE_SLOT_LIMIT (1u << 16)
 
-void serTraceRay(
+void serTraceRayOffset(
     vec3 origin,
     float tMin,
     vec3 direction,
     float tMax,
     uint rayFlags,
     uint cullMask,
-    uint hint
+    uint hint,
+    uint sbtOffset
 )
 {
     // RT 计数器：SER 漏斗入口计一次射线（与下方 fallback 的 traceRayEXT 臂一一对应）。
@@ -109,7 +110,7 @@ void serTraceRay(
             topLevelAS,
             rayFlags,
             cullMask,
-            0,
+            sbtOffset,
             0,
             0,
             origin,
@@ -127,7 +128,7 @@ void serTraceRay(
         topLevelAS,
         rayFlags,
         cullMask,
-        0,
+        sbtOffset,
         0,
         0,
         origin,
@@ -197,6 +198,19 @@ void serTraceRay(
     }
 }
 
+void serTraceRay(
+    vec3 origin,
+    float tMin,
+    vec3 direction,
+    float tMax,
+    uint rayFlags,
+    uint cullMask,
+    uint hint
+)
+{
+    serTraceRayOffset(origin, tMin, direction, tMax, rayFlags, cullMask, hint, 0u);
+}
+
 // Entry point of the diffuse-GI bounce.  Kept as a named wrapper so the call
 // site and its measured behaviour stay recognisable; the body is now the shared
 // funnel, so GI cannot drift away from the other paths.
@@ -208,7 +222,7 @@ void traceDiffuseSer(vec3 origin, vec3 direction, uint bouncePhase)
         direction,
         perfGiTraceMaxDistance(10000.0),
         secondaryTraverseFlags(),
-        0xff,
+        0xefu,
         bouncePhase
     );
 }
@@ -294,6 +308,7 @@ const uint RT_STATE_PARTICLE_BIT       = 1u << 16u;
 // 回退：宿主 ORION_GI_NO_POM=0（CameraUBO.giHalfParams.z 写 0）。
 // =====================================================
 const uint RT_STATE_GI_NO_POM_BIT      = 1u << 17u;
+const uint RT_STATE_FOLIAGE_BIT        = 1u << 18u;
 
 // 2026-11-09：次级射线（反射 / 水体 / 玻璃后）跳过 POM 的宿主开关。
 // 复用同一个 state 位与同一条早退路径（rchit 播种 → getPOMDepthScale() 返 0），

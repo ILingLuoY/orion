@@ -188,6 +188,7 @@ public class LevelRendererMixin {
         com.example.client.FrameBudget.beginCaptureHead();
         rtx$partialTick = Minecraft.getInstance().getDeltaTracker().getGameTimeDeltaPartialTick(false);
         rtx$logJavaMemory();
+        long rtx$tV0 = System.nanoTime();
         VoxyLodManager.tick();
         long rtx$t0 = System.nanoTime();
         DhBridge.tick();
@@ -200,8 +201,16 @@ public class LevelRendererMixin {
         EntityRtCapture.beginEarlyFrame();
         ParticleRtCapture.beginFrame();
         DynamicLightCapture.submitFrame();
+        long rtx$t3 = System.nanoTime();
         rtx$uploadVisibleSections(cameraState);
-        VoxyLodManager.perfAdd(VoxyLodManager.PERF_CAPTURE, System.nanoTime() - rtx$t2);
+        long rtx$t4 = System.nanoTime();
+        VoxyLodManager.perfAdd(VoxyLodManager.PERF_CAPTURE, rtx$t4 - rtx$t2);
+        com.example.client.FrameBudget.recordCaptureHeadBreakdown(
+                (rtx$t0 - rtx$tV0) / 1_000_000.0,
+                (rtx$t1 - rtx$t0) / 1_000_000.0,
+                (rtx$t2 - rtx$t1) / 1_000_000.0,
+                (rtx$t3 - rtx$t2) / 1_000_000.0,
+                (rtx$t4 - rtx$t3) / 1_000_000.0);
         com.example.client.FrameBudget.endCaptureHead();
     }
 

@@ -776,7 +776,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->playerX = static_cast<float>(playerX);
     ubo->playerY = static_cast<float>(playerY);
     ubo->playerZ = static_cast<float>(playerZ);
-    ubo->playerInWater = playerInWater > 0.5f ? 1.0f : 0.0f;
+    ubo->playerInWater =
+        playerInWater > 1.5f ? 2.0f : (playerInWater > 0.5f ? 1.0f : 0.0f);
     ubo->playerVelocityX = static_cast<float>(playerVelocityX);
     ubo->playerVelocityY = static_cast<float>(playerVelocityY);
     ubo->playerVelocityZ = static_cast<float>(playerVelocityZ);
@@ -799,7 +800,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     g_waterNearbySurfaceY = static_cast<float>(waterSurfaceY);
 
     if(g_waterSimPlayerStateValid &&
-       nowInWater != g_waterSimPlayerWasInWater)
+       nowInWater != g_waterSimPlayerWasInWater &&
+       g_waterSimLastSurfaceY > -500.0f &&
+       std::fabs(ubo->playerY - g_waterSimLastSurfaceY) <= 2.5f)
     {
         const float eventSpeed = std::sqrt(
             ubo->playerVelocityX * ubo->playerVelocityX +
@@ -848,8 +851,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
         1.0f / static_cast<float>(WATER_SIM_MASK_EXTENT);
     ubo->glassCausticParams[3] =
         (maskValidSnapshot && (nowInWater || nearbyWaterSurfaceOk)) ? 1.0f : 0.0f;
-    ubo->cameraInWater =
-        cameraInWater > 0.5f ? 1u : 0u;
+    const bool camInWaterNow = cameraInWater > 0.5f;
+    const float underwaterSkyFactor = camInWaterNow
+        ? std::clamp(cameraInWater - 1.0f, 0.0f, 1.0f)
+        : 1.0f;
+    ubo->cameraInWater = camInWaterNow ? 1u : 0u;
     g_cameraInWater.store(ubo->cameraInWater, std::memory_order_relaxed);
     // 2026-11-21 车道改写：GLSL vec4 waterSimImpulse 原装玩家入水脉冲
     //（着色端零读者 —— sim 侧走 push 常量不经此路），改载群系水色
@@ -916,6 +922,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     populateSkyModelParams(ubo->skyModelParams);
     populateMoonParams(ubo->moonParams);
     populateFogMoodParams(ubo->fogMoodParams);
+    ubo->fogMoodParams[2] = underwaterSkyFactor;
+    {
+        const bool hasWaterSectionsInit =
+            !g_tlasWaterSectionCountValid.load(std::memory_order_relaxed) ||
+            g_tlasWaterSectionCount.load(std::memory_order_relaxed) > 0u;
+        ubo->fogMoodParams[3] = hasWaterSectionsInit ? 1.0f : 0.0f;
+    }
     populateWindParams(ubo->windParams);
     populateGalaxyParams(ubo->galaxyParams);
     populateGodRayParams(ubo->godRayParams);
@@ -2248,6 +2261,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
                 1.0f / static_cast<float>(WATER_SIM_MASK_EXTENT);
             g_cameraUboHost.glassCausticParams[3] =
                 (maskValidNow && (nowInWaterNow || nearbyWaterSurfaceNow)) ? 1.0f : 0.0f;
+            const bool hasWaterSectionsNow =
+                !g_tlasWaterSectionCountValid.load(std::memory_order_relaxed) ||
+                g_tlasWaterSectionCount.load(std::memory_order_relaxed) > 0u;
+            g_cameraUboHost.fogMoodParams[3] = hasWaterSectionsNow ? 1.0f : 0.0f;
         }
         vkCmdUpdateBuffer(
             cmd,
@@ -2278,6 +2295,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u,
             &cameraBarrier, 0u, nullptr);
     }
+
+    recordSectionTablesSync(cmd);
 
     recordDynamicLightUpload(cmd);
 
@@ -2337,6 +2356,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     perfL10CpuPhaseAdvance(PERF_L10_CPU_P_VLI);
 
     {
+        ScopedVkDebugLabel vliLabel(cmd, "VLI-LightGrid");
         const auto rtxVliBegin = std::chrono::steady_clock::now();
 
         recordVLIUpdates(cmd);
@@ -3834,7 +3854,10 @@ if(rrGuideBarrierCount > 0)
 
     setPerfL10GpuRenderSize(renderWidth, renderHeight);
     rtCheckpoint(cmd, "frame:sky-atmo");
-    recordSkyAtmosphere(cmd);
+    {
+        ScopedVkDebugLabel skyLabel(cmd, "Sky-Atmosphere");
+        recordSkyAtmosphere(cmd);
+    }
 
     recordVolumeRestir(cmd, renderWidth, renderHeight);
     rtSpikeSky = rtMark();
@@ -3866,7 +3889,10 @@ if(rrGuideBarrierCount > 0)
         nullptr
     );
 
-    recordSparseActiveMask(cmd, renderWidth, renderHeight);
+    {
+        ScopedVkDebugLabel sparseMaskLabel(cmd, "Sparse-Mask");
+        recordSparseActiveMask(cmd, renderWidth, renderHeight);
+    }
 
     recordGlassAlphaBlendPrepare(cmd);
 
@@ -3874,30 +3900,15 @@ if(rrGuideBarrierCount > 0)
     //（2026-11-16 主管线退役定案：6-stage 主单体创建点全 #if 0，单发 fallback
     // 随之消失——traceK1K2 失败=腿创建失败，整局无 RT 属既有口径）。
     rtCheckpoint(cmd, "frame:trace-start");
-    if(!traceK1K2(
-           cmd,
-           renderWidth,
-           renderHeight
-       ))
     {
-        // 腿创建失败时整局无 RT：空管线 dispatch 会直接 AV，这里必须挡住。
-#if 0
-        // 2026-11-16 退役：g_rayTracingPipeline 恒 null，单发主管线 fallback
-        // 不复存在（回滚 = 还原三处 main 创建点后去掉本 #if 0）。
-        if(g_rayTracingPipeline != VK_NULL_HANDLE)
+        ScopedVkDebugLabel rtK1K2Label(cmd, "RT-K1K2");
+        if(!traceK1K2(
+               cmd,
+               renderWidth,
+               renderHeight
+           ))
         {
-            trace(
-                cmd,
-                &g_raygenRegion,
-                &g_missRegion,
-                &g_hitRegion,
-                &g_callableRegion,
-                renderWidth,
-                renderHeight,
-                1
-            );
         }
-#endif
     }
     rtCheckpoint(cmd, "frame:trace-done");
     rtSpikeTrace = rtMark();
@@ -4232,7 +4243,8 @@ if(rrGuideBarrierCount > 0)
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
 
         0,
 
@@ -4397,7 +4409,8 @@ if(dlssLayoutBarrierCount > 0)
 
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
 
         0,
 
@@ -5416,7 +5429,7 @@ rrTransparencyHint.usage =
             vkCmdPipelineBarrier(
                 cmd,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0u, 0u, nullptr, 0u, nullptr, 1u, &expInit);
 
             g_dlssExposureLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -5694,14 +5707,17 @@ sl::ResourceTag outputTag(
         }
 
 
-        sl::Result dlssResult =
-            g_slEvaluateFeature(
+        sl::Result dlssResult = sl::Result::eOk;
+        {
+            ScopedVkDebugLabel dlssLabel(cmd, useSR ? "DLSS-SR" : "DLSS-RR");
+            dlssResult = g_slEvaluateFeature(
                 useSR ? sl::kFeatureDLSS : sl::kFeatureDLSS_RR,
                 *frameToken,
                 inputs,
                 inputCount,
                 slCmd
             );
+        }
 
 
         static bool hasLoggedRREvaluateResult = false;
@@ -6009,7 +6025,9 @@ if(g_volumetricCloudResolvedImage != VK_NULL_HANDLE)
 vkCmdPipelineBarrier(
     cmd,
 
-    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 
     0,
@@ -6027,6 +6045,7 @@ vkCmdPipelineBarrier(
 
 
 {
+    ScopedVkDebugLabel aeLabel(cmd, "AutoExposure");
     const bool aeActive =
         g_aeHistogramPipeline != VK_NULL_HANDLE &&
         g_aeAdaptPipeline != VK_NULL_HANDLE &&
@@ -6218,12 +6237,15 @@ vkCmdPipelineBarrier(
         );
 
 
-        vkCmdDispatch(
-            cmd,
-            1,
-            1,
-            1
-        );
+        {
+            ScopedVkDebugLabel aeAdaptLabel(cmd, "AE-Adapt");
+            vkCmdDispatch(
+                cmd,
+                1,
+                1,
+                1
+            );
+        }
 
 
 
@@ -6296,7 +6318,7 @@ vkCmdPipelineBarrier(
             vkCmdPipelineBarrier(
                 cmd,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0u, 0u, nullptr, 0u, nullptr, 1u, &expPostBarrier);
         }
 
@@ -6365,21 +6387,24 @@ vkCmdPipelineBarrier(
             );
 
 
-            vkCmdDispatch(
-                cmd,
+            {
+                ScopedVkDebugLabel aeHistLabel(cmd, "AE-Histogram");
+                vkCmdDispatch(
+                    cmd,
 
-                (
-                    g_dlssOutputWidth +
-                    63
-                ) / 64,
+                    (
+                        g_dlssOutputWidth +
+                        63
+                    ) / 64,
 
-                (
-                    g_dlssOutputHeight +
-                    63
-                ) / 64,
+                    (
+                        g_dlssOutputHeight +
+                        63
+                    ) / 64,
 
-                1
-            );
+                    1
+                );
+            }
         }
 
 
@@ -6435,6 +6460,8 @@ vkCmdPipelineBarrier(
 
 recordBloom(cmd);
 
+{
+ScopedVkDebugLabel sdrLabel(cmd, "SDR-Post");
 bakeAces2Lut3DIfNeeded(cmd);
 
 vkCmdBindPipeline(
@@ -6504,21 +6531,25 @@ vkCmdBindDescriptorSets(
     );
 }
 
-vkCmdDispatch(
-    cmd,
+{
+    ScopedVkDebugLabel sdrToneLabel(cmd, "SDR-Tonemap");
+    vkCmdDispatch(
+        cmd,
 
-    (
-        g_dlssOutputWidth +
-        7
-    ) / 8,
+        (
+            g_dlssOutputWidth +
+            7
+        ) / 8,
 
-    (
-        g_dlssOutputHeight +
-        7
-    ) / 8,
+        (
+            g_dlssOutputHeight +
+            7
+        ) / 8,
 
-    1
-);
+        1
+    );
+}
+}
 
 
 writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SDR);
@@ -6657,7 +6688,9 @@ dlssToTransfer.subresourceRange.layerCount = 1;
 vkCmdPipelineBarrier(
     cmd,
 
-    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+        VK_PIPELINE_STAGE_TRANSFER_BIT |
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 
     VK_PIPELINE_STAGE_TRANSFER_BIT,
 
@@ -6744,20 +6777,23 @@ blit.dstSubresource.layerCount = 1;
                 1
             };
         }
-        vkCmdBlitImage(
-            cmd,
+        {
+            ScopedVkDebugLabel blitLabel(cmd, "Blit-Present");
+            vkCmdBlitImage(
+                cmd,
 
-            g_dlssOutputImage,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                g_dlssOutputImage,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 
-            target,
-            targetLayout,
+                target,
+                targetLayout,
 
-            1,
-            &blit,
+                1,
+                &blit,
 
-            VK_FILTER_NEAREST
-        );
+                VK_FILTER_NEAREST
+            );
+        }
 
         writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_BLIT);
 
@@ -6775,6 +6811,7 @@ if(
     )
 )
 {
+ScopedVkDebugLabel fgLabel(cmd, "DLSS-FG");
     VkImageMemoryBarrier
         hudlessBarriers[2]{};
 
@@ -6865,7 +6902,9 @@ if(
     vkCmdPipelineBarrier(
         cmd,
 
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_TRANSFER_BIT |
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
 
         0,
@@ -7129,7 +7168,7 @@ vkCmdPipelineBarrier(
 
     VK_PIPELINE_STAGE_TRANSFER_BIT,
 
-    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 
     0,
 

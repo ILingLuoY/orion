@@ -567,15 +567,23 @@ VkBuffer g_sectionVertexAddressBuffer =
     VK_NULL_HANDLE;
 VkDeviceMemory g_sectionVertexAddressMemory =
     VK_NULL_HANDLE;
+VkBuffer g_sectionVertexAddressStagingBuffer =
+    VK_NULL_HANDLE;
+VkDeviceMemory g_sectionVertexAddressStagingMemory =
+    VK_NULL_HANDLE;
 size_t g_sectionVertexAddressCapacity = 0;
 uint32_t g_sectionVertexAddressNextSlot = 1u;
 std::vector<uint32_t> g_sectionVertexAddressFreeSlots;
 void* g_sectionVertexAddressMapped = nullptr;
 VkBuffer g_sectionRoleBuffer = VK_NULL_HANDLE;
 VkDeviceMemory g_sectionRoleMemory = VK_NULL_HANDLE;
+VkBuffer g_sectionRoleStagingBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_sectionRoleStagingMemory = VK_NULL_HANDLE;
 void* g_sectionRoleMapped = nullptr;
 VkBuffer g_lodCoverageBuffer = VK_NULL_HANDLE;
 VkDeviceMemory g_lodCoverageMemory = VK_NULL_HANDLE;
+VkBuffer g_lodCoverageStagingBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_lodCoverageStagingMemory = VK_NULL_HANDLE;
 void* g_lodCoverageMapped = nullptr;
 uint32_t g_lodCoverageWordCount = 0;
 VkDeviceMemory g_blasScratchMemory=VK_NULL_HANDLE;
@@ -1875,6 +1883,7 @@ size_t
 
 std::atomic<bool>
     g_localLightsDirty = true;
+std::atomic<uint32_t> g_vptTotalEmitterCount{0u};
 VkBuffer g_sharcHashEntriesBuffer = VK_NULL_HANDLE;
 VkDeviceMemory g_sharcHashEntriesMemory = VK_NULL_HANDLE;
 VkBuffer g_sharcAccumulationBuffer = VK_NULL_HANDLE;
@@ -2143,10 +2152,21 @@ VkPipeline g_k2iCompactPipeline = VK_NULL_HANDLE;
 bool g_k2iCompactPipelineFailed = false;
 VkPipeline g_k2locCompactPipeline = VK_NULL_HANDLE;
 bool g_k2locCompactPipelineFailed = false;
+VkPipeline g_k1GlassCompactPipeline = VK_NULL_HANDLE;
+bool g_k1GlassCompactPipelineFailed = false;
+VkPipeline g_sharcCompactPipeline = VK_NULL_HANDLE;
+bool g_sharcCompactPipelineFailed = false;
 // ④ K2-D 再拆分（默认开，ORION_K2_SPLIT2=0 回退到 ③ 的 K2-D/K2-I 两腿）：
 // K2-SUN（水+太阳直射/GGX/SSS/RTAO）+ K2-LOC（局部光/水面反射太阳/GGX 镜面）
+VkPipeline g_k1GlassPipeline = VK_NULL_HANDLE;
 VkPipeline g_k2sunPipeline = VK_NULL_HANDLE;
 VkPipeline g_k2locPipeline = VK_NULL_HANDLE;
+VkPipeline g_k2locNeePipeline = VK_NULL_HANDLE;
+VkPipeline g_k2locGlossyPipeline = VK_NULL_HANDLE;
+VkStridedDeviceAddressRegionKHR g_k1GlassRaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k1GlassMissRegion{};
+VkStridedDeviceAddressRegionKHR g_k1GlassHitRegion{};
+VkStridedDeviceAddressRegionKHR g_k1GlassCallableRegion{};
 VkStridedDeviceAddressRegionKHR g_k2sunRaygenRegion{};
 VkStridedDeviceAddressRegionKHR g_k2sunMissRegion{};
 VkStridedDeviceAddressRegionKHR g_k2sunHitRegion{};
@@ -2155,6 +2175,14 @@ VkStridedDeviceAddressRegionKHR g_k2locRaygenRegion{};
 VkStridedDeviceAddressRegionKHR g_k2locMissRegion{};
 VkStridedDeviceAddressRegionKHR g_k2locHitRegion{};
 VkStridedDeviceAddressRegionKHR g_k2locCallableRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locNeeRaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locNeeMissRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locNeeHitRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locNeeCallableRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locGlossyRaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locGlossyMissRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locGlossyHitRegion{};
+VkStridedDeviceAddressRegionKHR g_k2locGlossyCallableRegion{};
 // ⑤ K2-SUN 再拆分（默认开，ORION_K2_SPLIT3=0 回退 ④ 三腿）：K2-SUNA（水+RTAO）
 // + K2-SUNB（阴影+GGX+植被SSS，load-add 复用 binding 89）。全局量定义跟随 ④。
 VkPipeline g_k2sunAPipeline = VK_NULL_HANDLE;

@@ -19,6 +19,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // 2026-10-30 方案 A：次级辐射射线要用 gl_RayFlagsForceOpacityMicromap2StateEXT，
 // glslang 要求显式请求该扩展（否则报 "required extension not requested"）。
 #extension GL_EXT_opacity_micromap : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
 #ifdef RT_ENABLE_SER
 #extension GL_EXT_shader_invocation_reorder : require
 #endif
@@ -335,7 +337,7 @@ layout(binding = 92, set = 0, rgba16f)
 uniform image2D k2GiTraceImage;
 #endif
 
-#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE
+#if defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE
 layout(std430, binding = 100, set = 0) readonly buffer K2iSparseCompactSSBO
 {
     uint width;
@@ -803,7 +805,7 @@ ivec2 sharcUpdateBlockOffset(const ivec2 sharcBlock, const uint blockSize)
 // 所以 update 变体里不能拿 gl_LaunchSizeEXT 做屏幕归一化。
 ivec2 rtLaunchSize()
 {
-#if SHARC_UPDATE || defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)
+#if SHARC_UPDATE || defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K1_GLASS_ONLY)
     return imageSize(image);
 #else
     return ivec2(gl_LaunchSizeEXT.xy);
@@ -2181,60 +2183,89 @@ vec3 evaluateVLIEmitterRadianceAtHit(
 )
 {
     vec3 blockFaceNormal = vptDominantBlockFaceNormal(hitNormal);
+    vec3 fracPos = fract(hitPos);
+    vec3 distToFace = min(fracPos, vec3(1.0) - fracPos);
+    float nearestFace = min(distToFace.x, min(distToFace.y, distToFace.z));
 #if VLI_EMITTER_GEOMETRIC_AXIS
+    if(nearestFace <= VLI_EMITTER_FACE_EPS)
     {
-        vec3 fracPos = fract(hitPos);
-        vec3 distToFace = min(fracPos, vec3(1.0) - fracPos);
-        float nearestFace = min(distToFace.x, min(distToFace.y, distToFace.z));
-        if(nearestFace <= VLI_EMITTER_FACE_EPS)
+        // 最近的那条轴就是命中点所在的面；符号沿用着色法线在该轴上的方向
+        // （外法线方向）。这样"往体内 0.02 格"必然落在**本块**里。
+        vec3 sampleNormal = normalize(hitNormal);
+        int axis = 0;
+        if(distToFace.y == nearestFace)
         {
-            // 最近的那条轴就是命中点所在的面；符号沿用着色法线在该轴上的方向
-            // （外法线方向）。这样"往体内 0.02 格"必然落在**本块**里。
-            vec3 sampleNormal = normalize(hitNormal);
-            int axis = 0;
-            if(distToFace.y == nearestFace)
-            {
-                axis = 1;
-            }
-            else if(distToFace.z == nearestFace)
-            {
-                axis = 2;
-            }
-            vec3 geometricFace = vec3(0.0);
-            geometricFace[axis] = sampleNormal[axis] >= 0.0 ? 1.0 : -1.0;
-            blockFaceNormal = geometricFace;
+            axis = 1;
         }
+        else if(distToFace.z == nearestFace)
+        {
+            axis = 2;
+        }
+        vec3 geometricFace = vec3(0.0);
+        geometricFace[axis] = sampleNormal[axis] >= 0.0 ? 1.0 : -1.0;
+        blockFaceNormal = geometricFace;
     }
 #endif
     ivec3 sourceBlock;
     uint source = 0u;
 #if VLI_EMITTER_SOLID_SIDE
     {
-        // 两侧各退半格，取**占用**那一侧（class 1 整格，或 class 3 半砖/栅栏
-        // 这类部分遮挡方块——它们同样是命中面的所有者）。见 VLI_EMITTER_SOLID_SIDE。
-        ivec3 cellInside = ivec3(floor(hitPos - blockFaceNormal * 0.5));
-        ivec3 cellOutside = ivec3(floor(hitPos + blockFaceNormal * 0.5));
-        uint insideSource = 0u;
-        uint outsideSource = 0u;
-        bool insideSolid = vptReadSourceVoxel(cellInside, insideSource) &&
-            vptVoxelOccupied(insideSource);
-        bool outsideSolid = vptReadSourceVoxel(cellOutside, outsideSource) &&
-            vptVoxelOccupied(outsideSource);
-        if(insideSolid)
+        // 2026-11-26 (Batch V, Bug 1b): Non-opaque emissive geometry (e.g. fire/soul_fire) sits inside a
+        // class-2 translucent voxel rather than class 1/3 solid. If we hit inside the cell
+        // (nearestFace > VLI_EMITTER_FACE_EPS), check cellAt first before +/-0.5 solid-side probing.
+        bool resolvedNonOpaque = false;
+        ivec3 cellAt = ivec3(floor(hitPos));
+        if(nearestFace > VLI_EMITTER_FACE_EPS)
         {
-            sourceBlock = cellInside;
-            source = insideSource;
+            uint atSource = 0u;
+            if(vptReadSourceVoxel(cellAt, atSource) &&
+               ((atSource & 3u) == 2u) &&
+               (((atSource >> 2u) & 15u) > 0u))
+            {
+                sourceBlock = cellAt;
+                source = atSource;
+                resolvedNonOpaque = true;
+            }
         }
-        else if(outsideSolid)
+        if(!resolvedNonOpaque)
         {
-            // 法线符号在缝上翻了面：以**占用**为准，不信符号。
-            sourceBlock = cellOutside;
-            source = outsideSource;
-        }
-        else
-        {
-            sourceBlock = cellInside;
-            source = 0u;
+            // 两侧各退半格，取**占用**那一侧（class 1 整格，或 class 3 半砖/栅栏
+            // 这类部分遮挡方块——它们同样是命中面的所有者）。见 VLI_EMITTER_SOLID_SIDE。
+            ivec3 cellInside = ivec3(floor(hitPos - blockFaceNormal * 0.5));
+            ivec3 cellOutside = ivec3(floor(hitPos + blockFaceNormal * 0.5));
+            uint insideSource = 0u;
+            uint outsideSource = 0u;
+            bool insideSolid = vptReadSourceVoxel(cellInside, insideSource) &&
+                vptVoxelOccupied(insideSource);
+            bool outsideSolid = vptReadSourceVoxel(cellOutside, outsideSource) &&
+                vptVoxelOccupied(outsideSource);
+            if(insideSolid)
+            {
+                sourceBlock = cellInside;
+                source = insideSource;
+            }
+            else if(outsideSolid)
+            {
+                // 法线符号在缝上翻了面：以**占用**为准，不信符号。
+                sourceBlock = cellOutside;
+                source = outsideSource;
+            }
+            else
+            {
+                uint atSource = 0u;
+                if(vptReadSourceVoxel(cellAt, atSource) &&
+                   ((atSource & 3u) == 2u) &&
+                   (((atSource >> 2u) & 15u) > 0u))
+                {
+                    sourceBlock = cellAt;
+                    source = atSource;
+                }
+                else
+                {
+                    sourceBlock = cellInside;
+                    source = 0u;
+                }
+            }
         }
     }
 #else
@@ -3634,7 +3665,7 @@ void neeVisCacheKey(
 
 uvec2 rtLogicalPixelCoord()
 {
-#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
+#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE) && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
     if(k2iSparseCompact.mode != 0u)
     {
         const uint compactIdx = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
@@ -3890,25 +3921,31 @@ vec3 evaluateVPTRISDirectLightingSingle(
             }
 
             vec3 candPos = basePos + safeOffset;
-            vec3 midPos  = basePos + safeOffset * 0.5;
-            ivec3 baseBlk = ivec3(floor(basePos));
-            ivec3 midBlk  = ivec3(floor(midPos));
-            ivec3 endBlk  = ivec3(floor(candPos));
-
-            bool midBlocked = false;
-            if(any(notEqual(midBlk, baseBlk)))
+            ivec3 baseCell = ivec3(floor(basePos / 4.0));
+            ivec3 candCell = ivec3(floor(candPos / 4.0));
+            vec3 gridLookupPos = basePos;
+            if(any(notEqual(candCell, baseCell)))
             {
-                uint midSrc = 0u;
-                midBlocked = vptReadSourceVoxel(midBlk, midSrc) && ((midSrc & 3u) == 1u);
-            }
-            bool endBlocked = midBlocked;
-            if(!endBlocked && any(notEqual(endBlk, midBlk)) && any(notEqual(endBlk, baseBlk)))
-            {
-                uint endSrc = 0u;
-                endBlocked = vptReadSourceVoxel(endBlk, endSrc) && ((endSrc & 3u) == 1u);
-            }
+                vec3 midPos  = basePos + safeOffset * 0.5;
+                ivec3 baseBlk = ivec3(floor(basePos));
+                ivec3 midBlk  = ivec3(floor(midPos));
+                ivec3 endBlk  = ivec3(floor(candPos));
 
-            vec3 gridLookupPos = !endBlocked ? candPos : (!midBlocked ? midPos : basePos);
+                bool midBlocked = false;
+                if(any(notEqual(midBlk, baseBlk)))
+                {
+                    uint midSrc = 0u;
+                    midBlocked = vptReadSourceVoxel(midBlk, midSrc) && ((midSrc & 3u) == 1u);
+                }
+                bool endBlocked = midBlocked;
+                if(!endBlocked && any(notEqual(endBlk, midBlk)) && any(notEqual(endBlk, baseBlk)))
+                {
+                    uint endSrc = 0u;
+                    endBlocked = vptReadSourceVoxel(endBlk, endSrc) && ((endSrc & 3u) == 1u);
+                }
+
+                gridLookupPos = !endBlocked ? candPos : (!midBlocked ? midPos : basePos);
+            }
             ivec3 relCell = ivec3(floor(gridLookupPos / 4.0)) - gridOrigin;
             if(all(greaterThanEqual(relCell, ivec3(0))) &&
                all(lessThan(relCell, ivec3(40, 20, 40))))
@@ -4657,7 +4694,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
             receiverOrigin,
             selectedSample,
             targetVoxelEntryDistance,
-            0xffu
+            0xefu
         )
         : vptTraceGlassTransmissionToEmitter(
             receiverOrigin,
@@ -4838,7 +4875,7 @@ const float DYNAMIC_LIGHT_VISIBILITY_SHORTEN = 0.6;
 // 要让那时也放行，需要给"本地玩家实体"单独一个 mask 位（native 按实体打标），留待需要时。
 //
 // 回退：改成 0xffu 即逐位回到改动前（包含"自己的模型挡自己的光"）。
-const uint DYNAMIC_LIGHT_CULL_MASK = 0xfdu;
+const uint DYNAMIC_LIGHT_CULL_MASK = 0xedu;
 
 // 颜色：优先用记录里带的**任意 RGB**（meta.y 的 8/8/8）；为 0 时回退到既有调色板
 // （vliDecodeEmitterColor）—— 于是"只给 typeCode"的记录仍然有效，两条路在火把上的
@@ -6908,9 +6945,10 @@ vec3 applyUnderwaterWaterColumn(
         ? min(hitDistance, 512.0)
         : UNDERWATER_DEEP_COLUMN;
     // 归一化到 0（地平线/夜）..1（正午）的天光，与云层用的 daylight 同源。
+    // 2026-11-26 (Batch V, Bug 2): Attenuate underwater sky column in covered caves via fogMoodParams.z.
     float skyLight = clamp(
         getClearTimeDrivenSkyLightRadianceScale() / TIME_DRIVEN_SUN_NOON_SCALE,
-        0.0, 1.0);
+        0.0, 1.0) * clamp(cam.fogMoodParams.z, 0.0, 1.0);
     vec3 skyColor = samplePhysicalClearSkyForAerialPerspective(vec3(0.0, 1.0, 0.0));
     return radiance * underwaterAbsorption(waterDistance) +
         underwaterScatter(worldDirection, skyColor, waterDistance, skyLight);
@@ -8090,7 +8128,7 @@ vec3 vptLocalEmitterSampleTransmittance(
             receiverOrigin,
             selectedSample,
             targetVoxelEntryDistance,
-            0xffu
+            0xefu
         )
         : vptTraceGlassTransmissionToEmitter(
             receiverOrigin,
@@ -8946,14 +8984,20 @@ struct GlassSurfaceInfo {
 #include "rgen_pbr_eval.glsl"
 #include "rgen_sun_lighting.glsl"
 #include "rgen_local_lights.glsl"
-#ifndef ORION_K2I_COMPOSE_COMPUTE
+#if !defined(ORION_K2I_COMPOSE_COMPUTE) && !defined(ORION_K1_DEFER_GLASS) && !defined(ORION_K2_LOC_NEE_ONLY) && !defined(ORION_K2_DIRECT_SUN_STAGE_B) && !SHARC_UPDATE
+#if !defined(ORION_K2_LOC_GLOSSY_ONLY) && !defined(ORION_K2_INDIRECT_TRACE_ONLY)
 #include "rgen_glass_reflection.glsl"
+#endif
 #include "rgen_receiver_gi.glsl"
+#if !defined(ORION_K2_LOC_GLOSSY_ONLY) && !defined(ORION_K2_INDIRECT_TRACE_ONLY)
 #include "rgen_water_caustics.glsl"
 #include "rgen_glass_primary.glsl"
 #include "rgen_transparent_primary.glsl"
 #include "rgen_water_receiver.glsl"
+#endif
+#if !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K1_GLASS_ONLY)
 #include "rgen_glossy.glsl"
+#endif
 #endif
 #include "rgen_dh_far.glsl"
 #include "rgen_vpt_sparse.glsl"

@@ -1289,13 +1289,10 @@ void createAeStateBuffers()
         sizeof(uint32_t);
 
 
-    createBuffer(
-        g_device,
-        g_physicalDevice,
+    uploadDeviceLocalBufferOnce(
+        nullptr,
         histogramBytes,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
         g_aeHistogramBuffer,
         g_aeHistogramMemory
     );
@@ -1314,34 +1311,6 @@ void createAeStateBuffers()
 
 
     {
-
-        void* histogramMapped =
-            nullptr;
-
-        check(
-            vkMapMemory(
-                g_device,
-                g_aeHistogramMemory,
-                0,
-                histogramBytes,
-                0,
-                &histogramMapped
-            ),
-            "map AE histogram buffer failed"
-        );
-
-        memset(
-            histogramMapped,
-            0,
-            size_t(histogramBytes)
-        );
-
-        vkUnmapMemory(
-            g_device,
-            g_aeHistogramMemory
-        );
-
-
         void* stateMapped =
             nullptr;
 
@@ -4531,6 +4500,7 @@ void createBloomResources(uint32_t outputWidth, uint32_t outputHeight)
 // 回退：设 ORION_BLOOM_SKIP_ZERO=0 恢复照旧录制整条链。
 void recordBloom(VkCommandBuffer cmd)
 {
+    ScopedVkDebugLabel bloomLabel(cmd, "Bloom");
     static const bool skipZeroBloom = []()
     {
         const char* raw = std::getenv("ORION_BLOOM_SKIP_ZERO");
@@ -4573,10 +4543,7 @@ void recordBloom(VkCommandBuffer cmd)
         barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 1u, &barrier, 0u, nullptr, 0u, nullptr);
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 1u, &barrier, 0u, nullptr, 0u, nullptr);
     }
 

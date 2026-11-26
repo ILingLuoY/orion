@@ -62,6 +62,13 @@ void ptLandingInvalidate(uint index)
     ptLandingRecords[index].c.w = 0u;
 }
 
+void ptLandingMarkGlass(uint index, vec2 dbgMotion)
+{
+    ptLandingRecords[index].a.x = 0.25;
+    ptLandingRecords[index].c.w = 0u;
+    ptLandingRecords[index].e.zw = dbgMotion;
+}
+
 // 切点身份快照。payload 此刻 = K1 精简 rchit 播种的身份五元组：
 //   hitDistance = gl_HitTEXT
 //   normal.xyz  = (资源槽位, primitiveIndex, baryX)

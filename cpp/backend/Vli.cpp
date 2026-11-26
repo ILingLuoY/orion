@@ -1134,6 +1134,13 @@ void createVLILightResources()
         g_vliPageTableMemory
     );
 
+    const uint32_t targetInitCap = std::min(vliPageCapacityLimit(), 3200u);
+    if(targetInitCap > g_vliPageCapacity)
+    {
+        g_vliPageCapacity = targetInitCap;
+        g_vliPageSectionKeys.resize(g_vliPageCapacity, VLI_INVALID_SECTION_KEY);
+    }
+
     createVLIPoolBuffers();
 
     g_vliNeedsInitialClear = true;
@@ -2015,6 +2022,25 @@ void rebuildVPTCandidateNeighborhoodLocked(
 // the emitter payloads.  Returns false when a new page is required while the
 // pool is at its current capacity: the payloads are then untouched and the
 // caller has to park the Section until the render thread has grown the pool.
+static void vliAdjustTotalEmitters(uint32_t removed, uint32_t added)
+{
+    if(added == removed)
+    {
+        return;
+    }
+    uint32_t cur = g_vptTotalEmitterCount.load(std::memory_order_relaxed);
+    while(true)
+    {
+        const uint32_t afterRemove = (cur > removed) ? (cur - removed) : 0u;
+        const uint32_t next = afterRemove + added;
+        if(g_vptTotalEmitterCount.compare_exchange_weak(
+               cur, next, std::memory_order_relaxed, std::memory_order_relaxed))
+        {
+            break;
+        }
+    }
+}
+
 bool applyVLISectionVoxelsLocked(
     uint64_t sectionKey,
     int32_t sectionX,
@@ -2031,9 +2057,14 @@ bool applyVLISectionVoxelsLocked(
 
     if(pageIt != g_vliSections.end())
     {
+        const uint32_t oldEc = pageIt->second.emitterIndexWords.empty()
+            ? 0u : pageIt->second.emitterIndexWords[0];
+        const uint32_t newEc = emitterIndexWords.empty()
+            ? 0u : emitterIndexWords[0];
         pageIt->second.sourceWords = std::move(incoming);
         pageIt->second.emitterIndexWords = std::move(emitterIndexWords);
         pageIt->second.emitterAliasWords = std::move(emitterAliasWords);
+        vliAdjustTotalEmitters(oldEc, newEc);
         pageIndex = pageIt->second.pageIndex;
 
         pageIt->second.lastUseTick = ++g_vliPageUseTick;
@@ -2098,6 +2129,9 @@ bool applyVLISectionVoxelsLocked(
         page.sourceWords = std::move(incoming);
         page.emitterIndexWords = std::move(emitterIndexWords);
         page.emitterAliasWords = std::move(emitterAliasWords);
+        const uint32_t newEc = page.emitterIndexWords.empty()
+            ? 0u : page.emitterIndexWords[0];
+        vliAdjustTotalEmitters(0u, newEc);
         g_vliSections.emplace(sectionKey, std::move(page));
         g_vliPageSectionKeys[pageIndex] = sectionKey;
         vliChunkIndexAdd(sectionX, sectionZ, sectionKey);
@@ -2167,10 +2201,13 @@ void refreshVPTEmitterSectionFromLocalLights(
                 emitterRevision
             );
 
+        const uint32_t oldEc = pageIt->second.emitterIndexWords.empty()
+            ? 0u : pageIt->second.emitterIndexWords[0];
         emitterCount = emitterIndexWords[0];
         pageIt->second.emitterIndexWords = std::move(emitterIndexWords);
         pageIt->second.emitterAliasWords =
             buildVPTEmitterAliasWords(pageIt->second.emitterIndexWords);
+        vliAdjustTotalEmitters(oldEc, emitterCount);
         pageIndex = pageIt->second.pageIndex;
         hasVoxelPage = true;
 
@@ -3161,6 +3198,7 @@ void clearVLISections()
     std::lock_guard<std::mutex> lock(g_vliMutex);
     vliLockHoldProbe.mark();
     g_vliSections.clear();
+    g_vptTotalEmitterCount.store(0u, std::memory_order_relaxed);
     g_vliChunkSectionIndex.clear();
 
     {
@@ -3441,6 +3479,9 @@ static bool evictFarthestVLIPageImpl(
 
         if(victimIt != g_vliSections.end())
         {
+            const uint32_t oldEc = victimIt->second.emitterIndexWords.empty()
+                ? 0u : victimIt->second.emitterIndexWords[0];
+            vliAdjustTotalEmitters(oldEc, 0u);
             s_vliEvictGarbage.push_back(std::move(victimIt->second));
 
             // JNI 线程可能在两个 drain 之间攒很多，兜底：攒到 16 个就地清一次。
@@ -4402,6 +4443,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
                 // 2026-11-06l：把大对象 move 出去（只搬内部指针），让 erase 立刻返回；
                 // 真正的析构发生在函数返回、g_vliMutex 已释放之后。
                 // 实测这一段曾占 chunkUnloadScan 的 98%（7 段 1.26ms，180µs/次）。
+                const uint32_t oldEc = vliPageIt->second.emitterIndexWords.empty()
+                    ? 0u : vliPageIt->second.emitterIndexWords[0];
+                vliAdjustTotalEmitters(oldEc, 0u);
                 vliUnloadGarbage.push_back(std::move(vliPageIt->second));
                 g_vliSections.erase(vliPageIt);
 
@@ -4433,6 +4477,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
                         continue;
                     }
 
+                    const uint32_t oldEc = page.emitterIndexWords.empty()
+                        ? 0u : page.emitterIndexWords[0];
+                    vliAdjustTotalEmitters(oldEc, 0u);
                     g_vliFreePages.push_back(page.pageIndex);
                     g_vliPageSectionKeys[page.pageIndex] = VLI_INVALID_SECTION_KEY;
                     eraseVLITableSlot(page.tableSlot);
@@ -4871,9 +4918,9 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
     const bool hardUrgent =
         !g_hasPrevCameraInverse ||
         !s_vptLightGridCacheValid ||
-        std::abs(originX - s_vptLightGridLastOriginX) >= 2 ||
-        std::abs(originY - s_vptLightGridLastOriginY) >= 2 ||
-        std::abs(originZ - s_vptLightGridLastOriginZ) >= 2 ||
+        std::abs(originX - s_vptLightGridLastOriginX) >= 4 ||
+        std::abs(originY - s_vptLightGridLastOriginY) >= 3 ||
+        std::abs(originZ - s_vptLightGridLastOriginZ) >= 4 ||
         rangeScale != s_vptLightGridLastRangeScale;
     const bool streamDirty =
         g_vliNextPage != s_vptLightGridLastLivePages ||
@@ -4892,7 +4939,7 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
         const double elapsedMs = std::chrono::duration<double, std::milli>(
             now - s_vptLightGridLastBuildTime
         ).count();
-        if(streamDirty && elapsedMs < 50.0)
+        if(streamDirty && elapsedMs < 120.0)
         {
             return;
         }
@@ -4921,23 +4968,25 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
         s_vptLightGridHasLastBuildTime = true;
         s_vptLightGridLastBuildTime = now;
     }
-    else if(s_vptLightGridSplitPhase == 0u)
-    {
-        sliceMode = 1u;
-        dispatchGroups = (VPT_LIGHT_GRID_CELLS + 1u) / 2u;
-        s_vptLightGridSplitPhase = 1u;
-        s_vptLightGridHasLastBuildTime = true;
-        s_vptLightGridLastBuildTime = now;
-    }
     else
     {
-        sliceMode = 2u;
-        dispatchGroups = VPT_LIGHT_GRID_CELLS / 2u;
-        s_vptLightGridSplitPhase = 0u;
-        s_vptLightGridLastLivePages = g_vliNextPage;
-        s_vptLightGridLastLightRev = g_localLightRevision;
-        s_vptLightGridLastEpoch = s_vptLightGridDataEpoch;
-        s_vptLightGridLastGeoEpoch = s_vptLightGridGeoEpoch;
+        const uint32_t offset = s_vptLightGridSplitPhase;
+        sliceMode = offset + 1u;
+        dispatchGroups = (VPT_LIGHT_GRID_CELLS > offset)
+            ? ((VPT_LIGHT_GRID_CELLS - 1u - offset) / 4u + 1u)
+            : 0u;
+        if(s_vptLightGridSplitPhase < 3u)
+        {
+            ++s_vptLightGridSplitPhase;
+        }
+        else
+        {
+            s_vptLightGridSplitPhase = 0u;
+            s_vptLightGridLastLivePages = g_vliNextPage;
+            s_vptLightGridLastLightRev = g_localLightRevision;
+            s_vptLightGridLastEpoch = s_vptLightGridDataEpoch;
+            s_vptLightGridLastGeoEpoch = s_vptLightGridGeoEpoch;
+        }
         s_vptLightGridHasLastBuildTime = true;
         s_vptLightGridLastBuildTime = now;
     }
@@ -4971,10 +5020,10 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
     );
 
     const uint32_t push[4] = {
-        VPT_LIGHT_GRID_DIM_X,
-        VPT_LIGHT_GRID_DIM_Y,
-        VPT_LIGHT_GRID_DIM_Z,
-        (g_vliNextPage & 0x3FFFFFFFu) | ((sliceMode & 3u) << 30u)
+        static_cast<uint32_t>(s_vptLightGridLastOriginX),
+        static_cast<uint32_t>(s_vptLightGridLastOriginY),
+        static_cast<uint32_t>(s_vptLightGridLastOriginZ),
+        (g_vliNextPage & 0x1FFFFFFFu) | ((sliceMode & 7u) << 29u)
     };
     vkCmdPushConstants(
         cmd,

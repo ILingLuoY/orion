@@ -1874,6 +1874,10 @@ inline constexpr uint64_t SECTION_AS_CLASS_PARTICLE = 7ull << 60ull;
 //   主相机射线   0x01 -> 0x05   （0x01 | 0x04）
 //   所有次级射线 0xff -> 0xfb   （0xff & ~0x04）
 inline constexpr uint64_t SECTION_AS_CLASS_HAND = 8ull << 60ull;
+// 2026-11-26 (Batch V, Feature 4): Split leaf triangles out of SECTION_AS_CLASS_OMM so leaves
+// keep real OMM cutouts for regular RT rays while emitting a paired solid-cube TLAS instance (0x10)
+// for volumetric fog & sunlight shafts.
+inline constexpr uint64_t SECTION_AS_CLASS_OMM_LEAVES = 9ull << 60ull;
 inline constexpr uint64_t LOD_AS_CLASS_ALPHA = 2ull << 60ull;
 inline constexpr uint64_t LOD_AS_CLASS_WATER = 3ull << 60ull;
 inline constexpr uint32_t SBT_RECORD_OPAQUE = 0u;
@@ -1886,6 +1890,7 @@ struct SectionGeometrySplit
 {
     std::vector<Vertex> opaque;
     std::vector<Vertex> ommCutout;
+    std::vector<Vertex> ommLeaves;
     std::vector<Vertex> alpha;
     std::vector<Vertex> water;
     std::vector<Vertex> entity;
@@ -1893,6 +1898,8 @@ struct SectionGeometrySplit
     std::vector<Vertex> particle;
     OmmCutoutInput ommInput;
     bool hasOmmInput = false;
+    OmmCutoutInput ommLeavesInput;
+    bool hasOmmLeavesInput = false;
 
     std::vector<float> entityMotion;
     std::vector<float> localPlayerMotion;
@@ -1900,6 +1907,7 @@ struct SectionGeometrySplit
 
     std::vector<SectionVertex> opaquePacked;
     std::vector<SectionVertex> ommCutoutPacked;
+    std::vector<SectionVertex> ommLeavesPacked;
     std::vector<SectionVertex> alphaPacked;
     std::vector<SectionVertex> waterPacked;
 };
@@ -1921,6 +1929,7 @@ struct CaptureArenaSegment
 
     std::span<const Vertex> opaque;
     std::span<const Vertex> ommCutout;
+    std::span<const Vertex> ommLeaves;
     std::span<const Vertex> alpha;
     std::span<const Vertex> water;
     std::span<const Vertex> entity;
@@ -1933,16 +1942,20 @@ struct CaptureArenaSegment
 
     std::span<const SectionVertex> opaquePacked;
     std::span<const SectionVertex> ommCutoutPacked;
+    std::span<const SectionVertex> ommLeavesPacked;
     std::span<const SectionVertex> alphaPacked;
     std::span<const SectionVertex> waterPacked;
 
     OmmCutoutInput ommInput;
     bool hasOmmInput = false;
+    OmmCutoutInput ommLeavesInput;
+    bool hasOmmLeavesInput = false;
 
     bool empty() const
     {
         return opaque.empty() &&
             ommCutout.empty() &&
+            ommLeaves.empty() &&
             alpha.empty() &&
             water.empty() &&
             entity.empty() &&
@@ -1952,9 +1965,9 @@ struct CaptureArenaSegment
 
     size_t vertexCount() const
     {
-        return opaque.size() + ommCutout.size() + alpha.size() +
-            water.size() + entity.size() + localPlayer.size() +
-            particle.size();
+        return opaque.size() + ommCutout.size() + ommLeaves.size() +
+            alpha.size() + water.size() + entity.size() +
+            localPlayer.size() + particle.size();
     }
 };
 
@@ -3146,6 +3159,13 @@ VkResult rtxTrackedCreateQueryPool(
     const VkAllocationCallbacks* allocator,
     VkQueryPool* queryPool);
 void createBuffer(VkDevice d,VkPhysicalDevice pd,VkDeviceSize size,VkBufferUsageFlags usage,VkMemoryPropertyFlags props,VkBuffer& buffer,VkDeviceMemory& memory,bool preferHostUploadMemory=false);
+void uploadDeviceLocalBufferOnce(
+    const void* srcData,
+    VkDeviceSize size,
+    VkBufferUsageFlags usage,
+    VkBuffer& dstBuffer,
+    VkDeviceMemory& dstMemory
+);
 bool perfL10RayStatsEnabled();
 VkDeviceSize perfL10RayStatsBytes();
 void destroyPerfL10RayStats();
@@ -3938,6 +3958,24 @@ void logDeviceFaultDiagnostics(const char* where);
 // 设备挂死后 logDeviceFaultDiagnostics 会打回 GPU 最后走到的标记。
 void rtCheckpoint(VkCommandBuffer cmd, const char* tag);
 
+void vkDebugLabelBegin(VkCommandBuffer cmd, const char* name, float r = 0.2f, float g = 0.6f, float b = 1.0f);
+void vkDebugLabelEnd(VkCommandBuffer cmd);
+struct ScopedVkDebugLabel
+{
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    ScopedVkDebugLabel(VkCommandBuffer c, const char* name, float r = 0.2f, float g = 0.6f, float b = 1.0f)
+        : cmd(c)
+    {
+        vkDebugLabelBegin(cmd, name, r, g, b);
+    }
+    ~ScopedVkDebugLabel()
+    {
+        vkDebugLabelEnd(cmd);
+    }
+    ScopedVkDebugLabel(const ScopedVkDebugLabel&) = delete;
+    ScopedVkDebugLabel& operator=(const ScopedVkDebugLabel&) = delete;
+};
+
 // =====================================================
 // 2026-11-14：GPU 卡死探针（看门狗 + 已释放显存地址环形记录）。
 //
@@ -4217,6 +4255,8 @@ inline constexpr const char* const RT_PIPELINE_SPV_FILES[] = {
     "shaders\\rt_test_ser.rgen.spv",
     "shaders\\rt_test_k1.rgen.spv",
     "shaders\\rt_test_k1_ser.rgen.spv",
+    "shaders\\rt_test_k1_glass.rgen.spv",
+    "shaders\\rt_test_k1_glass_ser.rgen.spv",
     "shaders\\rt_test_k2.rgen.spv",
     "shaders\\rt_test_k2_ser.rgen.spv",
     // 2026-11-05 设备丢失二分变体（ORION_K2_VARIANT 门控加载，仅诊断用）
@@ -4232,6 +4272,10 @@ inline constexpr const char* const RT_PIPELINE_SPV_FILES[] = {
     "shaders\\rt_test_k2sun_ser.rgen.spv",
     "shaders\\rt_test_k2loc.rgen.spv",
     "shaders\\rt_test_k2loc_ser.rgen.spv",
+    "shaders\\rt_test_k2loc_nee.rgen.spv",
+    "shaders\\rt_test_k2loc_nee_ser.rgen.spv",
+    "shaders\\rt_test_k2loc_glossy.rgen.spv",
+    "shaders\\rt_test_k2loc_glossy_ser.rgen.spv",
     // ⑤ K2-SUN 再拆分（默认加载，ORION_K2_SPLIT3=0 回退 ④ 三腿）：
     //    SUNA = 水+RTAO，SUNB = 阴影+GGX+植被SSS（load-add 复用 binding 89）
     "shaders\\rt_test_k2sunA.rgen.spv",
@@ -4785,17 +4829,25 @@ extern VkDeviceMemory g_tlasInstancesMemory;
 extern VkDeviceAddress g_tlasInstancesAddress;
 extern VkBuffer g_sectionVertexAddressBuffer;
 extern VkDeviceMemory g_sectionVertexAddressMemory;
+extern VkBuffer g_sectionVertexAddressStagingBuffer;
+extern VkDeviceMemory g_sectionVertexAddressStagingMemory;
 extern size_t g_sectionVertexAddressCapacity;
 extern uint32_t g_sectionVertexAddressNextSlot;
 extern std::vector<uint32_t> g_sectionVertexAddressFreeSlots;
 extern void* g_sectionVertexAddressMapped;
 extern VkBuffer g_sectionRoleBuffer;
 extern VkDeviceMemory g_sectionRoleMemory;
+extern VkBuffer g_sectionRoleStagingBuffer;
+extern VkDeviceMemory g_sectionRoleStagingMemory;
 extern void* g_sectionRoleMapped;
 extern VkBuffer g_lodCoverageBuffer;
 extern VkDeviceMemory g_lodCoverageMemory;
+extern VkBuffer g_lodCoverageStagingBuffer;
+extern VkDeviceMemory g_lodCoverageStagingMemory;
 extern void* g_lodCoverageMapped;
 extern uint32_t g_lodCoverageWordCount;
+void markLodCoverageDirty();
+void recordSectionTablesSync(VkCommandBuffer cmd);
 extern VkDeviceMemory g_blasScratchMemory;
 extern VkDeviceAddress g_blasScratchAddress;
 extern VkBuffer g_tlasBuffer;
@@ -6043,6 +6095,7 @@ extern size_t
 
 extern std::atomic<bool>
     g_localLightsDirty;
+extern std::atomic<uint32_t> g_vptTotalEmitterCount;
 extern VkBuffer g_sharcHashEntriesBuffer;
 extern VkDeviceMemory g_sharcHashEntriesMemory;
 extern VkBuffer g_sharcAccumulationBuffer;
@@ -6325,11 +6378,22 @@ extern VkPipeline g_k2iCompactPipeline;
 extern bool g_k2iCompactPipelineFailed;
 extern VkPipeline g_k2locCompactPipeline;
 extern bool g_k2locCompactPipelineFailed;
+extern VkPipeline g_k1GlassCompactPipeline;
+extern bool g_k1GlassCompactPipelineFailed;
+extern VkPipeline g_sharcCompactPipeline;
+extern bool g_sharcCompactPipelineFailed;
 // ④ K2-D 再拆分（默认开，ORION_K2_SPLIT2=0 回退 ③ 两腿）：K2-SUN + K2-LOC
+extern VkPipeline g_k1GlassPipeline;
 extern VkPipeline g_k2sunPipeline;
 extern VkPipeline g_k2sunAPipeline;
 extern VkPipeline g_k2sunBPipeline;
 extern VkPipeline g_k2locPipeline;
+extern VkPipeline g_k2locNeePipeline;
+extern VkPipeline g_k2locGlossyPipeline;
+extern VkStridedDeviceAddressRegionKHR g_k1GlassRaygenRegion;
+extern VkStridedDeviceAddressRegionKHR g_k1GlassMissRegion;
+extern VkStridedDeviceAddressRegionKHR g_k1GlassHitRegion;
+extern VkStridedDeviceAddressRegionKHR g_k1GlassCallableRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2sunRaygenRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2sunMissRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2sunHitRegion;
@@ -6346,6 +6410,14 @@ extern VkStridedDeviceAddressRegionKHR g_k2locRaygenRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2locMissRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2locHitRegion;
 extern VkStridedDeviceAddressRegionKHR g_k2locCallableRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locNeeRaygenRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locNeeMissRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locNeeHitRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locNeeCallableRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locGlossyRaygenRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locGlossyMissRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locGlossyHitRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2locGlossyCallableRegion;
 // ③ K2-D→K2-I 直射级交接图（binding 89，rgba32f，全分辨率）
 extern VkImage g_k2DirectImage;
 extern VkDeviceMemory g_k2DirectMemory;

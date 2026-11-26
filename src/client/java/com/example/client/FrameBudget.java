@@ -128,7 +128,21 @@ public final class FrameBudget {
     }
 
     private static double lastCaptureHeadMs;
+    private static double lastCapVoxyMs;
+    private static double lastCapDhMs;
+    private static double lastCapFfgMs;
+    private static double lastCapDynMs;
+    private static double lastCapVisMs;
     private static double lastRecordFrameMs;
+
+    public static void recordCaptureHeadBreakdown(
+            double voxyMs, double dhMs, double ffgMs, double dynMs, double visMs) {
+        lastCapVoxyMs = voxyMs;
+        lastCapDhMs = dhMs;
+        lastCapFfgMs = ffgMs;
+        lastCapDynMs = dynMs;
+        lastCapVisMs = visMs;
+    }
     private static long renderLevelStartNanos;
     private static long renderLevelEndNanos;
     private static long lastLevelRenderStartNanos;
@@ -511,6 +525,11 @@ public final class FrameBudget {
 
         lastHeadNanos = now;
         lastCaptureHeadMs = 0.0;
+        lastCapVoxyMs = 0.0;
+        lastCapDhMs = 0.0;
+        lastCapFfgMs = 0.0;
+        lastCapDynMs = 0.0;
+        lastCapVisMs = 0.0;
         lastRecordFrameMs = 0.0;
         lastLevelRenderMs = 0.0;
         renderLevelStartNanos = 0L;
@@ -561,12 +580,20 @@ public final class FrameBudget {
             lastSpikeGcTimeMs = gcTimeMs;
             lastSpikeGcCount = gcCount;
 
+            final String capBreakdown = lastCaptureHeadMs >= 5.0
+                    ? "[voxy=" + round(lastCapVoxyMs)
+                            + " dh=" + round(lastCapDhMs)
+                            + " ffg=" + round(lastCapFfgMs)
+                            + " dyn=" + round(lastCapDynMs)
+                            + " vis=" + round(lastCapVisMs) + "]"
+                    : "";
+
             System.out.println(
                     "[RENDER SPIKE] total=" + round(lastRenderMs)
                             + "ms | preRL=" + round(preRL)
                             + " rlPreLv=" + round(rlPreLv)
                             + " lv=" + round(lastLevelRenderMs)
-                            + "(cap=" + round(lastCaptureHeadMs) + ")"
+                            + "(cap=" + round(lastCaptureHeadMs) + capBreakdown + ")"
                             + " rlPostLv=" + round(rlPostLv)
                             + "(rec=" + round(lastRecordFrameMs) + ")"
                             + " postRL_gui=" + round(postRLGui)

@@ -3816,7 +3816,8 @@ void recordWaterSimulation(VkCommandBuffer cmd)
     }
 
     WaterSimPushConstants push{};
-    push.playerInWater = playerInWater ? 1u : 0u;
+    push.playerInWater =
+        (ubo->playerInWater > 0.5f && ubo->playerInWater < 1.5f) ? 1u : 0u;
     push.waveSpongeWidth = g_waterSimSpongeWidth.load();
     push.waveReservedObstacle = waterWindStrength();
     push.waveShapeScale = g_waterWaveLengthScale.load();

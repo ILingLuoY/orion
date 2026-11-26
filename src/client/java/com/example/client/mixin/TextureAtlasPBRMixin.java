@@ -373,6 +373,134 @@ public class TextureAtlasPBRMixin {
         }
     }
 
+    private static void copyResampledSpecularRgba(
+            NativeImage source,
+            NativeImage diffuse,
+            NativeImage destination,
+            int dstX,
+            int dstY,
+            int width,
+            int height,
+            String spriteName
+    ) {
+        if (PBR_ATLAS_DOWNSCALE > 1) {
+            copyBoxFilteredRgba(
+                    source,
+                    destination,
+                    dstX,
+                    dstY,
+                    width,
+                    height,
+                    source.getWidth(),
+                    sourceFrameHeight(source)
+            );
+            for (int py = 0; py < height; ++py) {
+                for (int px = 0; px < width; ++px) {
+                    long pixel = pixelAddress(destination, dstX + px, dstY + py);
+                    if ((MemoryUtil.memGetByte(pixel + 3L) & 0xFF) == 0) {
+                        MemoryUtil.memPutByte(pixel + 3L, (byte) 255);
+                    }
+                }
+            }
+            return;
+        }
+
+        logResampledPbrTexture(
+                spriteName,
+                "_s",
+                source,
+                width,
+                height
+        );
+
+        int sampledSourceHeight =
+                sourceFrameHeight(source);
+
+        boolean hasCutoutBackground = false;
+        int avgR = 0;
+        int avgG = 0;
+        int avgB = 0;
+
+        if (diffuse != null && diffuse.getWidth() > 0 && diffuse.getHeight() > 0) {
+            int diffuseWidth = diffuse.getWidth();
+            int diffuseFrameHeight = sourceFrameHeight(diffuse);
+            long sumR = 0L;
+            long sumG = 0L;
+            long sumB = 0L;
+            int opaqueCount = 0;
+
+            for (int py = 0; py < height; ++py) {
+                int diffY = nearestSourceCoordinate(py, height, diffuseFrameHeight);
+                int sourceY = nearestSourceCoordinate(py, height, sampledSourceHeight);
+                for (int px = 0; px < width; ++px) {
+                    int diffX = nearestSourceCoordinate(px, width, diffuseWidth);
+                    int diffAlpha = MemoryUtil.memGetByte(pixelAddress(diffuse, diffX, diffY) + 3L) & 0xFF;
+                    if (diffAlpha == 0) {
+                        hasCutoutBackground = true;
+                    } else {
+                        int sourceX = nearestSourceCoordinate(px, width, source.getWidth());
+                        long srcPixel = pixelAddress(source, sourceX, sourceY);
+                        sumR += MemoryUtil.memGetByte(srcPixel) & 0xFF;
+                        sumG += MemoryUtil.memGetByte(srcPixel + 1L) & 0xFF;
+                        sumB += MemoryUtil.memGetByte(srcPixel + 2L) & 0xFF;
+                        ++opaqueCount;
+                    }
+                }
+            }
+
+            if (opaqueCount > 0) {
+                avgR = (int) ((sumR + opaqueCount / 2L) / opaqueCount);
+                avgG = (int) ((sumG + opaqueCount / 2L) / opaqueCount);
+                avgB = (int) ((sumB + opaqueCount / 2L) / opaqueCount);
+            }
+        }
+
+        for (int py = 0; py < height; ++py) {
+            int sourceY =
+                    nearestSourceCoordinate(
+                            py,
+                            height,
+                            sampledSourceHeight
+                    );
+            int diffY = (hasCutoutBackground && diffuse != null)
+                    ? nearestSourceCoordinate(py, height, sourceFrameHeight(diffuse))
+                    : 0;
+
+            for (int px = 0; px < width; ++px) {
+                int sourceX =
+                        nearestSourceCoordinate(
+                                px,
+                                width,
+                                source.getWidth()
+                        );
+                long destinationPixel =
+                        pixelAddress(
+                                destination,
+                                dstX + px,
+                                dstY + py
+                        );
+
+                if (hasCutoutBackground && diffuse != null) {
+                    int diffX = nearestSourceCoordinate(px, width, diffuse.getWidth());
+                    int diffAlpha = MemoryUtil.memGetByte(pixelAddress(diffuse, diffX, diffY) + 3L) & 0xFF;
+                    if (diffAlpha == 0) {
+                        MemoryUtil.memPutByte(destinationPixel, (byte) avgR);
+                        MemoryUtil.memPutByte(destinationPixel + 1L, (byte) avgG);
+                        MemoryUtil.memPutByte(destinationPixel + 2L, (byte) avgB);
+                        MemoryUtil.memPutByte(destinationPixel + 3L, (byte) 255);
+                        continue;
+                    }
+                }
+
+                long srcPixel = pixelAddress(source, sourceX, sourceY);
+                MemoryUtil.memCopy(srcPixel, destinationPixel, 4L);
+                if ((MemoryUtil.memGetByte(srcPixel + 3L) & 0xFF) == 0) {
+                    MemoryUtil.memPutByte(destinationPixel + 3L, (byte) 255);
+                }
+            }
+        }
+    }
+
     private static void fillSpriteAverageAlbedo(
             NativeImage source,
             NativeImage destination,
@@ -823,15 +951,15 @@ public class TextureAtlasPBRMixin {
 
 
             if (specularImg != null) {
-                copyResampledRgba(
+                copyResampledSpecularRgba(
                         specularImg,
+                        diffuseImg,
                         PBRAtlasStorage.globalSpecularAtlas,
                         atlasSpriteX,
                         atlasSpriteY,
                         atlasSpriteWidth,
                         atlasSpriteHeight,
-                        spriteName,
-                        "_s"
+                        spriteName
                 );
             }
         }

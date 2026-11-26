@@ -209,8 +209,9 @@
     // ── fogMoodParams ──（2026-11-16 追加在末尾，与 OrionInternal.h 顺序一致）
     //   x = 雾形态强度 0..2（0 = 均匀灰膜旧档，1 = 出厂团块）
     //   y = 晨雾峰值倍率 1..3（1 = 不增强，1.75 = 出厂）
-    //   z/w = 保留
-    // 消费方：fog_froxel_density.comp
+    //   z = 水下水面正上方天光系数 0..1（2026-11-26 Batch V Bug 2：洞穴水下压暗，默认 1.0）
+    //   w = TLAS 是否存在活跃水体段（2026-11-26 Batch V2：1.0 = 有水或未就绪，0.0 = 零水体段）
+    // 消费方：fog_froxel_density.comp / rt_test.rgen / vpt_k2loc_compact.comp / rgen_main_body.glsl
     vec4 fogMoodParams;
 
     // ── visQueryAb ──（2026-11-16 追加在末尾，与 OrionInternal.h 顺序一致）

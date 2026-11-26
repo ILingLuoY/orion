@@ -1527,6 +1527,63 @@ void rtCheckpoint(VkCommandBuffer cmd, const char* tag)
         g_perfL10FrameSerial + 1ull);
 }
 
+namespace
+{
+    VkDevice s_debugLabelDevice = VK_NULL_HANDLE;
+    PFN_vkCmdBeginDebugUtilsLabelEXT s_cmdBeginDebugLabel = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT s_cmdEndDebugLabel = nullptr;
+
+    void ensureDebugLabelFunctions()
+    {
+        if(g_device == VK_NULL_HANDLE)
+        {
+            return;
+        }
+        if(s_debugLabelDevice != g_device)
+        {
+            s_debugLabelDevice = g_device;
+            s_cmdBeginDebugLabel = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+                vkGetDeviceProcAddr(g_device, "vkCmdBeginDebugUtilsLabelEXT"));
+            s_cmdEndDebugLabel = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+                vkGetDeviceProcAddr(g_device, "vkCmdEndDebugUtilsLabelEXT"));
+        }
+    }
+}
+
+void vkDebugLabelBegin(VkCommandBuffer cmd, const char* name, float r, float g, float b)
+{
+    if(cmd == VK_NULL_HANDLE || name == nullptr)
+    {
+        return;
+    }
+    ensureDebugLabelFunctions();
+    if(s_cmdBeginDebugLabel == nullptr)
+    {
+        return;
+    }
+    VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    label.pLabelName = name;
+    label.color[0] = r;
+    label.color[1] = g;
+    label.color[2] = b;
+    label.color[3] = 1.0f;
+    s_cmdBeginDebugLabel(cmd, &label);
+}
+
+void vkDebugLabelEnd(VkCommandBuffer cmd)
+{
+    if(cmd == VK_NULL_HANDLE)
+    {
+        return;
+    }
+    ensureDebugLabelFunctions();
+    if(s_cmdEndDebugLabel == nullptr)
+    {
+        return;
+    }
+    s_cmdEndDebugLabel(cmd);
+}
+
 // =====================================================
 // 2026-10-16 泄漏归因探针（只读时钟+只读计数器，零行为变更）
 //

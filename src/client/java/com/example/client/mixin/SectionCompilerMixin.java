@@ -146,6 +146,7 @@ public class SectionCompilerMixin {
     private static final int RT_MARKER_HONEY = 22;
     private static final int RT_MARKER_NETHER_PORTAL = 24;
     private static final int RT_MARKER_FOLIAGE = 25;
+    private static final int RT_MARKER_LEAVES = 26;
 
     private static final int GLASS_CONNECT_MASK_SHIFT = 8;
     private static final int GLASS_CONNECT_MASK_BITS = 0x0F;
@@ -942,7 +943,8 @@ public class SectionCompilerMixin {
         if (vertexBuffer == null ||
                 !vertexBuffer.isDirect() ||
                 stride != 28 ||
-                vertexCount <= 0) {
+                vertexCount <= 0 ||
+                (vertexCount % 4) != 0) {
             return 0;
         }
 
@@ -954,21 +956,42 @@ public class SectionCompilerMixin {
                         );
 
         int tagged = 0;
+        final int quadCount = vertexCount / 4;
 
-        for (int vertex = 0; vertex < vertexCount; ++vertex) {
-            final int markerOffset =
-                    vertex * stride + 27;
+        for (int quad = 0; quad < quadCount; ++quad) {
+            final int quadVertexBase = quad * 4;
+            final float centerU = (
+                    vertices.getFloat(quadVertexBase * stride + 16) +
+                    vertices.getFloat((quadVertexBase + 1) * stride + 16) +
+                    vertices.getFloat((quadVertexBase + 2) * stride + 16) +
+                    vertices.getFloat((quadVertexBase + 3) * stride + 16)
+            ) * 0.25f;
+            final float centerV = (
+                    vertices.getFloat(quadVertexBase * stride + 20) +
+                    vertices.getFloat((quadVertexBase + 1) * stride + 20) +
+                    vertices.getFloat((quadVertexBase + 2) * stride + 20) +
+                    vertices.getFloat((quadVertexBase + 3) * stride + 20)
+            ) * 0.25f;
 
-            if ((vertices.get(markerOffset) & 0xFF) != 0) {
+            if (!PBRAtlasStorage.spriteIsSeeThrough(centerU, centerV)) {
                 continue;
             }
 
-            vertices.put(
-                    markerOffset,
-                    (byte) RT_MARKER_GENERIC_TRANSLUCENT
-            );
+            for (int v = 0; v < 4; ++v) {
+                final int markerOffset =
+                        (quadVertexBase + v) * stride + 27;
 
-            ++tagged;
+                if ((vertices.get(markerOffset) & 0xFF) != 0) {
+                    continue;
+                }
+
+                vertices.put(
+                        markerOffset,
+                        (byte) RT_MARKER_GENERIC_TRANSLUCENT
+                );
+
+                ++tagged;
+            }
         }
 
         return tagged;
@@ -1240,33 +1263,36 @@ public class SectionCompilerMixin {
                 translucentMarker =
                         preMarker;
             } else {
+                final net.minecraft.world.level.block.state.BlockState ownerStateA =
+                        region.getBlockState(ownerCandidateA);
+                final net.minecraft.world.level.block.state.BlockState ownerStateB =
+                        region.getBlockState(ownerCandidateB);
+
                 translucentMarker =
-                        getTranslucentMarker(
-                                region.getBlockState(
-                                        ownerCandidateA
-                                )
-                        );
+                        getTranslucentMarker(ownerStateA);
 
                 if (translucentMarker < 2) {
                     translucentMarker =
-                            getTranslucentMarker(
-                                    region.getBlockState(
-                                            ownerCandidateB
-                                    )
-                            );
+                            getTranslucentMarker(ownerStateB);
                 }
 
                 glassConnectCandidate =
                         translucentMarker >= 2;
 
-                if (translucentMarker == 0) {
-                    final int firstVertexBase =
-                            (quad * 4) * stride;
+                final boolean isRedstoneWireOwner =
+                        ownerStateA.is(Blocks.REDSTONE_WIRE) ||
+                        ownerStateB.is(Blocks.REDSTONE_WIRE);
+
+                if (translucentMarker == 0 && !isRedstoneWireOwner) {
+                    final float centerU =
+                            (u[0] + u[1] + u[2] + u[3]) * 0.25f;
+                    final float centerV =
+                            (v[0] + v[1] + v[2] + v[3]) * 0.25f;
 
                     translucentMarker =
                             PBRAtlasStorage.spriteIsSeeThrough(
-                                    vertices.getFloat(firstVertexBase + 16),
-                                    vertices.getFloat(firstVertexBase + 20)
+                                    centerU,
+                                    centerV
                             )
                                     ? RT_MARKER_GENERIC_TRANSLUCENT
                                     : 0;
@@ -2036,8 +2062,11 @@ public class SectionCompilerMixin {
                         foliageOwner = isFoliageOwnerState(ownerState);
                     }
                     if (foliageOwner) {
+                        final byte foliageMarker = ownerState.is(net.minecraft.tags.BlockTags.LEAVES)
+                                ? (byte) RT_MARKER_LEAVES
+                                : (byte) RT_MARKER_FOLIAGE;
                         for (int v = 0; v < 4; ++v) {
-                            vertices.put((quad * 4 + v) * stride + 27, (byte) 25);
+                            vertices.put((quad * 4 + v) * stride + 27, foliageMarker);
                         }
                     }
                 }

@@ -34,7 +34,8 @@ const float FOG_INV_EXP_K = 1.0 / 4.2;
 //   - Solid terrain/blocks & opaque OMM leaf micro-triangles BLOCK light
 //   - Glass windows & water (FORCE_NO_OPAQUE) LET light pass through
 //   - Hand, player body, and particles are completely excluded
-const uint FOG_WORLD_CULL_MASK = 0x08u;
+// 2026-11-26 (Batch V, Feature 4): 0x18u = world opaque (0x08) | solid-cube leaves (0x10).
+const uint FOG_WORLD_CULL_MASK = 0x18u;
 
 float fogNormalizedToDistance(float u, float maxDistance)
 {

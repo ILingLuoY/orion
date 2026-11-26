@@ -1363,6 +1363,19 @@ pbrLod = min(pbrLod + matTexFarMipBias, pbrMaxLod);
 const float giAlbedoMipBias = isDiffuseGiRay ? effectiveSecondaryMipBias : 0.0;
 const float matTexAlbedoLod = min(max(matTexFarMipBias, giAlbedoMipBias), pbrMaxLod);
 
+// 2026-11-26 (Batch V, Bug 1a): mip-aware safe UV inset for textureLod sampling on high-res packs (e.g. rt1).
+// Mip 0 half-texel inset (safeMin/safeMax) still serves POM traversal and mip-0 emissive texelFetch.
+vec2 spriteRawSpan = max(spriteMax - spriteMin, vec2(0.0));
+bool hasSpriteBounds = (spriteRawSpan.x > 0.0) && (spriteRawSpan.y > 0.0);
+float pbrMipScale = exp2(ceil(max(pbrLod, 0.0)));
+vec2 pbrInset = min(0.5 * pbrMipScale * atlasTexel, spriteRawSpan * 0.499);
+vec2 pbrSafeMin = min(spriteMin + pbrInset, spriteCenter);
+vec2 pbrSafeMax = max(spriteMax - pbrInset, spriteCenter);
+float albedoMipScale = exp2(ceil(max(matTexAlbedoLod, 0.0)));
+vec2 albedoInset = min(0.5 * albedoMipScale * atlasTexel, spriteRawSpan * 0.499);
+vec2 albedoSafeMin = min(spriteMin + albedoInset, spriteCenter);
+vec2 albedoSafeMax = max(spriteMax - albedoInset, spriteCenter);
+
 // =====================================================
 // POM eligibility
 //
@@ -1416,7 +1429,9 @@ if(!isWaterMaterial)
     baseNormalSample =
         textureLod(
             normalAtlas,
-            basePbrTexCoord,
+            hasSpriteBounds
+                ? clamp(basePbrTexCoord, pbrSafeMin, pbrSafeMax)
+                : basePbrTexCoord,
             pbrLod
         );
 }
@@ -1559,7 +1574,13 @@ if(useExactAlbedo)
             : (matTexAlbedoLod > 0.0
                 ? textureLod(
                     blockAtlas,
-                    (vec2(albedoTexel) + vec2(0.5)) / vec2(albedoSize),
+                    hasSpriteBounds
+                        ? clamp(
+                            (vec2(albedoTexel) + vec2(0.5)) / vec2(albedoSize),
+                            albedoSafeMin,
+                            albedoSafeMax
+                        )
+                        : (vec2(albedoTexel) + vec2(0.5)) / vec2(albedoSize),
                     matTexAlbedoLod
                 )
                 : texelFetch(blockAtlas, albedoTexel, 0)) * interpColor;
@@ -1572,7 +1593,9 @@ else
             // 2026-11-15 远场降档：lod 0 → matTexAlbedoLod（0 时逐位不变）。
             : textureLod(
                 blockAtlas,
-                materialSampleUV,
+                hasSpriteBounds
+                    ? clamp(materialSampleUV, albedoSafeMin, albedoSafeMax)
+                    : materialSampleUV,
                 matTexAlbedoLod
             ) *
             interpColor;
@@ -1629,7 +1652,9 @@ if(!isWaterMaterial)
             isPOMSurface
                 ? textureLod(
                     normalAtlas,
-                    pbrTexCoord,
+                    hasSpriteBounds
+                        ? clamp(pbrTexCoord, pbrSafeMin, pbrSafeMax)
+                        : pbrTexCoord,
                     pbrLod
                 )
                 : baseNormalSample;
@@ -1783,7 +1808,9 @@ if(!isWaterMaterial)
         specularSample =
             textureLod(
                 specularAtlas,
-                pbrTexCoord,
+                hasSpriteBounds
+                    ? clamp(pbrTexCoord, pbrSafeMin, pbrSafeMax)
+                    : pbrTexCoord,
                 pbrLod
             );
     }

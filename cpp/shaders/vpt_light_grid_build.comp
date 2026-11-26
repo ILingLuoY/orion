@@ -264,25 +264,24 @@ shared float s_pCell[64];
 
 void main()
 {
-    uint sliceMode = gridParams.w >> 30u;
-    uint livePageCount = gridParams.w & 0x3FFFFFFFu;
+    uint sliceMode = gridParams.w >> 29u;
+    uint livePageCount = gridParams.w & 0x1FFFFFFFu;
     uint cellIdx = (sliceMode == 0u)
         ? gl_WorkGroupID.x
-        : (gl_WorkGroupID.x * 2u + (sliceMode - 1u));
+        : (gl_WorkGroupID.x * 4u + (sliceMode - 1u));
     uint lane = gl_LocalInvocationID.x;
-    uint dimX = max(gridParams.x, 1u);
-    uint dimY = max(gridParams.y, 1u);
-    uint dimZ = max(gridParams.z, 1u);
-    if(cellIdx >= VPT_LIGHT_GRID_CELLS || cellIdx >= dimX * dimY * dimZ)
+    const uint dimX = 40u;
+    const uint dimY = 20u;
+    const uint dimZ = 40u;
+    if(cellIdx >= VPT_LIGHT_GRID_CELLS)
     {
         return;
     }
 
-    vec3 camPos = (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
-    ivec3 gridOriginCell = ivec3(floor(camPos / 4.0)) - ivec3(
-        int(dimX / 2u),
-        int(dimY / 2u),
-        int(dimZ / 2u)
+    ivec3 gridOriginCell = ivec3(
+        int(gridParams.x),
+        int(gridParams.y),
+        int(gridParams.z)
     );
 
     if(cellIdx == 0u && lane == 0u)

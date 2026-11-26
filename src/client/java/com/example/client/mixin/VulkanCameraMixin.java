@@ -725,21 +725,48 @@ public class VulkanCameraMixin {
                 ? Vec3.ZERO : this.minecraft.player.position();
         Vec3 playerVelocity = this.minecraft.player == null
                 ? Vec3.ZERO : this.minecraft.player.getDeltaMovement();
-        float playerInWater = this.minecraft.player != null &&
-                this.minecraft.player.isInWater() ? 1.0f : 0.0f;
+        boolean playerInWaterRaw = this.minecraft.player != null &&
+                this.minecraft.player.isInWater();
         // 2026-11-16：玩家在水里走原探针（水柱顶面）；不在水里走近水探针
         //（96 格网格找水面，找不到喂哨兵）—— 供后端焦散近水门使用，详见
         // findNearbyWaterSurfaceY 的注释。
         float waterSurfaceY =
-                playerInWater > 0.5f
+                playerInWaterRaw
                         ? findPlayerWaterSurfaceY(playerPosition)
                         : findNearbyWaterSurfaceY(playerPosition);
-        if (playerInWater > 0.5f) {
+        if (playerInWaterRaw) {
             cachedNearbyWaterSurfaceY = waterSurfaceY;
             cachedNearbyWaterValid = true;
             lastNearbyWaterProbeNanos = System.nanoTime();
         }
-        float cameraInWater = isRenderCameraInWater(pos) ? 1.0f : 0.0f;
+
+        // 2026-11-26 (Batch V, Bug 3): Distinguish touching the water surface (1.0f) from fully
+        // submerged diving (2.0f) so submerged swimming does not keep triggering surface ripples.
+        boolean playerTouchesSurface = false;
+        if (playerInWaterRaw && waterSurfaceY > -500.0f && this.minecraft.player != null) {
+            double feetY = this.minecraft.player.getY();
+            double topY = feetY + this.minecraft.player.getBbHeight();
+            playerTouchesSurface =
+                    (topY >= (double) waterSurfaceY - 0.12) &&
+                    (feetY <= (double) waterSurfaceY + 0.25);
+        }
+        float playerInWater = !playerInWaterRaw
+                ? 0.0f
+                : (playerTouchesSurface ? 1.0f : 2.0f);
+
+        // 2026-11-26 (Batch V, Bug 2): Encode sky light above water surface into [1.0, 2.0] when camera is submerged.
+        boolean camInWaterBool = isRenderCameraInWater(pos);
+        float underwaterSkyFactor = 1.0f;
+        if (camInWaterBool && this.minecraft.level != null) {
+            double probeY = waterSurfaceY > -500.0f
+                    ? Math.ceil((double) waterSurfaceY)
+                    : (pos.y + 1.0);
+            int skyLight = this.minecraft.level.getBrightness(
+                    net.minecraft.world.level.LightLayer.SKY,
+                    BlockPos.containing(pos.x, probeY, pos.z));
+            underwaterSkyFactor = net.minecraft.util.Mth.clamp(skyLight / 15.0f, 0.0f, 1.0f);
+        }
+        float cameraInWater = camInWaterBool ? (1.0f + underwaterSkyFactor) : 0.0f;
 
         // 2026-11-24: update mask before updateCamera so CameraUBO receives matching origin same frame.
         updateWaterSimMask(waterSurfaceY);
@@ -794,7 +821,7 @@ public class VulkanCameraMixin {
                 projInvArray
         );
 
-        tickWaterInteractionEntities(waterSurfaceY);
+        tickWaterInteractionEntities(waterSurfaceY, playerTouchesSurface);
 
         frameCount++;
 
@@ -813,7 +840,7 @@ public class VulkanCameraMixin {
      * </ul>
      * 24 格 = 水模拟盒（48×48，玩家居中）的半宽——盒外的源本来就落不进波场。
      */
-    private void tickWaterInteractionEntities(float waterSurfaceY) {
+    private void tickWaterInteractionEntities(float waterSurfaceY, boolean playerTouchesSurface) {
         final Level level = this.minecraft == null ? null : this.minecraft.level;
         if (level == null) {
             return;
@@ -886,19 +913,19 @@ public class VulkanCameraMixin {
         }
         NativeVulkan.updateWaterBoats(waterBoatData, boatCount);
 
-        stampPlayerWaterTrail();
+        stampPlayerWaterTrail(playerTouchesSurface);
     }
 
     /**
      * 2026-11-21 徒步玩家尾迹 stamp：与船同款按位移间隔入队；坐船/坐其他
-     * 载具时不发（载具自己有 stamp，避免双份）。速度停摆即重置锚点。
+     * 载具时不发（载具自己有 stamp，避免双份）。速度停摆或完全潜入水下即重置锚点。
      */
-    private void stampPlayerWaterTrail() {
+    private void stampPlayerWaterTrail(boolean playerTouchesSurface) {
         if (this.minecraft == null || this.minecraft.player == null) {
             return;
         }
         final var player = this.minecraft.player;
-        if (!player.isInWater() || player.getVehicle() != null) {
+        if (!playerTouchesSurface || player.getVehicle() != null) {
             waterPlayerStampX = Double.NaN;
             return;
         }

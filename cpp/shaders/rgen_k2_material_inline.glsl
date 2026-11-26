@@ -149,9 +149,12 @@ vec3 readVertexMotion(VertexMotions motions, uint vertexIndex)
 //   .w  = 位移段里的 float 个数（顶点数 × 3），仅供调试核对
 // ⚠ 必须与 VulkanCore.cpp 的 GPUSectionVertexAddress 保持逐字节一致；这里改成
 //   uvec2 会让 CPU 侧按 16B 步长写的地址被半个 entry 错位读走（整片几何塌掉）。
+#ifndef ORION_SECTION_VERTEX_ADDR_BUFFER_DEFINED
+#define ORION_SECTION_VERTEX_ADDR_BUFFER_DEFINED
 layout(std430, binding = 21, set = 0) readonly buffer SectionVertexAddressBuffer {
     uvec4 vertexAddresses[];
 } sectionVertexAddressBuffer;
+#endif
 
 // ---- materialLodRole 依赖的 LOD 常量与角色表 ----
 // rgen 侧 binding 19 已以 serLodRoles 名义声明（rgen_trace_state.glsl，SER 用）。

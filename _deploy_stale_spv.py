@@ -119,8 +119,10 @@ EXTRA_FLAGS = {
     'sparse_active_mask.comp.spv': ['-DSPARSE_ORDERED_BAYER=0'],
     # 2026-11-05 B：K1/K2 变体的编译期开关。stale 路径（EXTRA_FLAGS.get）与
     # 下方变体补录共用同一份 ⇒ 漏了会把变体重编成主变体。
-    'rt_test_k1.rgen.spv': ['-DORION_K1_PRIMARY'],
-    'rt_test_k1_ser.rgen.spv': ['-DORION_K1_PRIMARY', '-DRT_ENABLE_SER'],
+    'rt_test_k1.rgen.spv': ['-DORION_K1_PRIMARY', '-DORION_K1_DEFER_GLASS'],
+    'rt_test_k1_ser.rgen.spv': ['-DORION_K1_PRIMARY', '-DORION_K1_DEFER_GLASS', '-DRT_ENABLE_SER'],
+    'rt_test_k1_glass.rgen.spv': ['-DORION_K1_PRIMARY', '-DORION_K1_GLASS_ONLY'],
+    'rt_test_k1_glass_ser.rgen.spv': ['-DORION_K1_PRIMARY', '-DORION_K1_GLASS_ONLY', '-DRT_ENABLE_SER'],
     'rt_test_k2.rgen.spv': ['-DORION_K2_TRANSPORT'],
     'rt_test_k2_ser.rgen.spv': ['-DORION_K2_TRANSPORT', '-DRT_ENABLE_SER'],
     'rt_test_k1.rchit.spv': ['-DORION_K1_PRIMARY'],
@@ -136,10 +138,12 @@ EXTRA_FLAGS = {
          '-DORION_K2_DIRECT_STAGE', '-DRT_ENABLE_SER'],
     'rt_test_k2i.rgen.spv':
         ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
-         '-DORION_K2_INDIRECT_STAGE'],
+         '-DORION_K2_INDIRECT_STAGE', '-DORION_K2_INDIRECT_TRACE_ONLY',
+         '-DORION_K2_CONSUMER_MAT_REUSE_ONLY'],
     'rt_test_k2i_ser.rgen.spv':
         ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
-         '-DORION_K2_INDIRECT_STAGE', '-DRT_ENABLE_SER'],
+         '-DORION_K2_INDIRECT_STAGE', '-DORION_K2_INDIRECT_TRACE_ONLY',
+         '-DORION_K2_CONSUMER_MAT_REUSE_ONLY', '-DRT_ENABLE_SER'],
     'rt_test_k2i_compose.comp.spv':
         ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
          '-DORION_K2_INDIRECT_STAGE', '-DORION_K2_INDIRECT_COMPOSE_ONLY',
@@ -155,10 +159,27 @@ EXTRA_FLAGS = {
          '-DORION_K2_DIRECT_SUN_STAGE', '-DRT_ENABLE_SER'],
     'rt_test_k2loc.rgen.spv':
         ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
-         '-DORION_K2_DIRECT_LOCAL_STAGE'],
+         '-DORION_K2_DIRECT_LOCAL_STAGE', '-DORION_K2_CONSUMER_MAT_REUSE_ONLY'],
     'rt_test_k2loc_ser.rgen.spv':
         ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
-         '-DORION_K2_DIRECT_LOCAL_STAGE', '-DRT_ENABLE_SER'],
+         '-DORION_K2_DIRECT_LOCAL_STAGE', '-DORION_K2_CONSUMER_MAT_REUSE_ONLY',
+         '-DRT_ENABLE_SER'],
+    'rt_test_k2loc_nee.rgen.spv':
+        ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
+         '-DORION_K2_DIRECT_LOCAL_STAGE', '-DORION_K2_LOC_NEE_ONLY',
+         '-DORION_K2_CONSUMER_MAT_REUSE_ONLY'],
+    'rt_test_k2loc_nee_ser.rgen.spv':
+        ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
+         '-DORION_K2_DIRECT_LOCAL_STAGE', '-DORION_K2_LOC_NEE_ONLY',
+         '-DORION_K2_CONSUMER_MAT_REUSE_ONLY', '-DRT_ENABLE_SER'],
+    'rt_test_k2loc_glossy.rgen.spv':
+        ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
+         '-DORION_K2_DIRECT_LOCAL_STAGE', '-DORION_K2_LOC_GLOSSY_ONLY',
+         '-DORION_K2_CONSUMER_MAT_REUSE_ONLY'],
+    'rt_test_k2loc_glossy_ser.rgen.spv':
+        ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
+         '-DORION_K2_DIRECT_LOCAL_STAGE', '-DORION_K2_LOC_GLOSSY_ONLY',
+         '-DORION_K2_CONSUMER_MAT_REUSE_ONLY', '-DRT_ENABLE_SER'],
     # 2026-11-22 ⑤：K2-SUN 再拆四腿变体（ORION_K2_SPLIT3=0 回退 ④ 三腿）。
     # SUNA = 水 + RTAO（写 binding 89，rgb 占位 0 / a=rtao）；SUNB = 阴影簇+
     # GGX+植被SSS（load-add 复用 binding 89，直射叠加）。切分依据：RTAO 的
@@ -172,10 +193,11 @@ EXTRA_FLAGS = {
          '-DORION_K2_DIRECT_SUN_STAGE_A', '-DRT_ENABLE_SER'],
     'rt_test_k2sunB.rgen.spv':
         ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
-         '-DORION_K2_DIRECT_SUN_STAGE_B'],
+         '-DORION_K2_DIRECT_SUN_STAGE_B', '-DORION_K2_CONSUMER_MAT_REUSE_ONLY'],
     'rt_test_k2sunB_ser.rgen.spv':
         ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
-         '-DORION_K2_DIRECT_SUN_STAGE_B', '-DRT_ENABLE_SER'],
+         '-DORION_K2_DIRECT_SUN_STAGE_B', '-DORION_K2_CONSUMER_MAT_REUSE_ONLY',
+         '-DRT_ENABLE_SER'],
 }
 
 STAGE = {'.rgen': 'rgen', '.rchit': 'rchit', '.rahit': 'rahit', '.rmiss': 'rmiss',
@@ -289,12 +311,13 @@ def collect_targets():
     add('rt_test.rmiss', 'rt_test_ser.rmiss.spv', ['-DRT_ENABLE_SER'])
     add('rt_test.rmiss', 'rt_test_nocloud.rmiss.spv', ['-DRMISS_SKIP_CLOUDS=1'])
 
-    # 3) SHaRC update 变体：同一份源码 + -DSHARC_UPDATE=1（走 K2-I 轻量化管线）。
+    # 3) SHaRC update 变体：同一份源码 + -DSHARC_UPDATE=1（走 K2-I 轻量化管线 + MatReuse 消费瘦身）。
     add('rt_test.rgen', 'rt_test_sharc_update.rgen.spv', [
         '-DSHARC_UPDATE=1',
         '-DORION_K2_TRANSPORT',
         '-DORION_K2_MATERIAL_INLINE',
         '-DORION_K2_INDIRECT_STAGE',
+        '-DORION_K2_CONSUMER_MAT_REUSE_ONLY',
     ])
 
     # 3.5) 批4b 植物真几何摇摆：foliage split 顶点逐帧位移 compute（无描述符，
@@ -304,6 +327,8 @@ def collect_targets():
     add('vpt_restir_spatial.comp', 'vpt_restir_spatial.comp.spv', [])
     add('vpt_sparse_compact.comp', 'vpt_sparse_compact.comp.spv', [])
     add('vpt_k2loc_compact.comp', 'vpt_k2loc_compact.comp.spv', [])
+    add('vpt_k1_glass_compact.comp', 'vpt_k1_glass_compact.comp.spv', [])
+    add('vpt_sharc_compact.comp', 'vpt_sharc_compact.comp.spv', [])
     add('aces2_bake_lut.comp', 'aces2_bake_lut.comp.spv', [])
 
     # 4) 半分辨率 GI 变体：同一份源码 + -DGI_HALFRES=1。
@@ -313,14 +338,15 @@ def collect_targets():
     add('rt_test.rchit', 'rt_test_pomdeferred.rchit.spv', ['-DPOM_DEFERRED_ONLY=1'])
 
     # 6) K1/K2 两趟拆分变体。
-    for spv_name, defines in (
-            ('rt_test_k1.rgen.spv', ['-DORION_K1_PRIMARY']),
-            ('rt_test_k1_ser.rgen.spv', ['-DORION_K1_PRIMARY', '-DRT_ENABLE_SER']),
-            ('rt_test_k2.rgen.spv', ['-DORION_K2_TRANSPORT']),
-            ('rt_test_k2_ser.rgen.spv', ['-DORION_K2_TRANSPORT', '-DRT_ENABLE_SER'])):
-        add('rt_test.rgen', spv_name, defines)
+    for spv_name in ('rt_test_k1.rgen.spv',
+                     'rt_test_k1_ser.rgen.spv',
+                     'rt_test_k1_glass.rgen.spv',
+                     'rt_test_k1_glass_ser.rgen.spv',
+                     'rt_test_k2.rgen.spv',
+                     'rt_test_k2_ser.rgen.spv'):
+        add('rt_test.rgen', spv_name, EXTRA_FLAGS[spv_name])
 
-    # 7) K2 内联 / D / I / SUN / LOC / SUNA / SUNB 变体（EXTRA_FLAGS 提供各自宏组合）。
+    # 7) K2 内联 / D / I / SUN / LOC / LOC_NEE / LOC_GLOSSY / SUNA / SUNB 变体。
     for spv_name in ('rt_test_k2_inline.rgen.spv',
                      'rt_test_k2d.rgen.spv',
                      'rt_test_k2d_ser.rgen.spv',
@@ -331,14 +357,19 @@ def collect_targets():
                      'rt_test_k2sun_ser.rgen.spv',
                      'rt_test_k2loc.rgen.spv',
                      'rt_test_k2loc_ser.rgen.spv',
+                     'rt_test_k2loc_nee.rgen.spv',
+                     'rt_test_k2loc_nee_ser.rgen.spv',
+                     'rt_test_k2loc_glossy.rgen.spv',
+                     'rt_test_k2loc_glossy_ser.rgen.spv',
                      'rt_test_k2sunA.rgen.spv',
                      'rt_test_k2sunA_ser.rgen.spv',
                      'rt_test_k2sunB.rgen.spv',
                      'rt_test_k2sunB_ser.rgen.spv'):
         add('rt_test.rgen', spv_name, EXTRA_FLAGS[spv_name])
 
-    # 8) K1 主命中组精简 rchit。
+    # 8) K1 主命中组精简 rchit + 极简主光线专用 rchit（~8 KB）。
     add('rt_test.rchit', 'rt_test_k1.rchit.spv', ['-DORION_K1_PRIMARY'])
+    add('rt_test_k1_primary.rchit', 'rt_test_k1_primary.rchit.spv', [])
 
     # 9) 材质 callable TU（生成文件，单一事实源 rt_test.rchit）。
     add('rt_test_material.rcall', 'rt_test_material.spv', [])

@@ -4498,7 +4498,7 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         cloudBarriers[0].image = g_volumetricCloudResolvedImage;
         cloudBarriers[1].image = g_volumetricCloudDepthImage;
         vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
             2u, cloudBarriers);
     }
@@ -4531,7 +4531,10 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
     }
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0u, 0u, nullptr, 0u, nullptr,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0u, 0u, nullptr, 0u, nullptr,
         7u, barriers);
 }
 void destroyRRGuideRelaxResources()

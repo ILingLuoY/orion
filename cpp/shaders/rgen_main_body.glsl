@@ -68,7 +68,7 @@ vec3 upsampleGiHalf(ivec2 fullCoord, float centerViewDepth)
 void main() {
     ivec2 size = imageSize(image);
 
-#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
+#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE) && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
     const bool k2iCompactTraceActive = (k2iSparseCompact.mode != 0u);
     ivec2 pixelCoord;
     if(k2iCompactTraceActive)
@@ -87,11 +87,36 @@ void main() {
     }
     else
     {
+#if SHARC_UPDATE
+        const ivec2 sharcBlock = ivec2(gl_LaunchIDEXT.xy);
+        const uint sharcBlockSize = sharcUpdateBlockSize();
+        pixelCoord =
+            sharcBlock * int(sharcBlockSize) +
+            sharcUpdateBlockOffset(sharcBlock, sharcBlockSize);
+        if(pixelCoord.x >= size.x || pixelCoord.y >= size.y)
+        {
+            return;
+        }
+#else
         if(gl_LaunchIDEXT.x >= size.x || gl_LaunchIDEXT.y >= size.y)
         {
             return;
         }
         pixelCoord = ivec2(gl_LaunchIDEXT.xy);
+#ifdef ORION_K1_GLASS_ONLY
+        {
+            const float glassMarker = ptLandingRecords[
+                ptLandingRecordIndex(
+                    uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x), 0
+                )
+            ].a.x;
+            if(glassMarker <= 0.1 || glassMarker >= 0.5)
+            {
+                return;
+            }
+        }
+#endif
+#endif
     }
 #else
     const bool k2iCompactTraceActive = false;
@@ -138,7 +163,7 @@ void main() {
 #endif
 
 
-#if !((defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY))
+#if !((defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE) && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY))
 #if GI_HALFRES
     // 2026-10-24 半分辨率 GI 变体：dispatch 是 (w+1)/2 × (h+1)/2，每个 invocation
     // 负责 2×2 块里的**一个**子像素；相位 (frameCount&1, frameCount>>1&1) 逐帧轮转，
@@ -166,25 +191,6 @@ void main() {
     ivec2 pixelCoord =
         ivec2(gl_LaunchIDEXT.xy);
 #endif
-#endif
-
-#if SHARC_UPDATE
-    // 块级 dispatch：launchID 是**块坐标**，不是像素坐标（见 sharcUpdateBlockOffset）。
-    // 块内偏移由 (块坐标, 帧号) 哈希选出唯一像素；最后一行/列不满块时像素可能
-    // 越界，直接退出（不追路径、不写任何输出图 —— 所有输出由渲染 pass 覆写）。
-    {
-        const ivec2 sharcBlock = ivec2(gl_LaunchIDEXT.xy);
-        const uint sharcBlockSize = sharcUpdateBlockSize();
-
-        pixelCoord =
-            sharcBlock * int(sharcBlockSize) +
-            sharcUpdateBlockOffset(sharcBlock, sharcBlockSize);
-
-        if(pixelCoord.x >= size.x || pixelCoord.y >= size.y)
-        {
-            return;
-        }
-    }
 #endif
 
 
@@ -238,7 +244,7 @@ void main() {
         return;
     }
 
-#if !GI_HALFRES && !SHARC_UPDATE
+#if !GI_HALFRES && !SHARC_UPDATE && !defined(ORION_K1_GLASS_ONLY)
     // 2026-11-21 P0-1：per-pixel 旁路槽清槽。样本循环**外**每像素无条件清一次
     //（vec4(0)，a=0 = 无有效偏移）；miss / 未被本帧重写的像素读回按 0 处理。
     // 不能每条射线清：多样本共享同一槽位，后写覆盖先写（蓝图 §3.6）。
@@ -261,6 +267,10 @@ void main() {
 
     vec3 accumulatedSampleColor =
         vec3(0.0);
+#ifdef ORION_K2_INDIRECT_TRACE_ONLY
+    vec3 k2iGiTraceAccum = vec3(0.0);
+    bool k2iGiTraceAny = false;
+#endif
 
     // "这个像素对我们是远场"的标记，供 main 末尾的 DH 合成块使用。
     // primaryHitDistance 的作用域只到采样循环体内，所以在循环外先开一个槽，
@@ -451,7 +461,7 @@ vec2 inUV =
 // rgen_k1_landing.glsl）。payload 快照 = 切点前的完整主命中状态。
 // 非 opaque 像素（miss/水/玻璃）K1 已独立完成全部输出，K2 直接跳样本。
 // =====================================================
-#ifdef ORION_K1_PRIMARY
+#if defined(ORION_K1_PRIMARY) && !defined(ORION_K1_GLASS_ONLY)
     // 每样本先盖哨兵：本样本若不走 opaque 切点，这条记录保持 valid=0，
     // K2 就不会读到上一帧的陈旧记录。
     ptLandingInvalidate(
@@ -465,19 +475,25 @@ vec2 inUV =
 #ifndef ORION_K2_TRANSPORT
         hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 hit.state = makeTraceState(RT_PURPOSE_PRIMARY_SKY);
+#if defined(ORION_K1_PRIMARY) && !defined(ORION_K1_GLASS_ONLY)
+const uint k1PrimarySbtOffset = 5u;
+#else
+const uint k1PrimarySbtOffset = 0u;
+#endif
 
 #ifdef RT_ENABLE_SER
 // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
 if(cam.perfSerAb.y != 0u)
 {
-    serTraceRay(
+    serTraceRayOffset(
         origin.xyz,
         0.001,
         worldDir.xyz,
         10000.0,
         gl_RayFlagsCullBackFacingTrianglesEXT,
         0x01,
-        s
+        s,
+        k1PrimarySbtOffset
     );
 }
 else
@@ -490,7 +506,7 @@ else
         topLevelAS,
     gl_RayFlagsCullBackFacingTrianglesEXT,
         0x01,
-        0, 0, 0,
+        k1PrimarySbtOffset, 0, 0,
         origin.xyz,
         0.001,
         worldDir.xyz,
@@ -617,12 +633,24 @@ primaryViewDirectionForWater = worldDir.xyz;
     resolveHitMaterial(
         origin.xyz,
         worldDir.xyz);
+    if(g_hitVertexMaterialId > 0.2 && g_hitVertexMaterialId < 0.45)
+    {
+        payload.state |= RT_STATE_FOLIAGE_BIT;
+    }
     if(matReuseOn)
     {
         matReuseStore(matReuseIdx);
     }
 #elif defined(ORION_K2_DIRECT_SUN_STAGE_B) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_INDIRECT_STAGE)
-    // 消费者腿（K2-LOC / K2-I）：复用打开时读记录灌回、跳过解析；校验臂双跑比对。
+    // 消费者腿（K2-SUNB / K2-LOC / K2-I）
+#ifdef ORION_K2_CONSUMER_MAT_REUSE_ONLY
+    MatReuseRecord reuseRecord;
+    if(!matReuseLoad(matReuseIdx, reuseRecord))
+    {
+        continue;
+    }
+    matReuseApply(reuseRecord);
+#else
     if(matReuseOn)
     {
         MatReuseRecord reuseRecord;
@@ -664,6 +692,7 @@ primaryViewDirectionForWater = worldDir.xyz;
             origin.xyz,
             worldDir.xyz);
     }
+#endif
 #else
     // 其余 K2 变体（单发 K2 / ③ K2-D / 内联版 / 各 SER 等）：不参与复用，原路径。
     #ifdef ORION_RT_STAGE_COUNTERS
@@ -1070,6 +1099,8 @@ if(getLegacyMaterialId(payload.state) >= 2.5)
 // Capture before any secondary ray overwrites payload.
 // =====================================================
 
+#if !defined(ORION_K2_DIRECT_SUN_STAGE_B) && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
+    && !defined(ORION_K2_INDIRECT_TRACE_ONLY) && !SHARC_UPDATE
 if(
     s == 0 &&
     primaryHitDistance >= 0.0 &&
@@ -1141,9 +1172,10 @@ if(
             guideRoughness
         );
 }
+#endif
 
 
-#ifndef ORION_K2_TRANSPORT
+#if !defined(ORION_K2_TRANSPORT) && !defined(ORION_K1_GLASS_ONLY)
 // K1 独占：G-buffer（depth / dlssMotion）写入。K1 对**所有**像素（含延期到
 // K2 的不透明/水）各写一遍，K2 跳过 —— 同址两写没有屏障保证顺序。
 // =====================================================
@@ -1412,6 +1444,15 @@ if (s == 0)
 }
 #endif
 
+#elif defined(ORION_K1_GLASS_ONLY)
+if(s == 0)
+{
+    rtDebugPrimaryMotion = ptLandingRecords[
+        ptLandingRecordIndex(
+            uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x), 0
+        )
+    ].e.zw;
+}
 #endif // ORION_K2_TRANSPORT（重开的 K1 独占段：G-buffer / depth / MV 写入）
 
 // =====================================================
@@ -1441,7 +1482,7 @@ if(s == 0)
 vec3 sampleColor =
     vec3(0.0);
 
-#if defined(ORION_K2_INDIRECT_STAGE) && !SHARC_UPDATE
+#if defined(ORION_K2_INDIRECT_STAGE) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_TRACE_ONLY)
 // ③ K2-I：直射级交接图在分叉前整体载入一次（水支在源序上先于 RTAO 桩出现，
 // GLSL 要求先声明后使用）。rgb = 直射三项和（或水的完整着色），a = rtaoFactor。
 const vec4 k2DirectFromImage = imageLoad(k2DirectImage, pixelCoord);
@@ -1453,7 +1494,11 @@ const vec4 k2DirectFromImage = vec4(0.0, 0.0, 0.0, 1.0);
         // 步骤 2: ClosestHit 结果判定 (若未击中则输出天空)
         // ==========================================
 if (primaryHitDistance < 0.0) {
-#ifndef ORION_K2_TRANSPORT
+#ifdef ORION_K1_GLASS_ONLY
+    anyLandingStored = true;
+    continue;
+#endif
+#if !defined(ORION_K2_TRANSPORT) && !defined(ORION_K1_GLASS_ONLY)
 #if GI_HALFRES
     // 2026-10-24 半分辨率 GI 变体：天空像素没有间接光。写"零辐照度 + 极远深度"
     // 的哨兵后**立即 return** —— 不能继续落到 24156 起的 RR guide 写入，那些由
@@ -1485,11 +1530,17 @@ if (primaryHitDistance < 0.0) {
 
 } else {
 #ifdef ORION_K1_PRIMARY
+#ifdef ORION_K1_GLASS_ONLY
+    if(getLegacyMaterialId(payload.state) < 2.5)
+    {
+        anyLandingStored = true;
+        continue;
+    }
+#else
     // B①：K1 切点 —— 主命中组（地形/水/实体/粒子）只落身份，材质解析与
     // 后续传输整体延期给 K2（landing → continue）。玻璃（matId >= 2.5，由
-    // 全功能 rt_test_translucent.rchit 写进 state）留在 K1 行内输运。
-    // K1 精简 rchit 不改写 state ⇒ 这里的 matId 是发射前的 0，恒 < 2.5；
-    // miss 像素走不到这里（上面 if 分支 return/落天空）。
+    // 全功能 rt_test_translucent.rchit 写进 state）在 ORION_K1_DEFER_GLASS 下
+    // 标为 a.x=0.25 交给压紧后的 k1-glass 腿，大幅瘦身 k1-primary。
     if(getLegacyMaterialId(payload.state) < 2.5)
     {
         ptLandingStore(
@@ -1502,6 +1553,21 @@ if (primaryHitDistance < 0.0) {
         anyLandingStored = true;
         continue;
     }
+#ifdef ORION_K1_DEFER_GLASS
+    else
+    {
+        ptLandingMarkGlass(
+            ptLandingRecordIndex(
+                uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x),
+                s
+            ),
+            rtDebugPrimaryMotion
+        );
+        anyLandingStored = true;
+        continue;
+    }
+#endif
+#endif
 #endif
     vec3 hitPos =
         origin.xyz +
@@ -1518,8 +1584,14 @@ if (primaryHitDistance < 0.0) {
             // 门控：全局只在 K2 内联材质路径（ORION_K2_MATERIAL_INLINE →
             // material_resolve）存在；K1/单发 K2/callable 路径不 include
             // material_resolve ⇒ 不引用。四腿/三腿/两腿档全是内联路径。
-#ifdef ORION_K2_MATERIAL_INLINE
-            if(g_hitVertexMaterialId > 0.2 && g_hitVertexMaterialId < 0.45)
+#if defined(ORION_K2_CONSUMER_MAT_REUSE_ONLY)
+            if((payload.state & RT_STATE_FOLIAGE_BIT) != 0u)
+            {
+                matId = 0.25;
+            }
+#elif defined(ORION_K2_MATERIAL_INLINE)
+            if((payload.state & RT_STATE_FOLIAGE_BIT) != 0u ||
+               (g_hitVertexMaterialId > 0.2 && g_hitVertexMaterialId < 0.45))
             {
                 matId = 0.25;
             }
@@ -1566,10 +1638,12 @@ if (matId > 0.5 && matId < 2.5) {
         return;
     }
 #endif
-#if SHARC_UPDATE
+#if SHARC_UPDATE || defined(ORION_K2_INDIRECT_TRACE_ONLY) \
+    || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_B)
     continue;
 #endif
-#ifndef ORION_K1_PRIMARY
+#if !defined(ORION_K1_PRIMARY) && !defined(ORION_K2_INDIRECT_TRACE_ONLY) \
+    && !SHARC_UPDATE && !defined(ORION_K2_DIRECT_LOCAL_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
 // ④ K1 死分支摘除：K1 的主命中组（地形/水/实体/粒子）全部在切点落 landing 后
 // continue，水像素永远走不到水分支体（水面着色整体延期给 K2）⇒ K1 编译期摘除。
 #ifndef WATER_K2_GUIDE_PROBE_DEDUP
@@ -1705,7 +1779,7 @@ if (matId > 0.5 && matId < 2.5) {
                             ((SER_PROBE_SECONDARY_FLAGS != 0) ||
                                 perfL10SerProbeSecondaryFlags())
                                 ? secondaryTraverseFlags() : gl_RayFlagsNoneEXT,
-                            0xff,
+                            0xefu,
                             0,
                             0,
                             0,
@@ -1727,7 +1801,7 @@ if (matId > 0.5 && matId < 2.5) {
                             rrWaterReflectionDir,
                             10000.0,
                             secondaryTraverseFlags(),
-                            0xff,
+                            0xefu,
                             s
                         );
                     }
@@ -1740,7 +1814,7 @@ if (matId > 0.5 && matId < 2.5) {
                         traceRayEXT(
                             topLevelAS,
                             secondaryTraverseFlags(),
-                            0xff,
+                            0xefu,
                             0,
                             0,
                             0,
@@ -2201,7 +2275,7 @@ else if(
     matId < 4.5
 )
 {
-#ifndef ORION_K2_TRANSPORT
+#if !defined(ORION_K2_TRANSPORT) && !defined(ORION_K1_DEFER_GLASS)
                 GlassSurfaceInfo glassSurface;
                 #if GI_RR_DELTA_FLAG
                 // (a) 这个像素的颜色来自"穿过玻璃"的路径：写进 RR input 的 diffuse-albedo alpha
@@ -2887,7 +2961,8 @@ if(rainSolidSurfaceCandidate &&
                     pbr2ReflectionStrength = evaluatePBR2ReflectionStrength(
                         roughness,
                         f0MetalCode);
-#if RR_GUIDE_PURIFY_V1
+#if RR_GUIDE_PURIFY_V1 && !defined(ORION_K2_DIRECT_SUN_STAGE_B) && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
+    && !defined(ORION_K2_INDIRECT_TRACE_ONLY) && !SHARC_UPDATE
                     if(s == 0 && matId <= 0.5)
                     {
                         vec3 wetGuideV = normalize(-worldDir.xyz);
@@ -3076,7 +3151,7 @@ for(
             aoVisQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xff,
+            0xefu,
             hitPos + aoDir * 0.001,
             0.01,
             aoDir,
@@ -3133,7 +3208,7 @@ for(
 
             gl_RayFlagsTerminateOnFirstHitEXT,
 
-            0xff,
+            0xefu,
             0,
             0,
             0,
@@ -3221,6 +3296,11 @@ const float rtaoFactor = 1.0;
 #if !VPT_SPARSE_SKIP_VISIBILITY
 #error "K2 直射/间接拆分要求 VPT_SPARSE_SKIP_VISIBILITY=1（直射已并进 image.rgb 参与 1/rate 补偿）"
 #endif
+#if defined(ORION_K2_INDIRECT_TRACE_ONLY) || SHARC_UPDATE
+const float rtaoFactor = 1.0;
+const vec3 shadowTransmittance = vec3(1.0);
+const float NdotL = max(0.0, dot(normal, sunDir));
+#else
 const float rtaoFactor = k2DirectFromImage.a;
 vec3 k2GlossyExtra = vec3(0.0);
 float k2SpecHitDistFromLanding = 0.0;
@@ -3244,9 +3324,12 @@ const vec3 shadowTransmittance = vec3(1.0);
 // 语义逐位同主变体。
 const float NdotL = max(0.0, dot(normal, sunDir));
 #endif
+#endif
 
                 vec3 V = -worldDir.xyz;
                 float NdotV = max(dot(normal, V), 0.0001);
+#if !defined(ORION_K2_DIRECT_LOCAL_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE_A) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
 vec3 F0 =
     materialF0;
 
@@ -3317,6 +3400,7 @@ vec3 brdfWeight =
     ) *
     albedo *
     g2bPrimaryMixtureWeight;
+#endif
 
 // ============================================================================
 // 2026-10-11 SHaRC 缓存值的归一化基准 —— **结论：就用 brdfWeight 原样除**
@@ -3861,7 +3945,7 @@ for (int si = 0;
             sunVisQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xff,
+            0xefu,
             shadowOrigin,
             SUN_SHADOW_RAY_TMIN,
             shadowDir,
@@ -3900,7 +3984,7 @@ for (int si = 0;
             (sunVisibilityFilterActive
                 ? 0u
                 : gl_RayFlagsSkipClosestHitShaderEXT),
-            0xff,
+            0xefu,
             si
         );
     }
@@ -3916,7 +4000,7 @@ for (int si = 0;
             (sunVisibilityFilterActive
                 ? 0u
                 : gl_RayFlagsSkipClosestHitShaderEXT),
-            0xff,
+            0xefu,
             0,
             0,
             0,
@@ -4206,7 +4290,7 @@ if(
     // 只有粒子/天气层被清掉了这一位（VulkanCore.cpp 的 TLAS 遮罩分支）。
     // 目的：雨丝不挡"天空可见度"（物理正确），同时让这根每像素 1~9 根的
     // 长射线不再穿过相机周围那块 7k 三角形的粒子 BLAS。
-    const uint RAIN_EXPOSURE_RAY_MASK = 0x08u;
+    const uint RAIN_EXPOSURE_RAY_MASK = 0x18u;
 
     uint rainExposureSoftFlags =
         gl_RayFlagsTerminateOnFirstHitEXT |
@@ -4839,20 +4923,27 @@ if(
         NdotL;
 
 
-    vec3 sunRadiance =
-        getTimeDrivenSkyLightColor() *
-        3.2 *
-        getTimeDrivenSkyLightRadianceScale() *
-        shadowTransmittance *
-        c3CloudSunTransmittance(hitPos + directL * 0.001, directL);
+    if(max(shadowTransmittance.r, max(shadowTransmittance.g, shadowTransmittance.b)) > 1.0e-5)
+    {
+        vec3 sunRadiance =
+            getTimeDrivenSkyLightColor() *
+            3.2 *
+            getTimeDrivenSkyLightRadianceScale() *
+            shadowTransmittance *
+            c3CloudSunTransmittance(hitPos + directL * 0.001, directL);
 
 
-    directLight =
-        sunRadiance *
-        (
-            directDiffuse +
-            directSpecular
-        );
+        directLight =
+            sunRadiance *
+            (
+                directDiffuse +
+                directSpecular
+            );
+    }
+    else
+    {
+        directLight = vec3(0.0);
+    }
 }
 
 #ifndef GI_FOLIAGE_BACKLIGHT
@@ -4954,7 +5045,7 @@ if(matId > 0.2 && matId < 0.45)
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT |
             gl_RayFlagsSkipClosestHitShaderEXT,
-            0xff,
+            0xefu,
             0,
             0,
             0,
@@ -5052,6 +5143,9 @@ bool splitHalfRight =
 // 发射体邻接自发光（命中面**背后**体素的 emission，hitPos - normal*0.02）
 // 无条件叠加：只在被看的面属于发光方块时非零 —— 它就是"光源方块自己亮"
 // 的唯一来源；非发光面它恒为 0，无副作用。
+#if !defined(ORION_K2_DIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B) \
+    && !defined(ORION_K2_DIRECT_LOCAL_STAGE) && !defined(ORION_K2_INDIRECT_TRACE_ONLY) && !SHARC_UPDATE
 vec3 localEmitterEmission = evaluateVLIEmitterRadianceAtHit(
     hitPos,
     normal,
@@ -5066,10 +5160,12 @@ if(DBG_SPLIT_ABLATION)
 {
     localEmitterEmission = splitHalfRight ? localEmitterEmission : vec3(0.0);
 }
+#endif
 
-// ④ 局部光 RIS/二级弹射归 K2-LOC（K2-SUN 不编译）。
+// ④ 局部光 RIS/二级弹射归 K2-LOC（K2-SUN 与 K2-LOC-GLOSSY 不编译）。
 #if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
-    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B) \
+    && !defined(ORION_K2_LOC_GLOSSY_ONLY)
 // Opaque primary receivers use full ReSTIR DI. Glass and water retain their
 // dedicated paths, so no transparent-layer history participates in reprojection.
 // （Orion indirect.rgen.slang:57）。XOR 保留乘法乘积的逐位结构，会让
@@ -5281,9 +5377,10 @@ if(DBG_SPLIT_ABLATION)
 }
 #endif // ORION_K2_INDIRECT_STAGE（③：局部光 RIS/二级弹射归 K2-D）
 
-// ④ 水面反射太阳/GGX 镜面/spec guide 快照归 K2-LOC（K2-SUN 不编译）。
+// ④ 水面反射太阳/GGX 镜面/spec guide 快照归 K2-LOC（K2-SUN 与 K2-LOC-NEE 不编译）。
 #if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
-    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B) \
+    && !defined(ORION_K2_LOC_NEE_ONLY)
                     // =====================================================
 // Explicit Sun -> Water -> Receiver reflection
 // =====================================================
@@ -5294,6 +5391,7 @@ if(DBG_SPLIT_ABLATION)
 uint waterReflectionInterval =
     clamp(cam.perfSecondary.z, 0u, 4u);
 bool runWaterReflection =
+    (cam.fogMoodParams.w > 0.5) &&
     waterReflectionInterval > 0u &&
     (waterReflectionInterval == 1u ||
      (cam.frameCount % waterReflectionInterval) == 0u)
@@ -5405,12 +5503,19 @@ else if(rtLodDistance >= 160.0 * perfL10TierScale())
 #ifndef VPT_GLOSSY_ROUGH_CUTOFF
 #define VPT_GLOSSY_ROUGH_CUTOFF 1
 #endif
+#ifndef VPT_GLOSSY_DIST_ROUGH_CUTOFF
+#define VPT_GLOSSY_DIST_ROUGH_CUTOFF 1
+#endif
 // 粗糙度级（ORION_GLOSSY_ROUGH_LOD）：只往上抬，不往回降。
 if(cam.giHalfParams.w > 0.5f)
 {
-    if(roughness >= 0.80 && metallic < 0.05 &&
+    if(metallic < 0.05 &&
        max(materialF0.r, max(materialF0.g, materialF0.b)) <= 0.06 &&
-       VPT_GLOSSY_ROUGH_CUTOFF != 0)
+       VPT_GLOSSY_ROUGH_CUTOFF != 0 &&
+       (roughness >= 0.80 ||
+        (VPT_GLOSSY_DIST_ROUGH_CUTOFF != 0 &&
+         ((rtLodDistance >= 40.0 * perfL10TierScale() && roughness >= 0.65) ||
+          (rtLodDistance >= 72.0 * perfL10TierScale() && roughness >= 0.50)))))
     {
         glossySampleLevel = 3;
     }
@@ -5732,6 +5837,58 @@ if(s == 0 && matId <= 0.5)
                 }
                 continue;
 #elif defined(ORION_K2_DIRECT_LOCAL_STAGE)
+                const uint spatialLandingIdx = ptLandingRecordIndex(
+                    uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x),
+                    s
+                );
+#if defined(ORION_K2_LOC_NEE_ONLY)
+                // Batch U：K2-LOC-NEE 独立腿，只做局部光 NEE + 二级体素弹射，不碰 .d 镜面槽。
+                const vec3 localAdd = localDirectLight + localSecondaryLight;
+                if(any(greaterThan(localAdd, vec3(0.0))))
+                {
+                    vec4 k2DirectAccum = imageLoad(k2DirectImage, pixelCoord);
+                    imageStore(
+                        k2DirectImage,
+                        pixelCoord,
+                        vec4(k2DirectAccum.rgb + localAdd, k2DirectAccum.a)
+                    );
+                }
+                if(cam.sparseParams.x >= 1.5 && s == 0 && runPrimaryDirectLight)
+                {
+                    ptLandingStoreSpatialMaterial(
+                        spatialLandingIdx,
+                        albedo,
+                        roughness,
+                        materialF0,
+                        metallic,
+                        normal,
+                        primaryLocalGeomFace,
+                        vptPixelActive
+                    );
+                }
+                else
+                {
+                    ptLandingRecords[spatialLandingIdx].c.w = 0u;
+                }
+                continue;
+#elif defined(ORION_K2_LOC_GLOSSY_ONLY)
+                // Batch U：K2-LOC-GLOSSY 独立腿，只做水面太阳反射与主表面 Glossy，不碰 .c 槽。
+                if(any(greaterThan(waterReflectedSunLight, vec3(0.0))))
+                {
+                    vec4 k2DirectAccum = imageLoad(k2DirectImage, pixelCoord);
+                    imageStore(
+                        k2DirectImage,
+                        pixelCoord,
+                        vec4(k2DirectAccum.rgb + waterReflectedSunLight, k2DirectAccum.a)
+                    );
+                }
+                ptLandingStoreGlossyExtra(
+                    spatialLandingIdx,
+                    glossyReflectionLight,
+                    rrSpecularHitDistance
+                );
+                continue;
+#else
                 // ==========================================
                 // ④ K2-LOC 不透明出口：局部光/水面反射太阳叠加进 K2-SUN
                 // 已落的直射和（**load-add-store 复用 binding 89**，a 原样
@@ -5749,10 +5906,6 @@ if(s == 0 && matId <= 0.5)
                             waterReflectedSunLight,
                         k2DirectAccum.a
                     )
-                );
-                const uint spatialLandingIdx = ptLandingRecordIndex(
-                    uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x),
-                    s
                 );
                 ptLandingStoreGlossyExtra(
                     spatialLandingIdx,
@@ -5777,6 +5930,7 @@ if(s == 0 && matId <= 0.5)
                     ptLandingRecords[spatialLandingIdx].c.w = 0u;
                 }
                 continue;
+#endif
 #endif
 // ④ GI/稀疏合成/公共尾段：主变体 + K2-I 编译；K2-D/K2-SUN/K2-LOC 全部不编译。
 #if !defined(ORION_K2_DIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
@@ -6311,6 +6465,7 @@ while(
                     // RT_HIT_OPAQUE ⇒ 下游走普通不透明 Lambert 分支，只是材质是近似的。
                     // 打空（30 格 / 64 步 / 未加载段）按 miss 回天空项，与真实方案的
                     // 远场行为一致。本档画面不正确是定义，不是 bug。
+#if !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_TRACE_ONLY)
                     if(perfL10VoxelDdaGi())
                     {
                         float ddaHitT;
@@ -6336,6 +6491,7 @@ while(
                         }
                     }
                     else
+#endif
                     {
 #ifdef RT_ENABLE_SER
                     // Perf-L10.7: the host alternates this every window so SER can
@@ -6356,13 +6512,13 @@ while(
                         #ifdef ORION_RT_STAGE_COUNTERS
                         rtCntRayIssued();
                         #endif
-                        traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                        traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xefu, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
                     }
 #else
                     #ifdef ORION_RT_STAGE_COUNTERS
                     rtCntRayIssued();
                     #endif
-                    traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                    traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xefu, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
 #endif
                     }
 
@@ -7150,6 +7306,9 @@ float nextMetallic =
 // 判据与主路径**逐字同源重算**（同样的 UBO 输入 ⇒ 同样的值），这样整帧的这一项
 // 要么都在、要么都不在 —— 时域滤波只面对一件事，比"半帧有半帧没有"更干净。
 // 局部重算而不引用上游变量：两处未必在同一层大括号里，重算比跨作用域引用安全。
+#if SHARC_UPDATE
+vec3 bounceWaterReflectedSun = vec3(0.0);
+#else
 #ifndef GI_BOUNCE_WATER_SUN_OPT
 #define GI_BOUNCE_WATER_SUN_OPT 1
 #endif
@@ -7217,6 +7376,7 @@ vec3 bounceWaterReflectedSun =
     (1.0 - nextMetallic) *
     bounceWaterReflectedSunFactor *
     c3CloudSunTransmittance(nextHitPos, sunDir);
+#endif
 #endif
 
 
@@ -7858,7 +8018,11 @@ if(runDiffuseGI)
 }
 #endif
 }   // 结束 2026-10-24 的 giHalfParams.x 运行时分支（起点见 diffuseGILodWeight 之后）
-#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
+#if defined(ORION_K2_INDIRECT_TRACE_ONLY)
+k2iGiTraceAccum += indirectLight;
+k2iGiTraceAny = true;
+continue;
+#elif (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE)) && !SHARC_UPDATE && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
 if(k2iCompactTraceActive)
 {
     imageStore(
@@ -7872,6 +8036,7 @@ if(k2iCompactTraceActive)
 #if SHARC_UPDATE
 continue;
 #endif
+#if !defined(ORION_K2_INDIRECT_TRACE_ONLY) && !SHARC_UPDATE
 
 #if GI_HALFRES
 // ============================================================================
@@ -8469,16 +8634,18 @@ sampleColor =
                 );
         }
 #endif
+#endif // !ORION_K2_INDIRECT_TRACE_ONLY && !SHARC_UPDATE
 #endif
 #endif // ORION_K2_DIRECT_STAGE（③：GI/稀疏合成/SS 分项归 K2-I，K2-D 不编译）
 // ④ K1 不透明管线摘除段结束。
             }
         }
 
-// ④ aerial/累积段归 K2-I；K2-D/K2-SUN/K2-LOC 不编译。
+// ④ aerial/累积段归 K2-I；K2-D/K2-SUN/K2-LOC/K2I-TRACE/SHARC 不编译。
 #if !defined(ORION_K2_DIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
     && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
-    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B) \
+    && !defined(ORION_K2_INDIRECT_TRACE_ONLY) && !SHARC_UPDATE
         // Apply the camera-to-first-visible-surface segment once.  Misses
         // already contain the physical sky from rmiss, and applying this
         // after all water/glass composition prevents double-fogging their
@@ -8503,14 +8670,26 @@ sampleColor =
         accumulatedSampleColor += sampleColor;
 #endif // ORION_K2_DIRECT_STAGE（③：aerial/累积归 K2-I，K2-D 每像素都提前 continue）
     }
+#ifdef ORION_K2_INDIRECT_TRACE_ONLY
+    if(k2iGiTraceAny)
+    {
+        imageStore(
+            k2GiTraceImage,
+            pixelCoord,
+            vec4(min(k2iGiTraceAccum / float(SAMPLES_PER_FRAME), vec3(60000.0)), 1.0)
+        );
+    }
+    return;
+#endif
 #if SHARC_UPDATE
     return;
 #endif
 
-// ④ 公共尾段（compose/guide/输出）归 K2-I；K2-D/K2-SUN/K2-LOC 不编译。
+// ④ 公共尾段（compose/guide/输出）归 K2-I；K2-D/K2-SUN/K2-LOC/K2I-TRACE/SHARC 不编译。
 #if !defined(ORION_K2_DIRECT_STAGE) && !defined(ORION_K2_DIRECT_SUN_STAGE) \
     && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
-    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
+    && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_SUN_STAGE_B) \
+    && !defined(ORION_K2_INDIRECT_TRACE_ONLY) && !SHARC_UPDATE
     // ==========================================
     // Perf-1.1
     // Custom Temporal removed from RayGen.
@@ -9208,7 +9387,7 @@ if ((cam.dhFarFieldParams.x > 0.5 || dhFarModeRequested == 14
                     traceRayEXT(
                         topLevelAS,
                         secondaryTraverseFlags(),
-                        0xff,
+                        0xefu,
                         0,
                         0,
                         0,

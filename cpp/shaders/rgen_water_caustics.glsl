@@ -833,12 +833,18 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
     }
 #endif
 
+    const bool sunVisNonZero =
+        max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)) > 1.0e-5;
 #if WATER_CAUSTIC_DEFERRED_SUN_TRACE
-    float causticCloudShadow = g_waterEntrySunValid
-        ? g_waterEntryCloudShadow
-        : c3CloudSunTransmittance(waterSurfacePosition, L);
+    float causticCloudShadow = sunVisNonZero
+        ? (g_waterEntrySunValid
+            ? g_waterEntryCloudShadow
+            : c3CloudSunTransmittance(waterSurfacePosition, L))
+        : 0.0;
 #else
-    float causticCloudShadow = c3CloudSunTransmittance(waterSurfacePosition, receiverToSun);
+    float causticCloudShadow = sunVisNonZero
+        ? c3CloudSunTransmittance(waterSurfacePosition, receiverToSun)
+        : 0.0;
 #endif
     vec3 sunRadiance =
         getTimeDrivenSkyLightColor() *

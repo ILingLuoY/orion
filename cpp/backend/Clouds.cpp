@@ -4183,6 +4183,7 @@ void syncFogRenderTargets()
 
 void recordFogFroxelPasses(VkCommandBuffer cmd)
 {
+    ScopedVkDebugLabel fogFroxelLabel(cmd, "Fog-Froxel");
     fogProbeLog();
     if(!g_fogEnabled.load() || g_cameraInWater.load() != 0u)
     {
@@ -4436,7 +4437,8 @@ void recordFogScreenApply(VkCommandBuffer cmd)
         sceneBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         sceneBarrier.image = g_rtOutputImage;
         sceneBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
             1u, &sceneBarrier);
     }
@@ -4896,7 +4898,7 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
             if(oldCount > 0u)
             {
                 vkCmdPipelineBarrier(cmd,
-                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr,
                     oldCount, oldBarriers);
             }
@@ -5044,7 +5046,9 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
             b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u };
         }
         vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0u, 1u, &asBarrier, 0u, nullptr,
             preVolImageCount, preVolBarriers);
@@ -5057,6 +5061,7 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
     if(cloudActive)
     {
         // Bake cloud shadow map BEFORE fog so volumetric shafts align with real cloud gaps.
+        ScopedVkDebugLabel cloudShadowLabel(cmd, "Clouds-Shadow");
         recordCloudShadowMap(cmd);
         rtCheckpoint(cmd, "cloud:shadow");
     }
@@ -5191,17 +5196,20 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, sceneBarriers);
     }
 
-    const VkPipeline cloudRenderPipeline = g_volumetricCloudRenderPipelineV3;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cloudRenderPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        g_volumetricCloudRenderPipelineLayout, 0u, 1u, &g_volumetricCloudRenderSet,
-        0u, nullptr);
-    const uint32_t temporalMode = g_cloudTemporalMode.load();
-    const uint32_t marchWidth = (temporalMode >= 1u)
-        ? (g_volumetricCloudWidth + 1u) / 2u : g_volumetricCloudWidth;
-    const uint32_t marchHeight = (temporalMode >= 2u)
-        ? (g_volumetricCloudHeight + 1u) / 2u : g_volumetricCloudHeight;
-    vkCmdDispatch(cmd, (marchWidth + 7u) / 8u, (marchHeight + 7u) / 8u, 1u);
+    {
+        ScopedVkDebugLabel cloudMarchLabel(cmd, "Clouds-March");
+        const VkPipeline cloudRenderPipeline = g_volumetricCloudRenderPipelineV3;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cloudRenderPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            g_volumetricCloudRenderPipelineLayout, 0u, 1u, &g_volumetricCloudRenderSet,
+            0u, nullptr);
+        const uint32_t temporalMode = g_cloudTemporalMode.load();
+        const uint32_t marchWidth = (temporalMode >= 1u)
+            ? (g_volumetricCloudWidth + 1u) / 2u : g_volumetricCloudWidth;
+        const uint32_t marchHeight = (temporalMode >= 2u)
+            ? (g_volumetricCloudHeight + 1u) / 2u : g_volumetricCloudHeight;
+        vkCmdDispatch(cmd, (marchWidth + 7u) / 8u, (marchHeight + 7u) / 8u, 1u);
+    }
 
     rtCheckpoint(cmd, "cloud:march");
 
@@ -5222,12 +5230,15 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, resolveBarriers);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volumetricCloudResolvePipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        g_volumetricCloudResolvePipelineLayout, 0u, 1u, &g_volumetricCloudResolveSet,
-        0u, nullptr);
-    vkCmdDispatch(cmd, (g_volumetricCloudWidth + 7u) / 8u,
-        (g_volumetricCloudHeight + 7u) / 8u, 1u);
+    {
+        ScopedVkDebugLabel cloudResolveLabel(cmd, "Clouds-Resolve");
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volumetricCloudResolvePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            g_volumetricCloudResolvePipelineLayout, 0u, 1u, &g_volumetricCloudResolveSet,
+            0u, nullptr);
+        vkCmdDispatch(cmd, (g_volumetricCloudWidth + 7u) / 8u,
+            (g_volumetricCloudHeight + 7u) / 8u, 1u);
+    }
 
     rtCheckpoint(cmd, "cloud:resolve");
 
@@ -5295,13 +5306,14 @@ void recordVolumetricClouds(VkCommandBuffer cmd)
         aeStateBarrier.buffer = g_aeStateBuffer;
         aeStateBarrier.offset = 0u;
         aeStateBarrier.size = VK_WHOLE_SIZE;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u,
             &aeStateBarrier, 0u, nullptr);
     }
 
     // 2026-11-13：pre-RR 云合成成为唯一路径（"远云脱离RR"开关已退役）。
     {
+        ScopedVkDebugLabel cloudCompLabel(cmd, "Clouds-Composite");
         // 2026-11-16：binding 1/6 会随 RT / RR 分辨率变化；这里与远带共用同一套
         // 句柄跟踪，避免"描述符冻死指向已销毁视图"（11-14 已踩过两次）。
         refreshCloudCompositeTargets();
@@ -5940,7 +5952,7 @@ void recordCloudFarBandComposite(VkCommandBuffer cmd)
     barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
     vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0u, 0u, nullptr, 0u, nullptr, 2u, barriers);
 

@@ -553,6 +553,11 @@ bool k2FourSplitEnabled()
 // 显式 ORION_MAT_REUSE_LEGS=0/f/F 可回到逐位旧行为做反向对照。
 bool matReuseLegsEnabled()
 {
+    if(k2ThreeSplitEnabled() || k2FourSplitEnabled())
+    {
+        return true;
+    }
+
     static const bool cached = []()
     {
         const char* raw = std::getenv("ORION_MAT_REUSE_LEGS");
@@ -984,8 +989,10 @@ void populateFogMoodParams(float* params)
 {
     params[0] = g_fogShapeStrength.load();
     params[1] = g_fogDawnBoost.load();
-    params[2] = 0.0f;
-    params[3] = 0.0f;
+    // 2026-11-26 (Batch V): [2] = underwaterSkyFactor (default 1.0 open sky),
+    // [3] = tlasHasWater (default 1.0 active water). Overwritten per-frame in Frame.cpp.
+    params[2] = 1.0f;
+    params[3] = 1.0f;
 }
 
 // 2026-11-21 统一风场（车道见 CameraUBO.windParams，消费方 wind_common.glsl）。

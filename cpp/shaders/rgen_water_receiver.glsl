@@ -152,7 +152,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 currentDirection,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 pathStep
             );
         }
@@ -163,7 +163,7 @@ const float WATER_EXTINCTION_DISTANCE =
             rtCntRayIssued();
             #endif
             traceRayEXT(
-                topLevelAS, secondaryTraverseFlags(), 0xff, 0, 0, 0,
+                topLevelAS, secondaryTraverseFlags(), 0xefu, 0, 0, 0,
                 currentOrigin, 0.001, currentDirection, 10000.0, 0
             );
         }
@@ -384,6 +384,14 @@ float perfL10WaterAdaptiveScale()
 // 代价（已知）：看穿两层以上的水/玻璃（叠水、水后玻璃）只解析第一层。
 // 回退：把 return 1 改回下面的 tierSteps（旧档 = 距离分档 + 帧时间收紧）。
 // ===========================================================================
+#ifndef WATER_WALKER_TRANSMIT_STEPS
+// 2026-11-25: 透射瓣（reflectionLobe=false）允许最多 4 步以穿透水下冰块/玻璃
+//（水侧壁 -> 冰底面 -> 冰下水面 -> 海底 = 4 步）。开阔水域 step0 命中海底即 return，
+// 零额外射线；反射瓣（reflectionLobe=true）维持 1 步，守住海面掠射性能。
+// A/B：-DWATER_WALKER_TRANSMIT_STEPS=1 回到旧档。
+#define WATER_WALKER_TRANSMIT_STEPS 4
+#endif
+
 int waterTransparentWalkerSteps(float lodDistance)
 {
     return 1;
@@ -516,10 +524,25 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
     bool insideWater =
         startInsideWater;
 
+    bool crossedTranslucent = false;
+    // 运行期 UBO 掩蔽上限，防止 spirv-opt -O / NV JIT 将 ~1000 行循环体按常量 4 次
+    // 全展开导致 SSA ID 溢出与冷编膨胀（实测未掩蔽时 k1 optSize 膨胀 3.75x、rt_test ID overflow）。
+    const int distTransmitSteps =
+        (waterGILodDistance < 24.0)
+            ? WATER_WALKER_TRANSMIT_STEPS
+            : ((waterGILodDistance < 48.0) ? min(WATER_WALKER_TRANSMIT_STEPS, 3) : 1);
+    const int transmitWalkerSteps =
+        (cam.frameCount != 0xFFFFFFFFu)
+            ? distTransmitSteps
+            : 0;
+    const int maxWalkerSteps =
+        reflectionLobe
+            ? waterTransparentWalkerSteps(waterGILodDistance)
+            : transmitWalkerSteps;
 
     for(
         int step = 0;
-        step < waterTransparentWalkerSteps(waterGILodDistance);
+        step < maxWalkerSteps;
         ++step
     )
     {
@@ -553,7 +576,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
                 currentDirection,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 step
             );
         }
@@ -566,7 +589,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 0,
                 0,
                 0,
@@ -609,7 +632,7 @@ if(payload.hitDistance < 0.0)
                 waterEntryDirection,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 step
             );
         }
@@ -622,7 +645,7 @@ if(payload.hitDistance < 0.0)
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xff,
+                0xefu,
                 0,
                 0,
                 0,
@@ -818,8 +841,10 @@ if(insideWater)
         }
 
         const float waterEntryCos = clamp(skyLightDir.y, 0.0, 1.0);
+        const float waterEntryOmc = 1.0 - waterEntryCos;
+        const float waterEntryOmc2 = waterEntryOmc * waterEntryOmc;
         const float waterEntryFresnel = WATER_F0 +
-            (1.0 - WATER_F0) * pow(1.0 - waterEntryCos, 5.0);
+            (1.0 - WATER_F0) * (waterEntryOmc2 * waterEntryOmc2 * waterEntryOmc);
 
         const vec3 directIntegral =
             (vec3(1.0) - exp(-sigmaT * (kDepth * hitDistance))) / kDepth;
@@ -866,8 +891,10 @@ if(insideWater)
         }
         vec3 stepInScatter = vec3(1.0) - exp(-volumeExtinction * hitDistance);
         float waterEntryCos = clamp(getTimeDrivenSkyLightDirection().y, 0.0, 1.0);
+        float waterEntryOmc = 1.0 - waterEntryCos;
+        float waterEntryOmc2 = waterEntryOmc * waterEntryOmc;
         float waterEntryFresnel = WATER_F0 +
-            (1.0 - WATER_F0) * pow(1.0 - waterEntryCos, 5.0);
+            (1.0 - WATER_F0) * (waterEntryOmc2 * waterEntryOmc2 * waterEntryOmc);
         accumulatedWaterScattering +=
             WATER_SCATTER_COLOR * WATER_SCATTERING *
             getTimeDrivenSkyLightColor() * getTimeDrivenSkyLightRadianceScale() *
@@ -1056,10 +1083,10 @@ surfaceRadiance +=
     waterReceiverLocalDirect;
 
 #if WATER_RECEIVER_GI_ADAPTIVE_GATE
-if(insideWater && enableWaterReceiverGI &&
+if(step < 2 && insideWater && enableWaterReceiverGI &&
    max(throughput.r, max(throughput.g, throughput.b)) > 0.12)
 #else
-if(insideWater && enableWaterReceiverGI)
+if(step < 2 && insideWater && enableWaterReceiverGI)
 #endif
 {
     surfaceRadiance +=
@@ -1121,6 +1148,8 @@ if(hitMaterialId >= 2.5)
             );
     }
 
+    crossedTranslucent = true;
+
     currentOrigin =
         hitPos +
         currentDirection *
@@ -1177,10 +1206,12 @@ if(hitMaterialId >= 2.5)
                     1.0
                 );
 
+            float mirrorOmc = 1.0 - mirrorCos;
+            float mirrorOmc2 = mirrorOmc * mirrorOmc;
             float mirrorFresnel =
                 WATER_F0 +
                 (1.0 - WATER_F0) *
-                pow(1.0 - mirrorCos, 5.0);
+                (mirrorOmc2 * mirrorOmc2 * mirrorOmc);
 
             throughput *= mirrorFresnel;
 
@@ -1200,6 +1231,14 @@ if(hitMaterialId >= 2.5)
             continue;
         }
 #endif
+
+        // Pure open-water transmission (!reflectionLobe && !crossedTranslucent):
+        // stop at step 0 on secondary water-water hits (grazing waves / far surface),
+        // reserving multi-step continuation for paths that actually cross underwater ice/glass.
+        if(!reflectionLobe && !crossedTranslucent)
+        {
+            break;
+        }
 
         bool exitingWater =
             hitMaterialId > 1.5;
@@ -1228,7 +1267,14 @@ if(hitMaterialId >= 2.5)
 #endif
 #if WATER_MEDIUM_STATE_AUTHORITY
         exitingWater = insideWater;
+        // 刚穿过水下冰/玻璃块后命中正面进水面（RT_WATER_AIR_TO_WATER, hitMaterialId < 1.5）时，
+        // 射线是离开固体半透明块重新入水，不能按 insideWater=true 强判成水→空气出射（防假 TIR 弹回天空）。
+        if(crossedTranslucent && hitMaterialId < 1.5)
+        {
+            exitingWater = false;
+        }
 #endif
+        crossedTranslucent = false;
 
         if(!exitingWater)
         {
@@ -1272,7 +1318,7 @@ if(hitMaterialId >= 2.5)
                             receiverSunVisQuery,
                             topLevelAS,
                             gl_RayFlagsTerminateOnFirstHitEXT,
-                            0xff,
+                            0xefu,
                             hitPos + sunDirection * 0.001,
                             0.02,
                             sunDirection,
@@ -1316,7 +1362,7 @@ if(hitMaterialId >= 2.5)
                             10000.0,
                             gl_RayFlagsTerminateOnFirstHitEXT |
                                 gl_RayFlagsSkipClosestHitShaderEXT,
-                            0xff,
+                            0xefu,
                             0u
                         );
                     }
@@ -1330,7 +1376,7 @@ if(hitMaterialId >= 2.5)
                             topLevelAS,
                             gl_RayFlagsTerminateOnFirstHitEXT |
                                 gl_RayFlagsSkipClosestHitShaderEXT,
-                            0xff,
+                            0xefu,
                             0,
                             0,
                             0,
@@ -1361,17 +1407,15 @@ if(hitMaterialId >= 2.5)
             );
 
 
+        float cosThetaOmc = 1.0 - cosTheta;
+        float cosThetaOmc2 = cosThetaOmc * cosThetaOmc;
         float fresnel =
             WATER_F0 +
             (
                 1.0 -
                 WATER_F0
             ) *
-            pow(
-                1.0 -
-                cosTheta,
-                5.0
-            );
+            (cosThetaOmc2 * cosThetaOmc2 * cosThetaOmc);
 
 
         float eta =
@@ -1486,12 +1530,61 @@ if(hitMaterialId >= 2.5)
     // 回退 = 把下面两处 exhaustSkyRadiance 换回 getTimeDrivenSkyLightColor()
     // × getTimeDrivenSkyLightRadianceScale()（逐位旧档）。
     // =====================================================
+    // 2026-11-26 (Batch V, Bug 2): Verify sky visibility on walker exhaustion so cave water
+    // never glows with daytime sky brightness when rays run out inside enclosed rock.
+    float exhaustSkyVisible = 1.0;
+#ifndef ORION_K2I_COMPOSE_COMPUTE
+    {
+        const vec3 probeDir =
+            (insideWater || currentDirection.y <= 0.0)
+                ? vec3(0.0, 1.0, 0.0)
+                : normalize(currentDirection);
+        rayQueryEXT exhaustSkyQuery;
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
+        rayQueryInitializeEXT(
+            exhaustSkyQuery,
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT,
+            0xefu,
+            currentOrigin + probeDir * 0.05,
+            0.02,
+            probeDir,
+            256.0
+        );
+        int exhaustSkyGuard = 0;
+        while(rayQueryProceedEXT(exhaustSkyQuery) && ++exhaustSkyGuard < 32)
+        {
+            if(rayQueryGetIntersectionTypeEXT(exhaustSkyQuery, false) ==
+               gl_RayQueryCandidateIntersectionTriangleEXT)
+            {
+                const uint candSbtOff =
+                    rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(
+                        exhaustSkyQuery, false);
+                if(candSbtOff != 2u && candSbtOff != 3u)
+                {
+                    rayQueryConfirmIntersectionEXT(exhaustSkyQuery);
+                }
+            }
+        }
+        if(rayQueryGetIntersectionTypeEXT(exhaustSkyQuery, true) !=
+           gl_RayQueryCommittedIntersectionNoneEXT)
+        {
+            exhaustSkyVisible = 0.0;
+        }
+    }
+#endif
+    const float exhaustSkyScale = mix(0.02, 1.0, exhaustSkyVisible);
+
     vec3 exhaustSkyRadiance =
         textureLod(
             skyScatteringTex,
             directionToEquirect(currentDirection),
             0.0
-        ).rgb;
+        ).rgb * exhaustSkyScale;
+    const float exhaustUpSkyWeight =
+        smoothstep(-0.12, 0.08, currentDirection.y);
     if(insideWater)
     {
 #if WATER_WALKER_EXHAUST_GLOW
@@ -1503,40 +1596,18 @@ if(hitMaterialId >= 2.5)
             getTimeDrivenSkyLightColor() *
             getTimeDrivenSkyLightRadianceScale() *
             waterSunVisibility *
-            UNDERWATER_COLUMN_SCATTER_BOOST;
+            UNDERWATER_COLUMN_SCATTER_BOOST *
+            exhaustSkyScale;
 #else
+        const vec3 deepWaterFallback =
+            WATER_SCATTER_COLOR * getSurfaceAmbientRadiance() * (0.5 * exhaustSkyScale);
         return
             accumulatedWaterScattering +
             throughput *
-            exhaustSkyRadiance;
+            mix(deepWaterFallback, exhaustSkyRadiance, exhaustUpSkyWeight);
 #endif
     }
 
-    // =====================================================================
-    // 2026-10-22（用户定案 c）：水后天空回退的「洞内压暗」。
-    //
-    // 这一支是折射/透射射线打空（或步数耗尽）时的返回：throughput × 满辐亮度
-    // 天空色。throughput 里已含 Beer 吸收与 WATER_GLASS_TINT(0.20,0.75,0.78)
-    // 的按厚度混色 ⇒ **洞里的水只要有一条折射路径能瞄到天空，就按「天空色 ×
-    // 青 tint」满功率上色**，与水是否在阴影里无关。这正是「洞里水发蓝」的主因，
-    // 也是水面 SSS 门控（P1/P1b）在结构上管不到它的原因 —— 那两项是水面自身的
-    // 叶瓣，不是这条背景。
-    //
-    // 物理上这条背景确实是「看得见的天空」，不该按直射光门控；但玩家读到的是
-    // 「背光洞穴里的水在发光」。折中：用入口那次太阳可见性（16386 的
-    // waterSunVisibility）把天空回退压到 WATER_SKY_FALLBACK_MIN，**不归零**
-    // —— 洞里保留一点天光，满饱和青消失。
-    //
-    // 闸门条件必须是 `waterSunVisibilityTraced && sunDirection.y > 0.0`，不能只看
-    // waterSunVisibility 的值：那个变量在「整条走查没进过水」时是初值 0.0
-    // （15808 的 `startInsideWater ? 1.0 : 0.0`），而水面**反射**走查（19280）
-    // 就是这种情况 —— 它只撞天空，若按 0.0 判就会把天空反射压到 30%。
-    // 太阳在地平线下时同样保持 1.0（夜里本来就没有「直射」可言，压了只会让
-    // 夜空倒影变脏）。
-    //
-    // 只压 throughput×sky 这一半：accumulatedWaterScattering 内部已逐项乘过
-    // waterSunVisibility（16133），不能再压第二次。
-    // =====================================================================
     const float WATER_SKY_FALLBACK_MIN = 0.30;
     float waterSkyFallbackDim = 1.0;
     if(waterSunVisibilityTraced && sunDirection.y > 0.0)
@@ -1545,10 +1616,12 @@ if(hitMaterialId >= 2.5)
             mix(WATER_SKY_FALLBACK_MIN, 1.0, waterSunVisibility);
     }
 
+    const vec3 exhaustNonWaterFallback =
+        mix(getSurfaceAmbientRadiance() * (0.35 * exhaustSkyScale), exhaustSkyRadiance, exhaustUpSkyWeight);
     return
         accumulatedWaterScattering +
         throughput *
-        exhaustSkyRadiance *
+        exhaustNonWaterFallback *
         waterSkyFallbackDim;
 }
 

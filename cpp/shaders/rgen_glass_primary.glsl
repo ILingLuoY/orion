@@ -64,7 +64,7 @@ vec3 tracePrimarySimpleGlassRadiance(
             straightDirection,
             10000.0,
             secondaryTraverseFlags(),
-            0xff,
+            0xefu,
             0u
         );
     }
@@ -77,7 +77,7 @@ vec3 tracePrimarySimpleGlassRadiance(
         traceRayEXT(
             topLevelAS,
             secondaryTraverseFlags(),
-            0xff,
+            0xefu,
             0,
             0,
             0,
@@ -218,7 +218,7 @@ bool glassMirrorPathIsClear(
     traceRayEXT(
         topLevelAS,
         gl_RayFlagsNoneEXT,
-        0xff,
+        0xefu,
         0,
         0,
         0,
@@ -487,6 +487,8 @@ vec3 tracePrimaryDielectricGlassRadiance(
     glassLobeWeightsValid = true;
 #endif
 
+    const float glassCamDist = length(glassSurfacePosition - cam.viewInverse[3].xyz);
+
     // ---------------- 反射瓣（确定性） ----------------
     // 掠射端就算 F 很小也保留这条射线：它是 RR 反射端点 guide 与
     // rrGlassReflectionHitDistance 的唯一来源。
@@ -495,17 +497,34 @@ vec3 tracePrimaryDielectricGlassRadiance(
 //     到底是反射天空，还是透射的解析出射点越界）。
 #define VPT_GLASS_REFLECTION 1
 #endif
+#ifndef ORION_GLASS_FAR_LOWF_REFL_FASTPATH
+#define ORION_GLASS_FAR_LOWF_REFL_FASTPATH 1
+#endif
     vec3 reflectionRadiance = vec3(0.0);
     vec3 sunSpecularGlint = vec3(0.0);
 #if VPT_GLASS_REFLECTION
     if(entryFresnel > 1.0e-4)
     {
-        reflectionRadiance =
-            traceGlassSceneReflectionOneRay(
-                glassSurfacePosition,
-                entryNormal,
-                -viewDirection,
-                sunDirection);
+        if(ORION_GLASS_FAR_LOWF_REFL_FASTPATH != 0 &&
+           glassCamDist >= 48.0 &&
+           entryFresnel < 0.08)
+        {
+            rrGlassReflectionHitDistance = 65504.0;
+            const vec3 cheapReflDir = normalize(reflect(viewDirection, entryNormal));
+            reflectionRadiance = mix(
+                getSurfaceAmbientRadiance(),
+                samplePhysicalClearSkyForAerialPerspective(cheapReflDir),
+                smoothstep(-0.05, 0.20, cheapReflDir.y));
+        }
+        else
+        {
+            reflectionRadiance =
+                traceGlassSceneReflectionOneRay(
+                    glassSurfacePosition,
+                    entryNormal,
+                    -viewDirection,
+                    sunDirection);
+        }
 
         // Narrow shadow-tested direct-sun GGX glint (gated by dot(R, L) > 0.92
         // so >98% of translucent pixels pay zero extra shadow rays).
@@ -586,7 +605,6 @@ vec3 tracePrimaryDielectricGlassRadiance(
     float currentIor = entryIor;
 #endif
 
-    const float glassCamDist = length(glassSurfacePosition - cam.viewInverse[3].xyz);
     const int effectiveGlassMaxInterfaces =
         (glassCamDist < 24.0)
             ? VPT_GLASS_MAX_INTERFACES
@@ -596,6 +614,10 @@ vec3 tracePrimaryDielectricGlassRadiance(
 
     for(int slabStep = 0; slabStep <= effectiveGlassMaxInterfaces; ++slabStep)
     {
+        if(max(throughput.r, max(throughput.g, throughput.b)) < 0.03)
+        {
+            break;
+        }
         // 当前板面：第一轮用入射面（已在函数入口算过 F），后续轮次用循环里遇到的
         // 新玻璃面重新算。这里先把"离开当前板"的位移做掉。
 #ifndef VPT_GLASS_REFRACTION_MODEL
@@ -747,7 +769,7 @@ vec3 tracePrimaryDielectricGlassRadiance(
         traceRayEXT(
             topLevelAS,
             gl_RayFlagsNoneEXT,
-            0xff,
+            0xefu,
             0,
             0,
             0,
@@ -1097,7 +1119,8 @@ vec3 tracePrimaryDielectricGlassRadiance(
         {
             const float receiverGILodDistance =
                 length(hitPosition - cam.viewInverse[3].xyz);
-            if(receiverGILodDistance < 64.0 * perfL10TierScale())
+            if(receiverGILodDistance < 40.0 * perfL10TierScale() &&
+               max(throughput.r, max(throughput.g, throughput.b)) > 0.12)
             {
                 const float clampedGiLodDist =
                     min(receiverGILodDistance, 31.0 * perfL10TierScale());
@@ -1164,7 +1187,8 @@ vec3 tracePrimaryDielectricGlassRadiance(
         {
             const float receiverGILodDistance =
                 length(hitPosition - cam.viewInverse[3].xyz);
-            if(receiverGILodDistance < 64.0 * perfL10TierScale())
+            if(receiverGILodDistance < 40.0 * perfL10TierScale() &&
+               max(throughput.r, max(throughput.g, throughput.b)) > 0.12)
             {
 #if GI_GLASS_RECEIVER_INDIRECT
                 receiverRadiance +=
