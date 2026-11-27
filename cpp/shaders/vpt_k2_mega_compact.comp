@@ -1,0 +1,552 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+shared uint s_wgCount1;
+shared uint s_wgCount2;
+shared uint s_wgCount3;
+shared uint s_wgCount4;
+shared uint s_wgCount5;
+shared uint s_wgBase1;
+shared uint s_wgBase2;
+shared uint s_wgBase3;
+shared uint s_wgBase4;
+shared uint s_wgBase5;
+
+layout(binding = 2, set = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(binding = 78, set = 0, r8ui) uniform readonly uimage2D sparseActiveMaskImage;
+
+struct PTLandingRecord
+{
+    vec4 a;
+    uvec4 b;
+    uvec4 c;
+    vec4 d;
+    vec4 e;
+};
+
+layout(std430, binding = 88, set = 0) buffer PTLandingSSBO
+{
+    PTLandingRecord ptLandingRecords[];
+};
+
+layout(binding = 89, set = 0, rgba16f) uniform readonly image2D k2DirectImage;
+
+struct MatReuseRecord
+{
+    uvec4 a;
+    uvec4 b;
+    uvec4 c;
+    uvec4 d;
+};
+
+layout(std430, binding = 94, set = 0) readonly buffer MatReuseSSBO
+{
+    MatReuseRecord matReuseRecords[];
+};
+
+struct CompactSlotHeader
+{
+    uint width;
+    uint height;
+    uint depth;
+    uint mode;
+    uint activeCount;
+    uint baseElemOffset;
+    uint pad0;
+    uint pad1;
+};
+
+layout(std430, binding = 100, set = 0) buffer K2iSparseCompactSSBO
+{
+    CompactSlotHeader headers[6];
+    uint activeCoords[];
+} k2iCompact;
+
+const float SOLAR_LATITUDE_35_SIN = 0.57357643635;
+const float SOLAR_LATITUDE_35_COS = 0.81915204429;
+
+uint pcgHash(inout uint state)
+{
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    state = (state * 747796405u) + 2891336453u;
+    return (word >> 22u) ^ word;
+}
+
+float evalPbr2ReflectionStrength(float encodedRoughness, int f0MetalCode)
+{
+    float perceptualSmoothness = 1.0 - sqrt(clamp(encodedRoughness, 0.0, 1.0));
+    float x = clamp(perceptualSmoothness * 2.5 - 0.85, 0.0, 1.0);
+    float shifted = x - 1.0;
+    float strength = 1.0 - shifted * shifted;
+    if(f0MetalCode >= 230)
+    {
+        strength = 1.0;
+    }
+    return clamp(strength, 0.0, 1.0);
+}
+
+float overworldRainStrength()
+{
+    return abs(cam.weatherParams.z - 1.0) < 0.25
+        ? clamp(cam.weatherParams.x, 0.0, 1.0)
+        : 0.0;
+}
+
+vec3 getTimeDrivenSunDirection3D()
+{
+    if(abs(cam.weatherParams.z - 3.0) < 0.25)
+    {
+        return vec3(0.0, 1.0, 0.0);
+    }
+    const float TWO_PI = 6.28318530718;
+    const float dayAngle = fract(cam.historyParams.w) * TWO_PI;
+    return vec3(
+        cos(dayAngle),
+        SOLAR_LATITUDE_35_COS * sin(dayAngle),
+        SOLAR_LATITUDE_35_SIN * sin(dayAngle)
+    );
+}
+
+bool computeRtLodDiffuseGiEnabled(ivec2 pixelCoord, float primaryHitDistance)
+{
+    const uint perfStage = cam.perfAblationStage.x;
+    if(perfStage == 3u || perfStage == 4u || perfStage == 28u || perfStage == 30u)
+    {
+        return false;
+    }
+
+    const float rtLodDistance = max(primaryHitDistance, 0.0);
+    const float tierScale = (perfStage == 13u) ? 0.5 : 1.0;
+
+    uint rtLodState =
+        uint(pixelCoord.x) * 73856093u ^
+        uint(pixelCoord.y) * 19349663u ^
+        cam.frameCount * 83492791u;
+    const uint rtLodRandom = pcgHash(rtLodState);
+
+    bool enabled = false;
+    if(rtLodDistance < 64.0 * tierScale)
+    {
+        enabled = true;
+    }
+    else if(rtLodDistance < 128.0 * tierScale)
+    {
+        enabled = (rtLodRandom & 1u) == 0u;
+    }
+    else if(rtLodDistance < 160.0 * tierScale)
+    {
+        enabled = (rtLodRandom & 3u) == 0u;
+    }
+    else if(rtLodDistance < 256.0 * tierScale)
+    {
+        enabled = ((rtLodRandom >> 5u) & 1u) == 0u;
+    }
+    else if(rtLodDistance < 384.0 * tierScale)
+    {
+        enabled = ((rtLodRandom >> 6u) & 1u) == 0u;
+    }
+    else
+    {
+        enabled = ((rtLodRandom >> 7u) & 1u) == 0u;
+    }
+
+    if(cam.giRayParams.x > 0.5f)
+    {
+        if(cam.giRayParams.x > 1.5f)
+        {
+            enabled = enabled && (((rtLodRandom >> 8u) & 3u) == 0u);
+        }
+        else
+        {
+            enabled = enabled && (((rtLodRandom >> 8u) & 1u) == 0u);
+        }
+    }
+
+    return enabled;
+}
+
+uint sharcUpdateBlockSize()
+{
+    const uint encoded = (cam.sharcCacheParams.w >> 8u) & 0xFFu;
+    return clamp(encoded == 0u ? 5u : encoded, 2u, 8u);
+}
+
+ivec2 sharcUpdateBlockOffset(const ivec2 sharcBlock, const uint blockSize)
+{
+    const uint sharcBlockArea = blockSize * blockSize;
+    uint sharcHash = uint(sharcBlock.x) * 73856093u ^
+        uint(sharcBlock.y) * 19349663u ^
+        cam.frameCount * 83492791u;
+    sharcHash ^= sharcHash >> 13u;
+    sharcHash *= 0x5bd1e995u;
+    sharcHash ^= sharcHash >> 15u;
+    const uint sharcIndex = sharcHash % sharcBlockArea;
+    return ivec2(int(sharcIndex % blockSize), int(sharcIndex / blockSize));
+}
+
+void main()
+{
+    if(gl_LocalInvocationIndex == 0u)
+    {
+        s_wgCount1 = 0u;
+        s_wgCount2 = 0u;
+        s_wgCount3 = 0u;
+        s_wgCount4 = 0u;
+        s_wgCount5 = 0u;
+    }
+    barrier();
+
+    const uint mode1 = k2iCompact.headers[1].mode;
+    const uint mode2 = k2iCompact.headers[2].mode;
+    const uint mode3 = k2iCompact.headers[3].mode;
+    const uint mode4 = k2iCompact.headers[4].mode;
+    const uint mode5 = k2iCompact.headers[5].mode;
+
+    const ivec2 size = imageSize(k2DirectImage);
+    const ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    const bool inBounds = (pixelCoord.x < size.x && pixelCoord.y < size.y);
+
+    bool active1 = false;
+    bool active2 = false;
+    bool active3 = false;
+    bool active4 = false;
+    bool active5 = false;
+
+    if(inBounds)
+    {
+        const float rtUserSpp = clamp(cam.rtSampleParams.x, 0.5, 4.0);
+        const bool rtSampleThisPixel =
+            (rtUserSpp >= 1.0) ||
+            (((uint(pixelCoord.x) + uint(pixelCoord.y)) & 1u) == (cam.frameCount & 1u));
+        if(rtSampleThisPixel)
+        {
+            const uint linearIdx = uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x);
+            if(ptLandingRecords[linearIdx].a.x > 0.5)
+            {
+                const MatReuseRecord mr = matReuseRecords[linearIdx];
+                const bool matReuseValid =
+                    (cam.matReuseAb.x != 0u) && (mr.d.w == (cam.frameCount + 1u));
+
+                bool maskBitLoaded = false;
+                bool maskBitActive = true;
+                if(mode2 == 1u || mode4 == 1u)
+                {
+                    const ivec2 blockCoord = ivec2(pixelCoord.x >> 2, pixelCoord.y >> 1);
+                    const uint bitIndex = (uint(pixelCoord.y & 1) << 2u) | uint(pixelCoord.x & 3);
+                    const uint maskVal = imageLoad(sparseActiveMaskImage, blockCoord).r;
+                    maskBitActive = ((maskVal >> bitIndex) & 1u) != 0u;
+                    maskBitLoaded = true;
+                }
+
+                if(!matReuseValid)
+                {
+                    active1 = (mode1 != 0u);
+                    if(mode2 != 0u)
+                    {
+                        active2 = (mode2 == 1u)
+                            ? (maskBitActive || (cam.sparseParams.x >= 0.5 && cam.sparseParams.z > 0.5))
+                            : true;
+                    }
+                    active3 = (mode3 != 0u);
+                    if(mode4 != 0u && cam.giHalfParams.x == 0.0f && cam.perfPrimary.z > 0u)
+                    {
+                        active4 = (mode4 != 1u) || maskBitActive;
+                    }
+                }
+                else
+                {
+                    const uint hitClass = (mr.b.x >> 3u) & 0x3u;
+                    if(hitClass != 1u)
+                    {
+                        const float primaryHitDistance = max(uintBitsToFloat(mr.a.x), 0.0);
+                        const uint perfStage = cam.perfAblationStage.x;
+                        const float tierScale = (perfStage == 13u) ? 0.5 : 1.0;
+
+                        // Slot 1: K2-SunB (every opaque/entity/foliage/particle landing pixel)
+                        active1 = (mode1 != 0u);
+
+                        // Slot 2: K2-Loc-NEE
+                        if(mode2 != 0u)
+                        {
+                            active2 = (mode2 == 1u)
+                                ? (maskBitActive || (cam.sparseParams.x >= 0.5 && cam.sparseParams.z > 0.5))
+                                : true;
+                        }
+
+                        // Slot 3: K2-Loc-Glossy
+                        if(mode3 != 0u)
+                        {
+                            const float roughness = uintBitsToFloat(mr.a.y);
+                            const float f0Metal = uintBitsToFloat(mr.a.z);
+                            const float normalY = uintBitsToFloat(mr.c.y);
+                            const vec3 hitNormal = vec3(
+                                uintBitsToFloat(mr.c.x),
+                                normalY,
+                                uintBitsToFloat(mr.c.z)
+                            );
+                            const int f0MetalCode = int(round(clamp(f0Metal, 0.0, 1.0) * 255.0));
+                            const float rainStrength = overworldRainStrength();
+                            const vec3 sunDir = getTimeDrivenSunDirection3D();
+                            const vec3 toWaterDir = vec3(sunDir.x, -sunDir.y, sunDir.z);
+
+                            const float waterY = cam.waterSimSurfaceAndOrigin.x;
+                            const bool hasNearbyWater =
+                                abs(cam.viewInverse[3].y - waterY) <= 128.0;
+                            const uint waterReflectionInterval = clamp(cam.perfSecondary.z, 0u, 4u);
+                            const bool needWaterSunCand =
+                                (cam.fogMoodParams.w > 0.5) &&
+                                (waterReflectionInterval > 0u) &&
+                                (waterReflectionInterval == 1u ||
+                                 (cam.frameCount % waterReflectionInterval) == 0u) &&
+                                (sunDir.y > 0.02) &&
+                                hasNearbyWater &&
+                                (primaryHitDistance < 96.0 * tierScale) &&
+                                (dot(hitNormal, toWaterDir) > 0.0) &&
+                                (rainStrength > 0.01 || normalY < 0.95);
+
+                            const bool glossyDisabledByStage =
+                                (perfStage == 2u || perfStage == 4u || perfStage == 28u || perfStage == 29u);
+                            bool needGlossy =
+                                (cam.ssHybridParams.z >= 0.5f) &&
+                                !glossyDisabledByStage &&
+                                (primaryHitDistance < 160.0 * tierScale);
+
+                            const bool needShorelineCheck =
+                                needGlossy &&
+                                (cam.glassCausticParams.w > 0.5) &&
+                                (cam.waterSimState.w == 0u) &&
+                                (primaryHitDistance < 48.0);
+
+                            float hitPosY = cam.viewInverse[3].y;
+                            bool hitPosYComputed = false;
+                            if(needWaterSunCand || needShorelineCheck)
+                            {
+                                const vec2 inUV = (vec2(pixelCoord) + vec2(0.5)) / vec2(size);
+                                vec2 ndc = inUV * 2.0 - 1.0;
+                                ndc.y = -ndc.y;
+                                const vec4 target = cam.projInverse * vec4(ndc.x, ndc.y, 1.0, 1.0);
+                                const vec3 viewTarget = abs(target.w) > 1.0e-6 ? (target.xyz / target.w) : target.xyz;
+                                const float vtLenSq = dot(viewTarget, viewTarget);
+                                const vec3 rayDirView = vtLenSq > 1.0e-12
+                                    ? viewTarget * inversesqrt(vtLenSq)
+                                    : vec3(0.0, 0.0, -1.0);
+                                const vec3 rayDirWorld = (cam.viewInverse * vec4(rayDirView, 0.0)).xyz;
+                                hitPosY = cam.viewInverse[3].y + rayDirWorld.y * primaryHitDistance;
+                                hitPosYComputed = true;
+                            }
+
+                            const bool needWaterSun =
+                                needWaterSunCand &&
+                                hitPosYComputed &&
+                                (hitPosY > waterY - 0.5) &&
+                                ((hitPosY - waterY) <= 64.0 * sunDir.y + 1.5);
+
+                            if(needGlossy)
+                            {
+                                uint rtLodState =
+                                    uint(pixelCoord.x) * 73856093u ^
+                                    uint(pixelCoord.y) * 19349663u ^
+                                    cam.frameCount * 83492791u;
+                                const uint rtLodRandom = pcgHash(rtLodState);
+                                const bool halfSample = ((rtLodRandom >> 3u) & 1u) == 0u;
+                                const bool quarterSample = ((rtLodRandom >> 3u) & 3u) == 0u;
+
+                                const float glossyFullResDist = float(clamp(cam.perfSecondary.w, 16u, 96u));
+                                int glossySampleLevel = 0;
+                                if(primaryHitDistance >= glossyFullResDist &&
+                                   primaryHitDistance < 128.0 * tierScale)
+                                {
+                                    glossySampleLevel = 1;
+                                }
+                                else if(primaryHitDistance >= 128.0 * tierScale)
+                                {
+                                    glossySampleLevel = 2;
+                                }
+
+                                const bool shorelineBandPossible =
+                                    needShorelineCheck &&
+                                    hitPosYComputed &&
+                                    (hitPosY > waterY - 0.65) &&
+                                    (hitPosY < waterY + 1.70);
+                                const bool wetPossible =
+                                    (rainStrength > 0.01) || shorelineBandPossible;
+                                if(!wetPossible)
+                                {
+                                    if(evalPbr2ReflectionStrength(roughness, f0MetalCode) <= 0.0)
+                                    {
+                                        glossySampleLevel = 3;
+                                    }
+                                    else if(cam.giHalfParams.w > 0.5f)
+                                    {
+                                        if(f0MetalCode <= 15 &&
+                                           (roughness >= 0.80 ||
+                                            (primaryHitDistance >= 40.0 * tierScale && roughness >= 0.65) ||
+                                            (primaryHitDistance >= 72.0 * tierScale && roughness >= 0.50)))
+                                        {
+                                            glossySampleLevel = 3;
+                                        }
+                                        else if(roughness >= 0.65)
+                                        {
+                                            glossySampleLevel = max(glossySampleLevel, 2);
+                                        }
+                                        else if(roughness >= 0.30)
+                                        {
+                                            glossySampleLevel = max(glossySampleLevel, 1);
+                                        }
+                                    }
+                                }
+
+                                needGlossy =
+                                    (glossySampleLevel == 0) ||
+                                    (glossySampleLevel == 1 && halfSample) ||
+                                    (glossySampleLevel == 2 && quarterSample);
+                            }
+
+                            active3 = needWaterSun || needGlossy;
+                            if(!active3)
+                            {
+                                const float rrSpecDist = (cam.ssHybridParams.z >= 0.5f)
+                                    ? max(primaryHitDistance, 1.0)
+                                    : 65504.0;
+                                ptLandingRecords[linearIdx].d = vec4(0.0, 0.0, 0.0, rrSpecDist);
+                            }
+                        }
+
+                        // Slots 4 & 5: share computeRtLodDiffuseGiEnabled evaluation
+                        const bool perfBandDisabled =
+                            (cam.perfBandParams.z > 0.5f) &&
+                            ((primaryHitDistance / 16.0) > max(1.0, cam.perfBandParams.x));
+                        const bool giAllowedGlobal =
+                            (cam.giHalfParams.x == 0.0f) && (cam.perfPrimary.z > 0u);
+                        const bool needK2iBase =
+                            (mode4 != 0u) &&
+                            giAllowedGlobal &&
+                            ((mode4 != 1u) || maskBitActive) &&
+                            !perfBandDisabled;
+
+                        bool sharcChosen = false;
+                        if(mode5 != 0u && cam.perfPrimary.z > 0u)
+                        {
+                            const uint blockSize = sharcUpdateBlockSize();
+                            const ivec2 sharcBlock = pixelCoord / int(blockSize);
+                            const ivec2 chosenPixel =
+                                sharcBlock * int(blockSize) +
+                                sharcUpdateBlockOffset(sharcBlock, blockSize);
+                            sharcChosen =
+                                (pixelCoord.x == chosenPixel.x &&
+                                 pixelCoord.y == chosenPixel.y);
+                        }
+
+                        if(needK2iBase || sharcChosen)
+                        {
+                            const bool rtLodGi =
+                                computeRtLodDiffuseGiEnabled(pixelCoord, primaryHitDistance);
+                            active4 = needK2iBase && rtLodGi;
+                            active5 = sharcChosen && rtLodGi;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const uvec4 ballot1 = subgroupBallot(active1);
+    const uvec4 ballot2 = subgroupBallot(active2);
+    const uvec4 ballot3 = subgroupBallot(active3);
+    const uvec4 ballot4 = subgroupBallot(active4);
+    const uvec4 ballot5 = subgroupBallot(active5);
+
+    uint wgSgOff1 = 0u;
+    uint wgSgOff2 = 0u;
+    uint wgSgOff3 = 0u;
+    uint wgSgOff4 = 0u;
+    uint wgSgOff5 = 0u;
+    {
+        const uint sg1 = subgroupBallotBitCount(ballot1);
+        const uint sg2 = subgroupBallotBitCount(ballot2);
+        const uint sg3 = subgroupBallotBitCount(ballot3);
+        const uint sg4 = subgroupBallotBitCount(ballot4);
+        const uint sg5 = subgroupBallotBitCount(ballot5);
+        if(subgroupElect())
+        {
+            if(sg1 > 0u) wgSgOff1 = atomicAdd(s_wgCount1, sg1);
+            if(sg2 > 0u) wgSgOff2 = atomicAdd(s_wgCount2, sg2);
+            if(sg3 > 0u) wgSgOff3 = atomicAdd(s_wgCount3, sg3);
+            if(sg4 > 0u) wgSgOff4 = atomicAdd(s_wgCount4, sg4);
+            if(sg5 > 0u) wgSgOff5 = atomicAdd(s_wgCount5, sg5);
+        }
+        wgSgOff1 = subgroupBroadcastFirst(wgSgOff1);
+        wgSgOff2 = subgroupBroadcastFirst(wgSgOff2);
+        wgSgOff3 = subgroupBroadcastFirst(wgSgOff3);
+        wgSgOff4 = subgroupBroadcastFirst(wgSgOff4);
+        wgSgOff5 = subgroupBroadcastFirst(wgSgOff5);
+    }
+    barrier();
+
+    if(gl_LocalInvocationIndex == 0u && s_wgCount1 > 0u)
+    {
+        s_wgBase1 = atomicAdd(k2iCompact.headers[1].activeCount, s_wgCount1);
+        const uint compactH = max(k2iCompact.headers[1].height, 1u);
+        atomicMax(k2iCompact.headers[1].width, (s_wgBase1 + s_wgCount1 + compactH - 1u) / compactH);
+    }
+    if(gl_LocalInvocationIndex == 1u && s_wgCount2 > 0u)
+    {
+        s_wgBase2 = atomicAdd(k2iCompact.headers[2].activeCount, s_wgCount2);
+        const uint compactH = max(k2iCompact.headers[2].height, 1u);
+        atomicMax(k2iCompact.headers[2].width, (s_wgBase2 + s_wgCount2 + compactH - 1u) / compactH);
+    }
+    if(gl_LocalInvocationIndex == 2u && s_wgCount3 > 0u)
+    {
+        s_wgBase3 = atomicAdd(k2iCompact.headers[3].activeCount, s_wgCount3);
+        const uint compactH = max(k2iCompact.headers[3].height, 1u);
+        atomicMax(k2iCompact.headers[3].width, (s_wgBase3 + s_wgCount3 + compactH - 1u) / compactH);
+    }
+    if(gl_LocalInvocationIndex == 3u && s_wgCount4 > 0u)
+    {
+        s_wgBase4 = atomicAdd(k2iCompact.headers[4].activeCount, s_wgCount4);
+        const uint compactH = max(k2iCompact.headers[4].height, 1u);
+        atomicMax(k2iCompact.headers[4].width, (s_wgBase4 + s_wgCount4 + compactH - 1u) / compactH);
+    }
+    if(gl_LocalInvocationIndex == 4u && s_wgCount5 > 0u)
+    {
+        s_wgBase5 = atomicAdd(k2iCompact.headers[5].activeCount, s_wgCount5);
+        const uint compactH = max(k2iCompact.headers[5].height, 1u);
+        atomicMax(k2iCompact.headers[5].width, (s_wgBase5 + s_wgCount5 + compactH - 1u) / compactH);
+    }
+    barrier();
+
+    const uint packedCoord =
+        (uint(pixelCoord.x) & 0xFFFFu) | ((uint(pixelCoord.y) & 0xFFFFu) << 16u);
+    if(active1)
+    {
+        const uint slot = k2iCompact.headers[1].baseElemOffset + s_wgBase1 + wgSgOff1 + subgroupBallotExclusiveBitCount(ballot1);
+        k2iCompact.activeCoords[slot] = packedCoord;
+    }
+    if(active2)
+    {
+        const uint slot = k2iCompact.headers[2].baseElemOffset + s_wgBase2 + wgSgOff2 + subgroupBallotExclusiveBitCount(ballot2);
+        k2iCompact.activeCoords[slot] = packedCoord;
+    }
+    if(active3)
+    {
+        const uint slot = k2iCompact.headers[3].baseElemOffset + s_wgBase3 + wgSgOff3 + subgroupBallotExclusiveBitCount(ballot3);
+        k2iCompact.activeCoords[slot] = packedCoord;
+    }
+    if(active4)
+    {
+        const uint slot = k2iCompact.headers[4].baseElemOffset + s_wgBase4 + wgSgOff4 + subgroupBallotExclusiveBitCount(ballot4);
+        k2iCompact.activeCoords[slot] = packedCoord;
+    }
+    if(active5)
+    {
+        const uint slot = k2iCompact.headers[5].baseElemOffset + s_wgBase5 + wgSgOff5 + subgroupBallotExclusiveBitCount(ballot5);
+        k2iCompact.activeCoords[slot] = packedCoord;
+    }
+}

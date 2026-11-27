@@ -20,6 +20,7 @@ layout(set = 0, binding = 0) uniform CameraProperties
     #include "camera_ubo.glsl"
 } cam;
 
+layout(rgba16f, set = 0, binding = 18) uniform readonly image3D fogDensityMeta;
 layout(rgba16f, set = 0, binding = 23) uniform readonly image3D fogLightRead;
 layout(rgba16f, set = 0, binding = 27) uniform writeonly image3D fogIntegratedOut;
 
@@ -31,6 +32,63 @@ layout(push_constant) uniform FogFroxelPush
 #include "fog_froxel_common.glsl"
 
 const float FOG_ACCUM_CLAMP = 12.0;
+
+void accumFogCompositeNeighbor(
+    ivec2 nxy,
+    int sliceIdx,
+    float d0,
+    float d1,
+    float cMin,
+    float cMax,
+    vec4 nMeta,
+    float maxDistance,
+    float centerLum,
+    float centerSigma,
+    inout vec4 sum,
+    inout float wSum)
+{
+    const vec4 ncell = imageLoad(fogLightRead, ivec3(nxy, sliceIdx));
+    if(ncell.a <= 1.0e-6)
+    {
+        return;
+    }
+#if FOG_EDGE_GHOST_FIX
+    const float nMin = (nMeta.a > 0.5) ? nMeta.r : 0.0;
+    const float nMax = (nMeta.a > 0.5) ? nMeta.g : maxDistance;
+    if(nMax <= d0)
+    {
+        return;
+    }
+    // Foreground silhouette protection: reject pure background neighbors behind this slice.
+    if(cMin <= d1 + 0.5 && nMin > d1 + 1.0)
+    {
+        return;
+    }
+    // Background protection: reject neighbors terminated by foreground geometry before d1.
+    if(cMax > d1 + 0.5 && nMax < d1 - 0.15)
+    {
+        return;
+    }
+    // Surface-clipped slice protection: match surface distance closely.
+    if(cMax < d1 && abs(nMax - cMax) > max(1.5, cMax * 0.15))
+    {
+        return;
+    }
+#endif
+    const float nLum = dot(ncell.rgb, vec3(0.2126, 0.7152, 0.0722));
+    const float lumDiff = abs(nLum - centerLum);
+#if FOG_EDGE_GHOST_FIX
+    const float lumScale = (nLum > centerLum)
+        ? max(centerLum * 0.85 + 0.008, 0.008)
+        : max(min(centerLum, nLum) * 1.5 + 0.015, 0.015);
+#else
+    const float lumScale = max(min(centerLum, nLum) * 1.5 + 0.015, 0.015);
+#endif
+    const float sigDiff = abs(ncell.a - centerSigma) / max(centerSigma + 0.01, 0.01);
+    const float w = 0.11 * exp(-sigDiff * 3.5 - lumDiff / lumScale);
+    sum += ncell * w;
+    wSum += w;
+}
 
 void main()
 {
@@ -58,6 +116,19 @@ void main()
         return;
     }
 
+    const int metaZ = clamp(layers - 1, 0, max(size.z - 1, 0));
+    const vec4 cMeta = imageLoad(fogDensityMeta, ivec3(xy, metaZ));
+    const float cMin = (cMeta.a > 0.5) ? cMeta.r : 0.0;
+    const float cMax = (cMeta.a > 0.5) ? cMeta.g : maxDistance;
+    const ivec2 nxy0 = clamp(xy + ivec2(-1, 0), ivec2(0), size.xy - ivec2(1));
+    const ivec2 nxy1 = clamp(xy + ivec2( 1, 0), ivec2(0), size.xy - ivec2(1));
+    const ivec2 nxy2 = clamp(xy + ivec2( 0,-1), ivec2(0), size.xy - ivec2(1));
+    const ivec2 nxy3 = clamp(xy + ivec2( 0, 1), ivec2(0), size.xy - ivec2(1));
+    const vec4 nMeta0 = imageLoad(fogDensityMeta, ivec3(nxy0, metaZ));
+    const vec4 nMeta1 = imageLoad(fogDensityMeta, ivec3(nxy1, metaZ));
+    const vec4 nMeta2 = imageLoad(fogDensityMeta, ivec3(nxy2, metaZ));
+    const vec4 nMeta3 = imageLoad(fogDensityMeta, ivec3(nxy3, metaZ));
+
     vec3 accumScatter = vec3(0.0);
     float accumTransmittance = 1.0;
 
@@ -78,24 +149,10 @@ void main()
                 const float centerSigma = cell.a;
                 vec4 sum = cell * 0.56;
                 float wSum = 0.56;
-                const ivec2 offsets[4] = ivec2[4](
-                    ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
-                for(int n = 0; n < 4; ++n)
-                {
-                    const ivec2 nxy = clamp(xy + offsets[n], ivec2(0), size.xy - ivec2(1));
-                    const vec4 ncell = imageLoad(fogLightRead, ivec3(nxy, s));
-                    if(ncell.a <= 1.0e-6)
-                    {
-                        continue;
-                    }
-                    const float nLum = dot(ncell.rgb, vec3(0.2126, 0.7152, 0.0722));
-                    const float lumDiff = abs(nLum - centerLum);
-                    const float lumScale = max(min(centerLum, nLum) * 1.5 + 0.015, 0.015);
-                    const float sigDiff = abs(ncell.a - centerSigma) / max(centerSigma + 0.01, 0.01);
-                    const float w = 0.11 * exp(-sigDiff * 3.5 - lumDiff / lumScale);
-                    sum += ncell * w;
-                    wSum += w;
-                }
+                accumFogCompositeNeighbor(nxy0, s, d0, d1, cMin, cMax, nMeta0, maxDistance, centerLum, centerSigma, sum, wSum);
+                accumFogCompositeNeighbor(nxy1, s, d0, d1, cMin, cMax, nMeta1, maxDistance, centerLum, centerSigma, sum, wSum);
+                accumFogCompositeNeighbor(nxy2, s, d0, d1, cMin, cMax, nMeta2, maxDistance, centerLum, centerSigma, sum, wSum);
+                accumFogCompositeNeighbor(nxy3, s, d0, d1, cMin, cMax, nMeta3, maxDistance, centerLum, centerSigma, sum, wSum);
                 cell = sum / max(wSum, 1.0e-4);
             }
             const vec3 inScatter = max(cell.rgb, vec3(0.0));

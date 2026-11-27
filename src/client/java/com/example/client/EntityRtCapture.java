@@ -102,6 +102,8 @@ public final class EntityRtCapture {
     private static final long[] publishedEntitySpecularViews = new long[MAX_TEXTURE_SLOTS];
     private static final long[] publishedEntitySpecularSamplers = new long[MAX_TEXTURE_SLOTS];
     private static final boolean[] entityPbrSettled = new boolean[MAX_TEXTURE_SLOTS];
+    // 2026-11-26(晚)：PBR 链路诊断行每槽只打一次的标记，见 uploadBatch 开头的 [RTX-PBR]。
+    private static final boolean[] pbrSlotDiagLogged = new boolean[MAX_TEXTURE_SLOTS];
     private static boolean entityPbrNativeAvailable = true;
     // 2026-11-09：包一层，只为在"没有任何捕获窗口打开"时用一个 volatile 标志短路。
     // BufferBuilderMixin 对**每一个**顶点都调 captureVertex，而绝大多数顶点
@@ -161,6 +163,17 @@ public final class EntityRtCapture {
             Collections.newSetFromMap(new IdentityHashMap<>());
     private static boolean localPlayerProxyAvatarPending;
     private static Identifier localPlayerProxyBodyTexture;
+    private static boolean submittingSyntheticLocalPlayer;
+    private static final boolean DIAG_ENABLED = resolveDiagEnabled();
+
+    private static boolean resolveDiagEnabled() {
+        String prop = System.getProperty("orion.entityDiag");
+        if (prop != null) {
+            return "1".equals(prop.trim()) || "true".equalsIgnoreCase(prop.trim());
+        }
+        String env = System.getenv("ORION_ENTITY_DIAG");
+        return env != null && ("1".equals(env.trim()) || "true".equalsIgnoreCase(env.trim()));
+    }
     private static final ThreadLocal<ActiveBatch> textBatch = ThreadLocal.withInitial(ActiveBatch::new);
     private static int textBatchSlot;
     private static boolean captureFrameActive;
@@ -301,6 +314,8 @@ public final class EntityRtCapture {
     }
 
     public static void beginFrame() {
+        submittingSyntheticLocalPlayer = false;
+        disarmLocalPlayerProxyFallback();
         com.example.client.cull.EntityVisibilityCuller.tick();
         if (activeBatch.get() != null) throw new IllegalStateException("Entity model capture leaked across frames");
         ++captureFrameSerial;
@@ -308,9 +323,12 @@ public final class EntityRtCapture {
         handCaptureWindow = false;
         textBatchSlot = 0;
         captureFrameActive = true;
+        frameCustomItemOrdinals.clear();
+        pendingCustomItemKey = null;
         bannerPatternLayerRanks.clear();
         frameOwnerRecords.clear();
         frameHistoryOrdinals.clear();
+        handBatchOrdinals.clear();
         // 上一帧若在某条短格式顶点中途结束（异常/取消），残留的 pending 会串到本帧的批次里。
         cancelShortVertex();
 
@@ -341,6 +359,8 @@ public final class EntityRtCapture {
      * {@code g_entityFrameOpen}，只关 Java 标记会让手/实体几何继续被静默丢弃）。</p>
      */
     public static void endFrame() {
+        submittingSyntheticLocalPlayer = false;
+        disarmLocalPlayerProxyFallback();
         captureFrameActive = false;
         entityFrameOpen = false;
         handCaptureWindow = false;
@@ -505,7 +525,7 @@ public final class EntityRtCapture {
     }
 
     public static boolean isDiagnosticFrame() {
-        return (captureFrameSerial & 63) == 1;
+        return DIAG_ENABLED && (captureFrameSerial & 63) == 1;
     }
 
     /**
@@ -533,6 +553,18 @@ public final class EntityRtCapture {
         beginModel(submit, false);
     }
 
+    public static void beginSyntheticLocalPlayerSubmit() {
+        submittingSyntheticLocalPlayer = true;
+    }
+
+    public static void endSyntheticLocalPlayerSubmit() {
+        submittingSyntheticLocalPlayer = false;
+    }
+
+    public static boolean isSubmittingSyntheticLocalPlayer() {
+        return submittingSyntheticLocalPlayer;
+    }
+
     public static void markLocalPlayerProxyState(Object state) {
         if (localPlayerProxyStates.size() >= 8) localPlayerProxyStates.clear();
         localPlayerProxyStates.add(state);
@@ -546,6 +578,7 @@ public final class EntityRtCapture {
     public static void disarmLocalPlayerProxyFallback() {
         localPlayerProxyAvatarPending = false;
         localPlayerProxyBodyTexture = null;
+        localPlayerProxyStates.clear();
     }
 
     public static boolean isLocalPlayerProxyState(ModelFeatureRenderer.Submit<?> submit) {
@@ -659,8 +692,23 @@ public final class EntityRtCapture {
     
 
     private static final java.util.HashMap<
-            double[], java.util.HashMap<ModelBatchKey, VertexHistory>>
+            double[], java.util.HashMap<Object, VertexHistory>>
             entityVertexHistories = new java.util.HashMap<>();
+
+    // ── 2026-11-26 物品（custom）批次逐顶点 MV ─────────────────────────────────
+    // 物品/掉落物走 custom 捕获路径，此前没有任何运动信息 ⇒ 掉落物自转+浮动时
+    // DLSS-RR 的历史重投影全错，实机表现为「贴着物品的一片方形暗残影」（天空被乘性
+    // 压暗、星星仍透出、剑刃带同色暗影）。给每件物品的批次挂「上一帧顶点位置」历史
+    // （与模型批次同一套 VertexHistory 机制）：uploadBatch 的 useVertexHistory 分支
+    // 按顶点序号取 p_prev − p_cur 写 MV。身份键 = (quads 列表身份, foil,
+    // displayContext) 的 64 位混合 + 帧内序号；同种物品多件并列靠帧内提交序区分。
+    private record CustomItemBatchKey(long identity, int ordinal) {}
+    private static final java.util.HashMap<Object, VertexHistory> customItemVertexHistories =
+            new java.util.HashMap<>();
+    private static final java.util.HashMap<Long, int[]> frameCustomItemOrdinals =
+            new java.util.HashMap<>();
+    private static final int CUSTOM_VERTEX_HISTORY_MAX_KEYS = 512;
+    private static Object pendingCustomItemKey;
 
     private static final int ENTITY_VERTEX_HISTORY_MAX_KEYS = 32;
 
@@ -948,7 +996,7 @@ public final class EntityRtCapture {
         if (!LIMB_MV_ENABLED) {
             return;
         }
-        final java.util.HashMap<ModelBatchKey, VertexHistory> history =
+        final java.util.HashMap<Object, VertexHistory> history =
                 entityVertexHistories.get(record);
         if (history == null) {
             return;
@@ -996,13 +1044,8 @@ public final class EntityRtCapture {
         ++modelSubmitCount;
         if (activeBatch.get() != null) throw new IllegalStateException("Nested entity model capture");
         Identifier texture = resolveSampler0(submit.renderType());
-        if (handPhase) {
-            if (!handTextureSubstituted) {
-                handTextureSubstituted = true;
-                System.out.println("[RTX-HAND] texture probe: original="
-                        + texture + " -> substituted with blocks atlas");
-            }
-            texture = BLOCKS_ATLAS_TEXTURE;
+        if (isEnchantedGlintTexture(texture)) {
+            return;
         }
         if (localPlayerProxy && isLocalPlayerBodyTexture(submit, texture)) {
             int textureSlot = MAX_TEXTURE_SLOTS;
@@ -1017,9 +1060,7 @@ public final class EntityRtCapture {
             return;
         }
         int textureSlot = slotFor(texture);
-        // 第一人称手部（手臂 + 手持物）的 state 是 Unit.INSTANCE，不是 AvatarRenderState，
-        // 所以这里不能按 state 类型过滤，只能按"第一人称"这个相机状态判断。
-        final boolean handBatch = isFirstPersonHandState(submit);
+        final boolean handBatch = !localPlayerProxy && isFirstPersonHandState(submit);
         if (handBatch) {
             handDiagLog("SLOT-PATH", submit, texture, textureSlot);
         }
@@ -1035,6 +1076,14 @@ public final class EntityRtCapture {
         if (textureSlot != 0) {
             ActiveBatch batch = acquireBatch(textureSlot, localPlayerProxy, false);
             batch.diagHand = handBatch;
+            boolean thirdPersonPlayer = false;
+            if (!localPlayerProxy && !handBatch
+                    && !Minecraft.getInstance().options.getCameraType().isFirstPerson()
+                    && submit.state() instanceof AvatarRenderState avatarState) {
+                var player = Minecraft.getInstance().player;
+                thirdPersonPlayer = (player != null && avatarState.id == player.getId());
+            }
+            batch.thirdPersonLocalPlayer = thirdPersonPlayer;
             // 2026-11-04：见 ActivaBatch.uvMapping 处的说明。
             batch.uvMapping = submit.uvMapping();
             // 2026-11-15：旗帜图案层按 Caustica 的 order 递增层序（不再是固定 +2）。
@@ -1072,6 +1121,11 @@ public final class EntityRtCapture {
         ActiveBatch batch = activeBatch.get();
         activeBatch.remove();
         if (batch == null || batch.vertexCount == 0) {
+            if (batch != null && batch.destroyOverlay && !destroyOverlayBatchLogged) {
+                destroyOverlayBatchLogged = true;
+                System.err.println("[RTX-ENTITY] block destroy overlay batch EMPTY (short-path capture got"
+                        + " no vertices) slot=" + batch.textureSlot);
+            }
             if (isDiagnosticFrame() && batch != null && batch.localPlayerProxy) {
                 System.err.println("[RTX-PROXY] proxy batch EMPTY, slot=" + batch.textureSlot);
             }
@@ -1160,14 +1214,25 @@ public final class EntityRtCapture {
     }
 
     /**
-     * 2026-11-03：第一人称手部批次的判据。26.3 的手臂/手持物走
-     * {@code submitModelPart}，state 是 {@code Unit.INSTANCE}（不是 AvatarRenderState），
-     * 所以只能按类名判。
+     * 2026-11-26：第一人称手部与手持特殊模型批次的判据。
+     * 只要在 {@code renderItemInHand} 窗口内且处于第一人称，不论 state 是手臂的
+     * {@code Unit.INSTANCE} 还是手持盾牌/箱子/旗帜/三叉戟等特殊模型状态，都归入
+     * 第一人称手部 RT 层。
      */
     private static boolean isFirstPersonHandState(ModelFeatureRenderer.Submit<?> submit) {
-        if (!handCaptureWindow || !Minecraft.getInstance().options.getCameraType().isFirstPerson()) return false;
-        final Object state = submit.state();
-        return state != null && "Unit".equals(state.getClass().getSimpleName());
+        if (!handCaptureWindow || !Minecraft.getInstance().options.getCameraType().isFirstPerson()) {
+            return false;
+        }
+        return submit != null;
+    }
+
+    /** 过滤独立附魔闪光层贴图，避免与手持物品/装备本体共面冲突或渲染成纯紫块。 */
+    private static boolean isEnchantedGlintTexture(Identifier texture) {
+        if (texture == null) {
+            return false;
+        }
+        final String path = texture.getPath();
+        return path.contains("enchanted_glint");
     }
 
     /** 取小数部分并夹到 [0,1)：末地门合成 UV 用（顶点在整数角点上，见 captureVertex）。 */
@@ -1193,27 +1258,71 @@ public final class EntityRtCapture {
     };
 
     // =====================================================
-    // 2026-11-03 手部 MV：上一帧的相机状态。
+    // 2026-11-26 手部光追变换与无鬼影 MV：完整的相机视图/逆矩阵状态。
     //
-    // 手部几何是"相机相对"的（GameRenderer.renderItemInHand 已把
-    // viewRotationMatrix.invert() 乘进 PoseStack），所以它每帧的世界位置变化
-    // 完全由相机状态决定：
-    //     p_prev = R_prev·R_cur⁻¹·p_cur + (pos_prev − R_prev·R_cur⁻¹·pos_cur)
-    // 这两个 setter 每帧各调一次（VulkanCameraMixin:300-303），所以在写入本帧值
-    // 之前把旧值存下来，就得到干净的上一帧。
+    // GameRenderer.renderItemInHand 传给 Feature 的顶点带有：
+    //   p_raw = viewRotationMatrix^-1 * M_bob * p_handLocal
+    //   1) 用未含 bob 的 viewRotationMatrix 拉回视图空间（抵消多余 bob，防止叠加两次）；
+    //   2) 按 tan(worldFov/2)/tan(hudFov/2) 做 FOV 透视匹配，并按 HAND_DEPTH_SCALE
+    //      缩放到玩家碰撞箱内（0.25× ≈ 0.05..0.22 格），彻底防止贴墙穿模；
+    //   3) 用含 bob 的 handCurViewInv 3x3 旋转回世界朝向（相对本帧 RT 相机原点）；
+    //   4) uploadBatch 用 R_eff_cur^T 恢复视图空间坐标并与跨帧历史 p_view_prev 比对，
+    //      再用 R_eff_prev 算得精确相机相对位移 p_rel_prev - p_rel_cur，消除转动视角鬼影。
     // =====================================================
-    private static final float[] prevHandRotation = new float[] {
+    private static final float[] handCurViewRot = new float[] {
             1.0f, 0.0f, 0.0f, 0.0f,
             0.0f, 1.0f, 0.0f, 0.0f,
             0.0f, 0.0f, 1.0f, 0.0f,
             0.0f, 0.0f, 0.0f, 1.0f
     };
-    private static final float[] handMotionMatrix = new float[9];
+    private static final float[] handCurViewInv = new float[] {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f
+    };
+    private static final float[] handPrevViewInv = new float[] {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f
+    };
+    private static final float HAND_DEPTH_SCALE = resolveHandDepthScale();
+
+    private static float resolveHandDepthScale() {
+        String raw = System.getProperty("orion.handDepthScale");
+        if (raw == null) raw = System.getenv("ORION_HAND_DEPTH_SCALE");
+        if (raw != null) {
+            try {
+                float parsed = Float.parseFloat(raw.trim());
+                if (Float.isFinite(parsed) && parsed >= 0.05f && parsed <= 1.0f) {
+                    return parsed;
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0.25f;
+    }
+
+    private static float handWorldFovDeg = 70.0f;
+    private static float handHudFovDeg = 70.0f;
+    private static float handFovScaleXY = 1.0f;
+    private static boolean handCameraStateValid;
+    private static boolean prevCameraRotationValid;
+    private static boolean cameraRotationSeen;
     private static float prevCameraWorldX;
     private static float prevCameraWorldY;
     private static float prevCameraWorldZ;
-    private static boolean prevCameraRotationValid;
-    private static boolean cameraRotationSeen;
+
+    private static final class HandViewHistory {
+        private int frame = Integer.MIN_VALUE;
+        private float[] viewPositions;
+    }
+
+    private static final java.util.HashMap<Long, HandViewHistory> handVertexHistories =
+            new java.util.HashMap<>();
+    private static final java.util.HashMap<Integer, Integer> handBatchOrdinals =
+            new java.util.HashMap<>();
 
     /** A/B 开关：-DORION_HAND_CAMERA_MV=0 关掉手部相机相对 MV。 */
     private static final boolean HAND_CAMERA_MV = resolveHandCameraMv();
@@ -1246,9 +1355,42 @@ public final class EntityRtCapture {
 
     public static void setHandRotation(float[] columnMajor) {
         if (columnMajor == null || columnMajor.length < 16) return;
-        System.arraycopy(handRotation, 0, prevHandRotation, 0, 16);
         System.arraycopy(columnMajor, 0, handRotation, 0, 16);
-        prevCameraRotationValid = cameraRotationSeen;
+    }
+
+    public static void setHandCameraState(
+            float[] curViewRotColMajor,
+            float[] curViewInvColMajor,
+            float worldFovDeg,
+            float hudFovDeg) {
+        if (curViewRotColMajor == null || curViewRotColMajor.length < 16
+                || curViewInvColMajor == null || curViewInvColMajor.length < 16) {
+            return;
+        }
+        System.arraycopy(handCurViewInv, 0, handPrevViewInv, 0, 16);
+        System.arraycopy(curViewRotColMajor, 0, handCurViewRot, 0, 16);
+        System.arraycopy(curViewInvColMajor, 0, handCurViewInv, 0, 16);
+
+        prevCameraWorldX = cameraWorldX;
+        prevCameraWorldY = cameraWorldY;
+        prevCameraWorldZ = cameraWorldZ;
+        cameraWorldX = curViewInvColMajor[12];
+        cameraWorldY = curViewInvColMajor[13];
+        cameraWorldZ = curViewInvColMajor[14];
+
+        float clampedWorldFov = (Float.isFinite(worldFovDeg) && worldFovDeg >= 10.0f && worldFovDeg <= 150.0f)
+                ? worldFovDeg : 70.0f;
+        float clampedHudFov = (Float.isFinite(hudFovDeg) && hudFovDeg >= 10.0f && hudFovDeg <= 150.0f)
+                ? hudFovDeg : 70.0f;
+        handWorldFovDeg = clampedWorldFov;
+        handHudFovDeg = clampedHudFov;
+        double tanWorld = Math.tan(Math.toRadians(clampedWorldFov) * 0.5);
+        double tanHud = Math.tan(Math.toRadians(clampedHudFov) * 0.5);
+        float scaleXY = tanHud > 1.0e-5 ? (float) (tanWorld / tanHud) : 1.0f;
+        handFovScaleXY = Math.max(0.35f, Math.min(2.5f, scaleXY));
+
+        prevCameraRotationValid = handCameraStateValid && cameraRotationSeen;
+        handCameraStateValid = true;
         cameraRotationSeen = true;
     }
 
@@ -1367,12 +1509,42 @@ public final class EntityRtCapture {
     private static void uploadBatch(ActiveBatch batch) {
         batch.pendingQuadVertexCount = 0;
         batch.buffer.flip();
+        // ── 2026-11-26(晚) PBR 链路诊断（每槽一次，可单独摘除）──────────────────
+        // 盔甲（实体路径：class + _n/_s 兄弟贴图）与手持物（图集路径：pad2=0 →
+        // 地形 LabPBR）的静态链路都已验证通畅；用户报这两处「无 PBR 高光」。
+        // 本行打印该槽运行时实际状态，下一局日志直接指出断在哪一环：
+        //   class=材质类别码（盔甲应 1..6）
+        //   nPb/sPb=_n/_s 是否已发布到 binding 63/64（盔甲应 1/1）
+        //   pad2=首顶点编码（盔甲应 slot+class/32；图集材质应为 0）
+        if (batch.textureSlot >= 1 && batch.textureSlot <= MAX_TEXTURE_SLOTS
+                && batch.vertexCount > 0
+                && !pbrSlotDiagLogged[batch.textureSlot - 1]) {
+            pbrSlotDiagLogged[batch.textureSlot - 1] = true;
+            final int index = batch.textureSlot - 1;
+            System.out.println("[RTX-PBR] slot=" + batch.textureSlot
+                    + " class=" + frameTextureClasses[index]
+                    + " nPb=" + (publishedEntityNormalViews[index] != 0L ? 1 : 0)
+                    + " sPb=" + (publishedEntitySpecularViews[index] != 0L ? 1 : 0)
+                    + " pad2=" + String.format(java.util.Locale.ROOT, "%.4f",
+                            batch.buffer.getFloat(11 * Float.BYTES))
+                    + " hand=" + (batch.diagHand ? 1 : 0)
+                    + " atlas=" + (batch.atlasMaterial ? 1 : 0)
+                    + " tex=" + frameTextureLabels[index]);
+        }
+        // ── 2026-11-26(晚) PBR 链路诊断（结束）─────────────────────────────────
         // 2026-11-19：旗帜图案层的 order 必须落到几何上。
         // 在此之前 coplanarLayerBoost 只被短格式 quad 路径读取，模型批次从不经过
         // 那条路 ⇒ 底布 / 底色层 / 图案层在 RT 里仍然严格共面，谁被 BLAS 命中
         // 完全随机，表现就是"旗帜图案时有时无"。这里整批沿指向相机的方向外移。
         if (batch.coplanarLayerBoost > 0 && batch.vertexCount > 0) {
             applyBannerLayerOffset(batch);
+        }
+        if (!destroyOverlayBatchLogged && batch.destroyOverlay && batch.vertexCount > 0) {
+            destroyOverlayBatchLogged = true;
+            System.out.println("[RTX-ENTITY] block destroy overlay batch upload slot=" + batch.textureSlot
+                    + " vertices=" + batch.vertexCount
+                    + " label=" + frameTextureLabels[Math.min(Math.max(batch.textureSlot - 1, 0),
+                            MAX_TEXTURE_SLOTS - 1)]);
         }
         if (!endPortalBatchLogged && batch.textureSlot >= 1
                 && batch.textureSlot <= MAX_TEXTURE_SLOTS) {
@@ -1385,51 +1557,16 @@ public final class EntityRtCapture {
             }
         }
         // =====================================================
-        // 2026-11-03：第一人称手部（手臂 + 手持物）的运动矢量。
+        // 2026-11-26：第一人称手部（手臂 + 手持物）逐顶点相机+动画 MV。
         //
-        // resolveBatchMotion 对手臂直接 return（它的 state 是 Unit，不是
-        // EntityRenderState），手持物走 custom 路径压根不调那个函数 ⇒ 两条路径
-        // 都拿不到 motion ⇒ MV 恒为 0。
-        //
-        // 而手部是"相机相对"的：转视角/走动时它的世界位置每帧都在变。MV=0 等于告诉
-        // DLSS"这个表面相对世界静止"，DLSS 于是按相机运动去重投影它 —— 但手明明
-        // 没跟着动，重投影落到错误位置，表现为闪动 + 鬼影。
-        //
-        // 这里用相机矩阵直接构造 poseDelta（3×4 行主序，p_prev = M·p_cur + t）：
-        //     M = R_prev·R_cur⁻¹      t = pos_prev − M·pos_cur
-        // handRotation 存的是相机旋转的**逆**（column-major），所以 R = (R⁻¹)ᵀ，
-        // 即 R_ij = inv[i*4+j]。
-        // A/B：-DORION_HAND_CAMERA_MV=0 关闭。
+        // 先用 R_eff_cur^T 把相机相对世界朝向坐标还原到视图空间 p_view_cur，
+        // 若上一帧同槽位同序号批次存在视图空间历史则取 p_view_prev（捕捉挥手、
+        // 转头惯性 xBob/yBob、走路摇晃、拉弓/吃东西等动画），否则取 p_view_cur；
+        // 再用 R_eff_prev 转回上一帧相机相对世界朝向，写出 p_rel_prev - p_rel_cur。
+        // 若相机纯平移且相对位移为 0，则写入 +1.0e-6f 哨兵触发 rchit 补 Δcam。
         // =====================================================
-        if (HAND_CAMERA_MV && batch.diagHand && !batch.hasPoseDelta
-                && prevCameraRotationValid) {
-            final float[] hp = prevHandRotation;
-            final float[] hc = handRotation;
-            final float[] m = handMotionMatrix;
-            for (int i = 0; i < 3; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < 3; ++k) {
-                        sum += hp[k * 4 + i] * hc[k * 4 + j];
-                    }
-                    m[i * 3 + j] = sum;
-                }
-            }
-            batch.poseDelta[0] = m[0];
-            batch.poseDelta[1] = m[1];
-            batch.poseDelta[2] = m[2];
-            batch.poseDelta[3] = 0.0f;
-            batch.poseDelta[4] = m[3];
-            batch.poseDelta[5] = m[4];
-            batch.poseDelta[6] = m[5];
-            batch.poseDelta[7] = 0.0f;
-            batch.poseDelta[8] = m[6];
-            batch.poseDelta[9] = m[7];
-            batch.poseDelta[10] = m[8];
-            batch.poseDelta[11] = 0.0f;
-            batch.hasPoseDelta = true;
-        }
         final boolean handCameraMoved = HAND_CAMERA_MV && batch.diagHand
+                && handCameraStateValid
                 && prevCameraRotationValid
                 && (Math.abs(prevCameraWorldX - cameraWorldX) > 1.0e-6f
                         || Math.abs(prevCameraWorldY - cameraWorldY) > 1.0e-6f
@@ -1438,7 +1575,87 @@ public final class EntityRtCapture {
         long motionPointer = 0L;
         final long motionStartNanos =
                 com.example.client.LevelPhaseProbe.enabled() ? System.nanoTime() : 0L;
-        if (batch.vertexCount > 0) {
+        if (batch.vertexCount > 0 && batch.diagHand && HAND_CAMERA_MV && handCameraStateValid) {
+            final int motionFloats = batch.vertexCount * 3;
+            final int slotKey = batch.textureSlot;
+            final int ordinal = handBatchOrdinals.getOrDefault(slotKey, 0);
+            handBatchOrdinals.put(slotKey, ordinal + 1);
+            final long historyKey = (((long) slotKey) << 32) | (ordinal & 0xFFFFFFFFL);
+
+            HandViewHistory histEntry = handVertexHistories.get(historyKey);
+            final boolean hasPrevView = prevCameraRotationValid
+                    && histEntry != null
+                    && histEntry.frame == entityMotionFrame - 1
+                    && histEntry.viewPositions != null
+                    && histEntry.viewPositions.length == motionFloats;
+            final float[] prevViewArr = hasPrevView ? histEntry.viewPositions : null;
+            final float[] nextViewArr = (histEntry != null
+                    && histEntry.viewPositions != null
+                    && histEntry.viewPositions.length == motionFloats)
+                    ? histEntry.viewPositions
+                    : new float[motionFloats];
+
+            final ByteBuffer positions = batch.buffer;
+            final float[] hc = handCurViewInv;
+            final float[] hp = handPrevViewInv;
+            final ByteBuffer motion = prevCameraRotationValid ? batch.motionScratchFor(motionFloats) : null;
+            boolean anyMotion = false;
+
+            for (int vertex = 0; vertex < batch.vertexCount; ++vertex) {
+                final int offset = vertex * BYTES_PER_VERTEX;
+                final float px = positions.getFloat(offset);
+                final float py = positions.getFloat(offset + 4);
+                final float pz = positions.getFloat(offset + 8);
+
+                // p_view_cur = R_eff_cur^T * p_rel_cur
+                final float vx = hc[0] * px + hc[1] * py + hc[2] * pz;
+                final float vy = hc[4] * px + hc[5] * py + hc[6] * pz;
+                final float vz = hc[8] * px + hc[9] * py + hc[10] * pz;
+
+                final int mIdx = vertex * 3;
+                final float pvx = prevViewArr != null ? prevViewArr[mIdx] : vx;
+                final float pvy = prevViewArr != null ? prevViewArr[mIdx + 1] : vy;
+                final float pvz = prevViewArr != null ? prevViewArr[mIdx + 2] : vz;
+
+                nextViewArr[mIdx] = vx;
+                nextViewArr[mIdx + 1] = vy;
+                nextViewArr[mIdx + 2] = vz;
+
+                if (motion != null) {
+                    // p_rel_prev = R_eff_prev * p_view_prev
+                    final float prevRelX = hp[0] * pvx + hp[4] * pvy + hp[8] * pvz;
+                    final float prevRelY = hp[1] * pvx + hp[5] * pvy + hp[9] * pvz;
+                    final float prevRelZ = hp[2] * pvx + hp[6] * pvy + hp[10] * pvz;
+
+                    float mx = prevRelX - px;
+                    final float my = prevRelY - py;
+                    final float mz = prevRelZ - pz;
+                    if (handCameraMoved
+                            && Math.abs(mx) < 1.0e-6f
+                            && Math.abs(my) < 1.0e-6f
+                            && Math.abs(mz) < 1.0e-6f) {
+                        mx = 1.0e-6f;
+                    }
+                    anyMotion |= mx != 0.0F || my != 0.0F || mz != 0.0F;
+                    motion.putFloat(mx).putFloat(my).putFloat(mz);
+                }
+            }
+
+            if (histEntry == null) {
+                if (handVertexHistories.size() >= 256) {
+                    handVertexHistories.clear();
+                }
+                histEntry = new HandViewHistory();
+                handVertexHistories.put(historyKey, histEntry);
+            }
+            histEntry.viewPositions = nextViewArr;
+            histEntry.frame = entityMotionFrame;
+
+            if (motion != null && anyMotion) {
+                motion.flip();
+                motionPointer = MemoryUtil.memAddress(motion);
+            }
+        } else if (batch.vertexCount > 0) {
             final int motionFloats = batch.vertexCount * 3;
             final boolean useVertexHistory = batch.vertexHistoryIsPreviousFrame(motionFloats);
             final float[] positionStore = batch.vertexHistoryPositions(motionFloats);
@@ -1466,9 +1683,6 @@ public final class EntityRtCapture {
                             mx = delta[0] * px + delta[1] * py + delta[2] * pz + delta[3] - px;
                             my = delta[4] * px + delta[5] * py + delta[6] * pz + delta[7] - py;
                             mz = delta[8] * px + delta[9] * py + delta[10] * pz + delta[11] - pz;
-                            if (handCameraMoved && mx == 0.0F && my == 0.0F && mz == 0.0F) {
-                                mx = 1.0e-7F;
-                            }
                         }
                         anyMotion |= mx != 0.0F || my != 0.0F || mz != 0.0F;
                         motion.putFloat(mx).putFloat(my).putFloat(mz);
@@ -1755,22 +1969,21 @@ public final class EntityRtCapture {
         ActiveBatch batch = currentCaptureBatch();
         if (batch == null) return;
         ++capturedVertexCount;
-        if (handPhase && handTransformMode != 0) {
-            final float rx;
-            final float ry;
-            final float rz;
-            if (handTransformMode == 1) {
-                rx = handRotation[0] * x + handRotation[4] * y + handRotation[8] * z;
-                ry = handRotation[1] * x + handRotation[5] * y + handRotation[9] * z;
-                rz = handRotation[2] * x + handRotation[6] * y + handRotation[10] * z;
-            } else {
-                rx = handRotation[0] * x + handRotation[1] * y + handRotation[2] * z;
-                ry = handRotation[4] * x + handRotation[5] * y + handRotation[6] * z;
-                rz = handRotation[8] * x + handRotation[9] * y + handRotation[10] * z;
-            }
-            x = rx;
-            y = ry;
-            z = rz;
+        if (batch.diagHand && handCameraStateValid) {
+            final float[] vr = handCurViewRot;
+            final float[] vi = handCurViewInv;
+            // 1) 用未含 bob 的 viewRotationMatrix 拉回视图空间（剔除 renderItemInHand 内的 bob）
+            final float viewX = vr[0] * x + vr[4] * y + vr[8] * z;
+            final float viewY = vr[1] * x + vr[5] * y + vr[9] * z;
+            final float viewZ = vr[2] * x + vr[6] * y + vr[10] * z;
+            // 2) FOV 透视校正 + 防穿墙深度缩放
+            final float scaledX = viewX * handFovScaleXY * HAND_DEPTH_SCALE;
+            final float scaledY = viewY * handFovScaleXY * HAND_DEPTH_SCALE;
+            final float scaledZ = viewZ * HAND_DEPTH_SCALE;
+            // 3) 用含 bob 的有效相机逆矩阵旋转回世界朝向（相对于本帧 RT 相机原点）
+            x = vi[0] * scaledX + vi[4] * scaledY + vi[8] * scaledZ;
+            y = vi[1] * scaledX + vi[5] * scaledY + vi[9] * scaledZ;
+            z = vi[2] * scaledX + vi[6] * scaledY + vi[10] * scaledZ;
         }
         if (batch.projectiveUv) {
             final float wx = x + cameraWorldX;
@@ -1780,15 +1993,14 @@ public final class EntityRtCapture {
             v = fract01(wz * 0.25f + wy * 0.125f);
         }
         final int incomingColor = color;
-        if (batch.projectiveUv || handPhase) {
+        if (batch.projectiveUv) {
             color = 0xFFFFFFFF;
         }
-        if ((batch.projectiveUv || handPhase) && !vertexColorLogged) {
+        if (batch.projectiveUv && !vertexColorLogged) {
             vertexColorLogged = true;
             System.out.println("[RTX-VCOLOR] incoming color=0x"
                     + Integer.toHexString(incomingColor)
-                    + " -> forced white; hand=" + handPhase
-                    + " portal=" + batch.projectiveUv
+                    + " -> forced white; portal=" + batch.projectiveUv
                     + " slot=" + batch.textureSlot);
         }
         // =====================================================
@@ -2266,6 +2478,29 @@ public final class EntityRtCapture {
      * 对数组取的是**identity**，不能直接用 ⇒ 这里逐项混入内容。
      */
     public static void noteItemSubmitKey(final ItemFeatureRenderer.Submit submit) {
+        // ── 2026-11-26 物品批次身份 + 逐顶点 MV 历史（可单独摘除的起点）────────────
+        // 见 CustomItemBatchKey 处的说明。为让顶点序逐帧稳定，此处按「换物品就收批」
+        // 把 merged 批次拆成每件一批；key 在 beginCustomSubmit 开批时消费。
+        if (CAPTURE_ENABLED && submit != null) {
+            final java.util.List<?> quads = submit.quads();
+            long identity = 1125899906842597L;
+            identity = identity * 0x9E3779B9L + System.identityHashCode(quads);
+            identity = identity * 0x9E3779B9L + submit.foilType().ordinal();
+            identity = identity * 0x9E3779B9L + submit.displayContext().ordinal();
+            identity ^= identity >>> 32;
+            final int[] counter = frameCustomItemOrdinals.computeIfAbsent(
+                    identity, key -> new int[1]);
+            final Object key = new CustomItemBatchKey(identity, counter[0]++);
+            final ActiveBatch open = customBatchOpen ? currentCaptureBatch() : null;
+            if (customBatchOpen && (open == null
+                    || !java.util.Objects.equals(open.customItemKey, key))) {
+                flushCustomBatch();
+            }
+            pendingCustomItemKey = key;
+        } else {
+            pendingCustomItemKey = null;
+        }
+        // ── 2026-11-26 物品批次身份（起点结束）────────────────────────────────────
         if (!LevelPhaseProbe.enabled() || submit == null) {
             return;
         }
@@ -2517,7 +2752,7 @@ public final class EntityRtCapture {
      * 未命中返回 false（正常转换，等 RETURN 时登记）。
      */
     public static boolean beginGroup(final long key) {
-        if (!GROUP_CACHE_ENABLED) {
+        if (!GROUP_CACHE_ENABLED || handCaptureWindow) {
             skipGroupCapture = false;
             pendingGroupEntry = null;
             return false;
@@ -2843,14 +3078,23 @@ public final class EntityRtCapture {
         GpuSampler sampler = texture.getSampler();
         if (view instanceof VulkanGpuTextureView vulkanView
                 && sampler instanceof VulkanGpuSampler vulkanSampler) {
-            publishTextureHandle(slot, vulkanView.vkImageView(), vulkanSampler.vkSampler());
-        } else if (isDiagnosticFrame()) {
-            // 2026-11-04 诊断：纹理槽绑定失败 ⇒ shader 采样返回 0 ⇒
-            // cutout 把每个纹素都当透明丢掉 ⇒ 几何"消失"（旗帜图案正是这种表现：
-            // 底色在、图案完全不见，也不遮挡）。只打印失败，不刷屏。
-            System.err.println("[RTX-TEX] publish failed slot=" + slot
-                    + " texture=" + textureId
-                    + " view=" + view + " sampler=" + sampler);
+            final long imageView = vulkanView.vkImageView();
+            final long vkSampler = vulkanSampler.vkSampler();
+            if (imageView != 0L && vkSampler != 0L) {
+                publishTextureHandle(slot, imageView, vkSampler);
+            } else {
+                slotTexturePublished[slot - 1] = false;
+            }
+        } else {
+            slotTexturePublished[slot - 1] = false;
+            if (isDiagnosticFrame()) {
+                // 2026-11-04 诊断：纹理槽绑定失败 ⇒ shader 采样返回 0 ⇒
+                // cutout 把每个纹素都当透明丢掉 ⇒ 几何"消失"（旗帜图案正是这种表现：
+                // 底色在、图案完全不见，也不遮挡）。只打印失败，不刷屏。
+                System.err.println("[RTX-TEX] publish failed slot=" + slot
+                        + " texture=" + textureId
+                        + " view=" + view + " sampler=" + sampler);
+            }
         }
         publishEntityPbrTexture(slot, textureId);
     }
@@ -2860,6 +3104,14 @@ public final class EntityRtCapture {
     private static void publishEntityPbrTexture(int slot, Identifier albedoTexture) {
         if (slot < 1 || slot > MAX_TEXTURE_SLOTS || albedoTexture == null) return;
         int index = slot - 1;
+
+        // 2026-11-26：图集槽不再走实体 _n/_s（该槽的批次已改走地形材质路径，
+        // 用的是原生 LabPBR 图集 binding）。跳过兄弟查找，避免把资源包万一携带的
+        // textures/atlas/blocks_n.png 当普通贴图整张加载。
+        if (BLOCKS_ATLAS_TEXTURE.equals(albedoTexture)) {
+            entityPbrSettled[index] = true;
+            return;
+        }
 
         Identifier[] siblings = resolveEntityPbrSiblings(albedoTexture);
         Identifier normalId = siblings[0];
@@ -2971,6 +3223,22 @@ public final class EntityRtCapture {
 
     /** 由 {@code RenderTypeFeatureRendererMixin} 在 getVertexBuilder 返回时调用。 */
     public static void beginCustomSubmit(RenderType renderType) {
+        beginCustomSubmit(renderType, false);
+    }
+
+    /**
+     * 2026-11-26：带来源标记的版本。
+     *
+     * <p>{@code flameGeometry} = 本 group 来自 {@code FlameFeatureRenderer}（实体着火火焰层）。
+     * 它不走 {@code ModelFeatureRenderer}，也不是全格式几何：{@code fireVertex} 写的是
+     * {@code addVertex(Pose,FFF)} → {@code BufferBuilder.addVertex(FFF)} 短格式，随后
+     * {@code setColor(-1)} / {@code setUv(u,v)} / {@code setUv1(0,10)} / {@code setLight}。
+     * 全格式 11 参钩子不会被调用，而短路径此前只对地图打开 ⇒ 火焰顶点全丢。</p>
+     *
+     * <p>顶点数有界（每个着火实体 3 个 quad × 4 顶点），并且短路径自带
+     * {@link #POSITION_ONLY_MAX_VERTICES} 上限，不会重演 hs_err_pid45160 那次无限量捕获。</p>
+     */
+    public static void beginCustomSubmit(RenderType renderType, boolean flameGeometry) {
         if (!CAPTURE_ENABLED) {
             return;
         }
@@ -3017,6 +3285,33 @@ public final class EntityRtCapture {
             customDiagLog("drop:no_texture", typeName, null);
             return;
         }
+        // ── 2026-11-26 方块破坏裂纹覆盖层（可单独摘除的起点）────────────────────
+        // 原版「破坏动画」= submitBreakingBlockModel → BlockModelFeatureRenderer.Submit，
+        // RenderType 名 "crumbling"，Sampler0 是独立小图 textures/block/destroy_stage_N.png
+        // （不是图集）。原版光栅被 FeaturePreparedFrameTakeoverMixin 取消，所以这层只能由
+        // RT 自己画。OIT 变体（destroy_oit_stage_N，仅「改进透明」开且挖玻璃/冰时用）
+        // 的 alpha 语义是 OIT 权重（背景白 α≈0.19、裂纹黑 α≈0.45），过不了下面的
+        // 0.1 镂空口径；RT 没有 OIT，直接换成同阶段号的普通贴图。
+        final boolean destroyOverlay = isBlockDestroyOverlayTexture(texture);
+        if (destroyOverlay && texture.getPath().contains(DESTROY_OVERLAY_OIT_MARKER)) {
+            texture = Identifier.fromNamespaceAndPath(
+                    texture.getNamespace(),
+                    texture.getPath().replace(DESTROY_OVERLAY_OIT_MARKER, DESTROY_OVERLAY_MARKER));
+        }
+        // ── 2026-11-26 方块破坏裂纹覆盖层（起点结束）──────────────────────────
+        // ── 2026-11-26 掉落物/展示框/手持物 PBR（可单独摘除的起点）────────────────
+        // Sampler0 是方块图集的 custom 批次（掉落物、展示框里的物品、第一人称手持物、
+        // 活塞推动的方块…）此前走实体材质分支：中性 _n/_s + class 0（粗糙度 0.72、F0 0）
+        // ⇒ 资源包（SPBR/EXTREAL）的 item _n/_s 完全吃不到，金属剑无高光。
+        // 现在打 atlasMaterial 标：emit 时 pad2 = 0 ⇒ rchit/rahit 改按**地形材质路径**
+        // 求值（blockAtlas + LabPBR _n/_s + POM），与贴在地上的方块同一套 PBR。
+        // 图集槽号仅保留作 JNI 分桶参数；实体 _n/_s 兄弟查找对图集槽跳过。
+        final boolean atlasMaterial = BLOCKS_ATLAS_TEXTURE.equals(texture);
+        // ── 2026-11-26 掉落物/展示框/手持物 PBR（起点结束）──────────────────────
+        if (isEnchantedGlintTexture(texture)) {
+            customDiagLog("drop:enchanted_glint", typeName, texture);
+            return;
+        }
         int textureSlot = slotFor(texture);
         if (textureSlot == 0) {
             customDiagLog("drop:no_slot", typeName, texture);
@@ -3024,12 +3319,39 @@ public final class EntityRtCapture {
         }
         customDiagLog("captured", typeName, texture);
         ActiveBatch customBatch = acquireBatch(textureSlot, false,
-                endPortal || isEmissiveGeometry(texture));
+                endPortal || isEmissiveGeometry(texture) || flameGeometry);
         customBatch.projectiveUv = endPortal;
         // 2026-11-15：地图（含物品展示框里的地图）与装饰图标走短格式 addVertex(FFF)，
         // 必须显式打开短路径捕获，见 beginShortVertex。判据用贴图路径而不是 RenderType
         // 名字：地图是动态贴图 minecraft:map/<id>，装饰是 map_decorations 图集。
-        customBatch.positionOnlyCapture = isMapGeometry(texture);
+        // 2026-11-26：火焰层同地图一样只走短格式 addVertex(FFF)，必须打开短路径；
+        // 判据由 RenderTypeFeatureRendererMixin 从 "this instanceof FlameFeatureRenderer"
+        // 传入（不能靠贴图路径 —— 火焰用的是 blocks 图集，和普通方块几何同槽）。
+        customBatch.positionOnlyCapture = isMapGeometry(texture) || flameGeometry;
+        customBatch.flameGeometry = flameGeometry;
+        customBatch.atlasMaterial = atlasMaterial;
+        // ── 2026-11-26 物品批次逐顶点 MV 历史 ──────────────────────────────────
+        // pendingCustomItemKey 由 noteItemSubmitKey 在 submit 头部置好；此处开批时
+        // 消费（置 null，避免同一 key 泄漏给后续非物品批次，比如破坏裂纹/火焰层）。
+        customBatch.customItemKey = pendingCustomItemKey;
+        if (pendingCustomItemKey != null) {
+            customBatch.vertexHistory = customItemVertexHistories;
+            customBatch.vertexHistoryKey = pendingCustomItemKey;
+            customBatch.vertexHistoryMaxKeys = CUSTOM_VERTEX_HISTORY_MAX_KEYS;
+            pendingCustomItemKey = null;
+        }
+        // ── 2026-11-26 物品批次逐顶点 MV 历史（结束）────────────────────────────
+        // ── 2026-11-26 方块破坏裂纹覆盖层 ──────────────────────────────────────
+        // 裂纹顶点由 SheetedDecalTextureGenerator 写出：addVertex(FFF) 只落位置，UV 是
+        // 在 setNormal 里按世界坐标投影算出、最后才经 setUv 补写 —— 全格式钩子
+        // （addVertex 11 参）根本不会被调用，所以此前顶点一个都没进批次。短格式路径的
+        // 收尾正好挂在 setUv 上（见 setShortVertexUv），天然拿到最终 UV。
+        if (destroyOverlay) {
+            customBatch.positionOnlyCapture = true;
+            customBatch.destroyOverlay = true;
+            customDiagLog("destroy_overlay", typeName, texture);
+        }
+        // ── 2026-11-26 方块破坏裂纹覆盖层（结束）──────────────────────────────
         if (customBatch.positionOnlyCapture) {
             customDiagLog("map_short", typeName, texture);
         }
@@ -3104,6 +3426,25 @@ public final class EntityRtCapture {
     }
 
     /**
+     * 2026-11-26：这张贴图是不是方块破坏裂纹覆盖层（原版 ModelBakery 写死的
+     * {@code textures/block/destroy_stage_N.png}，OIT 变体为 {@code destroy_oit_stage_N}）。
+     * 判据用贴图路径：资源包只能换图内容，换不了这个路径。
+     */
+    private static boolean isBlockDestroyOverlayTexture(Identifier texture) {
+        if (texture == null) {
+            return false;
+        }
+        final String path = texture.getPath();
+        return path.contains(DESTROY_OVERLAY_MARKER) || path.contains(DESTROY_OVERLAY_OIT_MARKER);
+    }
+
+    private static final String DESTROY_OVERLAY_MARKER = "/destroy_stage_";
+    private static final String DESTROY_OVERLAY_OIT_MARKER = "/destroy_oit_stage_";
+    /** 方块破坏裂纹覆盖层相对方块面的抬高量（格），见 {@code ActiveBatch#applyDestroyOverlayLift}。 */
+    private static final float DESTROY_OVERLAY_LIFT = 2.0e-3f;
+    private static boolean destroyOverlayBatchLogged;
+
+    /**
      * 2026-11-15：这批 custom 几何是不是地图（地图本体或装饰图标）。
      *
      * <p>地图贴图是 {@code minecraft:map/<id>}（{@code MapTextureManager} 直接把
@@ -3116,7 +3457,9 @@ public final class EntityRtCapture {
             return false;
         }
         final String path = texture.getPath();
-        return path.startsWith("map/") || path.contains("map_decorations");
+        return path.startsWith("map/")
+                || path.contains("map_decorations")
+                || path.contains("map_background");
     }
 
     /** RenderType 的构造名（26.3 字段 {@code name}，经 {@code RenderTypeAccessor} 读）。 */
@@ -3232,6 +3575,7 @@ public final class EntityRtCapture {
     private static final class ActiveBatch {
         private int textureSlot;
         private boolean localPlayerProxy;
+        private boolean thirdPersonLocalPlayer;
         private boolean emissive;
         // 2026-11-03 诊断：这批是不是第一人称手部（state=Unit）。每次 beginModel 重设，
         // 不需要在 reset() 里清（避免漏一条路径就串味）。
@@ -3255,6 +3599,18 @@ public final class EntityRtCapture {
         // 只对地图（含物品展示框里的地图）打开：其它短格式几何顶点数无上界，
         // 全量捕获曾把驱动打崩（见 beginShortVertex 的说明）。
         private boolean positionOnlyCapture;
+        // 2026-11-26：本批来自 FlameFeatureRenderer（实体着火火焰层）。
+        // 该层由 fireVertex 写出：addVertex(Pose,FFF) → BufferBuilder.addVertex(FFF)
+        // 短格式 + setColor/setUv/setLight，全格式 11 参钩子永远不触发。
+        // 旧实现只对地图打开短路径捕获 ⇒ 火焰顶点一个都没进批次 ⇒ 着火实体完全无火焰。
+        private boolean flameGeometry;
+        // 2026-11-26：本批是方块破坏裂纹覆盖层（贴在方块面上的共面贴花），每个 quad 沿自身
+        // 法线朝相机一侧抬高一层，保证主射线先命中裂纹而不是与它严格共面的地形面。
+        private boolean destroyOverlay;
+        // 2026-11-26：Sampler0 是方块图集（物品/掉落物/手持物/活塞方块）。
+        // emit 时 pad2 写 0 ⇒ 原生侧不覆盖 ⇒ rchit/rahit 走地形材质路径（blockAtlas
+        // + LabPBR _n/_s + POM），资源包的物品 PBR 才能生效。见 beginCustomSubmit。
+        private boolean atlasMaterial;
         private float minX = Float.MAX_VALUE;
         private float minY = Float.MAX_VALUE;
         private float minZ = Float.MAX_VALUE;
@@ -3269,8 +3625,13 @@ public final class EntityRtCapture {
         private ByteBuffer motionScratch;
         
 
-        private java.util.HashMap<ModelBatchKey, VertexHistory> vertexHistory;
-        private ModelBatchKey vertexHistoryKey;
+        private java.util.HashMap<Object, VertexHistory> vertexHistory;
+        private Object vertexHistoryKey;
+        // 2026-11-26：物品（custom）批次的身份键 —— 「换物品就收批」与逐顶点历史共用。
+        private Object customItemKey;
+        // 逐顶点历史的容量上限：模型批次沿用 32；物品批次共用一张大表（展示框墙可有
+        // 上百件），单独放大，避免整表被频繁 clear 导致历史反复失效。
+        private int vertexHistoryMaxKeys = ENTITY_VERTEX_HISTORY_MAX_KEYS;
 
         private static final int PENDING_VERTEX_FLOATS = 5;
         private final float[] pendingQuadVertices = new float[4 * PENDING_VERTEX_FLOATS];
@@ -3284,10 +3645,14 @@ public final class EntityRtCapture {
         private ActiveBatch reset(int textureSlot, boolean localPlayerProxy, boolean emissive) {
             this.textureSlot = textureSlot;
             this.localPlayerProxy = localPlayerProxy;
+            this.thirdPersonLocalPlayer = false;
             this.emissive = emissive;
             this.diagHand = false;
             this.projectiveUv = false;
             this.positionOnlyCapture = false;
+            this.flameGeometry = false;
+            this.destroyOverlay = false;
+            this.atlasMaterial = false;
             this.coplanarLayering = false;
             this.coplanarHits = 0;
             this.minX = this.minY = this.minZ = Float.MAX_VALUE;
@@ -3342,7 +3707,7 @@ public final class EntityRtCapture {
         private void storeVertexHistory(float[] positions) {
             VertexHistory entry = vertexHistory.get(vertexHistoryKey);
             if (entry == null) {
-                if (vertexHistory.size() >= ENTITY_VERTEX_HISTORY_MAX_KEYS) {
+                if (vertexHistory.size() >= vertexHistoryMaxKeys) {
                     vertexHistory.clear();
                 }
                 entry = new VertexHistory();
@@ -3375,9 +3740,74 @@ public final class EntityRtCapture {
                 if (coplanarLayering) {
                     applyCoplanarLayerOffset();
                 }
+                if (destroyOverlay) {
+                    applyDestroyOverlayLift();
+                }
                 emit(0); emit(1); emit(2);
                 emit(0); emit(2); emit(3);
                 pendingQuadVertexCount = 0;
+            }
+        }
+
+        /**
+         * 2026-11-26 方块破坏裂纹覆盖层：整个 quad 沿自身法线朝相机一侧抬高
+         * {@link #DESTROY_OVERLAY_LIFT}。
+         *
+         * <p>裂纹 quad 与地形方块面严格共面（它就是同一个方块模型的 quads），两者分属
+         * 实体 TLAS 实例与地形 TLAS 实例，谁被命中是随机的 —— 表现就是裂纹时有时无、
+         * 逐像素闪烁。抬高方向取「自身几何法线中朝向相机的那一侧」：顶点是相机相对坐标，
+         * 相机在原点，面心向量 c = 相机→面心，可见面的外法线 n 与 c 成钝角，即
+         * {@code dot(n, c) < 0}；所以 {@code dot > 0} 时翻转。可见面因此被抬到方块外侧，
+         * 背面被推进方块内部（本来就看不见）。不依赖顶点绕序。</p>
+         *
+         * <p>⚠ 2026-11-26 实机一轮返工：首版把符号写反（{@code dot < 0} 时翻转），
+         * 裂纹被整体推进方块内 2 mm，日志显示 36 顶点上传成功但画面全无。</p>
+         *
+         * <p>抬高量取 2e-3（2 mm）而不是旗帜层的 2e-4：实体与地形是两个 TLAS 实例，
+         * 遍历在世界坐标下做，世界坐标几千格时 float32 的 ulp 已到 1e-4 量级，
+         * 2e-4 不足以稳定分出前后。</p>
+         */
+        private void applyDestroyOverlayLift() {
+            final float ax = pendingQuadVertices[0];
+            final float ay = pendingQuadVertices[1];
+            final float az = pendingQuadVertices[2];
+            final float e1x = pendingQuadVertices[PENDING_VERTEX_FLOATS] - ax;
+            final float e1y = pendingQuadVertices[PENDING_VERTEX_FLOATS + 1] - ay;
+            final float e1z = pendingQuadVertices[PENDING_VERTEX_FLOATS + 2] - az;
+            final float e2x = pendingQuadVertices[2 * PENDING_VERTEX_FLOATS] - ax;
+            final float e2y = pendingQuadVertices[2 * PENDING_VERTEX_FLOATS + 1] - ay;
+            final float e2z = pendingQuadVertices[2 * PENDING_VERTEX_FLOATS + 2] - az;
+            float nx = e1y * e2z - e1z * e2y;
+            float ny = e1z * e2x - e1x * e2z;
+            float nz = e1x * e2y - e1y * e2x;
+            final float length = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            if (length < 1.0e-6f) {
+                return;
+            }
+            final float cx = (ax + pendingQuadVertices[PENDING_VERTEX_FLOATS]
+                    + pendingQuadVertices[2 * PENDING_VERTEX_FLOATS]
+                    + pendingQuadVertices[3 * PENDING_VERTEX_FLOATS]) * 0.25f;
+            final float cy = (ay + pendingQuadVertices[PENDING_VERTEX_FLOATS + 1]
+                    + pendingQuadVertices[2 * PENDING_VERTEX_FLOATS + 1]
+                    + pendingQuadVertices[3 * PENDING_VERTEX_FLOATS + 1]) * 0.25f;
+            final float cz = (az + pendingQuadVertices[PENDING_VERTEX_FLOATS + 2]
+                    + pendingQuadVertices[2 * PENDING_VERTEX_FLOATS + 2]
+                    + pendingQuadVertices[3 * PENDING_VERTEX_FLOATS + 2]) * 0.25f;
+            // 朝向相机的一侧 = dot(n, c) < 0（见方法注释）；大于 0 说明法线背对相机，翻转。
+            if (nx * cx + ny * cy + nz * cz > 0.0f) {
+                nx = -nx;
+                ny = -ny;
+                nz = -nz;
+            }
+            final float scale = DESTROY_OVERLAY_LIFT / length;
+            nx *= scale;
+            ny *= scale;
+            nz *= scale;
+            for (int vertex = 0; vertex < 4; ++vertex) {
+                final int slot = vertex * PENDING_VERTEX_FLOATS;
+                pendingQuadVertices[slot] += nx;
+                pendingQuadVertices[slot + 1] += ny;
+                pendingQuadVertices[slot + 2] += nz;
             }
         }
 
@@ -3484,8 +3914,18 @@ public final class EntityRtCapture {
                     .putFloat(pendingQuadVertices[offset + 4]);
             buffer.putFloat(((color >>> 16) & 0xFF) / 255.0f).putFloat(((color >>> 8) & 0xFF) / 255.0f);
             buffer.putFloat((color & 0xFF) / 255.0f).putFloat(((color >>> 24) & 0xFF) / 255.0f);
+            final float pad1;
+            if (diagHand) {
+                pad1 = emissive ? 3.0f : 2.0f;
+            } else if (localPlayerProxy) {
+                pad1 = 1.0f;
+            } else if (thirdPersonLocalPlayer) {
+                pad1 = emissive ? 5.0f : 4.0f;
+            } else {
+                pad1 = emissive ? -1.0f : 0.0f;
+            }
             buffer.putFloat(0.0f)
-                    .putFloat(localPlayerProxy ? 1.0f : emissive ? -1.0f : 0.0f)
+                    .putFloat(pad1)
                     .putFloat(encodedTextureSlot());
             ++vertexCount;
             final float px = pendingQuadVertices[offset];
@@ -3501,6 +3941,11 @@ public final class EntityRtCapture {
 
         private float encodedTextureSlot() {
             if (textureSlot < 1 || textureSlot > MAX_TEXTURE_SLOTS) {
+                return 0.0f;
+            }
+            // 2026-11-26：图集材质批次（物品/掉落物/手持物/活塞方块）pad2 = 0 ⇒
+            // 原生按地形材质路径求值。槽号仍在 JNI 参数里，仅供分桶。
+            if (atlasMaterial) {
                 return 0.0f;
             }
 

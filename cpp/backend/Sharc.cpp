@@ -109,7 +109,7 @@ uint32_t sharcUpdateBlockForResolution(uint32_t width, uint32_t height)
     const double pixels = static_cast<double>(std::max(1u, width)) *
                           static_cast<double>(std::max(1u, height));
     const uint32_t block = static_cast<uint32_t>(
-        std::lround(std::sqrt(pixels / 32000.0)));
+        std::lround(std::sqrt(pixels / 14000.0)));
     return std::clamp(block, 2u, 8u);
 }
 // ---------------------------------------------------------------------------
@@ -1973,7 +1973,7 @@ namespace
             const char* raw = std::getenv("ORION_SHARC_RESOLVE_PARITY");
             if(raw == nullptr || raw[0] == '\0')
             {
-                return 2u;
+                return 1u;
             }
             const int parsed = std::atoi(raw);
             if(parsed < 1)
@@ -1999,6 +1999,21 @@ namespace
 
     VkPipelineLayout s_k2iCompactPipelineLayout = VK_NULL_HANDLE;
 
+    struct CompactSlotHeaderHost
+    {
+        uint32_t width;
+        uint32_t height;
+        uint32_t depth;
+        uint32_t mode;
+        uint32_t activeCount;
+        uint32_t baseElemOffset;
+        uint32_t pad0;
+        uint32_t pad1;
+    };
+    static_assert(
+        sizeof(CompactSlotHeaderHost) == 32u,
+        "CompactSlotHeaderHost must match 32-byte shader header");
+
     void recordCompactIndirectTrace(
         VkCommandBuffer cmd,
         uint32_t width,
@@ -2012,8 +2027,12 @@ namespace
         PFN_vkCmdTraceRaysIndirectKHR traceIndirect,
         uint32_t compactMode = 1u,
         uint32_t dispatchX = 0u,
-        uint32_t dispatchY = 0u);
-    void recordCompactBufferDisabledFallback(VkCommandBuffer cmd, uint32_t height);
+        uint32_t dispatchY = 0u,
+        uint32_t slotIndex = 0u);
+    void recordCompactBufferDisabledFallback(
+        VkCommandBuffer cmd,
+        uint32_t height,
+        uint32_t slotIndex = 0u);
 }
 
 void recordSharcUpdateImpl(
@@ -2078,11 +2097,11 @@ void recordSharcUpdateImpl(
                 &g_sharcUpdateRaygenRegion, &g_sharcUpdateMissRegion,
                 &g_sharcUpdateHitRegion, &g_sharcUpdateCallableRegion,
                 traceIndirect, 1u,
-                (sharcUpdateWidth + 15u) / 16u, (sharcUpdateHeight + 15u) / 16u);
+                (sharcUpdateWidth + 15u) / 16u, (sharcUpdateHeight + 15u) / 16u, 5u);
         }
         else
         {
-            recordCompactBufferDisabledFallback(cmd, height);
+            recordCompactBufferDisabledFallback(cmd, height, 5u);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                               g_sharcUpdatePipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -2104,7 +2123,7 @@ void recordSharcUpdate(VkCommandBuffer cmd, uint32_t width, uint32_t height)
 {
     recordSharcUpdateImpl(cmd, width, height, false);
 }
-void recordSharcResolve(VkCommandBuffer cmd)
+static void recordSharcResolveImpl(VkCommandBuffer cmd, bool skipLeadingBarrier)
 {
     if(!g_sharcZeroed || !g_sharcBuffersReady)
     {
@@ -2124,17 +2143,20 @@ void recordSharcResolve(VkCommandBuffer cmd)
     // 留到下一次 Resolve 一起合并。
     // 成本：hash 32MB + accumulation 64MB + resolved 64MB + lock 16MB = 176MB，
     // 全量扫描（1<<22 entry ⇒ 65536 个 workgroup）的显存流量地板约 0.20~0.25 ms/帧。
-    // ORION_SHARC_RESOLVE_PARITY=1 回到每帧（A/B 用），默认 2 = 隔帧。
+    // ORION_SHARC_RESOLVE_PARITY=1 回到每帧（默认 1 = 拆灯/熄灯即时响应）。
     const uint32_t parity = sharcResolveParityValue();
     if(parity > 1u && (s_sharcResolveTick++ % parity) != 0u)
     {
         return;
     }
 
-    sharcCacheBarrier(
-        cmd,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    if(!skipLeadingBarrier)
+    {
+        sharcCacheBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
 
     {
         ScopedVkDebugLabel sharcResLabel(cmd, "SHaRC-Resolve");
@@ -2149,7 +2171,7 @@ void recordSharcResolve(VkCommandBuffer cmd)
             0u, nullptr);
 
         const uint32_t sharcResolveGroups =
-            (g_sharcEntryCountResolved + 63u) / 64u;
+            (g_sharcEntryCountResolved + 255u) / 256u;
 
         vkCmdDispatch(cmd, sharcResolveGroups, 1u, 1u);
     }
@@ -2159,6 +2181,10 @@ void recordSharcResolve(VkCommandBuffer cmd)
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+}
+void recordSharcResolve(VkCommandBuffer cmd)
+{
+    recordSharcResolveImpl(cmd, false);
 }
 void destroyGiHalfPipeline()
 {
@@ -2840,6 +2866,11 @@ void destroyK2iCompactResources()
         vkDestroyPipeline(g_device, g_sharcCompactPipeline, nullptr);
         g_sharcCompactPipeline = VK_NULL_HANDLE;
     }
+    if(g_k2MegaCompactPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_k2MegaCompactPipeline, nullptr);
+        g_k2MegaCompactPipeline = VK_NULL_HANDLE;
+    }
     if(s_k2iCompactPipelineLayout != VK_NULL_HANDLE)
     {
         vkDestroyPipelineLayout(g_device, s_k2iCompactPipelineLayout, nullptr);
@@ -2872,6 +2903,7 @@ void destroyK2iCompactResources()
     g_k2locCompactPipelineFailed = false;
     g_k1GlassCompactPipelineFailed = false;
     g_sharcCompactPipelineFailed = false;
+    g_k2MegaCompactPipelineFailed = false;
 }
 
 void ensureK2iCompactResources(uint32_t width, uint32_t height)
@@ -2934,7 +2966,9 @@ void ensureK2iCompactResources(uint32_t width, uint32_t height)
             }
             g_k2iCompactBufferAddress = 0u;
             g_k2iCompactCapacityPixels = 0u;
-            const VkDeviceSize bytes = 20ull + static_cast<VkDeviceSize>(pixels) * 4ull;
+            const VkDeviceSize bytes =
+                6ull * sizeof(CompactSlotHeaderHost) +
+                6ull * static_cast<VkDeviceSize>(pixels) * 4ull;
             createBuffer(
                 g_device,
                 g_physicalDevice,
@@ -2964,7 +2998,7 @@ void ensureK2iCompactResources(uint32_t width, uint32_t height)
     if(s_k2iCompactPipelineLayout == VK_NULL_HANDLE &&
        (!g_k2iCompactPipelineFailed || !g_k2locCompactPipelineFailed ||
         !g_k1GlassCompactPipelineFailed || !g_sharcCompactPipelineFailed ||
-        !s_k2iComposePipelineFailed))
+        !g_k2MegaCompactPipelineFailed || !s_k2iComposePipelineFailed))
     {
         try
         {
@@ -2984,6 +3018,7 @@ void ensureK2iCompactResources(uint32_t width, uint32_t height)
             g_k2locCompactPipelineFailed = true;
             g_k1GlassCompactPipelineFailed = true;
             g_sharcCompactPipelineFailed = true;
+            g_k2MegaCompactPipelineFailed = true;
             s_k2iComposePipelineFailed = true;
             RTLog(std::string("[K2-I COMPACT] compute layout 创建失败: ") + error.what());
         }
@@ -3048,6 +3083,11 @@ void ensureK2iCompactResources(uint32_t width, uint32_t height)
             "[SHARC COMPACT] compute 管线",
             g_sharcCompactPipeline,
             g_sharcCompactPipelineFailed);
+        ensureCompactComputePipeline(
+            "shaders/vpt_k2_mega_compact.comp.spv",
+            "[K2-MEGA COMPACT] compute 管线",
+            g_k2MegaCompactPipeline,
+            g_k2MegaCompactPipelineFailed);
         ensureCompactComputePipeline(
             "shaders/rt_test_k2i_compose.comp.spv",
             "[K2-I COMPACT] compose compute 管线",
@@ -4107,7 +4147,8 @@ void recordCompactIndirectTrace(
     PFN_vkCmdTraceRaysIndirectKHR traceIndirect,
     uint32_t compactMode,
     uint32_t dispatchX,
-    uint32_t dispatchY)
+    uint32_t dispatchY,
+    uint32_t slotIndex)
 {
     VkMemoryBarrier preUpdateBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     preUpdateBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -4118,8 +4159,28 @@ void recordCompactIndirectTrace(
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         0u, 1u, &preUpdateBarrier, 0u, nullptr, 0u, nullptr);
 
-    const uint32_t hdr[5] = { 0u, height, 1u, compactMode, 0u };
-    vkCmdUpdateBuffer(cmd, g_k2iCompactBuffer, 0u, sizeof(hdr), hdr);
+    if(slotIndex == 2u || slotIndex == 3u)
+    {
+        const uint32_t cap = g_k2iCompactCapacityPixels;
+        const CompactSlotHeaderHost pairHdr[2] = {
+            { 0u, height, 1u, (slotIndex == 2u) ? compactMode : 0u, 0u, 2u * cap, 0u, 0u },
+            { 0u, height, 1u, (slotIndex == 3u) ? compactMode : 0u, 0u, 3u * cap, 0u, 0u },
+        };
+        vkCmdUpdateBuffer(
+            cmd, g_k2iCompactBuffer,
+            2ull * sizeof(CompactSlotHeaderHost), sizeof(pairHdr), pairHdr);
+    }
+    else
+    {
+        const CompactSlotHeaderHost hdr{
+            0u, height, 1u, compactMode, 0u,
+            slotIndex * g_k2iCompactCapacityPixels, 0u, 0u
+        };
+        vkCmdUpdateBuffer(
+            cmd, g_k2iCompactBuffer,
+            static_cast<VkDeviceSize>(slotIndex) * sizeof(CompactSlotHeaderHost),
+            sizeof(hdr), &hdr);
+    }
 
     VkMemoryBarrier xferToComp{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     xferToComp.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -4158,10 +4219,14 @@ void recordCompactIndirectTrace(
         0u, nullptr);
     traceIndirect(
         cmd, raygenRegion, missRegion, hitRegion, callableRegion,
-        g_k2iCompactBufferAddress);
+        g_k2iCompactBufferAddress +
+            static_cast<VkDeviceSize>(slotIndex) * sizeof(CompactSlotHeaderHost));
 }
 
-void recordCompactBufferDisabledFallback(VkCommandBuffer cmd, uint32_t height)
+void recordCompactBufferDisabledFallback(
+    VkCommandBuffer cmd,
+    uint32_t height,
+    uint32_t slotIndex)
 {
     if(g_k2iCompactBuffer == VK_NULL_HANDLE)
     {
@@ -4176,8 +4241,13 @@ void recordCompactBufferDisabledFallback(VkCommandBuffer cmd, uint32_t height)
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         0u, 1u, &preUpdate, 0u, nullptr, 0u, nullptr);
 
-    const uint32_t hdr[5] = { 0u, height, 1u, 0u, 0u };
-    vkCmdUpdateBuffer(cmd, g_k2iCompactBuffer, 0u, sizeof(hdr), hdr);
+    const CompactSlotHeaderHost hdr{
+        0u, height, 1u, 0u, 0u, slotIndex * g_k2iCompactCapacityPixels, 0u, 0u
+    };
+    vkCmdUpdateBuffer(
+        cmd, g_k2iCompactBuffer,
+        static_cast<VkDeviceSize>(slotIndex) * sizeof(CompactSlotHeaderHost),
+        sizeof(hdr), &hdr);
 
     VkMemoryBarrier xferToTrace{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     xferToTrace.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -4214,11 +4284,12 @@ void recordK1GlassDispatch(
         recordCompactIndirectTrace(
             cmd, width, height, g_k1GlassCompactPipeline, g_k1GlassPipeline,
             &g_k1GlassRaygenRegion, &g_k1GlassMissRegion,
-            &g_k1GlassHitRegion, &g_k1GlassCallableRegion, traceIndirect, 1u);
+            &g_k1GlassHitRegion, &g_k1GlassCallableRegion,
+            traceIndirect, 1u, 0u, 0u, 0u);
         return;
     }
 
-    recordCompactBufferDisabledFallback(cmd, height);
+    recordCompactBufferDisabledFallback(cmd, height, 0u);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, g_k1GlassPipeline);
     vkCmdBindDescriptorSets(
         cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -4283,11 +4354,11 @@ void recordK2locDispatch(
             cmd, width, height, g_k2locCompactPipeline, g_k2locPipeline,
             &g_k2locRaygenRegion, &g_k2locMissRegion,
             &g_k2locHitRegion, &g_k2locCallableRegion, traceIndirect,
-            zeroSceneLights ? 2u : 1u);
+            zeroSceneLights ? 2u : 1u, 0u, 0u, 3u);
         return;
     }
 
-    recordCompactBufferDisabledFallback(cmd, height);
+    recordCompactBufferDisabledFallback(cmd, height, 3u);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, g_k2locPipeline);
     vkCmdBindDescriptorSets(
@@ -4339,11 +4410,12 @@ void recordK2locSplitDispatch(
             recordCompactIndirectTrace(
                 cmd, width, height, g_k2locCompactPipeline, g_k2locNeePipeline,
                 &g_k2locNeeRaygenRegion, &g_k2locNeeMissRegion,
-                &g_k2locNeeHitRegion, &g_k2locNeeCallableRegion, traceIndirect, 3u);
+                &g_k2locNeeHitRegion, &g_k2locNeeCallableRegion,
+                traceIndirect, 3u, 0u, 0u, 2u);
         }
         else
         {
-            recordCompactBufferDisabledFallback(cmd, height);
+            recordCompactBufferDisabledFallback(cmd, height, 2u);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, g_k2locNeePipeline);
             vkCmdBindDescriptorSets(
                 cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -4373,11 +4445,12 @@ void recordK2locSplitDispatch(
             recordCompactIndirectTrace(
                 cmd, width, height, g_k2locCompactPipeline, g_k2locGlossyPipeline,
                 &g_k2locGlossyRaygenRegion, &g_k2locGlossyMissRegion,
-                &g_k2locGlossyHitRegion, &g_k2locGlossyCallableRegion, traceIndirect, 2u);
+                &g_k2locGlossyHitRegion, &g_k2locGlossyCallableRegion,
+                traceIndirect, 2u, 0u, 0u, 3u);
         }
         else
         {
-            recordCompactBufferDisabledFallback(cmd, height);
+            recordCompactBufferDisabledFallback(cmd, height, 3u);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, g_k2locGlossyPipeline);
             vkCmdBindDescriptorSets(
                 cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -4387,6 +4460,35 @@ void recordK2locSplitDispatch(
                 cmd, &g_k2locGlossyRaygenRegion, &g_k2locGlossyMissRegion,
                 &g_k2locGlossyHitRegion, &g_k2locGlossyCallableRegion, width, height, 1u);
         }
+    }
+}
+
+void recordK2iComposePass(VkCommandBuffer cmd, uint32_t width, uint32_t height)
+{
+    if(g_k2iComposePipeline != VK_NULL_HANDLE &&
+       s_k2iCompactPipelineLayout != VK_NULL_HANDLE)
+    {
+        ScopedVkDebugLabel k2iComposeLabel(cmd, "K2-I-Compose");
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_k2iComposePipeline);
+        vkCmdBindDescriptorSets(
+            cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            s_k2iCompactPipelineLayout, 0u, 1u, &g_rayTracingDescriptorSet,
+            0u, nullptr);
+        vkCmdDispatch(cmd, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
+
+        VkMemoryBarrier composeToDownstream{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        composeToDownstream.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        composeToDownstream.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT |
+            VK_ACCESS_SHADER_WRITE_BIT |
+            VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 1u, &composeToDownstream, 0u, nullptr, 0u, nullptr);
     }
 }
 
@@ -4442,11 +4544,11 @@ void recordK2iDispatch(
                 cmd, width, height, g_k2iCompactPipeline, g_k2iPipeline,
                 &g_k2iRaygenRegion, &g_k2iMissRegion,
                 &g_k2iHitRegion, &g_k2iCallableRegion, traceIndirect,
-                (sparsePct < 100) ? 1u : 2u);
+                (sparsePct < 100) ? 1u : 2u, 0u, 0u, 4u);
         }
         else
         {
-            recordCompactBufferDisabledFallback(cmd, height);
+            recordCompactBufferDisabledFallback(cmd, height, 4u);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, g_k2iPipeline);
             vkCmdBindDescriptorSets(
                 cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -4468,31 +4570,7 @@ void recordK2iDispatch(
             0u, 1u, &traceToCompose, 0u, nullptr, 0u, nullptr);
     }
 
-    if(g_k2iComposePipeline != VK_NULL_HANDLE &&
-       s_k2iCompactPipelineLayout != VK_NULL_HANDLE)
-    {
-        ScopedVkDebugLabel k2iComposeLabel(cmd, "K2-I-Compose");
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_k2iComposePipeline);
-        vkCmdBindDescriptorSets(
-            cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            s_k2iCompactPipelineLayout, 0u, 1u, &g_rayTracingDescriptorSet,
-            0u, nullptr);
-        vkCmdDispatch(cmd, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
-
-        VkMemoryBarrier composeToDownstream{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        composeToDownstream.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        composeToDownstream.dstAccessMask =
-            VK_ACCESS_SHADER_READ_BIT |
-            VK_ACCESS_SHADER_WRITE_BIT |
-            VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(
-            cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0u, 1u, &composeToDownstream, 0u, nullptr, 0u, nullptr);
-    }
+    recordK2iComposePass(cmd, width, height);
 }
 } // namespace
 
@@ -4672,71 +4750,334 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
             rtCheckpoint(cmd, "k1k2:post-k2suna");
             if(logTrace) RTLog("[K1/K2] post trace-k2suna");
 
-            vkCmdPipelineBarrier(
-                cmd,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
-
+            ensureK2iCompactResources(width, height);
+            const uint32_t giBounces =
+                g_perfGiBounces.load(std::memory_order_relaxed);
+            if(giBounces > 0u &&
+               g_sharcZeroed &&
+               g_sharcBuffersReady &&
+               g_matReuseBuffer != VK_NULL_HANDLE &&
+               sharcUpdateEnabled())
             {
-                ScopedVkDebugLabel sunBLabel(cmd, "K2-SunB");
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-                                  g_k2sunBPipeline);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-                                        g_rayTracingPipelineLayout, 0u, 1u,
-                                        &g_rayTracingDescriptorSet, 0u, nullptr);
-                rtCheckpoint(cmd, "k1k2:trace-k2sunb");
-                trace(cmd, &g_k2sunBRaygenRegion, &g_k2sunBMissRegion,
-                      &g_k2sunBHitRegion, &g_k2sunBCallableRegion, width, height, 1u);
+                ensureSharcUpdatePipeline();
             }
-            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2SUNB);
-            rtCheckpoint(cmd, "k1k2:post-k2sunb");
-            if(logTrace) RTLog("[K1/K2] post trace-k2sunb");
+            const bool sharcActive =
+                (giBounces > 0u) &&
+                g_sharcZeroed &&
+                g_sharcBuffersReady &&
+                sharcUpdateEnabled() &&
+                (g_sharcUpdatePipeline != VK_NULL_HANDLE);
 
-            vkCmdPipelineBarrier(
-                cmd,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+            auto traceIndirect = getCmdTraceRaysIndirect();
+            const bool useMegaCompact =
+                traceRaysIndirectSupported() &&
+                traceIndirect != nullptr &&
+                g_k2MegaCompactPipeline != VK_NULL_HANDLE &&
+                s_k2iCompactPipelineLayout != VK_NULL_HANDLE &&
+                g_k2iCompactBuffer != VK_NULL_HANDLE &&
+                g_k2iCompactBufferAddress != 0u &&
+                g_k2DirectView != VK_NULL_HANDLE &&
+                g_k2GiTraceView != VK_NULL_HANDLE &&
+                g_sparseActiveMaskImage != VK_NULL_HANDLE &&
+                g_matReuseBuffer != VK_NULL_HANDLE &&
+                matReuseLegsEnabled() &&
+                slots == 1u &&
+                g_cameraUboHost.giHalfParams[0] == 0.0f;
+
+            if(useMegaCompact)
+            {
+                const int sparsePct = sparseRatePercent();
+                const bool zeroSceneLights =
+                    (g_vptTotalEmitterCount.load(std::memory_order_relaxed) == 0u) &&
+                    (g_localLightGpuCount == 0u) &&
+                    (g_dynamicLightUpload.count == 0u);
+                const uint32_t neeMode = zeroSceneLights
+                    ? 0u
+                    : ((sparsePct > 0 && sparsePct < 100 &&
+                        g_cameraUboHost.sparseParams[0] < 0.5f) ? 1u : 2u);
+                const uint32_t giMode = (giBounces == 0u)
+                    ? 0u
+                    : ((sparsePct > 0 && sparsePct < 100) ? 1u : 2u);
+                const uint32_t sharcBlock =
+                    sharcUpdateBlockForResolution(width, height);
+                const uint32_t sharcH =
+                    std::max(1u, (height + sharcBlock - 1u) / sharcBlock);
+                const uint32_t cap = g_k2iCompactCapacityPixels;
+
+                const CompactSlotHeaderHost megaHdrs[5] = {
+                    { 0u, height, 1u, 1u, 0u, 1u * cap, 0u, 0u },
+                    { 0u, height, 1u, neeMode, 0u, 2u * cap, 0u, 0u },
+                    { 0u, height, 1u, 1u, 0u, 3u * cap, 0u, 0u },
+                    { 0u, height, 1u, giMode, 0u, 4u * cap, 0u, 0u },
+                    { 0u, sharcH, 1u, sharcActive ? 1u : 0u, 0u, 5u * cap, 0u, 0u },
+                };
+
+                VkMemoryBarrier preUpdateBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                preUpdateBarrier.srcAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+                preUpdateBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                vkCmdPipelineBarrier(
+                    cmd,
+                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0u, 1u, &preUpdateBarrier, 0u, nullptr, 0u, nullptr);
+
+                vkCmdUpdateBuffer(
+                    cmd, g_k2iCompactBuffer,
+                    sizeof(CompactSlotHeaderHost), sizeof(megaHdrs), megaHdrs);
+
+                VkMemoryBarrier xferToComp{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                xferToComp.srcAccessMask =
+                    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                xferToComp.dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(
+                    cmd,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT |
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+                    0u, 1u, &xferToComp, 0u, nullptr, 0u, nullptr);
 
-            rtCheckpoint(cmd, "k1k2:trace-k2loc");
-            recordK2locSplitDispatch(cmd, width, height, slots, trace);
-            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2LOC);
-            rtCheckpoint(cmd, "k1k2:post-k2loc");
-            if(logTrace) RTLog("[K1/K2] post trace-k2loc");
+                {
+                    ScopedVkDebugLabel megaLabel(cmd, "K2-Mega-Compact");
+                    vkCmdBindPipeline(
+                        cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_k2MegaCompactPipeline);
+                    vkCmdBindDescriptorSets(
+                        cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        s_k2iCompactPipelineLayout, 0u, 1u,
+                        &g_rayTracingDescriptorSet, 0u, nullptr);
+                    vkCmdDispatch(
+                        cmd, (width + 15u) / 16u, (height + 15u) / 16u, 1u);
+                }
 
-            if(g_vptRestirSpatialActiveFrame)
-            {
-                recordVPTRestirSpatialPass(cmd, width, height);
-            }
-            else
-            {
+                VkMemoryBarrier compToTrace{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                compToTrace.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                compToTrace.dstAccessMask =
+                    VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
+                    VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(
+                    cmd,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    0u, 1u, &compToTrace, 0u, nullptr, 0u, nullptr);
+
+                // Overlap SHaRC-Update concurrently with K2-SunB / K2-Loc-NEE /
+                // K2-Loc-Glossy: SHaRC-Update writes only accumulation while the
+                // three legs never write SHaRC accumulation and ptLandingLoad
+                // reads only .a/.b/.e.zw.
+                if(sharcActive)
+                {
+                    ScopedVkDebugLabel sharcUpLabel(cmd, "SHaRC-Update");
+                    vkCmdBindPipeline(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_sharcUpdatePipeline);
+                    vkCmdBindDescriptorSets(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_rayTracingPipelineLayout, 0u, 1u,
+                        &g_rayTracingDescriptorSet, 0u, nullptr);
+                    traceIndirect(
+                        cmd, &g_sharcUpdateRaygenRegion, &g_sharcUpdateMissRegion,
+                        &g_sharcUpdateHitRegion, &g_sharcUpdateCallableRegion,
+                        g_k2iCompactBufferAddress +
+                            5ull * sizeof(CompactSlotHeaderHost));
+                }
+
+                {
+                    ScopedVkDebugLabel sunBLabel(cmd, "K2-SunB");
+                    vkCmdBindPipeline(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_k2sunBPipeline);
+                    vkCmdBindDescriptorSets(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_rayTracingPipelineLayout, 0u, 1u,
+                        &g_rayTracingDescriptorSet, 0u, nullptr);
+                    rtCheckpoint(cmd, "k1k2:trace-k2sunb");
+                    traceIndirect(
+                        cmd, &g_k2sunBRaygenRegion, &g_k2sunBMissRegion,
+                        &g_k2sunBHitRegion, &g_k2sunBCallableRegion,
+                        g_k2iCompactBufferAddress +
+                            1ull * sizeof(CompactSlotHeaderHost));
+                }
+                writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2SUNB);
+                rtCheckpoint(cmd, "k1k2:post-k2sunb");
+                if(logTrace) RTLog("[K1/K2] post trace-k2sunb");
+
                 vkCmdPipelineBarrier(
                     cmd,
                     VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                     VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
-            }
 
-            rtCheckpoint(cmd, "k1k2:trace-k2i");
-            const uint32_t giBounces = g_perfGiBounces.load(std::memory_order_relaxed);
-            if(giBounces > 0u)
-            {
-                if(g_sharcZeroed && g_sharcBuffersReady)
+                rtCheckpoint(cmd, "k1k2:trace-k2loc");
+                if(!zeroSceneLights)
                 {
-                    const bool skipBarrier =
-                        sharcResolveDueThisFrame() &&
-                        g_sharcResolvePipeline != VK_NULL_HANDLE;
-                    recordSharcUpdateImpl(cmd, width, height, skipBarrier);
-                    recordSharcResolve(cmd);
+                    ScopedVkDebugLabel neeLabel(cmd, "K2-Loc-NEE");
+                    vkCmdBindPipeline(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_k2locNeePipeline);
+                    vkCmdBindDescriptorSets(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_rayTracingPipelineLayout, 0u, 1u,
+                        &g_rayTracingDescriptorSet, 0u, nullptr);
+                    traceIndirect(
+                        cmd, &g_k2locNeeRaygenRegion, &g_k2locNeeMissRegion,
+                        &g_k2locNeeHitRegion, &g_k2locNeeCallableRegion,
+                        g_k2iCompactBufferAddress +
+                            2ull * sizeof(CompactSlotHeaderHost));
+
+                    VkMemoryBarrier neeToGlossy{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                    neeToGlossy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    neeToGlossy.dstAccessMask =
+                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                    vkCmdPipelineBarrier(
+                        cmd,
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        0u, 1u, &neeToGlossy, 0u, nullptr, 0u, nullptr);
                 }
+
+                {
+                    ScopedVkDebugLabel glossyLabel(cmd, "K2-Loc-Glossy");
+                    vkCmdBindPipeline(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_k2locGlossyPipeline);
+                    vkCmdBindDescriptorSets(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_rayTracingPipelineLayout, 0u, 1u,
+                        &g_rayTracingDescriptorSet, 0u, nullptr);
+                    traceIndirect(
+                        cmd, &g_k2locGlossyRaygenRegion, &g_k2locGlossyMissRegion,
+                        &g_k2locGlossyHitRegion, &g_k2locGlossyCallableRegion,
+                        g_k2iCompactBufferAddress +
+                            3ull * sizeof(CompactSlotHeaderHost));
+                }
+                writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2LOC);
+                rtCheckpoint(cmd, "k1k2:post-k2loc");
+                if(logTrace) RTLog("[K1/K2] post trace-k2loc");
+
+                bool k1k2BarrierDone = false;
+                if(g_vptRestirSpatialActiveFrame &&
+                   g_vptRestirSpatialPipeline != VK_NULL_HANDLE)
+                {
+                    recordVPTRestirSpatialPass(cmd, width, height);
+                }
+                else
+                {
+                    vkCmdPipelineBarrier(
+                        cmd,
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+                    k1k2BarrierDone = true;
+                }
+
+                rtCheckpoint(cmd, "k1k2:trace-k2i");
+                if(sharcActive)
+                {
+                    recordSharcResolveImpl(cmd, k1k2BarrierDone);
+                }
+                if(giBounces > 0u)
+                {
+                    ScopedVkDebugLabel k2iTraceLabel(cmd, "K2-I-Trace");
+                    vkCmdBindPipeline(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_k2iPipeline);
+                    vkCmdBindDescriptorSets(
+                        cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                        g_rayTracingPipelineLayout, 0u, 1u,
+                        &g_rayTracingDescriptorSet, 0u, nullptr);
+                    traceIndirect(
+                        cmd, &g_k2iRaygenRegion, &g_k2iMissRegion,
+                        &g_k2iHitRegion, &g_k2iCallableRegion,
+                        g_k2iCompactBufferAddress +
+                            4ull * sizeof(CompactSlotHeaderHost));
+
+                    VkMemoryBarrier traceToCompose{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                    traceToCompose.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    traceToCompose.dstAccessMask =
+                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                    vkCmdPipelineBarrier(
+                        cmd,
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0u, 1u, &traceToCompose, 0u, nullptr, 0u, nullptr);
+                }
+                recordK2iComposePass(cmd, width, height);
+                writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2I);
+                rtCheckpoint(cmd, "k1k2:post-k2i");
+                if(logTrace) RTLog("[K1/K2] post trace-k2i");
             }
-            recordK2iDispatch(cmd, width, height, slots, trace, giBounces == 0u);
-            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2I);
-            rtCheckpoint(cmd, "k1k2:post-k2i");
-            if(logTrace) RTLog("[K1/K2] post trace-k2i");
+            else
+            {
+                vkCmdPipelineBarrier(
+                    cmd,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+
+                recordCompactBufferDisabledFallback(cmd, height, 1u);
+                {
+                    ScopedVkDebugLabel sunBLabel(cmd, "K2-SunB");
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                      g_k2sunBPipeline);
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                            g_rayTracingPipelineLayout, 0u, 1u,
+                                            &g_rayTracingDescriptorSet, 0u, nullptr);
+                    rtCheckpoint(cmd, "k1k2:trace-k2sunb");
+                    trace(cmd, &g_k2sunBRaygenRegion, &g_k2sunBMissRegion,
+                          &g_k2sunBHitRegion, &g_k2sunBCallableRegion, width, height, 1u);
+                }
+                writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2SUNB);
+                rtCheckpoint(cmd, "k1k2:post-k2sunb");
+                if(logTrace) RTLog("[K1/K2] post trace-k2sunb");
+
+                vkCmdPipelineBarrier(
+                    cmd,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+
+                rtCheckpoint(cmd, "k1k2:trace-k2loc");
+                recordK2locSplitDispatch(cmd, width, height, slots, trace);
+                writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2LOC);
+                rtCheckpoint(cmd, "k1k2:post-k2loc");
+                if(logTrace) RTLog("[K1/K2] post trace-k2loc");
+
+                if(g_vptRestirSpatialActiveFrame)
+                {
+                    recordVPTRestirSpatialPass(cmd, width, height);
+                }
+                else
+                {
+                    vkCmdPipelineBarrier(
+                        cmd,
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+                }
+
+                rtCheckpoint(cmd, "k1k2:trace-k2i");
+                if(giBounces > 0u)
+                {
+                    if(g_sharcZeroed && g_sharcBuffersReady)
+                    {
+                        const bool skipBarrier =
+                            sharcResolveDueThisFrame() &&
+                            g_sharcResolvePipeline != VK_NULL_HANDLE;
+                        recordSharcUpdateImpl(cmd, width, height, skipBarrier);
+                        recordSharcResolve(cmd);
+                    }
+                }
+                recordK2iDispatch(cmd, width, height, slots, trace, giBounces == 0u);
+                writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_K2I);
+                rtCheckpoint(cmd, "k1k2:post-k2i");
+                if(logTrace) RTLog("[K1/K2] post trace-k2i");
+            }
 
             if(g_rayTracingPipeline != VK_NULL_HANDLE)
             {

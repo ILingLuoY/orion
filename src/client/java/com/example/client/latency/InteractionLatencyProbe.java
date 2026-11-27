@@ -72,10 +72,24 @@ public final class InteractionLatencyProbe {
 
     private static final long QUEUE_WINDOW_MS = 8_000L;
 
+    private static final boolean ENABLED = resolveEnabled();
+
+    private static boolean resolveEnabled() {
+        String prop = System.getProperty("orion.latencyProbe");
+        if (prop != null) {
+            return "1".equals(prop.trim()) || "true".equalsIgnoreCase(prop.trim());
+        }
+        String env = System.getenv("ORION_LATENCY_PROBE");
+        return env != null && ("1".equals(env.trim()) || "true".equalsIgnoreCase(env.trim()));
+    }
+
     private InteractionLatencyProbe() {
     }
 
     private static boolean queueWindowOpen() {
+        if (!ENABLED) {
+            return false;
+        }
         final long last = lastAckWallMs;
         return last != 0L
                 && System.currentTimeMillis() - last < QUEUE_WINDOW_MS;
@@ -83,7 +97,7 @@ public final class InteractionLatencyProbe {
 
     /** 玩家动作发出（渲染主线程）。 */
     public static void onAction(BlockPos pos, String action) {
-        if (pos == null) {
+        if (!ENABLED || pos == null) {
             return;
         }
         final long now = System.nanoTime();
@@ -93,7 +107,7 @@ public final class InteractionLatencyProbe {
 
     /** 额外登记一个位置（如放置落点）。 */
     public static void watchExtra(BlockPos pos, String action) {
-        if (pos == null) {
+        if (!ENABLED || pos == null) {
             return;
         }
         final long now = System.nanoTime();
@@ -106,7 +120,7 @@ public final class InteractionLatencyProbe {
      * （onMain=true，真正 setServerVerifiedBlockState）。
      */
     public static void onAck(BlockPos pos, boolean onMain) {
-        if (pos == null) {
+        if (!ENABLED || pos == null) {
             return;
         }
         final long now = System.nanoTime();
@@ -130,6 +144,9 @@ public final class InteractionLatencyProbe {
 
     /** LevelExtractor.setSectionDirty 入口。 */
     public static void noteDirtyMark(int sectionX, int sectionY, int sectionZ) {
+        if (!ENABLED) {
+            return;
+        }
         final long key = SectionPos.of(sectionX, sectionY, sectionZ).asLong();
 
         // 从「动作发出」起算：能抓到预测路径（在 ack 之前）的标脏。
@@ -162,7 +179,7 @@ public final class InteractionLatencyProbe {
 
     /** 方块更新派发点（sendBlockUpdated / setBlockDirty）观测。 */
     public static void noteBlockUpdated(BlockPos pos, String site) {
-        if (pos == null) {
+        if (!ENABLED || pos == null) {
             return;
         }
         final Ack ack = ACKED.get(SectionPos.of(pos).asLong());
@@ -176,14 +193,14 @@ public final class InteractionLatencyProbe {
 
     /** setServerVerifiedBlockState 落地前：记录当前状态是否已与包内状态相同。 */
     public static void noteVerifiedEnter(BlockPos pos, boolean alreadySame) {
-        if (pos != null) {
+        if (ENABLED && pos != null) {
             VERIFY_ALREADY_SAME.put(pos.asLong(), alreadySame);
         }
     }
 
     /** setServerVerifiedBlockState 落地时刻。 */
     public static void noteVerifiedState(BlockPos pos) {
-        if (pos == null) {
+        if (!ENABLED || pos == null) {
             return;
         }
         final Boolean alreadySame = VERIFY_ALREADY_SAME.remove(pos.asLong());
@@ -199,6 +216,9 @@ public final class InteractionLatencyProbe {
 
     /** SectionUpdateRenderState 构造（提取循环）。 */
     public static void noteExtracted(long sectionNode) {
+        if (!ENABLED) {
+            return;
+        }
         final Ack ack = ACKED.get(sectionNode);
         if (ack != null && !ack.extractedLogged) {
             ack.extractedLogged = true;
@@ -209,7 +229,7 @@ public final class InteractionLatencyProbe {
 
     /** SectionCompiler.compile 入口（worker 或渲染线程）。 */
     public static void noteCompileStart(SectionPos sectionPos) {
-        if (sectionPos == null) {
+        if (!ENABLED || sectionPos == null) {
             return;
         }
         final Ack ack = ACKED.get(sectionPos.asLong());
@@ -222,7 +242,7 @@ public final class InteractionLatencyProbe {
 
     /** SectionCompiler.compile RETURN。 */
     public static void noteCompileReturn(SectionPos sectionPos) {
-        if (sectionPos == null) {
+        if (!ENABLED || sectionPos == null) {
             return;
         }
         final Act act = ACTIONED.remove(sectionPos.asLong());

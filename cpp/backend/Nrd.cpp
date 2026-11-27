@@ -4209,7 +4209,7 @@ void createRRGuideRelaxResources()
         return;
     }
 
-    VkDescriptorSetLayoutBinding bindings[10]{};
+    VkDescriptorSetLayoutBinding bindings[12]{};
     for(uint32_t i = 0u; i < 5u; ++i)
     {
         bindings[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
@@ -4225,17 +4225,21 @@ void createRRGuideRelaxResources()
         VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     bindings[9] = { 9u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
         VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    bindings[10] = { 10u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    bindings[11] = { 11u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     VkDescriptorSetLayoutCreateInfo layoutInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
     };
-    layoutInfo.bindingCount = 10u;
+    layoutInfo.bindingCount = 12u;
     layoutInfo.pBindings = bindings;
     check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
         &g_rrGuideRelaxSetLayout), "rr guide relax set layout failed");
 
     VkDescriptorPoolSize poolSizes[3] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7u },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8u },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3u },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u }
     };
     VkDescriptorPoolCreateInfo poolInfo{
@@ -4310,8 +4314,20 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         g_motionView != VK_NULL_HANDLE &&
         g_motionLayout == VK_IMAGE_LAYOUT_GENERAL;
 
+    const bool fogGuideActive =
+        g_fogEnabled.load() &&
+        g_cameraInWater.load() == 0u &&
+        g_fogFroxelFrameSerial == g_perfL10FrameSerial &&
+        g_fogFroxelIntegratedImage != VK_NULL_HANDLE &&
+        g_fogFroxelIntegratedView != VK_NULL_HANDLE &&
+        g_fogFroxelDensityImage != VK_NULL_HANDLE &&
+        g_fogFroxelDensityView != VK_NULL_HANDLE &&
+        g_volumetricCloudSampler != VK_NULL_HANDLE &&
+        g_fogFroxelWidth > 0u &&
+        g_fogFroxelHeight > 0u;
+
     if(cmd == VK_NULL_HANDLE ||
-       (!relaxEnabled && !farCloudEnabled && !specMotionEnabled) ||
+       (!relaxEnabled && !farCloudEnabled && !specMotionEnabled && !fogGuideActive) ||
        g_rrGuideRelaxPipeline == VK_NULL_HANDLE ||
        g_rrGuideRelaxPipelineLayout == VK_NULL_HANDLE ||
        g_rrGuideRelaxDescriptorPool == VK_NULL_HANDLE ||
@@ -4353,6 +4369,8 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         g_rrGuideRelaxCachedSpecularHitDistance = VK_NULL_HANDLE;
         g_rrGuideRelaxCachedCloudResolved = VK_NULL_HANDLE;
         g_rrGuideRelaxCachedCloudDepth = VK_NULL_HANDLE;
+        g_rrGuideRelaxCachedFogIntegrated = VK_NULL_HANDLE;
+        g_rrGuideRelaxCachedFogDensity = VK_NULL_HANDLE;
         g_rrGuideRelaxCachedPrimaryMotion = VK_NULL_HANDLE;
         g_rrGuideRelaxCachedSpecularMotion = VK_NULL_HANDLE;
         g_rrGuideRelaxCachedCamera = VK_NULL_HANDLE;
@@ -4367,6 +4385,8 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
        g_rrGuideRelaxCachedSpecularHitDistance != g_rrSpecularHitDistanceView ||
        g_rrGuideRelaxCachedCloudResolved != g_volumetricCloudResolvedView ||
        g_rrGuideRelaxCachedCloudDepth != g_volumetricCloudDepthView ||
+       g_rrGuideRelaxCachedFogIntegrated != g_fogFroxelIntegratedView ||
+       g_rrGuideRelaxCachedFogDensity != g_fogFroxelDensityView ||
        g_rrGuideRelaxCachedPrimaryMotion != g_motionView ||
        g_rrGuideRelaxCachedSpecularMotion != g_rrSpecularMotionView ||
        g_rrGuideRelaxCachedCamera != g_cameraUboBuffer)
@@ -4395,6 +4415,18 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         cloudDepthInfo.imageView = g_volumetricCloudDepthView;
         cloudDepthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+        const bool fogSamplersWritable =
+            g_fogFroxelIntegratedView != VK_NULL_HANDLE &&
+            g_fogFroxelDensityView != VK_NULL_HANDLE &&
+            g_volumetricCloudSampler != VK_NULL_HANDLE;
+        VkDescriptorImageInfo fogIntegratedInfo{};
+        fogIntegratedInfo.sampler = g_volumetricCloudSampler;
+        fogIntegratedInfo.imageView = g_fogFroxelIntegratedView;
+        fogIntegratedInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo fogDensityInfo{};
+        fogDensityInfo.imageView = g_fogFroxelDensityView;
+        fogDensityInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
         VkDescriptorBufferInfo cameraInfo{};
         cameraInfo.buffer = g_cameraUboBuffer;
         cameraInfo.offset = 0u;
@@ -4407,7 +4439,7 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         specularMotionInfo.imageView = g_rrSpecularMotionView;
         specularMotionInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[10]{};
+        VkWriteDescriptorSet writes[12]{};
         for(uint32_t i = 0u; i < 5u; ++i)
         {
             writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
@@ -4435,6 +4467,17 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
             g_rrGuideRelaxSet, 9u, 0u, 1u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             &specularMotionInfo, nullptr, nullptr };
+        if(fogSamplersWritable)
+        {
+            writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                nullptr, g_rrGuideRelaxSet, 10u, 0u, 1u,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &fogIntegratedInfo,
+                nullptr, nullptr };
+            writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                nullptr, g_rrGuideRelaxSet, 11u, 0u, 1u,
+                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fogDensityInfo,
+                nullptr, nullptr };
+        }
         vkUpdateDescriptorSets(g_device, writeCount, writes, 0u, nullptr);
 
         g_rrGuideRelaxCachedNormal = g_rrNormalRoughnessView;
@@ -4444,6 +4487,8 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
         g_rrGuideRelaxCachedSpecularHitDistance = g_rrSpecularHitDistanceView;
         g_rrGuideRelaxCachedCloudResolved = g_volumetricCloudResolvedView;
         g_rrGuideRelaxCachedCloudDepth = g_volumetricCloudDepthView;
+        g_rrGuideRelaxCachedFogIntegrated = g_fogFroxelIntegratedView;
+        g_rrGuideRelaxCachedFogDensity = g_fogFroxelDensityView;
         g_rrGuideRelaxCachedPrimaryMotion = g_motionView;
         g_rrGuideRelaxCachedSpecularMotion = g_rrSpecularMotionView;
         g_rrGuideRelaxCachedCamera = g_cameraUboBuffer;
@@ -4503,6 +4548,32 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
             2u, cloudBarriers);
     }
 
+    if(fogGuideActive)
+    {
+        VkImageMemoryBarrier fogBarriers[2]{};
+        for(uint32_t i = 0u; i < 2u; ++i)
+        {
+            fogBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            fogBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            fogBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            fogBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            fogBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            fogBarriers[i].srcAccessMask =
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            fogBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            fogBarriers[i].subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            fogBarriers[i].subresourceRange.levelCount = 1u;
+            fogBarriers[i].subresourceRange.layerCount = 1u;
+        }
+        fogBarriers[0].image = g_fogFroxelIntegratedImage;
+        fogBarriers[1].image = g_fogFroxelDensityImage;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+            2u, fogBarriers);
+    }
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_rrGuideRelaxPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
         g_rrGuideRelaxPipelineLayout, 0u, 1u, &g_rrGuideRelaxSet, 0u, nullptr);
@@ -4514,8 +4585,8 @@ void recordRRGuideRelax(VkCommandBuffer cmd)
     push.minRoughness = 0.02f;
     push.normalFalloff = 1.0f;
     push.farCloudDistance = farCloudEnabled ? farCloudDistance : 0.0f;
-    push.padding1 = 0.0f;
-    push.padding2 = 0.0f;
+    push.fogMaxDistance = fogGuideActive ? std::max(g_fogMaxDistance.load(), 16.0f) : 0.0f;
+    push.fogLayers = fogGuideActive ? float(FOG_FROXEL_DEPTH) : 0.0f;
     vkCmdPushConstants(cmd, g_rrGuideRelaxPipelineLayout,
         VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
 
@@ -4567,6 +4638,8 @@ void destroyRRGuideRelaxResources()
     g_rrGuideRelaxCachedSpecularHitDistance = VK_NULL_HANDLE;
     g_rrGuideRelaxCachedCloudResolved = VK_NULL_HANDLE;
     g_rrGuideRelaxCachedCloudDepth = VK_NULL_HANDLE;
+    g_rrGuideRelaxCachedFogIntegrated = VK_NULL_HANDLE;
+    g_rrGuideRelaxCachedFogDensity = VK_NULL_HANDLE;
     g_rrGuideRelaxCachedPrimaryMotion = VK_NULL_HANDLE;
     g_rrGuideRelaxCachedSpecularMotion = VK_NULL_HANDLE;
     g_rrGuideRelaxCachedCamera = VK_NULL_HANDLE;

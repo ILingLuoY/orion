@@ -81,12 +81,14 @@ public final class TerrainTakeover {
 
     private static int parseLevel(final String raw) {
         if (raw == null || raw.isBlank()) {
-            return 0;
+            // Batch Y: default to Variant B (LEVEL=1, EXTRACT_SKIP=false) which preserves
+            // vanilla CPU bookkeeping/uniforms/locks while cancelling wasted GPU terrain draws.
+            return 1;
         }
         try {
             return Math.max(0, Math.min(2, Integer.parseInt(raw.trim())));
         } catch (final NumberFormatException ignored) {
-            return 0;
+            return 1;
         }
     }
 

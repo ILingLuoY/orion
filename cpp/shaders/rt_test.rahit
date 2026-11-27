@@ -723,6 +723,19 @@ void main() {
     bool transparentPassthrough =
         getRayPurpose(payload.state) == RT_PURPOSE_PASSTHROUGH;
 
+    // 2026-11-26 Batch AA: parity with rt_test_translucent.rahit — visibility rays
+    // clipping water (materialId ~ 1.0) must pass through rather than occluding as solid.
+    if(getRayPurpose(payload.state) == RT_PURPOSE_GLASS_VISIBILITY &&
+       !isVoxyAnyHit &&
+       materialId > 0.5 &&
+       materialId < 1.5)
+    {
+        payload.albedoPacked = packAlbedoUnorm(
+            clamp(unpackAlbedoUnorm(payload.albedoPacked) * 0.98, vec3(0.0), vec3(1.0)));
+        ignoreIntersectionEXT;
+        return;
+    }
+
 
     // =====================================================
     // 2026-11-13⑦：可见性链清玻璃的**廉价早退**（图集 texelFetch 之前）。

@@ -25,6 +25,12 @@ static uint64_t s_vptLightGridLastGeoEpoch = 0u;
 static float s_vptLightGridLastRangeScale = -1.0f;
 static bool s_vptLightGridHasLastBuildTime = false;
 static std::chrono::steady_clock::time_point s_vptLightGridLastBuildTime{};
+static std::atomic<bool> s_vptLightGridUrgentQueued{ false };
+static std::atomic<bool> s_vptLightGridUrgentDirty{ false };
+static std::atomic<float> s_vptLastCamX{ 0.0f };
+static std::atomic<float> s_vptLastCamY{ 0.0f };
+static std::atomic<float> s_vptLastCamZ{ 0.0f };
+static std::atomic<bool> s_vptHasLastCam{ false };
 
 
 // Total bytes of the capacity-sized VLI/VPT pools, i.e. every buffer that
@@ -2547,15 +2553,11 @@ void recordVLIUpdates(VkCommandBuffer cmd)
         // 就是这么来的），从日志看像是"时间凭空消失"。
         if(!deferredNeighborhoodPages.empty())
         {
-            const auto vliDedupBegin = std::chrono::steady_clock::now();
-
-            rebuildVPTNeighborhoodPagesLocked(deferredNeighborhoodPages);
-
-            g_vliMsApply +=
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - vliDedupBegin
-                ).count();
-
+            s_deferredVptNeighborhoodPages.insert(
+                deferredNeighborhoodPages.begin(),
+                deferredNeighborhoodPages.end()
+            );
+            s_hasDeferredVptNeighborhoodPages.store(true, std::memory_order_release);
             deferredNeighborhoodPages.clear();
         }
 
@@ -2578,11 +2580,47 @@ void recordVLIUpdates(VkCommandBuffer cmd)
 
         if(!s_deferredVptNeighborhoodPages.empty())
         {
-            // 2026-11-06i：计入 apply，别让它再落进 rest 残差。
+            const bool urgentLightEdit =
+                s_vptLightGridUrgentQueued.load(std::memory_order_acquire);
+            const size_t kMaxDeferredVptPagesPerFrame = urgentLightEdit ? 128u : 48u;
+            const double kMaxDeferredVptBudgetMs = urgentLightEdit ? 4.0 : 1.5;
             const auto vliDeferredBegin = std::chrono::steady_clock::now();
+            size_t rebuiltThisFrame = 0u;
 
-            rebuildVPTNeighborhoodPagesLocked(s_deferredVptNeighborhoodPages);
-            s_deferredVptNeighborhoodPages.clear();
+            for(auto it = s_deferredVptNeighborhoodPages.begin();
+                it != s_deferredVptNeighborhoodPages.end() &&
+                rebuiltThisFrame < kMaxDeferredVptPagesPerFrame;)
+            {
+                const uint32_t pageIndex = *it;
+                it = s_deferredVptNeighborhoodPages.erase(it);
+
+                if(pageIndex < g_vliPageSectionKeys.size())
+                {
+                    const uint64_t sectionKey = g_vliPageSectionKeys[pageIndex];
+                    if(sectionKey != VLI_INVALID_SECTION_KEY)
+                    {
+                        const auto pageIt = g_vliSections.find(sectionKey);
+                        if(pageIt != g_vliSections.end())
+                        {
+                            rebuildVPTCandidatePageLocked(pageIt->second);
+                            rebuildVPTSourceDirectoryPageLocked(pageIt->second);
+                            ++rebuiltThisFrame;
+                        }
+                    }
+                }
+
+                if((rebuiltThisFrame & 7u) == 0u && rebuiltThisFrame > 0u)
+                {
+                    const double elapsedMs =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - vliDeferredBegin
+                        ).count();
+                    if(elapsedMs >= kMaxDeferredVptBudgetMs)
+                    {
+                        break;
+                    }
+                }
+            }
 
             g_vliMsApply +=
                 std::chrono::duration<double, std::milli>(
@@ -2590,7 +2628,10 @@ void recordVLIUpdates(VkCommandBuffer cmd)
                 ).count();
         }
 
-        s_hasDeferredVptNeighborhoodPages.store(false, std::memory_order_release);
+        if(s_deferredVptNeighborhoodPages.empty())
+        {
+            s_hasDeferredVptNeighborhoodPages.store(false, std::memory_order_release);
+        }
     }
 
     const auto vliBreakdownGatherBegin =
@@ -2809,6 +2850,11 @@ void recordVLIUpdates(VkCommandBuffer cmd)
        !emitterUploads.empty() || !sourceDirectoryUploads.empty())
     {
         ++s_vptLightGridDataEpoch;
+        if(!s_hasDeferredVptNeighborhoodPages.load(std::memory_order_acquire) &&
+           s_vptLightGridUrgentQueued.exchange(false, std::memory_order_acq_rel))
+        {
+            s_vptLightGridUrgentDirty.store(true, std::memory_order_release);
+        }
     }
     if(!sourceUploads.empty())
     {
@@ -3766,6 +3812,20 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
                 g_totalLocalLights - previousCount + derivedCount;
 
             g_localLightsDirty = true;
+
+            if((previousCount > 0u || derivedCount > 0u) &&
+               s_vptHasLastCam.load(std::memory_order_acquire))
+            {
+                const float secCenterX = static_cast<float>(sectionX * 16 + 8);
+                const float secCenterY = static_cast<float>(sectionY * 16 + 8);
+                const float secCenterZ = static_cast<float>(sectionZ * 16 + 8);
+                if(std::abs(secCenterX - s_vptLastCamX.load(std::memory_order_relaxed)) <= 64.0f &&
+                   std::abs(secCenterY - s_vptLastCamY.load(std::memory_order_relaxed)) <= 48.0f &&
+                   std::abs(secCenterZ - s_vptLastCamZ.load(std::memory_order_relaxed)) <= 64.0f)
+                {
+                    s_vptLightGridUrgentQueued.store(true, std::memory_order_release);
+                }
+            }
         }
 
         vliWorkerProbe.lightsMs =
@@ -4536,24 +4596,25 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
             );
         }
 
-    }
+        if(!vliRemovedCoordinates.empty())
+        {
+            for(const auto& coordinate : vliRemovedCoordinates)
+            {
+                markVLINeighborhoodDirty(
+                    coordinate[0],
+                    coordinate[1],
+                    coordinate[2]
+                );
+                collectVPTNeighborhoodPageIndices(
+                    coordinate[0],
+                    coordinate[1],
+                    coordinate[2],
+                    s_deferredVptNeighborhoodPages
+                );
+            }
+            s_hasDeferredVptNeighborhoodPages.store(true, std::memory_order_release);
+        }
 
-    for(const auto& coordinate : vliRemovedCoordinates)
-    {
-        VliLockHoldProbe vliLockHoldProbe("chunkUnloadNbr");
-        std::lock_guard<std::mutex> lock(g_vliMutex);
-        vliLockHoldProbe.mark();
-
-        markVLINeighborhoodDirty(
-            coordinate[0],
-            coordinate[1],
-            coordinate[2]
-        );
-        rebuildVPTCandidateNeighborhoodLocked(
-            coordinate[0],
-            coordinate[1],
-            coordinate[2]
-        );
     }
 
 
@@ -4697,36 +4758,40 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
     }
 
 
-    std::stringstream ss;
+    static uint64_t s_removeLightChunkLogCount = 0u;
+    if((++s_removeLightChunkLogCount % 256u) == 1u)
+    {
+        std::stringstream ss;
 
-    ss
-        << "[RT LOCAL LIGHTS L6]"
-        << " chunk=("
-        << chunkX
-        << ","
-        << chunkZ
-        << ")"
-        << " removedSections="
-        << removedSections
-        << " removedLights="
-        << removedLights
-        << " total="
-        << remainingLights
-        << " vliRemovedSections="
-        << vliRemovedSections
-        << " vliPeakPages="
-        << g_vliNextPage
-        << " vliLivePages="
-        << g_vliSections.size()
-        << " vliFreePages="
-        << g_vliFreePages.size()
-        << " geometryLayers="
-        << removedGeometryLayers;
+        ss
+            << "[RT LOCAL LIGHTS L6]"
+            << " chunk=("
+            << chunkX
+            << ","
+            << chunkZ
+            << ")"
+            << " removedSections="
+            << removedSections
+            << " removedLights="
+            << removedLights
+            << " total="
+            << remainingLights
+            << " vliRemovedSections="
+            << vliRemovedSections
+            << " vliPeakPages="
+            << g_vliNextPage
+            << " vliLivePages="
+            << g_vliSections.size()
+            << " vliFreePages="
+            << g_vliFreePages.size()
+            << " geometryLayers="
+            << removedGeometryLayers;
 
 
-    RTLog(
-        ss.str()
-    );
+        RTLog(
+            ss.str()
+        );
+    }
 }
 
 static VkDescriptorSet s_vptLightGridBoundSet = VK_NULL_HANDLE;
@@ -4914,8 +4979,18 @@ void recordVPTLightGridBuild(VkCommandBuffer cmd)
                             static_cast<int32_t>(VPT_LIGHT_GRID_DIM_Y / 2u);
     const int32_t originZ = static_cast<int32_t>(std::floor(g_prevCameraViewInverse[14] / 4.0f)) -
                             static_cast<int32_t>(VPT_LIGHT_GRID_DIM_Z / 2u);
+    if(g_hasPrevCameraInverse)
+    {
+        s_vptLastCamX.store(g_prevCameraViewInverse[12], std::memory_order_relaxed);
+        s_vptLastCamY.store(g_prevCameraViewInverse[13], std::memory_order_relaxed);
+        s_vptLastCamZ.store(g_prevCameraViewInverse[14], std::memory_order_relaxed);
+        s_vptHasLastCam.store(true, std::memory_order_release);
+    }
+    const bool urgentLightEdit =
+        s_vptLightGridUrgentDirty.exchange(false, std::memory_order_acq_rel);
     const float rangeScale = g_localLightMaxDistance.load(std::memory_order_relaxed);
     const bool hardUrgent =
+        urgentLightEdit ||
         !g_hasPrevCameraInverse ||
         !s_vptLightGridCacheValid ||
         std::abs(originX - s_vptLightGridLastOriginX) >= 4 ||

@@ -141,6 +141,8 @@ void destroyEntityPbrFallbackResources()
     g_entityPbrFallbackMemory = VK_NULL_HANDLE;
 }
 
+static bool g_thirdPersonPlayerSeenThisFrame = false;
+
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_beginEntityFrame(
     JNIEnv*,
@@ -148,6 +150,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_beginEntityFrame(
 )
 {
     std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+    g_thirdPersonPlayerSeenThisFrame = false;
     if(g_cameraUboMapped)
     {
         const CameraUBO* camera =
@@ -208,9 +211,17 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadEntityBatch(
         : nullptr;
 
     // pad1 编码批次归属（Java 侧 EntityRtCapture.emit 写入）：
-    //   0.0 = 普通实体 / -1.0 = 自发光 / +1.0 = 本地玩家代理 / +2.0 = 第一人称手部
-    const bool handBatch = source[0].pad1 > 1.5f;
-    const bool localPlayerProxy = !handBatch && source[0].pad1 > 0.5f;
+    //   0.0 = 普通实体 / -1.0 = 自发光 / +1.0 = 本地玩家代理 / +2.0 = 第一人称手部 /
+    //   +3.0 = 第一人称自发光手部 / +4.0 = 第三人称本地玩家 / +5.0 = 第三人称自发光本地玩家
+    const bool thirdPersonLocalPlayer = source[0].pad1 > 3.5f;
+    const bool handBatch = !thirdPersonLocalPlayer && source[0].pad1 > 1.5f;
+    const bool handEmissive = handBatch && source[0].pad1 > 2.5f;
+    const bool localPlayerProxy =
+        !thirdPersonLocalPlayer && !handBatch && source[0].pad1 > 0.5f;
+    if(thirdPersonLocalPlayer)
+    {
+        g_thirdPersonPlayerSeenThisFrame = true;
+    }
     std::vector<Vertex>& target = handBatch
         ? g_handFrameVertices
         : (localPlayerProxy ? g_localPlayerFrameVertices : g_entityFrameVertices);
@@ -233,12 +244,26 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadEntityBatch(
         vertex.y += g_dynamicCaptureCameraY;
         vertex.z += g_dynamicCaptureCameraZ;
         vertex.materialId = 0.0f;
+        if(handBatch)
+        {
+            vertex.pad1 = handEmissive ? -1.0f : 0.0f;
+        }
+        else if(thirdPersonLocalPlayer)
+        {
+            vertex.pad1 = (vertex.pad1 > 4.5f) ? -1.0f : 0.0f;
+        }
         const float incomingPad2 = source[index].pad2;
         const float classFraction =
             incomingPad2 > 0.0f
                 ? incomingPad2 - std::floor(incomingPad2)
                 : 0.0f;
-        vertex.pad2 = static_cast<float>(textureSlot) + classFraction;
+        // 2026-11-26：pad2 == 0 是 Java 侧显式声明的「图集材质」批次（掉落物/展示框物品/
+        // 手持物/活塞方块等，Sampler0 = 方块图集）。保持 0 ⇒ rchit/rahit 的 encodedTextureSlot
+        // 为 0 ⇒ 走地形材质路径（blockAtlas + LabPBR _n/_s + POM），资源包的物品 PBR 才生效；
+        // 其余实体贴图照旧写成 textureSlot + class/32。
+        vertex.pad2 = incomingPad2 > 0.0f
+            ? static_cast<float>(textureSlot) + classFraction
+            : 0.0f;
         target[oldSize + static_cast<size_t>(index)] = vertex;
 
         if(motionSource != nullptr)
@@ -593,6 +618,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
             g_localPlayerFrameVertices.size(),
             localPlayerChanged
         );
+    const bool handMotionReset =
+        publishDynamicLayerMotion(
+            HAND_RT_LAYER_KEY,
+            g_handFrameMotion,
+            g_handFrameVertices.size(),
+            handChanged
+        );
 
     const bool changed =
         bucketChanged ||
@@ -600,7 +632,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
         localPlayerChanged ||
         handChanged ||
         entityMotionReset ||
-        localPlayerMotionReset;
+        localPlayerMotionReset ||
+        handMotionReset;
 
     if(
         !changed &&
@@ -674,9 +707,12 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
 
     bool requestRebuild =
         requestDynamicRTASRebuild(entityChanged || entityMotionReset);
-    if(handChanged)
+    if(handChanged || handMotionReset ||
+       (g_thirdPersonPlayerSeenThisFrame &&
+        (bucketChanged || entityChanged || entityMotionReset)))
     {
         requestRebuild = true;
+        g_handRebuildRequested.store(true, std::memory_order_release);
     }
     if(localPlayerChanged || localPlayerMotionReset)
     {

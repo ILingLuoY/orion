@@ -55,7 +55,12 @@ public class RenderTypeFeatureRendererMixin {
         }
 
         final long captureStart = probe ? System.nanoTime() : 0L;
-        EntityRtCapture.beginCustomSubmit(renderType);
+        // 2026-11-26：FlameFeatureRenderer（实体着火火焰层）继承本类，也走
+        // getVertexBuilder → prepareGroup。但它的顶点是 addVertex(Pose,FFF) 短格式
+        // （fireVertex），全格式钩子抓不到，必须由这里把来源告诉捕获层去开短路径。
+        EntityRtCapture.beginCustomSubmit(
+                renderType,
+                (Object) this instanceof net.minecraft.client.renderer.feature.FlameFeatureRenderer);
         if (probe && captureStart != 0L) {
             com.example.client.LevelPhaseProbe.captureGenericAdd(System.nanoTime() - captureStart);
         }

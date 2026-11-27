@@ -68,17 +68,19 @@ vec3 upsampleGiHalf(ivec2 fullCoord, float centerViewDepth)
 void main() {
     ivec2 size = imageSize(image);
 
-#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE) && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
-    const bool k2iCompactTraceActive = (k2iSparseCompact.mode != 0u);
+#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_B) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE) && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
+    const bool k2iCompactTraceActive = (k2iSparseCompact.headers[K2_COMPACT_SLOT].mode != 0u);
     ivec2 pixelCoord;
     if(k2iCompactTraceActive)
     {
         const uint compactIdx = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
-        if(compactIdx >= k2iSparseCompact.activeCount)
+        if(compactIdx >= k2iSparseCompact.headers[K2_COMPACT_SLOT].activeCount)
         {
             return;
         }
-        const uint packedCoord = k2iSparseCompact.activeCoords[compactIdx];
+        const uint packedCoord = k2iSparseCompact.activeCoords[
+            k2iSparseCompact.headers[K2_COMPACT_SLOT].baseElemOffset + compactIdx
+        ];
         pixelCoord = ivec2(int(packedCoord & 0xFFFFu), int(packedCoord >> 16u));
         if(pixelCoord.x >= size.x || pixelCoord.y >= size.y)
         {
@@ -163,7 +165,7 @@ void main() {
 #endif
 
 
-#if !((defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE) && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY))
+#if !((defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_B) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE) && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY))
 #if GI_HALFRES
     // 2026-10-24 半分辨率 GI 变体：dispatch 是 (w+1)/2 × (h+1)/2，每个 invocation
     // 负责 2×2 块里的**一个**子像素；相位 (frameCount&1, frameCount>>1&1) 逐帧轮转，
@@ -244,7 +246,7 @@ void main() {
         return;
     }
 
-#if !GI_HALFRES && !SHARC_UPDATE && !defined(ORION_K1_GLASS_ONLY)
+#if !GI_HALFRES && !SHARC_UPDATE && !defined(ORION_K1_GLASS_ONLY) && !defined(ORION_K2_TRANSPORT)
     // 2026-11-21 P0-1：per-pixel 旁路槽清槽。样本循环**外**每像素无条件清一次
     //（vec4(0)，a=0 = 无有效偏移）；miss / 未被本帧重写的像素读回按 0 处理。
     // 不能每条射线清：多样本共享同一槽位，后写覆盖先写（蓝图 §3.6）。
@@ -322,6 +324,8 @@ vec3 rrTransparentReceiverWorldPos =
 // depth image -- see GI_GLASS_PANE_DEPTH_GUIDE.
 bool rrTransparentReceiverIsPane =
     false;
+bool rrGlassPstrActive =
+    false;
 
 // =====================================================
 // 2026-10-01：(a) "主导路径是否穿过玻璃"标记 → RR guide 的空闲通道
@@ -336,6 +340,9 @@ bool rrTransparentReceiverIsPane =
 #define GI_RR_DELTA_FLAG 1
 #endif
 
+#ifndef ORION_GLASS_REMIX_PSTR_GUIDES
+#define ORION_GLASS_REMIX_PSTR_GUIDES 1
+#endif
 #ifndef RR_GUIDE_PURIFY_V1
 #define RR_GUIDE_PURIFY_V1 1
 #endif
@@ -352,6 +359,8 @@ float rrDeltaCrossedFlag =
 // 本标记是旧机制 kBufferTypeTransparencyHint 的最小接入。
 // =====================================================
 bool rrParticlePixel =
+    false;
+bool primaryHandPixel =
     false;
 
 #if RR_STABLE_GLASS_RADIANCE
@@ -474,10 +483,11 @@ vec2 inUV =
 
 #ifndef ORION_K2_TRANSPORT
         hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
-hit.state = makeTraceState(RT_PURPOSE_PRIMARY_SKY);
 #if defined(ORION_K1_PRIMARY) && !defined(ORION_K1_GLASS_ONLY)
+hit.state = makeTraceState(RT_PURPOSE_PRIMARY_SKY) | RT_STATE_K1_LANDING_BIT;
 const uint k1PrimarySbtOffset = 5u;
 #else
+hit.state = makeTraceState(RT_PURPOSE_PRIMARY_SKY);
 const uint k1PrimarySbtOffset = 0u;
 #endif
 
@@ -491,7 +501,7 @@ if(cam.perfSerAb.y != 0u)
         worldDir.xyz,
         10000.0,
         gl_RayFlagsCullBackFacingTrianglesEXT,
-        0x01,
+        0x21u,
         s,
         k1PrimarySbtOffset
     );
@@ -505,7 +515,7 @@ else
     traceRayEXT(
         topLevelAS,
     gl_RayFlagsCullBackFacingTrianglesEXT,
-        0x01,
+        0x21u,
         k1PrimarySbtOffset, 0, 0,
         origin.xyz,
         0.001,
@@ -562,6 +572,9 @@ if(s == 0)
 //（与上面 prevOffset 的注释同一约束）。消费者：循环外的 TransparencyHint 写入。
 rrParticlePixel =
     (payload.state & RT_STATE_PARTICLE_BIT) != 0u;
+primaryHandPixel =
+    (payload.state & RT_STATE_HAND_BIT) != 0u;
+g_secondaryCullMask = primaryHandPixel ? 0xcdu : 0xcfu;
 
 // =====================================================
 // DH 的"我们侧"判据（09-23 第三次定案）：**只有 miss 算远场**
@@ -716,6 +729,9 @@ primaryViewDirectionForWater = worldDir.xyz;
     // 重算 —— 粒子位由 material_resolve 的 makeHitState 置位。
     rrParticlePixel =
         (payload.state & RT_STATE_PARTICLE_BIT) != 0u;
+    primaryHandPixel =
+        (payload.state & RT_STATE_HAND_BIT) != 0u;
+    g_secondaryCullMask = primaryHandPixel ? 0xcdu : 0xcfu;
 
     // 主变体在 #ifndef 段声明 primaryHitDistance；K2 在这里自己声明。
     float primaryHitDistance = payload.hitDistance;
@@ -1663,6 +1679,18 @@ if (matId > 0.5 && matId < 2.5) {
                 float fresnelX2 = fresnelX * fresnelX;
                 float fresnel = R0 + (1.0 - R0) * (fresnelX2 * fresnelX2) * fresnelX;
 
+                // Geometric water normal (flat horizontal top/bottom or non-wave side wall)
+                // used to keep ray-origin offsets and DLSS-RR guide switches wave-invariant.
+                vec3 waterGeoN = (abs(normal.y) > 0.25)
+                    ? vec3(0.0, (dot(worldDir.xyz, vec3(0.0, 1.0, 0.0)) < 0.0) ? 1.0 : -1.0, 0.0)
+                    : normalize((dot(primaryGeometricNormal, worldDir.xyz) > 0.0)
+                        ? -primaryGeometricNormal
+                        : primaryGeometricNormal);
+                float geoCosTheta = clamp(dot(waterGeoN, viewDir), 0.0, 1.0);
+                float geoFresnelX = 1.0 - geoCosTheta;
+                float geoFresnelX2 = geoFresnelX * geoFresnelX;
+                float geoFresnel = R0 + (1.0 - R0) * (geoFresnelX2 * geoFresnelX2) * geoFresnelX;
+
                 // =====================================================
                 // RR-6.2 - Primary water guides
                 // =====================================================
@@ -1779,7 +1807,7 @@ if (matId > 0.5 && matId < 2.5) {
                             ((SER_PROBE_SECONDARY_FLAGS != 0) ||
                                 perfL10SerProbeSecondaryFlags())
                                 ? secondaryTraverseFlags() : gl_RayFlagsNoneEXT,
-                            0xefu,
+                            0xcfu,
                             0,
                             0,
                             0,
@@ -1801,7 +1829,7 @@ if (matId > 0.5 && matId < 2.5) {
                             rrWaterReflectionDir,
                             10000.0,
                             secondaryTraverseFlags(),
-                            0xefu,
+                            0xcfu,
                             s
                         );
                     }
@@ -1814,7 +1842,7 @@ if (matId > 0.5 && matId < 2.5) {
                         traceRayEXT(
                             topLevelAS,
                             secondaryTraverseFlags(),
-                            0xefu,
+                            0xcfu,
                             0,
                             0,
                             0,
@@ -1907,7 +1935,7 @@ if(matId > 1.5 && cam.waterSimState.w != 0u)
     {
         underwaterTir = true;
         waterLobeCount = 1;
-        lobe0Origin = hitPos + normal * 0.01;
+        lobe0Origin = hitPos + waterGeoN * 0.015;
         lobe0Dir = exitReflDir;
         lobe0InsideWater = true;
         lobe0AllowGi = false;
@@ -1923,7 +1951,7 @@ if(matId > 1.5 && cam.waterSimState.w != 0u)
         exitFresnel = R0 + (1.0 - R0) * (efX2 * efX2) * efX;
 
         waterLobeCount = 1;
-        lobe0Origin = hitPos - normal * 0.01;
+        lobe0Origin = hitPos - waterGeoN * 0.015;
         lobe0Dir = exitRefrDirN;
         lobe0InsideWater = false;
         lobe0AllowGi = false;
@@ -1933,7 +1961,7 @@ if(matId > 1.5 && cam.waterSimState.w != 0u)
         if(exitFresnel > 0.03)
         {
             waterLobeCount = 2;
-            lobe1Origin = hitPos + normal * 0.01;
+            lobe1Origin = hitPos + waterGeoN * 0.015;
             lobe1Dir = exitReflDir;
             lobe1InsideWater = true;
             lobe1AllowGi = false;
@@ -1951,7 +1979,7 @@ if(!underwaterExit)
     {
         waterSurfaceSunTransmittance =
             traceSunTransmittanceThroughWater(
-                hitPos + sunDir * 0.001,
+                hitPos + waterGeoN * 0.02 + sunDir * 0.001,
                 sunDir
             );
 #if WATER_SKY_SUN_OCCLUSION
@@ -1967,11 +1995,11 @@ if(!underwaterExit)
     }
     waterSurfaceCloudShadow =
         (sunDir.y > 0.02 && !waterSurfaceSunOccluded)
-            ? c3CloudSunTransmittance(hitPos + sunDir * 0.001, sunDir)
+            ? c3CloudSunTransmittance(hitPos + waterGeoN * 0.02 + sunDir * 0.001, sunDir)
             : 0.0;
 
     waterLobeCount = 1;
-    lobe0Origin = hitPos + normal * 0.01;
+    lobe0Origin = hitPos + waterGeoN * 0.015;
     lobe0Dir = normalize(reflect(worldDir.xyz, normal));
     lobe0InsideWater = false;
     lobe0AllowGi = false;
@@ -1988,7 +2016,7 @@ if(!underwaterExit)
     {
         hasAboveTransmitted = true;
         waterLobeCount = 2;
-        lobe1Origin = hitPos - normal * 0.01;
+        lobe1Origin = hitPos - waterGeoN * 0.015;
         lobe1Dir = refrDir;
         lobe1InsideWater = true;
 #if WATER_RECEIVER_GI_ADAPTIVE_GATE
@@ -2073,7 +2101,7 @@ else
                     if(
                         s == 0 &&
                         transmittedTransmissionInfo.reachedUnderwaterReceiver > 0.5 &&
-                        fresnel < 0.5
+                        geoFresnel < 0.5
                     )
                     {
                         applyTransparentReceiverRRGuides(
@@ -2634,12 +2662,40 @@ else if(
                                 rrTransmittedGuideRoughness(
                                     glassTransmissionInfo.receiverRoughness)
                             );
+                        rrTransparentReceiverWorldPos =
+                            glassTransmissionInfo.receiverWorldPos;
+#elif ORION_GLASS_REMIX_PSTR_GUIDES
+                        const bool glassPstrTransmissionDominant =
+#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_RADIANCE_DOMINANCE_FIX
+                            !g_glassReflectionDominatesPixel;
+#else
+                            true;
+#endif
+                        if(glassPstrTransmissionDominant)
+                        {
+                            rrNormalRoughness = vec4(
+                                normalize(glassTransmissionInfo.receiverNormal),
+                                rrTransmittedGuideRoughness(glassTransmissionInfo.receiverRoughness)
+                            );
+                            rrTransparentReceiverWorldPos =
+                                origin.xyz +
+                                worldDir.xyz * (primaryHitDistance + max(glassTransmissionInfo.waterPathLength, 0.0));
+                            rrGlassPstrActive = true;
+                        }
+                        else
+                        {
+                            rrNormalRoughness = vec4(glassSurface.normal, PANE_SOLID_ROUGHNESS);
+                            rrTransparentReceiverWorldPos = glassTransmissionInfo.receiverWorldPos;
+                            rrGlassPstrActive = false;
+                        }
 #elif GI_GLASS_RECEIVER_GUIDE_MODE == 3
                         rrNormalRoughness =
                             vec4(
                                 glassSurface.normal,
                                 PANE_SOLID_ROUGHNESS
                             );
+                        rrTransparentReceiverWorldPos =
+                            glassTransmissionInfo.receiverWorldPos;
 #elif GI_GLASS_RECEIVER_GUIDE_MODE >= 1
                         vec3 transmittedGuideNormal =
 #if GI_GLASS_RECEIVER_GUIDE_MODE >= 2
@@ -2655,10 +2711,12 @@ else if(
                                     glassTransmissionInfo.receiverRoughness
                                 )
                             );
-#endif
-
                         rrTransparentReceiverWorldPos =
                             glassTransmissionInfo.receiverWorldPos;
+#else
+                        rrTransparentReceiverWorldPos =
+                            glassTransmissionInfo.receiverWorldPos;
+#endif
 
                         rrTransparentReceiverGuideValid =
                             true;
@@ -3151,7 +3209,7 @@ for(
             aoVisQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xefu,
+            g_secondaryCullMask,
             hitPos + aoDir * 0.001,
             0.01,
             aoDir,
@@ -3208,7 +3266,7 @@ for(
 
             gl_RayFlagsTerminateOnFirstHitEXT,
 
-            0xefu,
+            g_secondaryCullMask,
             0,
             0,
             0,
@@ -3913,7 +3971,7 @@ for (int si = 0;
     }
 
     vec3 shadowOrigin =
-        hitPos + shadowDir * SUN_SHADOW_RAY_ORIGIN_OFFSET;
+        hitPos + primaryGeometricNormal * 0.015 + shadowDir * SUN_SHADOW_RAY_ORIGIN_OFFSET;
 
 
     hit.hitDistance =
@@ -3945,7 +4003,7 @@ for (int si = 0;
             sunVisQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xefu,
+            g_secondaryCullMask,
             shadowOrigin,
             SUN_SHADOW_RAY_TMIN,
             shadowDir,
@@ -3984,7 +4042,7 @@ for (int si = 0;
             (sunVisibilityFilterActive
                 ? 0u
                 : gl_RayFlagsSkipClosestHitShaderEXT),
-            0xefu,
+            g_secondaryCullMask,
             si
         );
     }
@@ -4000,7 +4058,7 @@ for (int si = 0;
             (sunVisibilityFilterActive
                 ? 0u
                 : gl_RayFlagsSkipClosestHitShaderEXT),
-            0xefu,
+            g_secondaryCullMask,
             0,
             0,
             0,
@@ -5045,7 +5103,7 @@ if(matId > 0.2 && matId < 0.45)
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT |
             gl_RayFlagsSkipClosestHitShaderEXT,
-            0xefu,
+            g_secondaryCullMask,
             0,
             0,
             0,
@@ -5388,13 +5446,19 @@ if(DBG_SPLIT_ABLATION)
 // (perfSecondary.z: 0 = off, 1 = every frame, 2/4 = every N frames).  On
 // skipped frames the term is simply dropped; the temporal filters smooth the
 // result, trading one visibility ray per skipped frame.
+const float waterReflPlaneY = cam.waterSimSurfaceAndOrigin.x;
+const bool waterReflPlaneReachable =
+    (abs(cam.viewInverse[3].y - waterReflPlaneY) <= 128.0) &&
+    (hitPos.y > waterReflPlaneY - 0.5) &&
+    ((hitPos.y - waterReflPlaneY) <= 64.0 * sunDir.y + 1.5);
 uint waterReflectionInterval =
     clamp(cam.perfSecondary.z, 0u, 4u);
 bool runWaterReflection =
     (cam.fogMoodParams.w > 0.5) &&
     waterReflectionInterval > 0u &&
     (waterReflectionInterval == 1u ||
-     (cam.frameCount % waterReflectionInterval) == 0u)
+     (cam.frameCount % waterReflectionInterval) == 0u) &&
+    waterReflPlaneReachable
 #if WATER_REFLECT_SUN_OPT_V1
     && sunDir.y > 0.02
     && rtLodDistance < 96.0 * perfL10TierScale()
@@ -6512,13 +6576,13 @@ while(
                         #ifdef ORION_RT_STAGE_COUNTERS
                         rtCntRayIssued();
                         #endif
-                        traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xefu, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                        traceRayEXT(topLevelAS, secondaryTraverseFlags(), g_secondaryCullMask, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
                     }
 #else
                     #ifdef ORION_RT_STAGE_COUNTERS
                     rtCntRayIssued();
                     #endif
-                    traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xefu, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                    traceRayEXT(topLevelAS, secondaryTraverseFlags(), g_secondaryCullMask, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
 #endif
                     }
 
@@ -8734,7 +8798,11 @@ bool rrUseReceiverDepthGuide =
     rrTransparentReceiverGuideValid;
 
 #if GI_GLASS_PANE_DEPTH_GUIDE
-if(rrTransparentReceiverIsPane)
+if(rrTransparentReceiverIsPane
+#if ORION_GLASS_REMIX_PSTR_GUIDES
+   && !rrGlassPstrActive
+#endif
+)
 {
     rrUseReceiverDepthGuide =
         false;
@@ -9387,7 +9455,7 @@ if ((cam.dhFarFieldParams.x > 0.5 || dhFarModeRequested == 14
                     traceRayEXT(
                         topLevelAS,
                         secondaryTraverseFlags(),
-                        0xefu,
+                        g_secondaryCullMask,
                         0,
                         0,
                         0,

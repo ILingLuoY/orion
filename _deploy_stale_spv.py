@@ -147,7 +147,7 @@ EXTRA_FLAGS = {
     'rt_test_k2i_compose.comp.spv':
         ['-DORION_K2_TRANSPORT', '-DORION_K2_MATERIAL_INLINE',
          '-DORION_K2_INDIRECT_STAGE', '-DORION_K2_INDIRECT_COMPOSE_ONLY',
-         '-DORION_K2I_COMPOSE_COMPUTE'],
+         '-DORION_K2_CONSUMER_MAT_REUSE_ONLY', '-DORION_K2I_COMPOSE_COMPUTE'],
     # 2026-11-12 ④：K2-D 再拆分三腿变体（ORION_K2_SPLIT2=0 回退 ③ 两腿）。
     # SUN = 水+太阳直射/GGX/SSS/RTAO（写 binding 89）；LOC = 局部光/水面反射
     # 太阳/GGX 镜面（load-add 复用 binding 89）。K2-I 不变。
@@ -329,6 +329,7 @@ def collect_targets():
     add('vpt_k2loc_compact.comp', 'vpt_k2loc_compact.comp.spv', [])
     add('vpt_k1_glass_compact.comp', 'vpt_k1_glass_compact.comp.spv', [])
     add('vpt_sharc_compact.comp', 'vpt_sharc_compact.comp.spv', [])
+    add('vpt_k2_mega_compact.comp', 'vpt_k2_mega_compact.comp.spv', [])
     add('aces2_bake_lut.comp', 'aces2_bake_lut.comp.spv', [])
 
     # 4) 半分辨率 GI 变体：同一份源码 + -DGI_HALFRES=1。

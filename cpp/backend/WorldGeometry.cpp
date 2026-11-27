@@ -345,7 +345,7 @@ bool rebuildWorldGeometry(
             std::unordered_map<uint64_t, size_t> updateIndices;
             updateIndices.reserve(selectedCount + 1u);
 
-            if(entityDirty && (adoptedCount + selectedCount) > 0u)
+            if(entityDirty)
             {
                 // 2026-11-07g：这里不 take，推迟到真正捕获前（见下方捕获循环）。
                 // 否则"选 key"阶段就把池掏空，捕获线程唤醒即 miss。
@@ -1027,16 +1027,22 @@ bool rebuildWorldGeometry(
             );
         };
 
-    // 2026-11-12：本帧已创建的 OMM 段数（见下方闸门）。
-    uint32_t ommSectionsCreatedThisFrame = 0u;
+    // 2026-11-26 (Batch AB): Per-frame & distance OMM GPU budget gate.
+    // Beyond 48 blocks from the camera or when a section/frame exceeds budget, cutout
+    // geometry builds immediately via the clean anyHit fallback (no mid-section requeue).
+    constexpr float kOmmMaxDistanceBlocks = 48.0f;
+    constexpr float kOmmMaxDistanceSq = kOmmMaxDistanceBlocks * kOmmMaxDistanceBlocks;
+    constexpr uint32_t kMaxOmmBuildsPerFrame = 2u;
+    constexpr size_t kMaxOmmBytesPerFrame = 256u * 1024u;
+    constexpr size_t kMaxSingleSectionOmmBytes = 512u * 1024u;
 
-    // 2026-11-13：OMM 闸门改为「本帧累计 OMM 耗时预算」。
-    // 旧实现 = 计数上限（默认 1 段/帧）+ requeueSectionsFrom ⇒ 一个 cutout 段
-    // 就把【当前段之后的整条队列】回填并 break（sectionAbortedMidway），整帧
-    // 剩余段全部停摆。方块更新会经光照把一片相邻 section 标脏，其中门/草/
-    // 树叶/玻璃都是 cutout 段 ⇒ 队列按 1 段/帧爬 ⇒ 用户感知"开门、放置方块
-    // 好几秒才有反应"。新实现按耗时设预算（默认 3ms，且至少放行 1 段），
-    // 超限只回填【当前这一段】，其它段本帧照常重建。
+    const CameraUBO* ommCamUbo =
+        g_cameraUboMapped != nullptr
+            ? static_cast<const CameraUBO*>(g_cameraUboMapped)
+            : nullptr;
+
+    uint32_t ommSectionsCreatedThisFrame = 0u;
+    size_t ommBytesCreatedThisFrame = 0u;
     double ommMsThisFrame = 0.0;
 
     static const double sOmmMsPerFrameCap = []
@@ -1053,7 +1059,7 @@ bool rebuildWorldGeometry(
         return parsed < 0.0 ? 0.0 : parsed;
     }();
 
-    uint64_t ommDeferredSectionsThisFrame = 0u;
+    uint64_t ommFallbackAnyHitThisFrame = 0u;
 
     // 2026-11-12：build loop 的"class 调用总和"，用来把 bld 拆成
     // 骨架（update 循环本身）与 class（rebuildGeometryClass × 7）两部分。
@@ -1119,32 +1125,15 @@ bool rebuildWorldGeometry(
 
         if(sectionUpdateIndex != 0u && g_asBuilt && !forceReset)
         {
+            constexpr VkDeviceSize kMaxStagingBytesPerFrame = 6ull * 1024ull * 1024ull;
             const double rebuildElapsedMs =
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - perfL10RebuildStart
                 ).count();
-            if(rebuildElapsedMs >= sectionRebuildBudgetMs)
+            if(rebuildElapsedMs >= sectionRebuildBudgetMs ||
+               totalStagingBytes >= kMaxStagingBytesPerFrame)
             {
-                {
-                    std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
-                    for(size_t pending = sectionUpdateIndex;
-                        pending < sectionUpdates.size();
-                        ++pending)
-                    {
-                        g_dirtySectionKeys.insert(sectionUpdates[pending].first);
-                    }
-                    g_worldGeometryDirty.store(
-                        !g_dirtySectionKeys.empty(),
-                        std::memory_order_release
-                    );
-                }
-                g_sectionRebuildInterrupted = true;
-                g_sectionRebuildContinueFrame =
-                    g_perfL10FrameSerial + SECTION_REBUILD_CONTINUE_FRAMES;
-                g_sectionRebuildBatchCap = std::max<size_t>(
-                    1u,
-                    g_sectionRebuildBatchCap / 2u
-                );
+                requeueSectionsFrom(sectionUpdateIndex);
                 break;
             }
         }
@@ -1369,12 +1358,13 @@ bool rebuildWorldGeometry(
 
                     const uint64_t classBits =
                         classKey & ~SPATIAL_SECTION_KEY_MASK;
+                    const bool isHandClass = classBits == SECTION_AS_CLASS_HAND;
                     const bool dynamicRefitClass =
-                        classBits == SECTION_AS_CLASS_ENTITY ||
-                        classBits == SECTION_AS_CLASS_LOCAL_PLAYER ||
-                        classBits == SECTION_AS_CLASS_PARTICLE ||
-                        classBits == SECTION_AS_CLASS_HAND ||
-                        !vertexMotion.empty();
+                        !isHandClass && (
+                            classBits == SECTION_AS_CLASS_ENTITY ||
+                            classBits == SECTION_AS_CLASS_LOCAL_PLAYER ||
+                            classBits == SECTION_AS_CLASS_PARTICLE ||
+                            !vertexMotion.empty());
                     const bool allowBlasRefit =
                         sectionBLASRefitEnabled() && dynamicRefitClass;
 
@@ -1500,7 +1490,8 @@ bool rebuildWorldGeometry(
            update.second.water.empty() &&
            update.second.entity.empty() &&
            update.second.localPlayer.empty() &&
-           update.second.particle.empty())
+           update.second.particle.empty() &&
+           update.second.hand.empty())
         {
             ++removedSectionCount;
         }
@@ -1515,7 +1506,7 @@ bool rebuildWorldGeometry(
             std::span<const SectionVertex> packed;
         };
 
-        constexpr size_t RT_GEOMETRY_CLASS_COUNT = 8u;
+        constexpr size_t RT_GEOMETRY_CLASS_COUNT = 9u;
 
         const RtGeometryClassPlan geometryClassPlan[RT_GEOMETRY_CLASS_COUNT] =
         {
@@ -1544,63 +1535,65 @@ bool rebuildWorldGeometry(
               update.second.localPlayerMotion, {} },
             { spatialSectionKey | SECTION_AS_CLASS_PARTICLE,
               update.second.particle, false, nullptr,
-              update.second.particleMotion, {} }
+              update.second.particleMotion, {} },
+            { spatialSectionKey | SECTION_AS_CLASS_HAND,
+              update.second.hand, false, nullptr,
+              update.second.handMotion, {} }
         };
 
-        bool sectionAbortedMidway = false;
+        bool sectionWithinOmmRange = true;
+        if(ommCamUbo != nullptr)
+        {
+            float secCx = 0.0f;
+            float secCy = 0.0f;
+            float secCz = 0.0f;
+            vramSectionCenterFromSpatialKey(
+                spatialSectionKey,
+                secCx,
+                secCy,
+                secCz
+            );
+            const float dx = secCx - ommCamUbo->playerX;
+            const float dy = secCy - ommCamUbo->playerY;
+            const float dz = secCz - ommCamUbo->playerZ;
+            sectionWithinOmmRange =
+                (dx * dx + dy * dy + dz * dz) <= kOmmMaxDistanceSq;
+        }
 
         for(size_t classIndex = 0u;
             classIndex < RT_GEOMETRY_CLASS_COUNT;
             ++classIndex)
         {
-            if(classIndex != 0u &&
-               sectionUpdateIndex != 0u &&
-               g_asBuilt &&
-               !forceReset &&
-               rebuildElapsedMsNow() >= sectionRebuildBudgetMs)
-            {
-                requeueSectionsFrom(sectionUpdateIndex);
-                sectionAbortedMidway = true;
-                break;
-            }
-
             const RtGeometryClassPlan& plan =
                 geometryClassPlan[classIndex];
 
-            // 2026-11-12：OMM 创建闸门。
-            // createSectionOpacityMicromap 单段实测 0.9~3.2ms（[RT SECTION SLOW] 的
-            // ommMs 占 99%：4 次池化分配 + vkGetMicromapBuildSizesEXT +
-            // vkCreateMicromapEXT + 2 次 map/unmap），且随三角形数线性增长。
-            // 一帧连着建多个 alpha/cutout 段会把 CPU 尖峰叠到 13~18ms
-            // （[PERF L10 CPUPHASE] geometry max、[RT GEOMETRY] buildLoopMs 峰值）。
-            // 2026-11-13：闸门已从「每帧 N 段」改为「每帧累计 ommMs 预算」，
-            // 见上方 ommMsThisFrame 声明处注释；ORION_OMM_MS_PER_FRAME 可调
-            // （默认 3.0，0 = 不限）。
-            if(plan.ommInput != nullptr &&
-               ((plan.classKey & ~SPATIAL_SECTION_KEY_MASK) ==
-                    SECTION_AS_CLASS_OMM ||
-                (plan.classKey & ~SPATIAL_SECTION_KEY_MASK) ==
-                    SECTION_AS_CLASS_OMM_LEAVES))
+            const uint64_t planClassBits =
+                plan.classKey & ~SPATIAL_SECTION_KEY_MASK;
+            const OmmCutoutInput* effectiveOmmInput = plan.ommInput;
+            if(effectiveOmmInput != nullptr &&
+               (planClassBits == SECTION_AS_CLASS_OMM ||
+                planClassBits == SECTION_AS_CLASS_OMM_LEAVES))
             {
-                // 2026-11-13：见 ommMsThisFrame 声明处注释。预算按「本帧累计
-                // OMM 耗时」而非段数。
-                // 2026-11-14：控制流退回旧版（requeueSectionsFrom +
-                // sectionAbortedMidway）。原因：改成「只回填当前段、继续建后续段」
-                // 之后，方块更新延迟改善，但崩溃频率暴涨（1~2 分钟一崩，同一个
-                // 5s 信号量超时，换存档也复现）—— 怀疑半成品段（部分 class 已
-                // 换新 AS、OMM/水/实体仍为旧）留在本帧 TLAS 里造成 GPU 侧悬垂。
-                // 现在只保留「按耗时而非按段数」这一条收益，中断语义回到已验证
-                // 版本。
-                if(sOmmMsPerFrameCap > 0.0 &&
-                   ommSectionsCreatedThisFrame > 0u &&
-                   ommMsThisFrame >= sOmmMsPerFrameCap)
+                const size_t ommBytes = effectiveOmmInput->data.size();
+                const bool allowOmm =
+                    sectionWithinOmmRange &&
+                    ommBytes <= kMaxSingleSectionOmmBytes &&
+                    ommSectionsCreatedThisFrame < kMaxOmmBuildsPerFrame &&
+                    (ommSectionsCreatedThisFrame == 0u ||
+                     ommBytesCreatedThisFrame + ommBytes <= kMaxOmmBytesPerFrame) &&
+                    (sOmmMsPerFrameCap <= 0.0 ||
+                     ommSectionsCreatedThisFrame == 0u ||
+                     ommMsThisFrame < sOmmMsPerFrameCap);
+                if(allowOmm)
                 {
-                    requeueSectionsFrom(sectionUpdateIndex);
-                    sectionAbortedMidway = true;
-                    break;
+                    ++ommSectionsCreatedThisFrame;
+                    ommBytesCreatedThisFrame += ommBytes;
                 }
-
-                ++ommSectionsCreatedThisFrame;
+                else
+                {
+                    effectiveOmmInput = nullptr;
+                    ++ommFallbackAnyHitThisFrame;
+                }
             }
 
             const double sectionClassCreateMsBefore =
@@ -1616,7 +1609,7 @@ bool rebuildWorldGeometry(
                 plan.classKey,
                 plan.vertices,
                 plan.opaqueGeometry,
-                plan.ommInput,
+                effectiveOmmInput,
                 plan.vertexMotion,
                 plan.packed
             );
@@ -1647,8 +1640,8 @@ bool rebuildWorldGeometry(
             bldClassSumMs += sectionClassMs;
             ++bldClassCalls;
             // g_sectionBuildOmmMs 是「最后一次 createSectionBLAS」的值，非 OMM
-            // 段会读到陈旧值 ⇒ 只累加本段确实是 OMM 类的那次。
-            if(plan.ommInput != nullptr)
+            // 段会读到陈旧值 ⇒ 只累加本段确实走 OMM 创建的那次。
+            if(effectiveOmmInput != nullptr)
             {
                 ommMsThisFrame += g_sectionBuildOmmMs;
             }
@@ -1686,11 +1679,6 @@ bool rebuildWorldGeometry(
                 );
             }
         }
-
-        if(sectionAbortedMidway)
-        {
-            break;
-        }
     }
 
     perfL10AfterBuildLoop =
@@ -1704,14 +1692,15 @@ bool rebuildWorldGeometry(
                 perfL10AfterBuildLoop - perfL10BuildLoopStart
             ).count();
 
-        if(ommDeferredSectionsThisFrame > 0u &&
+        if(ommFallbackAnyHitThisFrame > 0u &&
            (g_perfL10FrameSerial % 60u) == 0u)
         {
             (CPUPERF_QUIET_HOT_LOGS ? RTLog : RTLogFlushed)(
                 "[RT OMM GATE] frame=" +
                 std::to_string(g_perfL10FrameSerial) +
-                " deferred=" + std::to_string(ommDeferredSectionsThisFrame) +
+                " fallbackAnyHit=" + std::to_string(ommFallbackAnyHitThisFrame) +
                 " created=" + std::to_string(ommSectionsCreatedThisFrame) +
+                " ommKB=" + std::to_string(ommBytesCreatedThisFrame / 1024u) +
                 " ommMsThisFrame=" + std::to_string(ommMsThisFrame) +
                 " capMs=" + std::to_string(sOmmMsPerFrameCap)
             );
@@ -1976,59 +1965,164 @@ bool rebuildWorldGeometry(
     static uint64_t s_orderedSectionsRevision = ~0ull;
     static size_t s_orderedSectionsCount = 0u;
     static uint64_t s_orderedSectionsFingerprint = 0xcbf29ce484222325ull;
+    static size_t s_orderedTerrainCount = 0u;
+    static uint64_t s_orderedTerrainFingerprint = 0xcbf29ce484222325ull;
+    static size_t s_orderedDynamicCount = 0u;
+    static uint64_t s_orderedDynamicFingerprint = 0xcbf29ce484222325ull;
+    static std::vector<RTSectionAS*> s_dynamicSectionsScratch;
 
     const uint64_t sectionRevisionNow =
         g_terrainGeometryRevision.load(std::memory_order_acquire);
 
-    // 2026-11-12：集合内容指纹（每帧一次 O(段数) 只读遍历，不排序、不写表）。
-    // 专为捕获"revision 未变、size 未变，但段被原地重建/替换"的情形 ——
-    // 这正是 2026-11-10 悬垂指针事故的根因，只靠 revision + size 判不出来。
-    // 空集合时该值等于 FNV 初值，与 s_orderedSectionsFingerprint 的初值一致。
-    uint64_t sectionSetFingerprintNow = 0xcbf29ce484222325ull;
+    uint64_t terrainFingerprintNow = 0xcbf29ce484222325ull;
+    size_t terrainCountNow = 0u;
+    uint64_t dynamicFingerprintNow = 0xcbf29ce484222325ull;
+    size_t dynamicCountNow = 0u;
+    s_dynamicSectionsScratch.clear();
 
-    for(const auto& fingerprintEntry : g_sectionBLAS)
+    for(auto& fingerprintEntry : g_sectionBLAS)
     {
-        sectionSetFingerprintNow =
-            (sectionSetFingerprintNow ^ fingerprintEntry.first) *
-            0x100000001b3ull;
-        // 节点地址：唯一标识一个 map 元素的生命周期，能捕获"同 key 段被
-        // erase 后重新 emplace 到不同节点"的指针变化（旧列表里的指针会悬垂）。
-        sectionSetFingerprintNow =
-            (sectionSetFingerprintNow ^
+        uint64_t entryHash = 0xcbf29ce484222325ull;
+        entryHash = (entryHash ^ fingerprintEntry.first) * 0x100000001b3ull;
+        entryHash =
+            (entryHash ^
              static_cast<uint64_t>(
                  reinterpret_cast<uintptr_t>(&fingerprintEntry.second))) *
             0x100000001b3ull;
-        sectionSetFingerprintNow =
-            (sectionSetFingerprintNow ^
+        entryHash =
+            (entryHash ^
              static_cast<uint64_t>(fingerprintEntry.second.blasAddress)) *
             0x100000001b3ull;
-        sectionSetFingerprintNow =
-            (sectionSetFingerprintNow ^
+        entryHash =
+            (entryHash ^
              static_cast<uint64_t>(fingerprintEntry.second.vertexAddress)) *
             0x100000001b3ull;
-        sectionSetFingerprintNow =
-            (sectionSetFingerprintNow ^
+        entryHash =
+            (entryHash ^
              static_cast<uint64_t>(fingerprintEntry.second.triangleCount)) *
             0x100000001b3ull;
+
+        const bool isDynamicEntry =
+            (fingerprintEntry.first & SPATIAL_SECTION_KEY_MASK) ==
+            ENTITY_RT_SPATIAL_KEY;
+        if(isDynamicEntry)
+        {
+            dynamicFingerprintNow =
+                (dynamicFingerprintNow ^ entryHash) * 0x100000001b3ull;
+            ++dynamicCountNow;
+            s_dynamicSectionsScratch.push_back(&fingerprintEntry.second);
+        }
+        else
+        {
+            terrainFingerprintNow =
+                (terrainFingerprintNow ^ entryHash) * 0x100000001b3ull;
+            ++terrainCountNow;
+        }
     }
+
+    const uint64_t sectionSetFingerprintNow =
+        (terrainFingerprintNow ^ dynamicFingerprintNow) * 0x100000001b3ull;
 
     // 上一次重建曾因槽位耗尽剔除过段（列表比 map 短）⇒ 不缓存，下一帧继续重试，
     // 与"每次重建都会重新尝试 ensureSectionVertexAddressSlot"的原语义一致。
     const bool cachedSectionListTruncated =
         orderedSections.size() != s_orderedSectionsCount;
 
-    const bool sectionSetChanged =
-        !s_sectionRoleCacheEnabled ||
-        cachedSectionListTruncated ||
-        sectionRevisionNow != s_orderedSectionsRevision ||
-        g_sectionBLAS.size() != s_orderedSectionsCount ||
-        sectionSetFingerprintNow != s_orderedSectionsFingerprint;
+    const bool terrainUnchanged =
+        s_sectionRoleCacheEnabled &&
+        !cachedSectionListTruncated &&
+        sectionRevisionNow == s_orderedSectionsRevision &&
+        terrainCountNow == s_orderedTerrainCount &&
+        terrainFingerprintNow == s_orderedTerrainFingerprint;
 
-    if(sectionSetChanged)
+    const bool dynamicUnchanged =
+        dynamicCountNow == s_orderedDynamicCount &&
+        dynamicFingerprintNow == s_orderedDynamicFingerprint;
+
+    if(terrainUnchanged && dynamicUnchanged)
+    {
+        // Everything unchanged: reuse orderedSections, role slots, and LOD coverage.
+    }
+    else if(terrainUnchanged && !dynamicUnchanged)
+    {
+        // Batch X (P1): Only dynamic sections (hand/entity/localPlayer/particle) changed.
+        // Splice out old ENTITY_RT_SPATIAL_KEY pointers, update slots for dynamic entries
+        // only, and insert in sorted sectionKey order without re-sorting terrain or calling
+        // rebuildLodCoverage(orderedSections).
+        orderedSections.erase(
+            std::remove_if(
+                orderedSections.begin(),
+                orderedSections.end(),
+                [](const RTSectionAS* section)
+                {
+                    return (section->sectionKey & SPATIAL_SECTION_KEY_MASK) ==
+                           ENTITY_RT_SPATIAL_KEY;
+                }
+            ),
+            orderedSections.end()
+        );
+
+        for(const RTSectionAS* dyn : s_dynamicSectionsScratch)
+        {
+            if(dyn->blas == VK_NULL_HANDLE ||
+               dyn->blasAddress == 0 ||
+               dyn->vertexAddress == 0)
+            {
+                throw std::runtime_error(
+                    "Section AS map contains an incomplete entry"
+                );
+            }
+        }
+
+        std::sort(
+            s_dynamicSectionsScratch.begin(),
+            s_dynamicSectionsScratch.end(),
+            [](const RTSectionAS* a, const RTSectionAS* b)
+            {
+                return a->sectionKey < b->sectionKey;
+            }
+        );
+
+        size_t activeDynamicCount = 0u;
+        for(RTSectionAS* section : s_dynamicSectionsScratch)
+        {
+            if(!ensureSectionVertexAddressSlot(*section))
+            {
+                continue;
+            }
+
+            writeSectionRoleSlot(*section);
+
+            auto insertPos = std::lower_bound(
+                orderedSections.begin(),
+                orderedSections.end(),
+                section,
+                [](const RTSectionAS* a, const RTSectionAS* b)
+                {
+                    return a->sectionKey < b->sectionKey;
+                }
+            );
+            orderedSections.insert(insertPos, section);
+            ++activeDynamicCount;
+        }
+
+        s_orderedDynamicCount = dynamicCountNow;
+        s_orderedDynamicFingerprint = dynamicFingerprintNow;
+        s_orderedSectionsCount =
+            (activeDynamicCount == dynamicCountNow)
+                ? g_sectionBLAS.size()
+                : (g_sectionBLAS.size() - (dynamicCountNow - activeDynamicCount));
+        s_orderedSectionsFingerprint = sectionSetFingerprintNow;
+    }
+    else
     {
     s_orderedSectionsRevision = sectionRevisionNow;
     s_orderedSectionsCount = g_sectionBLAS.size();
     s_orderedSectionsFingerprint = sectionSetFingerprintNow;
+    s_orderedTerrainCount = terrainCountNow;
+    s_orderedTerrainFingerprint = terrainFingerprintNow;
+    s_orderedDynamicCount = dynamicCountNow;
+    s_orderedDynamicFingerprint = dynamicFingerprintNow;
 
     orderedSections.clear();
 
@@ -3290,12 +3384,12 @@ bool rebuildWorldGeometry(
                 instance.mask = 0x02;
             }
 
-            // 2026-11-03：第一人称手部（见 SECTION_AS_CLASS_HAND 的说明）。
-            // 0x04 = 只被主相机射线（0x05）命中，所有次级射线（0xfb）都排除它
-            // ⇒ 手能看见、但不在世界里投影。
+            // 2026-11-26：第一人称手部（见 SECTION_AS_CLASS_HAND 的说明）。
+            // 0x20 = 只被主相机射线（0x21）命中，所有次级射线（0xcf）与动态光（0xcd）都排除它
+            // ⇒ 手能看见、但不在世界里投影或遮光。
             if(geometryClass == SECTION_AS_CLASS_HAND)
             {
-                instance.mask = 0x04;
+                instance.mask = 0x20u;
             }
 
             if(geometryClass == SECTION_AS_CLASS_PARTICLE)
@@ -3303,7 +3397,7 @@ bool rebuildWorldGeometry(
                 instance.mask = 0xf7;
             }
 
-            if(primaryMaskCull)
+            if(primaryMaskCull && geometryClass != SECTION_AS_CLASS_HAND)
             {
                 instance.mask &= 0xfeu;
                 s_cullPrimaryMaskedCount += 1;
@@ -3311,7 +3405,11 @@ bool rebuildWorldGeometry(
 
             // 2026-11-26 (Batch V, Feature 4): Reserve bit 4 (0x10) exclusively for the paired
             // solid-cube leaves instance used by volumetric light / fog queries.
-            instance.mask &= static_cast<uint8_t>(~0x10u);
+            // Reserve bit 5 (0x20) exclusively for SECTION_AS_CLASS_HAND.
+            if(geometryClass != SECTION_AS_CLASS_HAND)
+            {
+                instance.mask &= static_cast<uint8_t>(~0x30u);
+            }
 
             if(geometryClass == SECTION_AS_CLASS_OPAQUE)
             {
@@ -3321,11 +3419,11 @@ bool rebuildWorldGeometry(
             else if(geometryClass == SECTION_AS_CLASS_OMM)
             {
                 instance.instanceShaderBindingTableRecordOffset =
-                    SBT_RECORD_OMM;
+                    section.hasOpacityMicromap ? SBT_RECORD_OMM : SBT_RECORD_ALPHA;
             }
             else if(geometryClass == SECTION_AS_CLASS_OMM_LEAVES)
             {
-                instance.mask = primaryMaskCull ? 0xe6u : 0xe7u;
+                instance.mask = primaryMaskCull ? 0xc6u : 0xc7u;
                 instance.instanceShaderBindingTableRecordOffset =
                     section.hasOpacityMicromap ? SBT_RECORD_OMM : SBT_RECORD_ALPHA;
             }
@@ -3374,11 +3472,13 @@ bool rebuildWorldGeometry(
                 (!opaqueGeometry && !ommGeometry) ||
                 (kTLAS_LOD_FORCE_NO_OPAQUE && lodSpatialKey);
 
+            const bool ommSurfaceCutout =
+                (geometryClass == SECTION_AS_CLASS_OMM) && ommGeometry;
             const bool ommLeafCutout =
                 (geometryClass == SECTION_AS_CLASS_OMM_LEAVES) && ommGeometry;
 
             instance.flags =
-                ((geometryClass == SECTION_AS_CLASS_OMM || ommLeafCutout)
+                ((ommSurfaceCutout || ommLeafCutout)
                     ? 0u
                     : VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR) |
                 (
@@ -3523,6 +3623,7 @@ bool rebuildWorldGeometry(
 
     bool tlasInstancesUnchanged =
         tlasHandleAtEntry != VK_NULL_HANDLE &&
+        sectionsNeedingBuild.empty() &&
         s_tlasInstancesShadow.size() == instances.size() &&
         (instances.empty() ||
          std::memcmp(
@@ -3891,6 +3992,116 @@ bool rebuildWorldGeometry(
     }
 
 
+    struct BlasBuildWave
+    {
+        size_t begin = 0u;
+        size_t end = 0u;
+        VkDeviceSize scratchBytes = 0u;
+    };
+
+    static std::vector<RTSectionAS*> liveSectionsToBuild;
+    liveSectionsToBuild.clear();
+    static std::vector<VkDeviceSize> waveScratchOffsets;
+    waveScratchOffsets.clear();
+    static std::vector<BlasBuildWave> blasBuildWaves;
+    blasBuildWaves.clear();
+
+    VkDeviceSize requiredBlasScratchSize = maxBLASScratchSize;
+
+    if(!sectionsNeedingBuild.empty())
+    {
+        liveSectionsToBuild.reserve(sectionsNeedingBuild.size());
+        for(RTSectionAS* section : sectionsNeedingBuild)
+        {
+            if(section == nullptr)
+            {
+                continue;
+            }
+
+            const auto liveEntry = g_sectionBLAS.find(section->sectionKey);
+            if(liveEntry == g_sectionBLAS.end() ||
+               &liveEntry->second != section)
+            {
+                static uint64_t blasStaleSkips = 0u;
+                ++blasStaleSkips;
+                if(blasStaleSkips <= 5u || (blasStaleSkips % 100u) == 0u)
+                {
+                    std::stringstream staleLog;
+                    staleLog
+                        << "[SECTION BLAS GUARD] skip#" << blasStaleSkips
+                        << " key=" << section->sectionKey
+                        << " (entry erased while queued)";
+                    RTLog(staleLog.str());
+                }
+                continue;
+            }
+
+            liveSectionsToBuild.push_back(section);
+        }
+
+        if(!liveSectionsToBuild.empty())
+        {
+            static const VkDeviceSize s_blasScratchAlign = []() -> VkDeviceSize
+            {
+                if(g_physicalDevice == VK_NULL_HANDLE)
+                {
+                    return 256u;
+                }
+                VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR
+                };
+                VkPhysicalDeviceProperties2 props2{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+                };
+                props2.pNext = &asProps;
+                vkGetPhysicalDeviceProperties2(g_physicalDevice, &props2);
+                const VkDeviceSize minAlign = static_cast<VkDeviceSize>(
+                    asProps.minAccelerationStructureScratchOffsetAlignment
+                );
+                return minAlign > 256u ? minAlign : 256u;
+            }();
+
+            constexpr VkDeviceSize kMaxBlasWaveScratchBytes = 16ull * 1024ull * 1024ull;
+            waveScratchOffsets.resize(liveSectionsToBuild.size());
+
+            size_t waveBegin = 0u;
+            VkDeviceSize waveOffset = 0u;
+            for(size_t i = 0u; i < liveSectionsToBuild.size(); ++i)
+            {
+                const RTSectionAS* sec = liveSectionsToBuild[i];
+                VkDeviceSize req = sec->pendingRefit ? sec->updateScratchSize : sec->buildScratchSize;
+                if(req == 0u)
+                {
+                    req = std::max(sec->buildScratchSize, sec->updateScratchSize);
+                }
+                const VkDeviceSize alignedReq =
+                    (req + s_blasScratchAlign - 1u) & ~(s_blasScratchAlign - 1u);
+
+                if(i > waveBegin && waveOffset + alignedReq > kMaxBlasWaveScratchBytes)
+                {
+                    blasBuildWaves.push_back(BlasBuildWave{waveBegin, i, waveOffset});
+                    requiredBlasScratchSize = std::max(requiredBlasScratchSize, waveOffset);
+                    waveBegin = i;
+                    waveOffset = 0u;
+                }
+
+                waveScratchOffsets[i] = waveOffset;
+                waveOffset += alignedReq;
+            }
+
+            if(waveBegin < liveSectionsToBuild.size())
+            {
+                blasBuildWaves.push_back(BlasBuildWave{
+                    waveBegin,
+                    liveSectionsToBuild.size(),
+                    waveOffset
+                });
+                requiredBlasScratchSize = std::max(requiredBlasScratchSize, waveOffset);
+            }
+        }
+    }
+
+
     VkBuffer blasScratchBuffer =
         VK_NULL_HANDLE;
 
@@ -3902,13 +4113,13 @@ bool rebuildWorldGeometry(
 
 
     if(
-        !sectionsNeedingBuild.empty() &&
-        maxBLASScratchSize > 0
+        !liveSectionsToBuild.empty() &&
+        requiredBlasScratchSize > 0
     )
     {
         RtxSectionBuildBufferSlot blasScratchSlot;
 
-        if(g_blasScratchPool.tryAcquire(maxBLASScratchSize, blasScratchSlot))
+        if(g_blasScratchPool.tryAcquire(requiredBlasScratchSize, blasScratchSlot))
         {
             blasScratchBuffer = blasScratchSlot.buffer;
             blasScratchMemory = blasScratchSlot.memory;
@@ -3919,7 +4130,7 @@ bool rebuildWorldGeometry(
         {
 
             const VkDeviceSize blasScratchSlotBytes =
-                sectionBuildPoolSlotBytes(maxBLASScratchSize);
+                sectionBuildPoolSlotBytes(requiredBlasScratchSize);
 
             createBuffer(
                 g_device,
@@ -4002,6 +4213,43 @@ bool rebuildWorldGeometry(
         "begin Section AS command buffer failed"
     );
 
+    const uint32_t geomTsSlot = beginGeomGpuTimestamp(cmd);
+
+
+    bool anyPendingRefit = false;
+    for(const RTSectionAS* section : sectionsNeedingBuild)
+    {
+        if(section != nullptr && section->pendingRefit)
+        {
+            anyPendingRefit = true;
+            break;
+        }
+    }
+    if(anyPendingRefit)
+    {
+        VkMemoryBarrier refitWarBarrier{
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER
+        };
+        refitWarBarrier.srcAccessMask =
+            VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+            VK_ACCESS_SHADER_READ_BIT;
+        refitWarBarrier.dstAccessMask =
+            VK_ACCESS_TRANSFER_WRITE_BIT |
+            VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_TRANSFER_BIT |
+                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            0,
+            1,
+            &refitWarBarrier,
+            0,
+            nullptr,
+            0,
+            nullptr
+        );
+    }
 
     if(!pendingUploads.empty())
     {
@@ -4109,6 +4357,14 @@ bool rebuildWorldGeometry(
     }
 
 
+    if(!liveSectionsToBuild.empty())
+    {
+        recordSectionOmmBuildBatch(cmd, liveSectionsToBuild);
+    }
+
+    markGeomGpuTimestamp(cmd, geomTsSlot, 1u);
+
+
     VkMemoryBarrier asBuildBarrier{
         VK_STRUCTURE_TYPE_MEMORY_BARRIER
     };
@@ -4121,43 +4377,24 @@ bool rebuildWorldGeometry(
         VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
 
 
-    for(RTSectionAS* section : sectionsNeedingBuild)
+    for(const BlasBuildWave& wave : blasBuildWaves)
     {
-        if(section == nullptr)
-        {
-            continue;
-        }
-
-        {
-            const auto liveEntry = g_sectionBLAS.find(section->sectionKey);
-
-            if(liveEntry == g_sectionBLAS.end() ||
-               &liveEntry->second != section)
-            {
-                static uint64_t blasStaleSkips = 0u;
-
-                ++blasStaleSkips;
-
-                if(blasStaleSkips <= 5u || (blasStaleSkips % 100u) == 0u)
-                {
-                    std::stringstream staleLog;
-                    staleLog
-                        << "[SECTION BLAS GUARD] skip#" << blasStaleSkips
-                        << " key=" << section->sectionKey
-                        << " (entry erased while queued)";
-                    RTLog(staleLog.str());
-                }
-
-                continue;
-            }
-        }
-
-        recordSectionBLASBuild(
-            cmd,
-            *section,
-            blasScratchAddress
+        const size_t waveCount = wave.end - wave.begin;
+        std::span<RTSectionAS* const> waveSections(
+            liveSectionsToBuild.data() + wave.begin,
+            waveCount
+        );
+        std::span<const VkDeviceSize> waveOffsets(
+            waveScratchOffsets.data() + wave.begin,
+            waveCount
         );
 
+        recordSectionBLASBuildWave(
+            cmd,
+            waveSections,
+            waveOffsets,
+            blasScratchAddress
+        );
 
         vkCmdPipelineBarrier(
             cmd,
@@ -4172,14 +4409,20 @@ bool rebuildWorldGeometry(
             nullptr
         );
 
-        enqueueBlasCompactionQuery(
-            cmd,
-            *section
-        );
+        for(RTSectionAS* section : waveSections)
+        {
+            enqueueBlasCompactionQuery(
+                cmd,
+                *section
+            );
+        }
     }
 
     std::vector<BlasCompactedAddressRemap> blasCompactedRemaps;
-    if(recordPendingBlasCompactions(cmd, blasCompactedRemaps) &&
+    if(recordPendingBlasCompactions(
+           cmd,
+           blasCompactedRemaps,
+           rebuiltSectionCount > 1u) &&
        !blasCompactedRemaps.empty())
     {
         for(VkAccelerationStructureInstanceKHR& inst : instances)
@@ -4220,6 +4463,8 @@ bool rebuildWorldGeometry(
         tlasUpdateRejectReason = "blas compacted";
     }
 
+
+    markGeomGpuTimestamp(cmd, geomTsSlot, 2u);
 
     tlasBuildInfo.dstAccelerationStructure =
         g_tlas;
@@ -4293,6 +4538,8 @@ bool rebuildWorldGeometry(
     }
 
     RTXMarkPhase("tlas:built");
+
+    markGeomGpuTimestamp(cmd, geomTsSlot, 3u);
 
 
     check(
@@ -4462,6 +4709,8 @@ bool rebuildWorldGeometry(
         "submit Section BLAS/TLAS build failed"
     );
 
+    commitGeomGpuTimestamp(geomTsSlot, g_perfL10FrameSerial);
+
     rtxTailAfterSubmit = std::chrono::steady_clock::now();
 
     if(!tlasInstancesUnchanged)
@@ -4557,7 +4806,7 @@ bool rebuildWorldGeometry(
         blasScratchMemory;
 
     g_deferredSectionBuild.blasScratchSize =
-        maxBLASScratchSize;
+        requiredBlasScratchSize;
 
     g_deferredSectionBuild.vertexStagingBuffer =
         vertexStagingBuffer;

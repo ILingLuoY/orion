@@ -17,6 +17,8 @@ layout(binding = 7) uniform CameraProperties
 } cam;
 layout(binding = 8, rg16f) readonly uniform image2D primaryMotionImage;
 layout(binding = 9, rg16f) writeonly uniform image2D specularMotionImage;
+layout(binding = 10) uniform sampler3D fogIntegrated;
+layout(binding = 11, rgba16f) readonly uniform image3D fogDensityMeta;
 
 layout(push_constant) uniform RRGuideRelaxPush
 {
@@ -25,12 +27,18 @@ layout(push_constant) uniform RRGuideRelaxPush
     float minRoughness;
     float normalFalloff;
     float farCloudDistance;
-    float padding1;
-    float padding2;
+    float fogMaxDistance;
+    float fogLayers;
 } pc;
+
+#include "fog_froxel_common.glsl"
 
 #ifndef RR_GUIDE_PURIFY_V1
 #define RR_GUIDE_PURIFY_V1 1
+#endif
+
+#ifndef RR_FOG_GUIDE_MODULATE
+#define RR_FOG_GUIDE_MODULATE 1
 #endif
 
 const float NEIGHBOR_EPS = 0.00002;
@@ -145,6 +153,7 @@ void main()
     float specHitDist = imageLoad(specularHitDistanceImage, pixel).r;
     bool needRayReconstruct =
         (pc.farCloudDistance > 0.0) ||
+        (pc.fogMaxDistance > 0.0) ||
         (centerDepth > 1.0e-6 && specHitDist > 0.05 && specHitDist < 50000.0 && roughness < 0.35);
 
     vec3 worldDirection = vec3(0.0, 0.0, -1.0);
@@ -181,7 +190,15 @@ void main()
             }
         }
     }
-    imageStore(specularMotionImage, pixel, vec4(specMV, 0.0, 0.0));
+    bool isCloudOverride = false;
+    float effectiveDepth = centerDepth;
+    float effectiveDist = sceneDist;
+    vec4 outNormalRough = vec4(center.xyz, (pc.relaxScale > 0.0) ? relaxed : roughness);
+    bool writeNormalRough = (pc.relaxScale > 0.0 && centerDepth > 1.0e-6);
+    vec4 outDiffAlbedo = vec4(0.0);
+    vec4 outSpecAlbedo = vec4(0.0);
+    bool writeAlbedo = false;
+    vec2 outSpecMV = specMV;
 
     if(pc.farCloudDistance > 0.0)
     {
@@ -201,35 +218,142 @@ void main()
             if(centerDepth <= 1.0e-6 || sceneDist >= cloudDistance)
 #endif
             {
+                isCloudOverride = true;
+                effectiveDepth = cloudDepth;
+                effectiveDist = cloudDistance;
                 float deltaFlag = imageLoad(diffuseAlbedoImage, pixel).a;
-
-                imageStore(diffuseAlbedoImage, pixel,
-                    vec4(max(cloudLayer.rgb, vec3(0.0)), deltaFlag));
-                imageStore(specularAlbedoImage, pixel, vec4(0.0, 0.0, 0.0, 1.0));
-                imageStore(normalRoughnessImage, pixel,
-                    vec4(-worldDirection, 1.0));
+                outDiffAlbedo = vec4(max(cloudLayer.rgb, vec3(0.0)), deltaFlag);
+                outSpecAlbedo = vec4(0.0, 0.0, 0.0, 1.0);
+                outNormalRough = vec4(-worldDirection, 1.0);
+                writeAlbedo = true;
+                writeNormalRough = true;
+                outSpecMV = primaryMV;
                 imageStore(specularHitDistanceImage, pixel,
                     vec4(cloudDistance, 0.0, 0.0, 0.0));
                 imageStore(depthImage, pixel, vec4(cloudDepth, 0.0, 0.0, 0.0));
-                imageStore(specularMotionImage, pixel, vec4(primaryMV, 0.0, 0.0));
-                return;
             }
         }
     }
 
-#if RR_GUIDE_PURIFY_V1
-    if(centerDepth <= 1.0e-6)
+#if RR_FOG_GUIDE_MODULATE
+    if(pc.fogMaxDistance > 0.0 &&
+       cam.cloudParams7.x >= 0.5 &&
+       cam.waterSimState.w == 0u &&
+       effectiveDepth > 1.0e-6)
     {
-        return;
+        const float maxDistance = max(pc.fogMaxDistance, 16.0);
+        const int layers = max(int(pc.fogLayers + 0.5), 2);
+        const float startDistance = clamp(cam.cloudParams9.x, 0.0, maxDistance);
+        const vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+        const float evalDistRaw = isCloudOverride
+            ? effectiveDist
+            : fogSceneDistanceForDepth(uv, effectiveDepth, cam.projInverse);
+        const float evalDistance = min(evalDistRaw, maxDistance);
+
+        if(evalDistance > startDistance + 1.0e-3)
+        {
+            const float lookupDistance = max(startDistance, evalDistance - 0.18);
+            const float wMin = 0.5 / float(layers);
+            const float wMax = (float(layers) - 0.5) / float(layers);
+            const float w = clamp(
+                fogDistanceToIntegratedW(lookupDistance, maxDistance, layers),
+                wMin,
+                wMax);
+
+            const ivec3 fogSize = textureSize(fogIntegrated, 0);
+            const int metaZ = clamp(layers - 1, 0, max(fogSize.z - 1, 0));
+            const vec2 fCoord = uv * vec2(fogSize.xy) - 0.5;
+            const ivec2 baseXy = ivec2(floor(fCoord));
+            const vec2 fracXy = clamp(fCoord - vec2(baseXy), 0.0, 1.0);
+            const vec2 invFogXy = 1.0 / vec2(max(fogSize.xy, ivec2(1)));
+
+            vec4 fogSum = vec4(0.0);
+            float wSum = 0.0;
+            float bestFallbackScore = -1.0e20;
+            vec4 bestFog = vec4(0.0, 0.0, 0.0, 1.0);
+
+            for(int oy = 0; oy <= 1; ++oy)
+            {
+                for(int ox = 0; ox <= 1; ++ox)
+                {
+                    const ivec2 cxy = clamp(
+                        baseXy + ivec2(ox, oy),
+                        ivec2(0),
+                        max(fogSize.xy - ivec2(1), ivec2(0)));
+                    const float bW =
+                        (ox == 0 ? 1.0 - fracXy.x : fracXy.x) *
+                        (oy == 0 ? 1.0 - fracXy.y : fracXy.y);
+                    const vec4 meta = imageLoad(fogDensityMeta, ivec3(cxy, metaZ));
+                    const float tileMinDist = (meta.a > 0.5) ? meta.r : 0.0;
+                    const float tileMaxDist = (meta.a > 0.5) ? meta.g : maxDistance;
+                    const float depthValid = fogScreenTapDepthWeight(
+                        lookupDistance, true, tileMinDist, tileMaxDist);
+                    const float farValid = smoothstep(
+                        lookupDistance * 0.72,
+                        lookupDistance * 0.96,
+                        tileMaxDist);
+                    const float fallbackScore =
+                        farValid * 1000.0 - abs(tileMinDist - lookupDistance) + bW * 0.1;
+                    const vec2 tapUv = (vec2(cxy) + 0.5) * invFogXy;
+                    const vec4 tapFog = textureLod(fogIntegrated, vec3(tapUv, w), 0.0);
+                    fogSum += tapFog * (bW * depthValid);
+                    wSum += bW * depthValid;
+                    if(fallbackScore > bestFallbackScore)
+                    {
+                        bestFallbackScore = fallbackScore;
+                        bestFog = tapFog;
+                    }
+                }
+            }
+            const vec4 fog = (wSum > 1.0e-4) ? (fogSum / wSum) : bestFog;
+
+            if(all(equal(fog, fog)))
+            {
+                const float fogT = clamp(fog.a, 0.0, 1.0);
+                const float fogOpacity = 1.0 - fogT;
+                if(fogOpacity > 1.0e-3)
+                {
+                    if(!writeAlbedo)
+                    {
+                        outDiffAlbedo = imageLoad(diffuseAlbedoImage, pixel);
+                        outSpecAlbedo = imageLoad(specularAlbedoImage, pixel);
+                    }
+                    const vec3 fogAlbedo = fogEffectiveGuideAlbedo(cam.fogOpticsParams);
+                    outDiffAlbedo.rgb = mix(fogAlbedo, max(outDiffAlbedo.rgb, vec3(0.0)), fogT);
+                    outSpecAlbedo.rgb = max(outSpecAlbedo.rgb, vec3(0.0)) * fogT;
+
+                    const float baseNLen2 = dot(outNormalRough.xyz, outNormalRough.xyz);
+                    const vec3 baseN = baseNLen2 > 1.0e-8
+                        ? outNormalRough.xyz * inversesqrt(baseNLen2)
+                        : -worldDirection;
+                    const float fogNormalW = smoothstep(0.18, 0.88, fogOpacity);
+                    const vec3 blendedN = mix(baseN, -worldDirection, fogNormalW);
+                    const float bnLen2 = dot(blendedN, blendedN);
+                    outNormalRough.xyz = (bnLen2 > 1.0e-8)
+                        ? blendedN * inversesqrt(bnLen2)
+                        : -worldDirection;
+                    outNormalRough.w = clamp(
+                        mix(outNormalRough.w, 1.0, fogOpacity),
+                        outNormalRough.w,
+                        1.0);
+
+                    outSpecMV = mix(primaryMV, outSpecMV, fogT);
+                    writeAlbedo = true;
+                    writeNormalRough = true;
+                }
+            }
+        }
     }
 #endif
 
-    if(pc.relaxScale > 0.0)
+    imageStore(specularMotionImage, pixel, vec4(outSpecMV, 0.0, 0.0));
+    if(writeAlbedo)
     {
-        imageStore(
-            normalRoughnessImage,
-            pixel,
-            vec4(center.xyz, relaxed)
-        );
+        imageStore(diffuseAlbedoImage, pixel, outDiffAlbedo);
+        imageStore(specularAlbedoImage, pixel, outSpecAlbedo);
+    }
+    if(writeNormalRough)
+    {
+        imageStore(normalRoughnessImage, pixel, outNormalRough);
     }
 }

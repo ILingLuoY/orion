@@ -152,7 +152,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 currentDirection,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 pathStep
             );
         }
@@ -163,7 +163,7 @@ const float WATER_EXTINCTION_DISTANCE =
             rtCntRayIssued();
             #endif
             traceRayEXT(
-                topLevelAS, secondaryTraverseFlags(), 0xefu, 0, 0, 0,
+                topLevelAS, secondaryTraverseFlags(), 0xcfu, 0, 0, 0,
                 currentOrigin, 0.001, currentDirection, 10000.0, 0
             );
         }
@@ -576,7 +576,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
                 currentDirection,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 step
             );
         }
@@ -589,7 +589,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 0,
                 0,
                 0,
@@ -632,7 +632,7 @@ if(payload.hitDistance < 0.0)
                 waterEntryDirection,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 step
             );
         }
@@ -645,7 +645,7 @@ if(payload.hitDistance < 0.0)
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 0,
                 0,
                 0,
@@ -1232,11 +1232,16 @@ if(hitMaterialId >= 2.5)
         }
 #endif
 
-        // Pure open-water transmission (!reflectionLobe && !crossedTranslucent):
-        // stop at step 0 on secondary water-water hits (grazing waves / far surface),
-        // reserving multi-step continuation for paths that actually cross underwater ice/glass.
+        // Close downward internal water quad while already inside water
+        // (e.g., stepped / flowing water quads below the surface): step
+        // straight through instead of breaking to a dark exhaust fallback.
         if(!reflectionLobe && !crossedTranslucent)
         {
+            if(insideWater && payload.hitDistance < 2.5 && currentDirection.y < -0.05)
+            {
+                currentOrigin = hitPos + currentDirection * 0.005;
+                continue;
+            }
             break;
         }
 
@@ -1318,7 +1323,7 @@ if(hitMaterialId >= 2.5)
                             receiverSunVisQuery,
                             topLevelAS,
                             gl_RayFlagsTerminateOnFirstHitEXT,
-                            0xefu,
+                            0xcfu,
                             hitPos + sunDirection * 0.001,
                             0.02,
                             sunDirection,
@@ -1362,7 +1367,7 @@ if(hitMaterialId >= 2.5)
                             10000.0,
                             gl_RayFlagsTerminateOnFirstHitEXT |
                                 gl_RayFlagsSkipClosestHitShaderEXT,
-                            0xefu,
+                            0xcfu,
                             0u
                         );
                     }
@@ -1376,7 +1381,7 @@ if(hitMaterialId >= 2.5)
                             topLevelAS,
                             gl_RayFlagsTerminateOnFirstHitEXT |
                                 gl_RayFlagsSkipClosestHitShaderEXT,
-                            0xefu,
+                            0xcfu,
                             0,
                             0,
                             0,
@@ -1547,7 +1552,7 @@ if(hitMaterialId >= 2.5)
             exhaustSkyQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xefu,
+            0xcfu,
             currentOrigin + probeDir * 0.05,
             0.02,
             probeDir,

@@ -494,6 +494,9 @@ VkImageView g_rrGuideRelaxCachedSpecularAlbedo = VK_NULL_HANDLE;
 VkImageView g_rrGuideRelaxCachedSpecularHitDistance = VK_NULL_HANDLE;
 VkImageView g_rrGuideRelaxCachedCloudResolved = VK_NULL_HANDLE;
 VkImageView g_rrGuideRelaxCachedCloudDepth = VK_NULL_HANDLE;
+VkImageView g_rrGuideRelaxCachedFogIntegrated = VK_NULL_HANDLE;
+VkImageView g_rrGuideRelaxCachedFogDensity = VK_NULL_HANDLE;
+uint64_t g_fogFroxelFrameSerial = ~0ull;
 VkImageView g_rrGuideRelaxCachedPrimaryMotion = VK_NULL_HANDLE;
 VkImageView g_rrGuideRelaxCachedSpecularMotion = VK_NULL_HANDLE;
 VkBuffer g_rrGuideRelaxCachedCamera = VK_NULL_HANDLE;
@@ -784,7 +787,9 @@ std::atomic<float> g_aeCompensationEV{0.0f};
 // Rollback: set kAE_EXTENDED_MIN_EV = false.
 static constexpr bool kAE_EXTENDED_MIN_EV = true;
 float g_aeMinEV = kAE_EXTENDED_MIN_EV ? -5.5f : -4.0f;
-float g_aeMaxEV = 2.2f;
+// 2026-11-26: maxEV 2.2 -> 1.0。实机日志（rt_debug.log 2026-11-26 21:10）夜间 avgLogLuma
+// 跌到 -5.8 时 EV 顶死 2.2（增益 2^1.1≈2.14），夜间亮源全部打白。回退：改回 2.2f。
+float g_aeMaxEV = 1.0f;
 float g_aeAdaptUpRate = 1.1f;
 float g_aeAdaptDownRate = 2.0f;
 float g_aeTrimLow = aeEnvFloat("ORION_AE_TRIM_LOW", 0.15f);
@@ -1777,6 +1782,7 @@ float g_dynamicCaptureCameraZ = 0.0f;
 bool g_entityFrameOpen = false;
 bool g_particleFrameOpen = false;
 std::atomic<bool> g_entityRebuildRequested{false};
+std::atomic<bool> g_handRebuildRequested{false};
 // 2026-11-12 实例化第 2 步：mesh key → N 组 3×4 行主序实例矩阵（见 OrionInternal.h）
 std::unordered_map<uint64_t, std::vector<float>> g_entityMeshInstances;
 uint64_t g_lastDynamicRTASUpdateFrame = UINT64_MAX;
@@ -2156,6 +2162,8 @@ VkPipeline g_k1GlassCompactPipeline = VK_NULL_HANDLE;
 bool g_k1GlassCompactPipelineFailed = false;
 VkPipeline g_sharcCompactPipeline = VK_NULL_HANDLE;
 bool g_sharcCompactPipelineFailed = false;
+VkPipeline g_k2MegaCompactPipeline = VK_NULL_HANDLE;
+bool g_k2MegaCompactPipelineFailed = false;
 // ④ K2-D 再拆分（默认开，ORION_K2_SPLIT2=0 回退到 ③ 的 K2-D/K2-I 两腿）：
 // K2-SUN（水+太阳直射/GGX/SSS/RTAO）+ K2-LOC（局部光/水面反射太阳/GGX 镜面）
 VkPipeline g_k1GlassPipeline = VK_NULL_HANDLE;

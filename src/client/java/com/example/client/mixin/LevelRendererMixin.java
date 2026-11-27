@@ -49,8 +49,13 @@ public class LevelRendererMixin {
 
     private static long rtx$nmtReportCount;
 
+    private static final boolean RTX$NMT_DIAG_ENABLED =
+            "1".equals(System.getProperty("orion.nmtDiag"))
+                    || Boolean.parseBoolean(System.getProperty("orion.nmtDiag"))
+                    || "1".equals(System.getenv("ORION_NMT_DIAG"));
+
     private static void rtx$logJavaMemory() {
-        if ((rtx$memReportFrame++ % 600L) != 0L) {
+        if ((rtx$memReportFrame++ % 3600L) != 0L) {
             return;
         }
 
@@ -64,7 +69,7 @@ public class LevelRendererMixin {
                 + " | " + rtx$directMemoryStats()
                 + " | dh=" + DhLodMeshSink.stats());
 
-        if ((rtx$nmtReportCount++ % 1L) == 0L) {
+        if (RTX$NMT_DIAG_ENABLED && (rtx$nmtReportCount++ % 1L) == 0L) {
             for (final String line : rtx$nativeMemorySummary().split("\\R")) {
                 if (!line.isBlank()) {
                     System.out.println("[RT MEM NMT]" + line);
@@ -252,11 +257,16 @@ public class LevelRendererMixin {
         }
         CameraRenderState cameraState = levelRenderState.cameraRenderState;
         var cameraPos = cameraState.pos;
-        this.entityRenderDispatcher.submit(
-                state, cameraState,
-                state.x - cameraPos.x(), state.y - cameraPos.y(), state.z - cameraPos.z(),
-                poseStack, output
-        );
+        EntityRtCapture.beginSyntheticLocalPlayerSubmit();
+        try {
+            this.entityRenderDispatcher.submit(
+                    state, cameraState,
+                    state.x - cameraPos.x(), state.y - cameraPos.y(), state.z - cameraPos.z(),
+                    poseStack, output
+            );
+        } finally {
+            EntityRtCapture.endSyntheticLocalPlayerSubmit();
+        }
     }
 
     @Inject(method = "render", at = @At("RETURN"))
@@ -269,6 +279,9 @@ public class LevelRendererMixin {
             boolean shouldRenderSky,
             boolean renderDebug,
             CallbackInfo ci) {
+
+        EntityRtCapture.endSyntheticLocalPlayerSubmit();
+        EntityRtCapture.disarmLocalPlayerProxyFallback();
 
         // 2026-11-09：level render 墙钟终点（第一句，保证覆盖整段）。
         com.example.client.FrameBudget.endLevelRender();

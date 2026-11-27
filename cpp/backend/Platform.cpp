@@ -6,8 +6,10 @@
 #include "TrackingHooks.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <ctime>
 #include <chrono>
+#include <deque>
 #include <thread>
 
 #include <windows.h>
@@ -242,24 +244,102 @@ void LoadMfgUnlockModuleIfPresent()
 
 // Writes one timestamped line.  Flushing is opt-in: the buffered path exists so
 // filesystem latency never lands on the render thread.
+namespace
+{
+    struct AsyncRtLogState
+    {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::condition_variable flushCv;
+        std::deque<std::string> queue;
+        uint64_t enqueuedSeq = 0u;
+        uint64_t flushTargetSeq = 0u;
+        uint64_t flushedSeq = 0u;
+        bool started = false;
+    };
+
+    AsyncRtLogState* getAsyncRtLogState()
+    {
+        static AsyncRtLogState* s_asyncLog = new AsyncRtLogState();
+        return s_asyncLog;
+    }
+
+    void asyncRtLogWorkerMain(AsyncRtLogState* state)
+    {
+        std::deque<std::string> localBatch;
+        for(;;)
+        {
+            uint64_t batchEndSeq = 0u;
+            bool needFlush = false;
+            {
+                std::unique_lock<std::mutex> lock(state->mtx);
+                state->cv.wait(
+                    lock,
+                    [state]()
+                    {
+                        return !state->queue.empty() ||
+                               state->flushTargetSeq > state->flushedSeq;
+                    }
+                );
+                localBatch.swap(state->queue);
+                batchEndSeq = state->enqueuedSeq;
+                needFlush = state->flushTargetSeq > state->flushedSeq;
+            }
+
+            if(!localBatch.empty() || needFlush)
+            {
+                std::lock_guard<std::mutex> fileLock(g_rtLogMutex);
+                for(const std::string& line : localBatch)
+                {
+                    rtLogFile << line;
+                }
+                if(needFlush)
+                {
+                    rtLogFile.flush();
+                }
+                localBatch.clear();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(state->mtx);
+                if(batchEndSeq > state->flushedSeq)
+                {
+                    state->flushedSeq = batchEndSeq;
+                }
+                if(needFlush)
+                {
+                    state->flushCv.notify_all();
+                }
+            }
+        }
+    }
+}
+
 void RTLogWrite(
     const std::string& msg,
     bool flush
 )
 {
-    auto now =
-        std::chrono::system_clock::now();
+    const auto now = std::chrono::system_clock::now();
+    const auto t = std::chrono::system_clock::to_time_t(now);
 
+    AsyncRtLogState* state = getAsyncRtLogState();
+    uint64_t targetSeq = 0u;
 
-    auto t =
-        std::chrono::system_clock::to_time_t(now);
-
-
-    std::lock_guard<std::mutex> lock(g_rtLogMutex);
-
-    if constexpr(CPUPERF_QUIET_HOT_LOGS)
     {
-        // 2026-11-23 CPU批④：同一秒内复用已格式化的时间戳（仍在锁内，localtime 安全）。
+        std::lock_guard<std::mutex> lock(state->mtx);
+
+        if(!state->started)
+        {
+            state->started = true;
+            std::thread(asyncRtLogWorkerMain, state).detach();
+        }
+
+        if(!flush && state->queue.size() >= 8192u)
+        {
+            return;
+        }
+
         static std::time_t s_lastStampSecond = static_cast<std::time_t>(-1);
         static char s_stamp[16] = "00:00:00";
 
@@ -276,29 +356,35 @@ void RTLogWrite(
             s_lastStampSecond = t;
         }
 
-        rtLogFile
-            << "[CPP] "
-            << s_stamp
-            << " "
-            << msg
-            << "\n";
+        std::string line;
+        line.reserve(16u + msg.size());
+        line.append("[CPP] ");
+        line.append(s_stamp);
+        line.push_back(' ');
+        line.append(msg);
+        line.push_back('\n');
+
+        state->queue.push_back(std::move(line));
+        targetSeq = ++state->enqueuedSeq;
+        if(flush && targetSeq > state->flushTargetSeq)
+        {
+            state->flushTargetSeq = targetSeq;
+        }
     }
-    else
-    {
-    rtLogFile
-        << "[CPP] "
-        << std::put_time(
-            std::localtime(&t),
-            "%H:%M:%S"
-        )
-        << " "
-        << msg
-        << "\n";
-    }
+
+    state->cv.notify_one();
 
     if(flush)
     {
-        rtLogFile.flush();
+        std::unique_lock<std::mutex> lock(state->mtx);
+        state->flushCv.wait_for(
+            lock,
+            std::chrono::milliseconds(200),
+            [state, targetSeq]()
+            {
+                return state->flushedSeq >= targetSeq;
+            }
+        );
     }
 }
 

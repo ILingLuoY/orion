@@ -475,11 +475,23 @@ public class SectionCompilerMixin {
                             );
                         }
                         scFusedNanos += System.nanoTime() - scTFused;
+                        if (layerId == 1) {
+                            final long scTTag = System.nanoTime();
+                            matchedTranslucentQuads += tagTranslucentQuads(
+                                    sectionPos,
+                                    region,
+                                    vertexBuffer,
+                                    vertexCount,
+                                    stride,
+                                    true
+                            );
+                            scTagNanos += System.nanoTime() - scTTag;
+                        }
                     }
 
                     ByteBuffer scCulledBuffer = null;
 
-                    if (translucentLayer) {
+                    if (translucentLayer || layerId == 1) {
                         final ByteBuffer[] scCullOut = new ByteBuffer[1];
                         final int scCulledVerts = cullInteriorGlassFaces(
                                 sectionPos,
@@ -564,9 +576,13 @@ public class SectionCompilerMixin {
 
                     if (layerId == 1) {
                         final long scTOmm = System.nanoTime();
+                        final ByteBuffer ommVertexBuffer =
+                                scCulledBuffer != null
+                                        ? scCulledBuffer
+                                        : vertexBuffer;
                         final OmmCutoutClassifier.Result omm =
                                 OmmCutoutClassifier.buildForMinecraftQuads(
-                                        vertexBuffer,
+                                        ommVertexBuffer,
                                         vertexCount,
                                         stride
                                 );
@@ -1004,6 +1020,24 @@ public class SectionCompilerMixin {
             int vertexCount,
             int stride
     ) {
+        return tagTranslucentQuads(
+                sectionPos,
+                region,
+                vertexBuffer,
+                vertexCount,
+                stride,
+                false
+        );
+    }
+
+    private static int tagTranslucentQuads(
+            SectionPos sectionPos,
+            net.minecraft.client.renderer.chunk.RenderSectionRegion region,
+            ByteBuffer vertexBuffer,
+            int vertexCount,
+            int stride,
+            boolean glassOnly
+    ) {
         if (
                 region == null ||
                         vertexBuffer == null ||
@@ -1065,7 +1099,11 @@ public class SectionCompilerMixin {
             final int preMarker =
                     vertices.get((quad * 4) * stride + 27) & 0xFF;
 
-            if (preMarker != 0 && !isGlassFamilyMarker(preMarker)) {
+            if (glassOnly) {
+                if (!isGlassFamilyMarker(preMarker)) {
+                    continue;
+                }
+            } else if (preMarker != 0 && !isGlassFamilyMarker(preMarker)) {
                 continue;
             }
 
@@ -1761,6 +1799,14 @@ public class SectionCompilerMixin {
                 || stride != 28 || vertexCount <= 0 || (vertexCount % 4) != 0) {
             return false;
         }
+        if (cutoutLayer) {
+            final int quadCount = vertexCount / 4;
+            for (int quad = 0; quad < quadCount; ++quad) {
+                if (isGlassFamilyMarker(vertexBuffer.get((quad * 4) * stride + 27) & 0xFF)) {
+                    return false;
+                }
+            }
+        }
         final com.mojang.blaze3d.platform.NativeImage albedoAtlas =
                 PBRAtlasStorage.globalVptAlbedoAtlas;
         final boolean doAlbedo = albedoAtlas != null;
@@ -1954,6 +2000,9 @@ public class SectionCompilerMixin {
         final BlockPos.MutableBlockPos owner = new BlockPos.MutableBlockPos();
 
         for (int quad = 0; quad < vertexCount / 4; ++quad) {
+            if (cutoutLayer && isGlassFamilyMarker(vertices.get((quad * 4) * stride + 27) & 0xFF)) {
+                continue;
+            }
             float centerX = 0.0f, centerY = 0.0f, centerZ = 0.0f;
             float centerU = 0.0f, centerV = 0.0f;
             float x0 = 0.0f, y0 = 0.0f, z0 = 0.0f;

@@ -22,8 +22,8 @@ layout(binding = 36, set = 0) uniform sampler2D entityAtlases[128];
 // "同一 Identifier 加 _n/_s" 查找），C++ 侧与 binding 36 同构：每槽一个 view。
 // 没有贴图的槽由 C++ 填中性 1×1 兜底（normal=(0,0,0,1)、specular=(0,0,0,1)），
 // 于是下面的内容判据自动判"无贴图"而不需要额外的标志位。
-layout(binding = 63, set = 0) uniform sampler2D entityNormalAtlases[64];
-layout(binding = 64, set = 0) uniform sampler2D entitySpecularAtlases[64];
+layout(binding = 63, set = 0) uniform sampler2D entityNormalAtlases[128];
+layout(binding = 64, set = 0) uniform sampler2D entitySpecularAtlases[128];
 layout(binding = 37, set = 0) uniform sampler2D particleAtlases[3];
 layout(binding = 40, set = 0) uniform sampler2D rainStreakAtlas;
 layout(binding = 45, set = 0) uniform sampler2D voxyLodAtlas;
@@ -163,6 +163,7 @@ layout(std430, binding = 21, set = 0) readonly buffer SectionVertexAddressBuffer
 #define LOD_ROLE_TERRAIN  0u
 #define LOD_ROLE_VOXY_LOD 1u
 #define LOD_ROLE_DH_FAR   2u
+#define LOD_ROLE_HAND     3u
 #define LOD_COVERAGE_SLOT_LIMIT (1u << 16)
 layout(std430, binding = 19, set = 0) readonly buffer K2LodRoles {
     uint roles[];

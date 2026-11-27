@@ -34,13 +34,23 @@ public class VulkanCameraMixin {
     @Shadow
     private Camera mainCamera;
 
+    @Shadow
+    private void bobHurt(CameraRenderState cameraState, com.mojang.blaze3d.vertex.PoseStack poseStack) {}
+
+    @Shadow
+    private void bobView(CameraRenderState cameraState, com.mojang.blaze3d.vertex.PoseStack poseStack) {}
+
     private final float[] viewInvArray = new float[16];
     private final float[] projInvArray = new float[16];
+    private final float[] viewRotArray = new float[16];
 
     private final Matrix4f tempViewInv = new Matrix4f();
     private final Matrix4f tempProjInv = new Matrix4f();
     private final Matrix4f tempView = new Matrix4f();
     private final Matrix4f rotInv = new Matrix4f();
+    private final com.mojang.blaze3d.vertex.PoseStack bobPoseStack = new com.mojang.blaze3d.vertex.PoseStack();
+    private final Matrix4f bobMatrix = new Matrix4f();
+    private final Matrix4f bobInv = new Matrix4f();
     private final float[] handRotationArray = new float[16];
 
     private int frameCount = 0;
@@ -610,20 +620,40 @@ public class VulkanCameraMixin {
 
         rotInv.set(viewRotationMatrix).invert();
 
+        if (replayPose == null && this.gameRenderState.optionsRenderState != null) {
+            bobPoseStack.last().pose().identity();
+            bobPoseStack.last().normal().identity();
+            this.bobHurt(cameraState, bobPoseStack);
+            if (this.gameRenderState.optionsRenderState.bobView) {
+                this.bobView(cameraState, bobPoseStack);
+            }
+            bobMatrix.set(bobPoseStack.last().pose());
+            bobInv.set(bobMatrix).invert();
+        } else {
+            bobInv.identity();
+        }
+
         tempViewInv
                 .translation(
                         (float) pos.x,
                         (float) pos.y,
                         (float) pos.z
                 )
-                .mul(rotInv);
+                .mul(rotInv)
+                .mul(bobInv);
 
         tempViewInv.get(viewInvArray);
 
+        viewRotationMatrix.get(viewRotArray);
         rotInv.get(handRotationArray);
         EntityRtCapture.setHandRotation(handRotationArray);
 
-        EntityRtCapture.setCameraOrigin((float) pos.x, (float) pos.y, (float) pos.z);
+        EntityRtCapture.setHandCameraState(
+                viewRotArray,
+                viewInvArray,
+                effectiveFovDegrees,
+                cameraState.hudFov
+        );
 
         tempProjInv
                 .set(projectionMatrix)

@@ -4,6 +4,7 @@
 #define LOD_ROLE_TERRAIN  0u
 #define LOD_ROLE_VOXY_LOD 1u
 #define LOD_ROLE_DH_FAR   2u
+#define LOD_ROLE_HAND     3u
 
 #define LOD_COVERAGE_SLOT_LIMIT (1u << 16)
 

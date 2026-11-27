@@ -549,8 +549,277 @@ void finishPerfL10CpuFrame()
 }
 
 
+namespace
+{
+    constexpr uint32_t kGeomGpuRingSize = 16u;
+    constexpr uint32_t kGeomGpuPoints = 4u;
+
+    struct GeomGpuTimestampSlot
+    {
+        bool inFlight = false;
+        uint64_t frameSerial = 0u;
+    };
+
+    struct GeomGpuWindow
+    {
+        uint64_t samples = 0u;
+        double sumTotalMs = 0.0;
+        double maxTotalMs = 0.0;
+        double sumOmmMs = 0.0;
+        double maxOmmMs = 0.0;
+        double sumBlasMs = 0.0;
+        double maxBlasMs = 0.0;
+        double sumTlasMs = 0.0;
+        double maxTlasMs = 0.0;
+    };
+
+    VkQueryPool s_geomGpuTimestampPool = VK_NULL_HANDLE;
+    GeomGpuTimestampSlot s_geomGpuSlots[kGeomGpuRingSize]{};
+    uint32_t s_geomGpuNextSlot = 0u;
+    GeomGpuWindow s_geomGpuWindow{};
+
+    void pollReadyGeomGpuSlots()
+    {
+        if(s_geomGpuTimestampPool == VK_NULL_HANDLE ||
+           g_device == VK_NULL_HANDLE ||
+           g_perfL10TimestampPeriodNs <= 0.0)
+        {
+            return;
+        }
+
+        const double ticksToMs = g_perfL10TimestampPeriodNs / 1000000.0;
+
+        for(uint32_t s = 0u; s < kGeomGpuRingSize; ++s)
+        {
+            GeomGpuTimestampSlot& slot = s_geomGpuSlots[s];
+            if(!slot.inFlight ||
+               g_perfL10FrameSerial < slot.frameSerial + 2u)
+            {
+                continue;
+            }
+
+            uint64_t results[kGeomGpuPoints * 2u]{};
+            const VkResult res = vkGetQueryPoolResults(
+                g_device,
+                s_geomGpuTimestampPool,
+                s * kGeomGpuPoints,
+                kGeomGpuPoints,
+                sizeof(results),
+                results,
+                sizeof(uint64_t) * 2u,
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT
+            );
+
+            if(res != VK_SUCCESS)
+            {
+                continue;
+            }
+
+            bool allReady = true;
+            for(uint32_t p = 0u; p < kGeomGpuPoints; ++p)
+            {
+                if(results[p * 2u + 1u] == 0u)
+                {
+                    allReady = false;
+                    break;
+                }
+            }
+
+            if(!allReady)
+            {
+                continue;
+            }
+
+            const uint64_t t0 = results[0];
+            const uint64_t t1 = results[2];
+            const uint64_t t2 = results[4];
+            const uint64_t t3 = results[6];
+
+            const double totalMs = (t3 >= t0) ? static_cast<double>(t3 - t0) * ticksToMs : 0.0;
+            const double ommMs   = (t1 >= t0) ? static_cast<double>(t1 - t0) * ticksToMs : 0.0;
+            const double blasMs  = (t2 >= t1) ? static_cast<double>(t2 - t1) * ticksToMs : 0.0;
+            const double tlasMs  = (t3 >= t2) ? static_cast<double>(t3 - t2) * ticksToMs : 0.0;
+
+            s_geomGpuWindow.samples += 1u;
+            s_geomGpuWindow.sumTotalMs += totalMs;
+            s_geomGpuWindow.maxTotalMs = std::max(s_geomGpuWindow.maxTotalMs, totalMs);
+            s_geomGpuWindow.sumOmmMs += ommMs;
+            s_geomGpuWindow.maxOmmMs = std::max(s_geomGpuWindow.maxOmmMs, ommMs);
+            s_geomGpuWindow.sumBlasMs += blasMs;
+            s_geomGpuWindow.maxBlasMs = std::max(s_geomGpuWindow.maxBlasMs, blasMs);
+            s_geomGpuWindow.sumTlasMs += tlasMs;
+            s_geomGpuWindow.maxTlasMs = std::max(s_geomGpuWindow.maxTlasMs, tlasMs);
+
+            slot.inFlight = false;
+        }
+    }
+}
+
+void initGeomGpuTimestampResources()
+{
+    if(s_geomGpuTimestampPool != VK_NULL_HANDLE ||
+       g_device == VK_NULL_HANDLE ||
+       g_physicalDevice == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    if(g_perfL10TimestampPeriodNs <= 0.0)
+    {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(g_physicalDevice, &properties);
+        g_perfL10TimestampPeriodNs =
+            static_cast<double>(properties.limits.timestampPeriod);
+    }
+
+    if(g_perfL10TimestampPeriodNs <= 0.0)
+    {
+        return;
+    }
+
+    VkQueryPoolCreateInfo createInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    createInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    createInfo.queryCount = kGeomGpuRingSize * kGeomGpuPoints;
+
+    if(vkCreateQueryPool(g_device, &createInfo, nullptr, &s_geomGpuTimestampPool) != VK_SUCCESS)
+    {
+        s_geomGpuTimestampPool = VK_NULL_HANDLE;
+        return;
+    }
+
+    s_geomGpuNextSlot = 0u;
+    for(GeomGpuTimestampSlot& slot : s_geomGpuSlots)
+    {
+        slot = {};
+    }
+    s_geomGpuWindow = {};
+}
+
+void destroyGeomGpuTimestampResources()
+{
+    if(s_geomGpuTimestampPool != VK_NULL_HANDLE && g_device != VK_NULL_HANDLE)
+    {
+        vkDestroyQueryPool(g_device, s_geomGpuTimestampPool, nullptr);
+    }
+    s_geomGpuTimestampPool = VK_NULL_HANDLE;
+    s_geomGpuNextSlot = 0u;
+    for(GeomGpuTimestampSlot& slot : s_geomGpuSlots)
+    {
+        slot = {};
+    }
+    s_geomGpuWindow = {};
+}
+
+void resetGeomGpuTimestampWindow()
+{
+    s_geomGpuWindow = {};
+}
+
+uint32_t beginGeomGpuTimestamp(VkCommandBuffer cmd)
+{
+    if(cmd == VK_NULL_HANDLE)
+    {
+        return UINT32_MAX;
+    }
+
+    initGeomGpuTimestampResources();
+    if(s_geomGpuTimestampPool == VK_NULL_HANDLE)
+    {
+        return UINT32_MAX;
+    }
+
+    pollReadyGeomGpuSlots();
+
+    const uint32_t slotIndex = s_geomGpuNextSlot;
+    s_geomGpuNextSlot = (s_geomGpuNextSlot + 1u) % kGeomGpuRingSize;
+
+    if(s_geomGpuSlots[slotIndex].inFlight)
+    {
+        return UINT32_MAX;
+    }
+
+    const uint32_t baseQuery = slotIndex * kGeomGpuPoints;
+    vkCmdResetQueryPool(cmd, s_geomGpuTimestampPool, baseQuery, kGeomGpuPoints);
+    vkCmdWriteTimestamp(
+        cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        s_geomGpuTimestampPool,
+        baseQuery + 0u
+    );
+    return slotIndex;
+}
+
+void markGeomGpuTimestamp(VkCommandBuffer cmd, uint32_t slot, uint32_t pointIndex)
+{
+    if(cmd == VK_NULL_HANDLE ||
+       s_geomGpuTimestampPool == VK_NULL_HANDLE ||
+       slot >= kGeomGpuRingSize ||
+       pointIndex >= kGeomGpuPoints)
+    {
+        return;
+    }
+
+    vkCmdWriteTimestamp(
+        cmd,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        s_geomGpuTimestampPool,
+        slot * kGeomGpuPoints + pointIndex
+    );
+}
+
+void commitGeomGpuTimestamp(uint32_t slot, uint64_t frameSerial)
+{
+    if(slot >= kGeomGpuRingSize)
+    {
+        return;
+    }
+    s_geomGpuSlots[slot].inFlight = true;
+    s_geomGpuSlots[slot].frameSerial = frameSerial;
+}
+
+void pollGeomGpuTimestampWindow(
+    double& outAvgTotalMs,
+    double& outMaxTotalMs,
+    double& outAvgOmmMs,
+    double& outAvgBlasMs,
+    double& outAvgTlasMs,
+    double& outMaxOmmMs,
+    double& outMaxBlasMs,
+    double& outMaxTlasMs,
+    uint64_t& outSamples
+)
+{
+    pollReadyGeomGpuSlots();
+    outSamples = s_geomGpuWindow.samples;
+    if(outSamples == 0u)
+    {
+        outAvgTotalMs = 0.0;
+        outMaxTotalMs = 0.0;
+        outAvgOmmMs = 0.0;
+        outAvgBlasMs = 0.0;
+        outAvgTlasMs = 0.0;
+        outMaxOmmMs = 0.0;
+        outMaxBlasMs = 0.0;
+        outMaxTlasMs = 0.0;
+        return;
+    }
+
+    const double n = static_cast<double>(outSamples);
+    outAvgTotalMs = s_geomGpuWindow.sumTotalMs / n;
+    outMaxTotalMs = s_geomGpuWindow.maxTotalMs;
+    outAvgOmmMs = s_geomGpuWindow.sumOmmMs / n;
+    outAvgBlasMs = s_geomGpuWindow.sumBlasMs / n;
+    outAvgTlasMs = s_geomGpuWindow.sumTlasMs / n;
+    outMaxOmmMs = s_geomGpuWindow.maxOmmMs;
+    outMaxBlasMs = s_geomGpuWindow.maxBlasMs;
+    outMaxTlasMs = s_geomGpuWindow.maxTlasMs;
+}
+
+
 void destroyPerfL10GpuTimestampPool()
 {
+    destroyGeomGpuTimestampResources();
+
     if(g_perfL10GpuTimestampPool != VK_NULL_HANDLE && g_device != VK_NULL_HANDLE)
     {
         vkDestroyQueryPool(
@@ -738,10 +1007,41 @@ void logPerfL10GpuPassWindow(
             << g_perfL10GpuPassWindow.maxScopeMs[scope];
     }
 
+    double geomAvgTotal = 0.0, geomMaxTotal = 0.0;
+    double geomAvgOmm = 0.0, geomAvgBlas = 0.0, geomAvgTlas = 0.0;
+    double geomMaxOmm = 0.0, geomMaxBlas = 0.0, geomMaxTlas = 0.0;
+    uint64_t geomSamples = 0u;
+    pollGeomGpuTimestampWindow(
+        geomAvgTotal,
+        geomMaxTotal,
+        geomAvgOmm,
+        geomAvgBlas,
+        geomAvgTlas,
+        geomMaxOmm,
+        geomMaxBlas,
+        geomMaxTlas,
+        geomSamples
+    );
+
+    averages
+        << std::setprecision(2)
+        << " geom=" << geomAvgTotal
+        << " gOmm=" << geomAvgOmm
+        << " gBlas=" << geomAvgBlas
+        << " gTlas=" << geomAvgTlas
+        << " gN=" << geomSamples;
+    maxima
+        << std::setprecision(2)
+        << " geom=" << geomMaxTotal
+        << " gOmm=" << geomMaxOmm
+        << " gBlas=" << geomMaxBlas
+        << " gTlas=" << geomMaxTlas;
+
     RTLog(averages.str());
     RTLog(maxima.str());
 
     g_perfL10GpuPassWindow = PerfL10GpuPassWindow{};
+    resetGeomGpuTimestampWindow();
 
     g_perfL10GpuWindowsLogged += 1u;
 }

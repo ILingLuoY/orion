@@ -721,6 +721,20 @@ if(
         v1.pad2 * barycentrics.y +
         v2.pad2 * barycentrics.z;
 
+    // 2026-11-26 Batch AA: visibility rays (sun shadow / local-light / AO) clipping
+    // water (materialId ~ 1.0) must NOT terminate as solid opaque blockers; otherwise
+    // per-frame sun-disk jitter near shorelines/waterlines intermittently flickers black.
+    if(getRayPurpose(payload.state) == RT_PURPOSE_GLASS_VISIBILITY &&
+       !isVoxyAnyHit &&
+       materialId > 0.5 &&
+       materialId < 1.5)
+    {
+        payload.albedoPacked = packAlbedoUnorm(
+            clamp(unpackAlbedoUnorm(payload.albedoPacked) * 0.98, vec3(0.0), vec3(1.0)));
+        ignoreIntersectionEXT;
+        return;
+    }
+
     // =====================================================
     // 2026-10-04 性能：玻璃在"不需要透射语义"的射线上直接接受命中（行为等价）
     //

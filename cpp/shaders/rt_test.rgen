@@ -337,16 +337,38 @@ layout(binding = 92, set = 0, rgba16f)
 uniform image2D k2GiTraceImage;
 #endif
 
-#if defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE
-layout(std430, binding = 100, set = 0) readonly buffer K2iSparseCompactSSBO
+#if defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_B) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE
+struct CompactSlotHeader
 {
     uint width;
     uint height;
     uint depth;
     uint mode;
     uint activeCount;
+    uint baseElemOffset;
+    uint pad0;
+    uint pad1;
+};
+
+layout(std430, binding = 100, set = 0) readonly buffer K2iSparseCompactSSBO
+{
+    CompactSlotHeader headers[6];
     uint activeCoords[];
 } k2iSparseCompact;
+
+#if defined(ORION_K1_GLASS_ONLY)
+#define K2_COMPACT_SLOT 0u
+#elif defined(ORION_K2_DIRECT_SUN_STAGE_B)
+#define K2_COMPACT_SLOT 1u
+#elif defined(ORION_K2_LOC_NEE_ONLY)
+#define K2_COMPACT_SLOT 2u
+#elif defined(ORION_K2_LOC_GLOSSY_ONLY) || defined(ORION_K2_DIRECT_LOCAL_STAGE)
+#define K2_COMPACT_SLOT 3u
+#elif SHARC_UPDATE
+#define K2_COMPACT_SLOT 5u
+#elif defined(ORION_K2_INDIRECT_STAGE)
+#define K2_COMPACT_SLOT 4u
+#endif
 #endif
 
 // ============================================================================
@@ -1140,33 +1162,7 @@ bool giRouletteEnabledForVariant()
 #endif
 int perfL10MarchSteps(vec3 worldPos)
 {
-    const bool diagnosticOneStep = perfL10Stage() == 12u;
-    const float farDistance = cam.rtSampleParams.z;
-    if(diagnosticOneStep)
-    {
-        return 1;
-    }
-    if(farDistance <= 0.0)
-    {
-        return WATER_SUN_MARCH_STEPS;
-    }
-    // 2026-11-18：重载时太阳透射 march 也砍到 1 步（见 rgen_water_receiver.glsl
-    // 的 perfL10WaterLoad 说明）。这是近水 36 ms 那一档的最后一刀：水面像素
-    // 每个界面步都会走一次这个 march，重载下整帧会到 40 ms 以上。
-    if(cam.rtSampleParams.w > 22.0)
-    {
-        return 1;
-    }
-    // 2026-11-16：远档 1 → 2 步。11-15 的"耗尽即返回透射"修复假设
-    // "出射后剩余是明确的天空直线"，但岸边遮挡物正好在这段空气直线里：
-    // 远档 1 步 = 水里穿出水面就耗尽，出水面后的空气段**从未查过** ⇒
-    // 岸边物体投在浅水水底/焦散上的影子整片漏光（离水面近=近档 3 步
-    // 有一步撞岸上物体 ⇒ 阴影出现；离远=远档 ⇒ 阴影消失，用户实测报告）。
-    // 2 步 = 出水后补一跳：miss ⇒ 返回同一透射（单水柱近/远档仍逐位
-    // 一致），撞不透明 ⇒ 正确阴影，撞到新水界面 ⇒ 走"仍在水中耗尽"的
-    // 保守 0（与近档同语义）。回退 = 改回 1。
-    return distance(worldPos, cam.viewInverse[3].xyz) > farDistance
-        ? 2 : WATER_SUN_MARCH_STEPS;
+    return WATER_SUN_MARCH_STEPS;
 }
 
 // Stage 13: halve every distance-LOD threshold.  The tier chain was measured
@@ -1246,6 +1242,11 @@ uint secondaryTraverseFlags()
     return SECONDARY_TRAVERSE_FLAGS_4STATE;
 }
 #endif
+
+// 当前像素发射次级可见性/GI/反射光线时使用的实例掩码：
+// 普通表面为 0xcfu（含 LOCAL_PLAYER 0x02，不含 HAND 0x20 与 SOLID_LEAVES 0x10）；
+// 第一人称手部像素切为 0xcdu（同时屏蔽 LOCAL_PLAYER 0x02，避免手在玩家头壳内部自遮挡）。
+uint g_secondaryCullMask = 0xcfu;
 
 // Binding 34 (the old 256x256 wavefront-area caustic map) is deliberately no
 // longer declared here.  Water caustics are analytic now; see
@@ -2365,9 +2366,71 @@ vec3 vptGeometricFaceNormalFromRay(vec3 hitPos, vec3 rayDirection)
     ivec3 blockOutside = ivec3(floor(hitPos - direction * 1.0e-3));
     ivec3 blockInside = ivec3(floor(hitPos + direction * 1.0e-3));
     ivec3 delta = blockInside - blockOutside;
-    if(delta.x != 0) return vec3(delta.x > 0 ? -1.0 : 1.0, 0.0, 0.0);
-    if(delta.y != 0) return vec3(0.0, delta.y > 0 ? -1.0 : 1.0, 0.0);
-    if(delta.z != 0) return vec3(0.0, 0.0, delta.z > 0 ? -1.0 : 1.0);
+    int crossCount = int(delta.x != 0) + int(delta.y != 0) + int(delta.z != 0);
+    if(crossCount == 0)
+    {
+        return vec3(0.0);
+    }
+    if(crossCount == 1)
+    {
+        if(delta.x != 0) return vec3(delta.x > 0 ? -1.0 : 1.0, 0.0, 0.0);
+        if(delta.y != 0) return vec3(0.0, delta.y > 0 ? -1.0 : 1.0, 0.0);
+        return vec3(0.0, 0.0, delta.z > 0 ? -1.0 : 1.0);
+    }
+
+    // Ray hits right on a block edge/seam (multiple axes crossed simultaneously):
+    // do NOT let fixed X > Y > Z precedence override a flat wall face. Prefer
+    // the crossed axis whose stepped voxel is actually occupied, breaking ties
+    // by closest integer boundary plane (pure scalar, 0 arrays).
+    vec3 f = fract(hitPos);
+    vec3 dPlane = min(f, vec3(1.0) - f);
+    ivec3 airCell = ivec3(floor(hitPos - direction * 0.01));
+
+    int bestAxis = -1;
+    float bestScore = 1.0e30;
+    if(delta.x != 0)
+    {
+        int sx = delta.x > 0 ? 1 : -1;
+        uint srcX = 0u;
+        bool occX = vptReadSourceVoxel(airCell + ivec3(sx, 0, 0), srcX) &&
+                    vptVoxelOccupied(srcX);
+        float scoreX = (occX ? 0.0 : 10.0) + dPlane.x;
+        if(scoreX < bestScore)
+        {
+            bestScore = scoreX;
+            bestAxis = 0;
+        }
+    }
+    if(delta.y != 0)
+    {
+        int sy = delta.y > 0 ? 1 : -1;
+        uint srcY = 0u;
+        bool occY = vptReadSourceVoxel(airCell + ivec3(0, sy, 0), srcY) &&
+                    vptVoxelOccupied(srcY);
+        float scoreY = (occY ? 0.0 : 10.0) + dPlane.y;
+        if(scoreY < bestScore)
+        {
+            bestScore = scoreY;
+            bestAxis = 1;
+        }
+    }
+    if(delta.z != 0)
+    {
+        int sz = delta.z > 0 ? 1 : -1;
+        uint srcZ = 0u;
+        bool occZ = vptReadSourceVoxel(airCell + ivec3(0, 0, sz), srcZ) &&
+                    vptVoxelOccupied(srcZ);
+        float scoreZ = (occZ ? 0.0 : 10.0) + dPlane.z;
+        if(scoreZ < bestScore)
+        {
+            bestScore = scoreZ;
+            bestAxis = 2;
+        }
+    }
+
+    if(bestAxis == 0) return vec3(delta.x > 0 ? -1.0 : 1.0, 0.0, 0.0);
+    if(bestAxis == 1) return vec3(0.0, delta.y > 0 ? -1.0 : 1.0, 0.0);
+    if(bestAxis == 2) return vec3(0.0, 0.0, delta.z > 0 ? -1.0 : 1.0);
     return vec3(0.0);
 }
 
@@ -2937,13 +3000,47 @@ bool vptVoxelPathBlocked(
         }
 
         // 棱/角：射线贴着两块相接的棱通过 ⇒ 网格那里没有面、硬件射线会滑过去，
-        // 这里保守判遮挡（这正是"封闭立方体内部每条棱都亮"的那条通道）。
+        // 仅当被擦过的相邻体素确有实心方块（class == 1 且非发光体本身）时才保守
+        // 判遮挡，避免在纯空气房间内把普通整数格棱误判成黑色硬线。
+        const float cornerEps = VPT_VOXEL_PATH_CORNER_EPS * (1.0 + abs(t));
         float otherA = axis == 0 ? tMax.y : tMax.x;
         float otherB = axis == 2 ? tMax.y : tMax.z;
-        if(min(abs(otherA - t), abs(otherB - t)) <=
-            VPT_VOXEL_PATH_CORNER_EPS * (1.0 + abs(t)))
+        if(min(abs(otherA - t), abs(otherB - t)) <= cornerEps)
         {
-            return true;
+            const bool tieX = (axis == 0) || (abs(tMax.x - t) <= cornerEps);
+            const bool tieY = (axis == 1) || (abs(tMax.y - t) <= cornerEps);
+            const bool tieZ = (axis == 2) || (abs(tMax.z - t) <= cornerEps);
+            uint edgeSrc = 0u;
+            if(tieX)
+            {
+                ivec3 adjX = cell + ivec3(stepVector.x, 0, 0);
+                if(!all(equal(adjX, emitterBlock)) &&
+                   vptReadSourceVoxel(adjX, edgeSrc) &&
+                   ((edgeSrc & 3u) == 1u))
+                {
+                    return true;
+                }
+            }
+            if(tieY)
+            {
+                ivec3 adjY = cell + ivec3(0, stepVector.y, 0);
+                if(!all(equal(adjY, emitterBlock)) &&
+                   vptReadSourceVoxel(adjY, edgeSrc) &&
+                   ((edgeSrc & 3u) == 1u))
+                {
+                    return true;
+                }
+            }
+            if(tieZ)
+            {
+                ivec3 adjZ = cell + ivec3(0, 0, stepVector.z);
+                if(!all(equal(adjZ, emitterBlock)) &&
+                   vptReadSourceVoxel(adjZ, edgeSrc) &&
+                   ((edgeSrc & 3u) == 1u))
+                {
+                    return true;
+                }
+            }
         }
 
         if(axis == 0)
@@ -3665,11 +3762,13 @@ void neeVisCacheKey(
 
 uvec2 rtLogicalPixelCoord()
 {
-#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE) && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
-    if(k2iSparseCompact.mode != 0u)
+#if (defined(ORION_K2_INDIRECT_STAGE) || defined(ORION_K2_DIRECT_LOCAL_STAGE) || defined(ORION_K2_DIRECT_SUN_STAGE_B) || defined(ORION_K1_GLASS_ONLY) || SHARC_UPDATE) && !defined(ORION_K2_INDIRECT_COMPOSE_ONLY)
+    if(k2iSparseCompact.headers[K2_COMPACT_SLOT].mode != 0u)
     {
         const uint compactIdx = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
-        const uint packedCoord = k2iSparseCompact.activeCoords[compactIdx];
+        const uint packedCoord = k2iSparseCompact.activeCoords[
+            k2iSparseCompact.headers[K2_COMPACT_SLOT].baseElemOffset + compactIdx
+        ];
         return uvec2(packedCoord & 0xFFFFu, packedCoord >> 16u);
     }
 #endif
@@ -4694,7 +4793,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
             receiverOrigin,
             selectedSample,
             targetVoxelEntryDistance,
-            0xefu
+            g_secondaryCullMask
         )
         : vptTraceGlassTransmissionToEmitter(
             receiverOrigin,
@@ -4875,7 +4974,7 @@ const float DYNAMIC_LIGHT_VISIBILITY_SHORTEN = 0.6;
 // 要让那时也放行，需要给"本地玩家实体"单独一个 mask 位（native 按实体打标），留待需要时。
 //
 // 回退：改成 0xffu 即逐位回到改动前（包含"自己的模型挡自己的光"）。
-const uint DYNAMIC_LIGHT_CULL_MASK = 0xedu;
+const uint DYNAMIC_LIGHT_CULL_MASK = 0xcdu;
 
 // 颜色：优先用记录里带的**任意 RGB**（meta.y 的 8/8/8）；为 0 时回退到既有调色板
 // （vliDecodeEmitterColor）—— 于是"只给 typeCode"的记录仍然有效，两条路在火把上的
@@ -8128,7 +8227,7 @@ vec3 vptLocalEmitterSampleTransmittance(
             receiverOrigin,
             selectedSample,
             targetVoxelEntryDistance,
-            0xefu
+            g_secondaryCullMask
         )
         : vptTraceGlassTransmissionToEmitter(
             receiverOrigin,
@@ -8985,15 +9084,21 @@ struct GlassSurfaceInfo {
 #include "rgen_sun_lighting.glsl"
 #include "rgen_local_lights.glsl"
 #if !defined(ORION_K2I_COMPOSE_COMPUTE) && !defined(ORION_K1_DEFER_GLASS) && !defined(ORION_K2_LOC_NEE_ONLY) && !defined(ORION_K2_DIRECT_SUN_STAGE_B) && !SHARC_UPDATE
-#if !defined(ORION_K2_LOC_GLOSSY_ONLY) && !defined(ORION_K2_INDIRECT_TRACE_ONLY)
+#if !defined(ORION_K2_LOC_GLOSSY_ONLY) && !defined(ORION_K2_INDIRECT_TRACE_ONLY) && !defined(ORION_K2_DIRECT_SUN_STAGE_A)
 #include "rgen_glass_reflection.glsl"
 #endif
 #include "rgen_receiver_gi.glsl"
 #if !defined(ORION_K2_LOC_GLOSSY_ONLY) && !defined(ORION_K2_INDIRECT_TRACE_ONLY)
+#if !defined(ORION_K1_GLASS_ONLY)
 #include "rgen_water_caustics.glsl"
+#endif
+#if !defined(ORION_K2_DIRECT_SUN_STAGE_A)
 #include "rgen_glass_primary.glsl"
 #include "rgen_transparent_primary.glsl"
+#endif
+#if !defined(ORION_K1_GLASS_ONLY)
 #include "rgen_water_receiver.glsl"
+#endif
 #endif
 #if !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K1_GLASS_ONLY)
 #include "rgen_glossy.glsl"

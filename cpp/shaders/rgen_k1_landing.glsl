@@ -96,21 +96,22 @@ void ptLandingStore(uint index, vec2 dbgMotion)
 // 留下的调试图值（A1 时域重投影会原样传给 resolve，调试视图也读它）。
 bool ptLandingLoad(uint index, out vec2 dbgMotion)
 {
-    PTLandingRecord r = ptLandingRecords[index];
-    if(r.a.x <= 0.5)
+    const vec4 ra = ptLandingRecords[index].a;
+    if(ra.x <= 0.5)
     {
         return false;
     }
 
-    payload.hitDistance = r.a.y;
+    const uvec4 rb = ptLandingRecords[index].b;
+    payload.hitDistance = ra.y;
     payload.normal = vec3(
-        uintBitsToFloat(r.b.x),
-        uintBitsToFloat(r.b.y),
-        r.a.z
+        uintBitsToFloat(rb.x),
+        uintBitsToFloat(rb.y),
+        ra.z
     );
-    payload.roughness = r.a.w;
-    payload.state = r.b.w;
-    dbgMotion = r.e.zw;
+    payload.roughness = ra.w;
+    payload.state = rb.w;
+    dbgMotion = ptLandingRecords[index].e.zw;
     return true;
 }
 

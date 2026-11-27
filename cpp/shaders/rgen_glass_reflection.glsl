@@ -31,8 +31,13 @@ vec3 traceGlassSceneReflectionOneRay(
 
     const float glassReflCamDist =
         length(glassSurfacePosition - cam.viewInverse[3].xyz);
+#ifdef ORION_K1_GLASS_ONLY
+    const int maxGlassReflectSteps =
+        (glassReflCamDist < 16.0) ? 2 : 1;
+#else
     const int maxGlassReflectSteps =
         (glassReflCamDist < 24.0) ? 3 : ((glassReflCamDist < 64.0) ? 2 : 1);
+#endif
 
     vec3 currentOrigin =
         glassSurfacePosition + N * 0.002 + reflectionDirection * 0.001;
@@ -66,7 +71,7 @@ vec3 traceGlassSceneReflectionOneRay(
                 currentDirection,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 0u
             );
         }
@@ -79,7 +84,7 @@ vec3 traceGlassSceneReflectionOneRay(
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 0,
                 0,
                 0,

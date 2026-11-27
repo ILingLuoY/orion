@@ -540,9 +540,10 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
         return vec3(0.0);
     }
 #else
-    vec3 sunTransmittance = traceSunTransmittanceThroughWater(
+    vec3 sunTransmittance = traceSunTransmittanceThroughWaterEx(
         receiver.receiverWorldPos + receiverN * 0.01,
-        receiverToSun
+        receiverToSun,
+        L
     );
     if(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)) <= 0.0)
     {
@@ -793,9 +794,10 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
     }
 
 #if WATER_CAUSTIC_DEFERRED_SUN_TRACE
-    vec3 sunTransmittance = traceSunTransmittanceThroughWater(
+    vec3 sunTransmittance = traceSunTransmittanceThroughWaterEx(
         receiver.receiverWorldPos + receiverN * 0.015,
-        receiverToSun
+        receiverToSun,
+        L
     );
     if(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)) <= 0.0)
     {

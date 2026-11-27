@@ -88,22 +88,22 @@ public abstract class MinecraftReflexMixin {
     ) {
         FrameBudget.tickHead();
 
+        final Minecraft self =
+                (Minecraft)(Object)this;
+
         long jniHeadNanos = System.nanoTime();
+        NativeVulkan.setFullscreenMenuOpen(
+                self.gui != null && self.gui.screen() != null
+        );
+        FrameBudget.jniTickHead(2, System.nanoTime() - jniHeadNanos);
+
+        jniHeadNanos = System.nanoTime();
         NativeVulkan.beginStreamlineFrame();
         FrameBudget.jniTickHead(0, System.nanoTime() - jniHeadNanos);
 
         jniHeadNanos = System.nanoTime();
         NativeVulkan.markSimulationStart();
         FrameBudget.jniTickHead(1, System.nanoTime() - jniHeadNanos);
-
-        final Minecraft self =
-                (Minecraft)(Object)this;
-
-        jniHeadNanos = System.nanoTime();
-        NativeVulkan.setFullscreenMenuOpen(
-                self.gui != null && self.gui.screen() != null
-        );
-        FrameBudget.jniTickHead(2, System.nanoTime() - jniHeadNanos);
 
         reflex$pollFlashTrigger();
     }

@@ -55,9 +55,10 @@
 // 远处水底太阳/焦散整片消失。现在：吸收一律按真实水程 Beer-Lambert，
 // "最后一步完成出射即返回累积透射"（见函数尾），透射观感只由水深决定，
 // 与性能档位无关。
-vec3 traceSunTransmittanceThroughWater(
+vec3 traceSunTransmittanceThroughWaterEx(
     vec3 startOrigin,
-    vec3 rayDir
+    vec3 rayDir,
+    vec3 airSunDir
 ) {
 
     const float WATER_IOR =
@@ -86,9 +87,39 @@ const float WATER_EXTINCTION_DISTANCE =
     vec3 currentDir =
         normalize(rayDir);
 
+    const vec3 targetAirDir =
+        normalize(airSunDir);
+
     // 2026-11-15：标记"最后一步刚好完成 Water->Air 出射（人已在空中）"。
     // 步数耗尽时用它决定返回累积透射还是保守 0 —— 见循环尾注释。
     bool exitedToAir = false;
+
+#if ORION_OPAQUE_VIS_FASTPATH && !defined(ORION_K2I_COMPOSE_COMPUTE)
+    {
+        rayQueryEXT waterSunVisQuery;
+        rayQueryInitializeEXT(
+            waterSunVisQuery,
+            topLevelAS,
+            secondaryTraverseFlags() | gl_RayFlagsTerminateOnFirstHitEXT,
+            0xcfu,
+            currentOrigin,
+            0.02,
+            currentDir,
+            10000.0
+        );
+        if(!rayQueryProceedEXT(waterSunVisQuery))
+        {
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntRayIssued();
+            #endif
+            return (rayQueryGetIntersectionTypeEXT(waterSunVisQuery, true) !=
+                    gl_RayQueryCommittedIntersectionNoneEXT)
+                ? vec3(0.0)
+                : vec3(1.0);
+        }
+        rayQueryTerminateEXT(waterSunVisQuery);
+    }
+#endif
 
     for(
         int step = 0;
@@ -114,7 +145,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 currentDir,
                 10000.0,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 step
             );
         }
@@ -128,7 +159,7 @@ const float WATER_EXTINCTION_DISTANCE =
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xefu,
+                0xcfu,
                 0,
                 0,
                 0,
@@ -406,19 +437,10 @@ if(hitMaterialId >= 2.5)
         // 若瀑布/水柱侧壁的太阳判定重新出问题（水面反射漏日盘、侧壁高光被压），
         // 就是这一项的责任，把开关置 1。
         // =====================================================
-#ifndef WATER_SUN_VERTICAL_INTERFACE_NORMAL_PROTECT
-#define WATER_SUN_VERTICAL_INTERFACE_NORMAL_PROTECT 0
-#endif
-#if WATER_SUN_VERTICAL_INTERFACE_NORMAL_PROTECT
-        const bool stabilizeExitNormal =
-            exitingWater &&
-            abs(hitNormal.y) > 0.15;
-#else
-        const bool stabilizeExitNormal =
-            exitingWater;
-#endif
+        // Keep geometry-stable normal on BOTH Water->Air and Air->Water interfaces
+        // while preserving vertical side walls (waterfalls / water columns).
         vec3 interfaceNormal =
-            stabilizeExitNormal
+            (abs(hitNormal.y) > 0.15)
                 ? vec3(
                     0.0,
                     hitNormal.y >= 0.0 ? 1.0 : -1.0,
@@ -436,19 +458,14 @@ if(hitMaterialId >= 2.5)
                 1.0
             );
 
-        // Fresnel transmission。
-        // 反射出去的能量在这里不允许继续作为透射太阳。
+        // Fresnel transmission (scalar x^5 instead of pow).
+        float fresnelX = 1.0 - cosTheta;
+        float fresnelX2 = fresnelX * fresnelX;
         float fresnel =
             WATER_F0 +
-            (
-                1.0 -
-                WATER_F0
-            ) *
-            pow(
-                1.0 -
-                cosTheta,
-                5.0
-            );
+            (1.0 - WATER_F0) *
+            (fresnelX2 * fresnelX2) *
+            fresnelX;
 
         transmittance *=
             1.0 -
@@ -462,91 +479,139 @@ if(hitMaterialId >= 2.5)
             return vec3(0.0);
         }
 
-float eta =
-    1.0 / WATER_IOR;
-
-        vec3 transmittedDir =
-            refract(
-                currentDir,
-                interfaceNormal,
-                eta
-            );
-
-        // Water -> Air 可能发生全反射。
-        // 这部分属于反射路径，
-        // 不能继续算作太阳透射。
-        if(
-            dot(
-                transmittedDir,
-                transmittedDir
-            ) < 1.0e-6
-        )
+        if(exitingWater)
         {
-            return vec3(0.0);
+            // Exiting water into air: receiver->air sun direction is already given
+            // (targetAirDir); do not apply an inverse eta = 1/WATER_IOR bend on
+            // Water->Air, which skews shadows and causes false TIR flickering.
+            exitedToAir = true;
+            currentOrigin =
+                hitPos -
+                interfaceNormal *
+                RAY_BIAS;
+            currentDir = targetAirDir;
         }
-
-        // 2026-11-15：本步完成了出射（TIR 已在上面 return），人在空中。
-        exitedToAir = exitingWater;
-
-        // interfaceNormal 始终朝向射线来源一侧，
-        // 所以透射后统一向 -normal 偏移即可跨过界面。
-        currentOrigin =
-            hitPos -
-            interfaceNormal *
-            RAY_BIAS;
-
-        currentDir =
-            normalize(
-                transmittedDir
-            );
+        else
+        {
+            exitedToAir = false;
+            float eta =
+                1.0 / WATER_IOR;
+            vec3 transmittedDir =
+                refract(
+                    currentDir,
+                    interfaceNormal,
+                    eta
+                );
+            currentOrigin =
+                hitPos -
+                interfaceNormal *
+                RAY_BIAS;
+            currentDir =
+                (dot(transmittedDir, transmittedDir) >= 1.0e-6)
+                    ? normalize(transmittedDir)
+                    : currentDir;
+        }
     }
 
     // 2026-11-15：步数耗尽语义。
-    // 2026-11-26 (Batch V, Bug 2): When exitedToAir is true after marching out of water,
-    // check whether a cave roof or solid block occludes the sun above the exit point.
+    // 2026-11-26 (Batch AC): once exited to air, run unified RT_PURPOSE_GLASS_VISIBILITY
+    // so cutouts/leaves (SBT 2), stained glass (SBT 3), and distant terrain match
+    // above-water sun visibility.
     if(!exitedToAir)
     {
         return vec3(0.0);
     }
 #ifndef ORION_K2I_COMPOSE_COMPUTE
     {
-        rayQueryEXT waterSunRoofQuery;
-        #ifdef ORION_RT_STAGE_COUNTERS
-        rtCntRayIssued();
-        #endif
-        rayQueryInitializeEXT(
-            waterSunRoofQuery,
-            topLevelAS,
-            gl_RayFlagsTerminateOnFirstHitEXT,
-            0xefu,
-            currentOrigin + currentDir * 0.02,
-            0.02,
-            currentDir,
-            256.0
-        );
-        int waterSunRoofGuard = 0;
-        while(rayQueryProceedEXT(waterSunRoofQuery) && ++waterSunRoofGuard < 32)
+        hit.hitDistance = 1.0;
+        hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
+        hit.parallaxRayTravel = 0.0;
+        hit.glassAlpha = 0.0;
+        hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
+
+        const vec3 airVisOrigin = currentOrigin + currentDir * 0.02;
+#if ORION_OPAQUE_VIS_FASTPATH
         {
-            if(rayQueryGetIntersectionTypeEXT(waterSunRoofQuery, false) ==
-               gl_RayQueryCandidateIntersectionTriangleEXT)
+            rayQueryEXT waterAirVisQuery;
+            rayQueryInitializeEXT(
+                waterAirVisQuery,
+                topLevelAS,
+                gl_RayFlagsTerminateOnFirstHitEXT,
+                g_secondaryCullMask,
+                airVisOrigin,
+                0.02,
+                currentDir,
+                10000.0
+            );
+            if(!rayQueryProceedEXT(waterAirVisQuery))
             {
-                const uint candSbtOff =
-                    rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(
-                        waterSunRoofQuery, false);
-                if(candSbtOff != 2u && candSbtOff != 3u)
+                #ifdef ORION_RT_STAGE_COUNTERS
+                rtCntRayIssued();
+                #endif
+                if(rayQueryGetIntersectionTypeEXT(waterAirVisQuery, true) !=
+                   gl_RayQueryCommittedIntersectionNoneEXT)
                 {
-                    rayQueryConfirmIntersectionEXT(waterSunRoofQuery);
+                    return vec3(0.0);
                 }
+                return transmittance;
             }
+            rayQueryTerminateEXT(waterAirVisQuery);
         }
-        if(rayQueryGetIntersectionTypeEXT(waterSunRoofQuery, true) !=
-           gl_RayQueryCommittedIntersectionNoneEXT)
+#endif
+#ifdef RT_ENABLE_SER
+        if(cam.perfSerAb.y != 0u)
+        {
+            serTraceRay(
+                airVisOrigin,
+                0.02,
+                currentDir,
+                10000.0,
+                gl_RayFlagsTerminateOnFirstHitEXT |
+                gl_RayFlagsSkipClosestHitShaderEXT,
+                g_secondaryCullMask,
+                1
+            );
+        }
+        else
+#endif
+        {
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntRayIssued();
+            #endif
+            traceRayEXT(
+                topLevelAS,
+                gl_RayFlagsTerminateOnFirstHitEXT |
+                gl_RayFlagsSkipClosestHitShaderEXT,
+                g_secondaryCullMask,
+                0,
+                0,
+                0,
+                airVisOrigin,
+                0.02,
+                currentDir,
+                10000.0,
+                0
+            );
+        }
+        if(payload.hitDistance >= 0.0)
         {
             return vec3(0.0);
         }
+        transmittance *= clamp(unpackAlbedoUnorm(payload.albedoPacked), vec3(0.0), vec3(1.0));
     }
 #endif
     return transmittance;
+}
+
+vec3 traceSunTransmittanceThroughWater(
+    vec3 startOrigin,
+    vec3 rayDir
+) {
+    return traceSunTransmittanceThroughWaterEx(
+        startOrigin,
+        rayDir,
+        rayDir
+    );
 }
 const float PI =
     3.14159265359;

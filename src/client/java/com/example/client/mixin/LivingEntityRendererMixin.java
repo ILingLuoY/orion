@@ -84,6 +84,9 @@ public abstract class LivingEntityRendererMixin {
     }
 
     private static boolean rtx$isFirstPersonLocalPlayer(LivingEntityRenderState state) {
+        if (!EntityRtCapture.isSubmittingSyntheticLocalPlayer()) {
+            return false;
+        }
         boolean isAvatar = state instanceof AvatarRenderState;
         Minecraft minecraft = Minecraft.getInstance();
         boolean idMatches = isAvatar

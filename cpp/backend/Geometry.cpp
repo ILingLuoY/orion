@@ -1207,6 +1207,15 @@ void geometryCaptureSectionLocked(
         {
             geometryAppendSectionVertices(split.localPlayer, layerEntry.second, 5);
         }
+        else if(layerEntry.first == HAND_RT_LAYER_KEY)
+        {
+            geometryAppendSectionVertices(split.hand, layerEntry.second, 7);
+            geometryAppendSectionMotion(
+                split.handMotion,
+                layerMotion,
+                layerEntry.second.size()
+            );
+        }
         else if(isEntityRtLayerKey(layerEntry.first))
         {
             geometryAppendSectionVertices(split.entity, layerEntry.second, 4);
@@ -1247,15 +1256,20 @@ void geometryCaptureSectionLocked(
                 ommIt->second.triangleCount == layer.size() / 3u;
 
             size_t leafVertexCount = 0u;
+            size_t glassVertexCount = 0u;
             for(size_t v = 0u; v + 2u < layer.size(); v += 3u)
             {
                 if(std::fabs(layer[v].materialId - 0.26f) < 0.005f)
                 {
                     leafVertexCount += 3u;
                 }
+                else if(layer[v].materialId >= 1.95f && layer[v].materialId < 2.5f)
+                {
+                    glassVertexCount += 3u;
+                }
             }
 
-            if(leafVertexCount == 0u)
+            if(leafVertexCount == 0u && glassVertexCount == 0u)
             {
                 if(validOmm)
                 {
@@ -1273,19 +1287,20 @@ void geometryCaptureSectionLocked(
                 constexpr uint32_t kOmmBytesPerTri = 64u;
                 const size_t triCount = layer.size() / 3u;
                 const size_t leafTriCount = leafVertexCount / 3u;
-                const size_t nonLeafTriCount = triCount - leafTriCount;
+                const size_t glassTriCount = glassVertexCount / 3u;
+                const size_t nonLeafTriCount = triCount - leafTriCount - glassTriCount;
                 const size_t nonLeafVertCount = nonLeafTriCount * 3u;
 
                 split.ommLeaves.reserve(split.ommLeaves.size() + leafVertexCount);
+                split.alpha.reserve(
+                    split.alpha.size() +
+                    glassVertexCount +
+                    (validOmm ? 0u : nonLeafVertCount));
                 if(validOmm)
                 {
                     split.ommCutout.reserve(split.ommCutout.size() + nonLeafVertCount);
                     split.ommInput.data.reserve(nonLeafTriCount * kOmmBytesPerTri);
                     split.ommLeavesInput.data.reserve(leafTriCount * kOmmBytesPerTri);
-                }
-                else
-                {
-                    split.alpha.reserve(split.alpha.size() + nonLeafVertCount);
                 }
 
                 uint32_t cutoutTris = 0u;
@@ -1294,7 +1309,19 @@ void geometryCaptureSectionLocked(
                 {
                     const size_t base = tri * 3u;
                     const bool isLeafTri = std::fabs(layer[base].materialId - 0.26f) < 0.005f;
-                    if(isLeafTri)
+                    const bool isGlassTri =
+                        !isLeafTri &&
+                        layer[base].materialId >= 1.95f &&
+                        layer[base].materialId < 2.5f;
+                    if(isGlassTri)
+                    {
+                        split.alpha.insert(
+                            split.alpha.end(),
+                            layer.begin() + base,
+                            layer.begin() + base + 3u
+                        );
+                    }
+                    else if(isLeafTri)
                     {
                         split.ommLeaves.insert(
                             split.ommLeaves.end(),
@@ -1357,6 +1384,14 @@ void geometryCaptureSectionLocked(
                         split.ommLeavesInput.subdivisionLevel = 4u;
                         split.ommLeavesInput.knownMicroTriangleCount = leafTris * 256u;
                         split.hasOmmLeavesInput = true;
+                    }
+                    else
+                    {
+                        split.ommLeavesInput.data.clear();
+                        split.ommLeavesInput.triangleCount = 0u;
+                        split.ommLeavesInput.subdivisionLevel = 0u;
+                        split.ommLeavesInput.knownMicroTriangleCount = 0u;
+                        split.hasOmmLeavesInput = false;
                     }
                 }
             }
@@ -1611,6 +1646,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         captureArenaPlanPiece(split.localPlayer, totalBytes);
     const size_t particleOffset =
         captureArenaPlanPiece(split.particle, totalBytes);
+    const size_t handOffset =
+        captureArenaPlanPiece(split.hand, totalBytes);
 
     const size_t entityMotionOffset =
         captureArenaPlanPiece(split.entityMotion, totalBytes);
@@ -1618,6 +1655,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         captureArenaPlanPiece(split.localPlayerMotion, totalBytes);
     const size_t particleMotionOffset =
         captureArenaPlanPiece(split.particleMotion, totalBytes);
+    const size_t handMotionOffset =
+        captureArenaPlanPiece(split.handMotion, totalBytes);
 
     const size_t opaquePackedOffset =
         captureArenaPlanPiece(split.opaquePacked, totalBytes);
@@ -1649,6 +1688,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         split.localPlayer, base, localPlayerOffset, segment.localPlayer);
     captureArenaCopyPiece(
         split.particle, base, particleOffset, segment.particle);
+    captureArenaCopyPiece(
+        split.hand, base, handOffset, segment.hand);
 
     captureArenaCopyPiece(
         split.entityMotion, base, entityMotionOffset, segment.entityMotion);
@@ -1659,6 +1700,8 @@ CaptureArenaSegment captureArenaCommit(const SectionGeometrySplit& split)
         segment.localPlayerMotion);
     captureArenaCopyPiece(
         split.particleMotion, base, particleMotionOffset, segment.particleMotion);
+    captureArenaCopyPiece(
+        split.handMotion, base, handMotionOffset, segment.handMotion);
 
     captureArenaCopyPiece(
         split.opaquePacked, base, opaquePackedOffset, segment.opaquePacked);
@@ -1814,7 +1857,8 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
         split.water.capacity() != 0u ||
         split.entity.capacity() != 0u ||
         split.localPlayer.capacity() != 0u ||
-        split.particle.capacity() != 0u;
+        split.particle.capacity() != 0u ||
+        split.hand.capacity() != 0u;
 
     if(!hasCapacity)
     {
@@ -1830,9 +1874,11 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
     split.entity.clear();
     split.localPlayer.clear();
     split.particle.clear();
+    split.hand.clear();
     split.entityMotion.clear();
     split.localPlayerMotion.clear();
     split.particleMotion.clear();
+    split.handMotion.clear();
     split.opaquePacked.clear();
     split.ommCutoutPacked.clear();
     split.ommLeavesPacked.clear();
@@ -2993,7 +3039,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
             ++rainPuddleMalformedQuads;
         }
 
-        if(layerId == 1)
+        const bool isGlassFamilyQuad =
+            quadVerts[0].materialId >= 1.95f && quadVerts[0].materialId < 2.5f;
+        if(layerId == 1 && !isGlassFamilyQuad)
         {
             const float edge1X = quadVerts[1].x - quadVerts[0].x;
             const float edge1Y = quadVerts[1].y - quadVerts[0].y;
@@ -3340,6 +3388,11 @@ uint32_t sectionRoleOf(const RTSectionAS& section)
     // （geometryCaptureSectionLocked 跳 DH 键）结构性保证：DH 键的 BLAS
     // 根本不会被创建，writeSectionRoleSlot 因此不会被 DH 节调用，本函数
     // 不会遇到 DH 键。旗标关闭时行为与改前逐位一致（本注释不改变行为）。
+    if((section.sectionKey & ~SPATIAL_SECTION_KEY_MASK) == SECTION_AS_CLASS_HAND)
+    {
+        return SECTION_ROLE_HAND;
+    }
+
     const bool lodSpatialKey =
         (section.sectionKey & VOXY_LOD_RESERVED_Y) == VOXY_LOD_RESERVED_Y;
 

@@ -6,9 +6,13 @@ import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.BlockModelLighter;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.item.DyeColor;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.StainedGlassBlock;
 import net.minecraft.world.level.block.state.BlockState;
+
+import java.util.IdentityHashMap;
 
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -28,15 +32,23 @@ public class BlockModelLighterMixin {
     private static final boolean STRIP_VANILLA_RASTER_SHADE = true;
 
     @Unique
+    private static final IdentityHashMap<Block, Integer> STAINED_PANE_MARKERS =
+            vulkan$createStainedPaneMarkers();
+
+    @Unique
+    private static IdentityHashMap<Block, Integer> vulkan$createStainedPaneMarkers() {
+        IdentityHashMap<Block, Integer> markers = new IdentityHashMap<>(32);
+        for (DyeColor dye : DyeColor.values()) {
+            markers.put(Blocks.STAINED_GLASS_PANE.pick(dye), 3 + dye.getId());
+        }
+        return markers;
+    }
+
+    @Unique
     private static boolean vulkan$isGlass(
             BlockState state
     ) {
-        var block =
-                state.getBlock();
-
-        return
-                block == Blocks.GLASS ||
-                        block instanceof StainedGlassBlock;
+        return vulkan$glassMarker(state) != 0;
     }
 
 
@@ -47,7 +59,7 @@ public class BlockModelLighterMixin {
         var block =
                 state.getBlock();
 
-        if (block == Blocks.GLASS) {
+        if (block == Blocks.GLASS || block == Blocks.GLASS_PANE) {
             return 2;
         }
 
@@ -62,6 +74,11 @@ public class BlockModelLighterMixin {
                     );
 
             return 3 + dyeId;
+        }
+
+        final Integer paneMarker = STAINED_PANE_MARKERS.get(block);
+        if (paneMarker != null) {
+            return paneMarker;
         }
 
         return 0;

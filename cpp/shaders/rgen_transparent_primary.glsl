@@ -77,7 +77,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
         , stableGlassRadiance
 #endif
     );
-#endif
+#else
 
     vec3 straightDirection =
         normalize(
@@ -274,7 +274,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
             straightDirection,
             10000.0,
             secondaryTraverseFlags(),
-            0xefu,
+            0xcfu,
             0u
         );
     }
@@ -287,7 +287,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
         traceRayEXT(
             topLevelAS,
             secondaryTraverseFlags(),
-            0xefu,
+            0xcfu,
             0,
             0,
             0,
@@ -743,7 +743,7 @@ vec3 localEntityIrradiance =
                 localEntityIrradiance +
                 ambientTerm;
 
-#if GI_GLASS_RECEIVER_INDIRECT
+#if GI_GLASS_RECEIVER_INDIRECT && !defined(ORION_K1_GLASS_ONLY)
             // The receiver is an ordinary opaque surface, so give it the same
             // single cosine-weighted bounce the water receiver has always
             // added.  Without it the receiver keeps only its direct sun and the
@@ -815,6 +815,9 @@ vec3 localEntityIrradiance =
             }
 
             WaterTransmissionInfo nestedWaterInfo;
+#if defined(ORION_K1_GLASS_ONLY)
+            behindRadiance = hitAlbedo * getSurfaceAmbientRadiance();
+#else
             behindRadiance =
                 tracePrimaryTransparentRadiance(
                     totalInternalReflection
@@ -841,6 +844,7 @@ vec3 localEntityIrradiance =
                     false,
                     nestedWaterInfo
                 );
+#endif
 
             transmissionInfo = nestedWaterInfo;
         }
@@ -1592,5 +1596,6 @@ vec3 localEntityIrradiance =
         transmittedRadiance +
         surfaceSceneReflection +
         surfaceSpecular;
+#endif
 #endif
 }

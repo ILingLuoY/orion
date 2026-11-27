@@ -47,6 +47,12 @@ layout(push_constant) uniform FogFroxelPush
 #include "clear_sky_aerial.glsl"
 #include "local_light_grid_common.glsl"
 
+layout(std430, binding = 30, set = 0) readonly buffer FogDynamicLightBuffer
+{
+    uvec4 header;
+    LocalLightGPU lights[];
+} fogDynamicLights;
+
 const float FOG_HAZE_ALBEDO           = 0.90;
 const float FOG_SHAFT_EXTINCTION_FRAC = 0.12;
 const float FOG_SUN_RAY_MAX_DIST      = 256.0;
@@ -68,6 +74,19 @@ shared vec2  sCellFarUv[4][4];
 #if FOG_SILHOUETTE_FIX
 shared vec2  sCellAwayDir[4][4];
 shared uint  sCellHasSky[4][4];
+#endif
+#if FOG_EDGE_GHOST_FIX
+shared float sLaneMinRaw[4][4][4];
+shared float sLaneMaxRaw[4][4][4];
+shared vec2  sLaneMinUv[4][4][4];
+shared vec2  sLaneMaxUv[4][4][4];
+shared uint  sLaneHasSky[4][4][4];
+shared vec2  sLaneSolidUvSum[4][4][4];
+shared float sLaneSolidCount[4][4][4];
+shared float sLaneBestSkyScore[4][4][4];
+shared vec2  sLaneBestSkyUv[4][4][4];
+shared float sCellSolidCount[4][4];
+shared vec2  sCellSolidCentroid[4][4];
 #endif
 
 // Exact geometric visibility ray query (1 = lit, 0 = occluded).
@@ -197,7 +216,7 @@ float fogSampleCloudShadow(vec3 worldPos, vec3 cameraPos, vec3 lightDir)
     return mix(shaped, 1.0, edgeFade);
 }
 
-// Local lights scattering (torches, lanterns, lava) when VolReSTIR is disabled.
+// Local lights scattering (torches, lanterns, lava) + moving dynamic lights when VolReSTIR is disabled.
 vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
 {
     const float localStrength = clamp(cam.fogExtrasParams.x, 0.0, 4.0);
@@ -206,53 +225,104 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
         return vec3(0.0);
     }
     const uint totalLights = fogLightBuffer.header.x;
-    if(totalLights == 0u)
+    const uint dynamicCount = min(fogDynamicLights.header.x, 32u);
+    const float dynUser = uintBitsToFloat(fogDynamicLights.header.y) - 1.0;
+    const float dynamicIntensity = (dynUser >= 0.0 && dynUser <= 16.0) ? dynUser : 1.0;
+    const bool hasDynamicLights = (dynamicCount > 0u && dynamicIntensity > 0.001);
+    if(totalLights == 0u && !hasDynamicLights)
     {
         return vec3(0.0);
     }
-
-    const ivec3 baseCell = localLightGridCellCoord(worldPos);
-    const int minX = localLightGridNeighborMinOffset(worldPos.x);
-    const int maxX = localLightGridNeighborMaxOffset(worldPos.x);
-    const int minY = localLightGridNeighborMinOffset(worldPos.y);
-    const int maxY = localLightGridNeighborMaxOffset(worldPos.y);
-    const int minZ = localLightGridNeighborMinOffset(worldPos.z);
-    const int maxZ = localLightGridNeighborMaxOffset(worldPos.z);
-    const uint packedBase = localLightGridPackedIndexBase();
 
     // Keep top 4 strongest local lights at this froxel, then shadow-test only those.
     vec3 bp0 = vec3(0.0), bp1 = vec3(0.0), bp2 = vec3(0.0), bp3 = vec3(0.0);
     vec3 bc0 = vec3(0.0), bc1 = vec3(0.0), bc2 = vec3(0.0), bc3 = vec3(0.0);
     float bs0 = 0.0, bs1 = 0.0, bs2 = 0.0, bs3 = 0.0;
 
-    int checked = 0;
-    for(int dz = minZ; dz <= maxZ && checked < 48; ++dz)
-    for(int dy = minY; dy <= maxY && checked < 48; ++dy)
-    for(int dx = minX; dx <= maxX && checked < 48; ++dx)
+    if(totalLights > 0u)
     {
-        uint firstIdx = 0u;
-        uint count = 0u;
-        if(!localLightGridLookupCell(baseCell + ivec3(dx, dy, dz), firstIdx, count))
+        const ivec3 baseCell = localLightGridCellCoord(worldPos);
+        const int minX = localLightGridNeighborMinOffset(worldPos.x);
+        const int maxX = localLightGridNeighborMaxOffset(worldPos.x);
+        const int minY = localLightGridNeighborMinOffset(worldPos.y);
+        const int maxY = localLightGridNeighborMaxOffset(worldPos.y);
+        const int minZ = localLightGridNeighborMinOffset(worldPos.z);
+        const int maxZ = localLightGridNeighborMaxOffset(worldPos.z);
+        const uint packedBase = localLightGridPackedIndexBase();
+
+        int checked = 0;
+        for(int dz = minZ; dz <= maxZ && checked < 48; ++dz)
+        for(int dy = minY; dy <= maxY && checked < 48; ++dy)
+        for(int dx = minX; dx <= maxX && checked < 48; ++dx)
         {
-            continue;
-        }
-        const uint limit = min(count, 24u);
-        for(uint k = 0u; k < limit && checked < 48; ++k)
-        {
-            ++checked;
-            const uint lightIdx = fogLightGrid.words[packedBase + firstIdx + k];
-            if(lightIdx >= totalLights)
+            uint firstIdx = 0u;
+            uint count = 0u;
+            if(!localLightGridLookupCell(baseCell + ivec3(dx, dy, dz), firstIdx, count))
             {
                 continue;
             }
-            const LocalLightGPU light = fogLightBuffer.lights[lightIdx];
-            const float emission = light.worldPosEmission.w;
+            const uint limit = min(count, 24u);
+            for(uint k = 0u; k < limit && checked < 48; ++k)
+            {
+                ++checked;
+                const uint lightIdx = fogLightGrid.words[packedBase + firstIdx + k];
+                if(lightIdx >= totalLights)
+                {
+                    continue;
+                }
+                const LocalLightGPU light = fogLightBuffer.lights[lightIdx];
+                const float emission = light.worldPosEmission.w;
+                if(emission <= 0.01)
+                {
+                    continue;
+                }
+                const uint typeCode = light.meta.x;
+                const vec3 toLight = light.worldPosEmission.xyz - worldPos;
+                const float dist2 = dot(toLight, toLight);
+                const float range = vptLocalLightRange(typeCode, emission);
+                if(dist2 >= range * range)
+                {
+                    continue;
+                }
+                const float d = sqrt(max(dist2, 0.25));
+                const float rangeFade = vptLocalLightRangeFade(d, typeCode, emission);
+                const float atten = rangeFade / (dist2 + 1.5);
+                const vec3 lightColor = localLightProfileColor(typeCode);
+                const float lumens = localLightProfileBrightness(typeCode, emission);
+                const float cosL = dot(viewDir, toLight / d);
+                const float phaseL = fogPhaseHaze(cosL, 0.35);
+                const vec3 contrib = lightColor * (lumens * LOCAL_LIGHT_ENERGY_SCALE * atten * phaseL);
+                const float score = dot(contrib, vec3(0.2126, 0.7152, 0.0722));
+
+                int worstSlot = 0;
+                float worstScore = bs0;
+                if(bs1 < worstScore) { worstScore = bs1; worstSlot = 1; }
+                if(bs2 < worstScore) { worstScore = bs2; worstSlot = 2; }
+                if(bs3 < worstScore) { worstScore = bs3; worstSlot = 3; }
+                if(score > worstScore)
+                {
+                    if(worstSlot == 0) { bs0 = score; bp0 = light.worldPosEmission.xyz; bc0 = contrib; }
+                    else if(worstSlot == 1) { bs1 = score; bp1 = light.worldPosEmission.xyz; bc1 = contrib; }
+                    else if(worstSlot == 2) { bs2 = score; bp2 = light.worldPosEmission.xyz; bc2 = contrib; }
+                    else { bs3 = score; bp3 = light.worldPosEmission.xyz; bc3 = contrib; }
+                }
+            }
+        }
+    }
+
+    if(hasDynamicLights)
+    {
+        for(uint di = 0u; di < dynamicCount; ++di)
+        {
+            const LocalLightGPU dlight = fogDynamicLights.lights[di];
+            const float emission = dlight.worldPosEmission.w;
             if(emission <= 0.01)
             {
                 continue;
             }
-            const uint typeCode = light.meta.x;
-            const vec3 toLight = light.worldPosEmission.xyz - worldPos;
+            const uint typeCode = dlight.meta.x;
+            const uint packedRgb = dlight.meta.y;
+            const vec3 toLight = dlight.worldPosEmission.xyz - worldPos;
             const float dist2 = dot(toLight, toLight);
             const float range = vptLocalLightRange(typeCode, emission);
             if(dist2 >= range * range)
@@ -262,8 +332,14 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
             const float d = sqrt(max(dist2, 0.25));
             const float rangeFade = vptLocalLightRangeFade(d, typeCode, emission);
             const float atten = rangeFade / (dist2 + 1.5);
-            const vec3 lightColor = localLightProfileColor(typeCode);
-            const float lumens = localLightProfileBrightness(typeCode, emission);
+            const vec3 lightColor = (packedRgb != 0u)
+                ? vec3(
+                    float((packedRgb >> 16u) & 255u),
+                    float((packedRgb >> 8u) & 255u),
+                    float(packedRgb & 255u)
+                  ) * (1.0 / 255.0)
+                : localLightProfileColor(typeCode);
+            const float lumens = localLightProfileBrightness(typeCode, emission) * dynamicIntensity;
             const float cosL = dot(viewDir, toLight / d);
             const float phaseL = fogPhaseHaze(cosL, 0.35);
             const vec3 contrib = lightColor * (lumens * LOCAL_LIGHT_ENERGY_SCALE * atten * phaseL);
@@ -276,10 +352,10 @@ vec3 fogEvaluateLocalLights(vec3 worldPos, vec3 viewDir, float scatterCoeff)
             if(bs3 < worstScore) { worstScore = bs3; worstSlot = 3; }
             if(score > worstScore)
             {
-                if(worstSlot == 0) { bs0 = score; bp0 = light.worldPosEmission.xyz; bc0 = contrib; }
-                else if(worstSlot == 1) { bs1 = score; bp1 = light.worldPosEmission.xyz; bc1 = contrib; }
-                else if(worstSlot == 2) { bs2 = score; bp2 = light.worldPosEmission.xyz; bc2 = contrib; }
-                else { bs3 = score; bp3 = light.worldPosEmission.xyz; bc3 = contrib; }
+                if(worstSlot == 0) { bs0 = score; bp0 = dlight.worldPosEmission.xyz; bc0 = contrib; }
+                else if(worstSlot == 1) { bs1 = score; bp1 = dlight.worldPosEmission.xyz; bc1 = contrib; }
+                else if(worstSlot == 2) { bs2 = score; bp2 = dlight.worldPosEmission.xyz; bc2 = contrib; }
+                else { bs3 = score; bp3 = dlight.worldPosEmission.xyz; bc3 = contrib; }
             }
         }
     }
@@ -331,8 +407,205 @@ void main()
     const int segmentCount = layers - 1;
     const float maxDistance = max(pc.params.y > 1.0 ? pc.params.y : cam.cloudParams8.w, 16.0);
 
-    // Per-(x,y) column depth range across in-cell 4x4 taps.
-    // barrier() runs unconditionally before any thread returns.
+    // Per-(x,y) column depth range across full-tile RT depth footprint.
+    // All barrier() calls run unconditionally before any thread returns.
+#if FOG_EDGE_GHOST_FIX
+    {
+        const uint lx = gl_LocalInvocationID.x;
+        const uint ly = gl_LocalInvocationID.y;
+        const uint lz = gl_LocalInvocationID.z;
+        const ivec2 depthSize = textureSize(sceneDepth, 0);
+        const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+
+        float laneMinRaw = 1.0;
+        float laneMaxRaw = 0.0;
+        vec2 laneMinUv = centerUv;
+        vec2 laneMaxUv = centerUv;
+        uint laneHasSky = 0u;
+        vec2 laneSolidUvSum = vec2(0.0);
+        float laneSolidCount = 0.0;
+
+        if(coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
+        {
+            const ivec2 pxMin = clamp(
+                ivec2(floor(vec2(coord.xy) * vec2(depthSize) / vec2(size.xy))),
+                ivec2(0), depthSize - ivec2(1));
+            const ivec2 pxMaxRaw = clamp(
+                ivec2(ceil(vec2(coord.xy + ivec2(1)) * vec2(depthSize) / vec2(size.xy))) - ivec2(1),
+                pxMin, depthSize - ivec2(1));
+            const ivec2 pxMax = min(pxMaxRaw, pxMin + ivec2(7, 7));
+            const int spanX = pxMax.x - pxMin.x + 1;
+            const int totalTaps = spanX * (pxMax.y - pxMin.y + 1);
+            for(int idx = int(lz); idx < totalTaps; idx += 4)
+            {
+                const int dx = idx % spanX;
+                const int dy = idx / spanX;
+                const ivec2 dCoord = pxMin + ivec2(dx, dy);
+                const vec2 snappedUv = (vec2(dCoord) + 0.5) / vec2(depthSize);
+                const float d = texelFetch(sceneDepth, dCoord, 0).r;
+                if(d <= 1.0e-5)
+                {
+                    laneHasSky = 1u;
+                }
+                else
+                {
+                    laneSolidUvSum += snappedUv;
+                    laneSolidCount += 1.0;
+                    if(d < laneMinRaw)
+                    {
+                        laneMinRaw = d;
+                        laneMinUv = snappedUv;
+                    }
+                    if(d > laneMaxRaw)
+                    {
+                        laneMaxRaw = d;
+                        laneMaxUv = snappedUv;
+                    }
+                }
+            }
+        }
+
+        sLaneMinRaw[lx][ly][lz] = laneMinRaw;
+        sLaneMaxRaw[lx][ly][lz] = laneMaxRaw;
+        sLaneMinUv[lx][ly][lz] = laneMinUv;
+        sLaneMaxUv[lx][ly][lz] = laneMaxUv;
+        sLaneHasSky[lx][ly][lz] = laneHasSky;
+        sLaneSolidUvSum[lx][ly][lz] = laneSolidUvSum;
+        sLaneSolidCount[lx][ly][lz] = laneSolidCount;
+    }
+    barrier();
+
+    if(gl_LocalInvocationID.z == 0u)
+    {
+        const uint lx = gl_LocalInvocationID.x;
+        const uint ly = gl_LocalInvocationID.y;
+        const ivec2 depthSize = textureSize(sceneDepth, 0);
+        const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+        float cellMax = maxDistance;
+        float cellMin = maxDistance;
+        vec2 farUv = centerUv;
+        uint hasSkyU = 0u;
+        float solidCount = 0.0;
+        vec2 solidUvSum = vec2(0.0);
+
+        if(coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
+        {
+            float minRawDepth = 1.0;
+            float maxRawDepth = 0.0;
+            vec2 minDepthUv = centerUv;
+            vec2 maxDepthUv = centerUv;
+            for(int k = 0; k < 4; ++k)
+            {
+                hasSkyU |= sLaneHasSky[lx][ly][k];
+                solidUvSum += sLaneSolidUvSum[lx][ly][k];
+                solidCount += sLaneSolidCount[lx][ly][k];
+                if(sLaneMinRaw[lx][ly][k] < minRawDepth)
+                {
+                    minRawDepth = sLaneMinRaw[lx][ly][k];
+                    minDepthUv = sLaneMinUv[lx][ly][k];
+                }
+                if(sLaneMaxRaw[lx][ly][k] > maxRawDepth)
+                {
+                    maxRawDepth = sLaneMaxRaw[lx][ly][k];
+                    maxDepthUv = sLaneMaxUv[lx][ly][k];
+                }
+            }
+            if(hasSkyU == 0u)
+            {
+                cellMax = min(maxDistance, fogSceneDistanceForDepth(minDepthUv, minRawDepth, cam.projInverse));
+                farUv = minDepthUv;
+            }
+            if(maxRawDepth > 1.0e-5)
+            {
+                cellMin = min(cellMax, fogSceneDistanceForDepth(maxDepthUv, maxRawDepth, cam.projInverse));
+            }
+            else
+            {
+                cellMin = cellMax;
+            }
+        }
+        sCellMinDist[lx][ly] = cellMin;
+        sCellMaxDist[lx][ly] = cellMax;
+        sCellFarUv[lx][ly] = farUv;
+        sCellHasSky[lx][ly] = hasSkyU;
+        sCellAwayDir[lx][ly] = vec2(0.0);
+        sCellSolidCount[lx][ly] = solidCount;
+        sCellSolidCentroid[lx][ly] = (solidCount > 0.5) ? (solidUvSum / solidCount) : centerUv;
+    }
+    barrier();
+
+    {
+        const uint lx = gl_LocalInvocationID.x;
+        const uint ly = gl_LocalInvocationID.y;
+        const uint lz = gl_LocalInvocationID.z;
+        const ivec2 depthSize = textureSize(sceneDepth, 0);
+        const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+        float bestScore = -1.0e20;
+        vec2 bestSkyUv = centerUv;
+
+        if(sCellHasSky[lx][ly] != 0u && sCellSolidCount[lx][ly] > 0.5 &&
+           coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
+        {
+            const vec2 solidCentroid = sCellSolidCentroid[lx][ly];
+            const ivec2 pxMin = clamp(
+                ivec2(floor(vec2(coord.xy) * vec2(depthSize) / vec2(size.xy))),
+                ivec2(0), depthSize - ivec2(1));
+            const ivec2 pxMaxRaw = clamp(
+                ivec2(ceil(vec2(coord.xy + ivec2(1)) * vec2(depthSize) / vec2(size.xy))) - ivec2(1),
+                pxMin, depthSize - ivec2(1));
+            const ivec2 pxMax = min(pxMaxRaw, pxMin + ivec2(7, 7));
+            const int spanX = pxMax.x - pxMin.x + 1;
+            const int totalTaps = spanX * (pxMax.y - pxMin.y + 1);
+            for(int idx = int(lz); idx < totalTaps; idx += 4)
+            {
+                const int dx = idx % spanX;
+                const int dy = idx / spanX;
+                const ivec2 dCoord = pxMin + ivec2(dx, dy);
+                if(texelFetch(sceneDepth, dCoord, 0).r <= 1.0e-5)
+                {
+                    const vec2 snappedUv = (vec2(dCoord) + 0.5) / vec2(depthSize);
+                    const vec2 dSolid = snappedUv - solidCentroid;
+                    const vec2 dCenter = snappedUv - centerUv;
+                    const float score = dot(dSolid, dSolid) - 0.15 * dot(dCenter, dCenter);
+                    if(score > bestScore)
+                    {
+                        bestScore = score;
+                        bestSkyUv = snappedUv;
+                    }
+                }
+            }
+        }
+        sLaneBestSkyScore[lx][ly][lz] = bestScore;
+        sLaneBestSkyUv[lx][ly][lz] = bestSkyUv;
+    }
+    barrier();
+
+    if(gl_LocalInvocationID.z == 0u)
+    {
+        const uint lx = gl_LocalInvocationID.x;
+        const uint ly = gl_LocalInvocationID.y;
+        if(sCellHasSky[lx][ly] != 0u && sCellSolidCount[lx][ly] > 0.5)
+        {
+            float bestScore = -1.0e20;
+            vec2 bestSkyUv = sCellFarUv[lx][ly];
+            for(int k = 0; k < 4; ++k)
+            {
+                if(sLaneBestSkyScore[lx][ly][k] > bestScore)
+                {
+                    bestScore = sLaneBestSkyScore[lx][ly][k];
+                    bestSkyUv = sLaneBestSkyUv[lx][ly][k];
+                }
+            }
+            sCellFarUv[lx][ly] = bestSkyUv;
+            const vec2 dAway = bestSkyUv - sCellSolidCentroid[lx][ly];
+            if(dot(dAway, dAway) > 1.0e-12)
+            {
+                sCellAwayDir[lx][ly] = normalize(dAway);
+            }
+        }
+    }
+    barrier();
+#else
     if(gl_LocalInvocationID.z == 0u)
     {
         float cellMax = maxDistance;
@@ -504,6 +777,7 @@ void main()
 #endif
     }
     barrier();
+#endif
 
     if(any(greaterThanEqual(coord, size)))
     {
@@ -629,7 +903,9 @@ void main()
             {
                 float viewVis = sampleBehindDepth
                     ? 0.0
-                    : fogTraceViewLineOfSight(cameraPos, worldDir, 0.05, dist);
+                    : ((dist < cellMinDist - 0.25)
+                        ? 1.0
+                        : fogTraceViewLineOfSight(cameraPos, worldDir, 0.05, dist));
 #if FOG_SILHOUETTE_FIX
                 if(viewVis < 0.5 &&
                    d0 >= cellMinDist &&
@@ -799,16 +1075,28 @@ void main()
         outSigmaT = 0.0;
     }
     vec4 currentVal = vec4(inScatter, outSigmaT);
-
-    // 5) 3D Temporal Reprojection & Accumulation (rejects silhouette discontinuities & tightens shadow clamp).
-    const bool silhouetteSlice = (d0 >= cellMinDist - 0.05) && ((cellMaxDist - cellMinDist) > 1.0);
-    if(!silhouetteSlice && !occludedFromCamera && pc.params.z > 0.5 && cam.historyValid != 0u && useJitter)
 #else
     vec4 currentVal = vec4(inScatter, totalSigmaT);
+#endif
 
     // 5) 3D Temporal Reprojection & Accumulation (rejects silhouette discontinuities & tightens shadow clamp).
+#if FOG_EDGE_GHOST_FIX
+    const bool silhouetteSlice =
+        (d1 >= cellMinDist - 0.25) && ((cellMaxDist - cellMinDist) > 1.0);
+    const bool surfaceClippedSlice =
+        (cellMaxDist < maxDistance - 0.5) && (d1 > cellMaxDist - 0.05);
+#if FOG_SILHOUETTE_FIX
+    if(!silhouetteSlice && !surfaceClippedSlice && !occludedFromCamera && pc.params.z > 0.5 && cam.historyValid != 0u && useJitter)
+#else
+    if(!silhouetteSlice && !surfaceClippedSlice && pc.params.z > 0.5 && cam.historyValid != 0u && useJitter)
+#endif
+#else
     const bool silhouetteSlice = (d0 >= cellMinDist - 0.05) && ((cellMaxDist - cellMinDist) > 1.0);
+#if FOG_SILHOUETTE_FIX
+    if(!silhouetteSlice && !occludedFromCamera && pc.params.z > 0.5 && cam.historyValid != 0u && useJitter)
+#else
     if(!silhouetteSlice && pc.params.z > 0.5 && cam.historyValid != 0u && useJitter)
+#endif
 #endif
     {
         // Reproject the UNJITTERED depth-clamped froxel center for exact temporal alignment.
@@ -840,6 +1128,24 @@ void main()
                     const float turnMotion = smoothstep(0.9995, 0.985, cosRot);
                     const float motion = clamp(max(smoothstep(1.2, 14.0, speed), turnMotion), 0.0, 1.0);
                     float histWeight = mix(0.90, 0.56, motion);
+#if FOG_EDGE_GHOST_FIX
+                    // Full history rejection on steep extinction or bright->dark transitions (eliminates disocclusion lag).
+                    const float sigmaDelta = abs(hist.a - currentVal.a) / max(currentVal.a + hist.a, 0.004);
+                    histWeight *= (1.0 - smoothstep(0.12, 0.45, sigmaDelta));
+                    histWeight *= mix(0.25, 1.0, geomVis);
+                    const float edgeDist = min(min(prevUv.x, 1.0 - prevUv.x), min(prevUv.y, 1.0 - prevUv.y));
+                    histWeight *= smoothstep(0.002, 0.035, edgeDist);
+                    histWeight *= clamp(cam.fogExtrasParams.w, 0.0, 1.0);
+
+                    const float lumCur = dot(currentVal.rgb, vec3(0.2126, 0.7152, 0.0722));
+                    const vec3 histRgb = max(hist.rgb, vec3(0.0));
+                    const float lumHist = dot(histRgb, vec3(0.2126, 0.7152, 0.0722));
+                    const float brightDrop = max(lumHist - lumCur, 0.0) / max(lumCur + 0.01, 0.01);
+                    histWeight *= (1.0 - smoothstep(0.35, 1.25, brightDrop));
+                    const float maxAllowedLum = (geomVis < 0.5)
+                        ? (lumCur * 1.20 + 0.002)
+                        : (lumCur * 1.65 + 0.015);
+#else
                     // Reduce history weight if extinction jumped sharply (e.g. slider/weather change).
                     const float sigmaDelta = abs(hist.a - currentVal.a) / max(currentVal.a + hist.a, 0.005);
                     histWeight *= mix(1.0, 0.35, smoothstep(0.35, 1.2, sigmaDelta));
@@ -854,6 +1160,7 @@ void main()
                     const float maxAllowedLum = (geomVis < 0.5)
                         ? (lumCur * 1.35 + 0.004)
                         : max(lumCur * 3.5 + 0.04, 0.08);
+#endif
                     vec3 clampedHistRgb = histRgb;
                     if(lumHist > maxAllowedLum && lumHist > 1.0e-6)
                     {

@@ -79,8 +79,24 @@ void clearBins()
 void publishCloudWhite()
 {
     cloudWhite = exp2(-currentEV) * ae.displayWhiteScale;
+
+    // 2026-11-26：DLSS-RR 曝光缓冲改回恒定 1.0。
+    // kBufferTypeExposure 的语义是"送进 DLSS 的颜色**已经乘过**的预曝光值"，
+    // DLSS-RR 会先把它除掉、在辐射域做时域累积、再乘回去。本管线的曝光是在
+    // DLSS **之后**的 rr_sdr_post / rr_hdr_encode 才乘的，DLSS 输入是未曝光辐射
+    // （Frame.cpp 里 preExposure 也声明为 1.0）。此前这里写的是
+    // 2^(currentEV*strength + manualEV)：曝光每变一次，DLSS 的历史帧就被按
+    // e_now/e_prev 的比例错误缩放，自动曝光适应期间出现亮度拖尾 / 呼吸。
+    // 预曝光若将来前移到 DLSS 输入之前，把 DLSS_EXPOSURE_PREEXPOSED 置 1 即恢复。
+#ifndef DLSS_EXPOSURE_PREEXPOSED
+#define DLSS_EXPOSURE_PREEXPOSED 0
+#endif
+#if DLSS_EXPOSURE_PREEXPOSED
     float activeEV = (ae.enabled != 0) ? (currentEV * ae.exposureStrength) : 0.0;
     float dlssExp = clamp(exp2(activeEV + ae.manualEV), 1.0 / 64.0, 64.0);
+#else
+    float dlssExp = 1.0;
+#endif
     imageStore(dlssExposureImage, ivec2(0, 0), vec4(dlssExp, 0.0, 0.0, 0.0));
 }
 

@@ -462,6 +462,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
         g_sectionBLAS.clear();
 
         destroyBlasCompactionResources();
+        destroyGeomGpuTimestampResources();
         destroySectionMemoryPool();
 
         if(g_blas&&fn) fn(g_device,g_blas,nullptr);

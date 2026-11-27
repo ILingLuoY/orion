@@ -2106,9 +2106,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
         }
     }
 
-    if(g_worldGeometryDirty.load(std::memory_order_acquire))
+    if(g_worldGeometryDirty.load(std::memory_order_acquire) ||
+       g_handRebuildRequested.load(std::memory_order_acquire))
     {
-        if(g_entityRebuildRequested.exchange(false, std::memory_order_acq_rel))
+        const bool handRebuildImmediate =
+            g_handRebuildRequested.exchange(false, std::memory_order_acq_rel);
+        if(g_entityRebuildRequested.exchange(false, std::memory_order_acq_rel) ||
+           handRebuildImmediate)
         {
             // 2026-11-09：动态层（实体/手/粒子/局部光）此前**无条件**触发
             // 整世界重建（绕过下面那条 6 帧间隔）⇒ 实体一动就每帧全量遍历
@@ -2117,6 +2121,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
             // 等"other"只有 0.01 ms。
             // 这里给它一个独立节流窗口（默认 2 帧 ≈ 30 Hz），未到期就把请求
             // 放回去，不丢更新。回退：ORION_DYN_REBUILD_INTERVAL=1 ⇒ 逐帧重建。
+            // 2026-11-26：第一人称手部变化（handRebuildImmediate）绕过节流立即重建，
+            // 消除隔帧滞后与转视角鬼影（静止时 handChanged==false，不触发）。
             static const uint32_t dynRebuildInterval = []()
             {
                 const char* raw = std::getenv("ORION_DYN_REBUILD_INTERVAL");
@@ -2131,7 +2137,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
                 lastDynRebuildFrame == 0u ||
                 g_perfL10FrameSerial >= lastDynRebuildFrame + dynRebuildInterval;
 
-            if(!dynRebuildDue && !forceCameraCullRebuild)
+            if(!dynRebuildDue && !forceCameraCullRebuild && !handRebuildImmediate)
             {
                 g_entityRebuildRequested.store(true, std::memory_order_release);
             }
@@ -2154,6 +2160,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
             if(!rtxRebuildDone)
             {
                 g_entityRebuildRequested.store(true, std::memory_order_release);
+                if(handRebuildImmediate)
+                {
+                    g_handRebuildRequested.store(true, std::memory_order_release);
+                }
             }
             }
         }
@@ -2887,7 +2897,7 @@ if(!g_dlssGFeatureInitialized)
     if(
         g_dlssGReady &&
         g_slDLSSGGetState &&
-        (g_perfL10FrameSerial % 120u) == 0u
+        (g_perfL10FrameSerial % 600u) == 0u
     )
     {
         sl::DLSSGState state{};
@@ -2907,33 +2917,6 @@ if(!g_dlssGFeatureInitialized)
                 state.numFramesToGenerateMax
             );
         }
-
-
-        fprintf(
-            stderr,
-            "[FG-1 STATE]"
-            " result=%d"
-            " status=%u"
-            " minWidthOrHeight=%u"
-            " numFramesToGenerateMax=%u"
-            " presented=%u\n",
-
-            static_cast<int>(
-                stateResult
-            ),
-
-            static_cast<unsigned int>(
-                state.status
-            ),
-
-            state.minWidthOrHeight,
-
-            state.numFramesToGenerateMax,
-
-            state.numFramesActuallyPresented
-        );
-
-        fflush(stderr);
 
         {
             std::ostringstream fgStateLog;
@@ -5724,17 +5707,12 @@ sl::ResourceTag outputTag(
         static sl::Result lastRREvaluateResult =
             sl::Result::eErrorFeatureNotSupported;
         if(!hasLoggedRREvaluateResult ||
-           dlssResult != lastRREvaluateResult ||
-           (g_perfL10FrameSerial % 120u) == 0u)
+           dlssResult != lastRREvaluateResult)
         {
-            fprintf(
-                stderr,
-                "[DLSS-4.1] Evaluate result=%d render=%ux%u output=%ux%u\n",
-                static_cast<int>(dlssResult),
-                g_rtOutputWidth,
-                g_rtOutputHeight,
-                g_dlssOutputWidth,
-                g_dlssOutputHeight
+            RTLog(
+                "[DLSS-4.1] Evaluate result=" + std::to_string(static_cast<int>(dlssResult)) +
+                " render=" + std::to_string(g_rtOutputWidth) + "x" + std::to_string(g_rtOutputHeight) +
+                " output=" + std::to_string(g_dlssOutputWidth) + "x" + std::to_string(g_dlssOutputHeight)
             );
             hasLoggedRREvaluateResult = true;
             lastRREvaluateResult = dlssResult;

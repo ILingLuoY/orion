@@ -460,7 +460,7 @@ vec3 evaluateSecondaryDiffuseLocalLights(
                     shadowMaxDistance,
                     gl_RayFlagsTerminateOnFirstHitEXT |
                     gl_RayFlagsSkipClosestHitShaderEXT,
-                    0xefu,
+                    g_secondaryCullMask,
                     slot
                 );
             }
@@ -476,7 +476,7 @@ vec3 evaluateSecondaryDiffuseLocalLights(
                     gl_RayFlagsTerminateOnFirstHitEXT |
                     gl_RayFlagsSkipClosestHitShaderEXT,
 
-                    0xefu,
+                    g_secondaryCullMask,
 
                     0,
                     0,

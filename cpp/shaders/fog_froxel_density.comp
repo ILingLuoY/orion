@@ -52,6 +52,20 @@ shared float sTileMinDist[4][4];
 #if FOG_SILHOUETTE_FIX
 shared vec2  sTileFarUv[4][4];
 #endif
+#if FOG_EDGE_GHOST_FIX
+shared float sLaneMinRaw[4][4][4];
+shared float sLaneMaxRaw[4][4][4];
+shared vec2  sLaneMinUv[4][4][4];
+shared vec2  sLaneMaxUv[4][4][4];
+shared uint  sLaneHasSky[4][4][4];
+shared vec2  sLaneSolidUvSum[4][4][4];
+shared float sLaneSolidCount[4][4][4];
+shared float sLaneBestSkyScore[4][4][4];
+shared vec2  sLaneBestSkyUv[4][4][4];
+shared uint  sTileHasSky[4][4];
+shared float sTileSolidCount[4][4];
+shared vec2  sTileSolidCentroid[4][4];
+#endif
 
 // Wide 9-tap hemisphere openness & smoothed ground elevation from terrainHeightMap.
 // Eliminates artificial vertical light pillars under small ceiling/canopy gaps and smooths
@@ -148,8 +162,199 @@ void main()
     const int segmentCount = layers - 1;
     const float maxDistance = max(pc.params.y > 1.0 ? pc.params.y : cam.cloudParams8.w, 16.0);
 
-    // Conservative per-(x,y) column max-depth computation across the workgroup.
-    // barrier() executes unconditionally for all invocations before any early return.
+    // Conservative per-(x,y) column depth bounds computation across the workgroup.
+    // All barrier() calls execute unconditionally for all invocations before any early return.
+#if FOG_EDGE_GHOST_FIX
+    {
+        const uint lx = gl_LocalInvocationID.x;
+        const uint ly = gl_LocalInvocationID.y;
+        const uint lz = gl_LocalInvocationID.z;
+        const ivec2 depthSize = textureSize(sceneDepth, 0);
+        const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+
+        float laneMinRaw = 1.0;
+        float laneMaxRaw = 0.0;
+        vec2 laneMinUv = centerUv;
+        vec2 laneMaxUv = centerUv;
+        uint laneHasSky = 0u;
+        vec2 laneSolidUvSum = vec2(0.0);
+        float laneSolidCount = 0.0;
+
+        if(coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
+        {
+            const ivec2 pxMin = clamp(
+                ivec2(floor(vec2(coord.xy) * vec2(depthSize) / vec2(size.xy))),
+                ivec2(0), depthSize - ivec2(1));
+            const ivec2 pxMaxRaw = clamp(
+                ivec2(ceil(vec2(coord.xy + ivec2(1)) * vec2(depthSize) / vec2(size.xy))) - ivec2(1),
+                pxMin, depthSize - ivec2(1));
+            const ivec2 pxMax = min(pxMaxRaw, pxMin + ivec2(7, 7));
+            const int spanX = pxMax.x - pxMin.x + 1;
+            const int totalTaps = spanX * (pxMax.y - pxMin.y + 1);
+            for(int idx = int(lz); idx < totalTaps; idx += 4)
+            {
+                const int dx = idx % spanX;
+                const int dy = idx / spanX;
+                const ivec2 dCoord = pxMin + ivec2(dx, dy);
+                const vec2 snappedUv = (vec2(dCoord) + 0.5) / vec2(depthSize);
+                const float d = texelFetch(sceneDepth, dCoord, 0).r;
+                if(d <= 1.0e-5)
+                {
+                    laneHasSky = 1u;
+                }
+                else
+                {
+                    laneSolidUvSum += snappedUv;
+                    laneSolidCount += 1.0;
+                    if(d < laneMinRaw)
+                    {
+                        laneMinRaw = d;
+                        laneMinUv = snappedUv;
+                    }
+                    if(d > laneMaxRaw)
+                    {
+                        laneMaxRaw = d;
+                        laneMaxUv = snappedUv;
+                    }
+                }
+            }
+        }
+
+        sLaneMinRaw[lx][ly][lz] = laneMinRaw;
+        sLaneMaxRaw[lx][ly][lz] = laneMaxRaw;
+        sLaneMinUv[lx][ly][lz] = laneMinUv;
+        sLaneMaxUv[lx][ly][lz] = laneMaxUv;
+        sLaneHasSky[lx][ly][lz] = laneHasSky;
+        sLaneSolidUvSum[lx][ly][lz] = laneSolidUvSum;
+        sLaneSolidCount[lx][ly][lz] = laneSolidCount;
+    }
+    barrier();
+
+    if(gl_LocalInvocationID.z == 0u)
+    {
+        const uint lx = gl_LocalInvocationID.x;
+        const uint ly = gl_LocalInvocationID.y;
+        const ivec2 depthSize = textureSize(sceneDepth, 0);
+        const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+        float tileMax = maxDistance;
+        float tileMin = maxDistance;
+        vec2 farUv = centerUv;
+        uint hasSkyU = 0u;
+        float solidCount = 0.0;
+        vec2 solidUvSum = vec2(0.0);
+
+        if(coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
+        {
+            float minRawDepth = 1.0;
+            float maxRawDepth = 0.0;
+            vec2 minDepthUv = centerUv;
+            vec2 maxDepthUv = centerUv;
+            for(int k = 0; k < 4; ++k)
+            {
+                hasSkyU |= sLaneHasSky[lx][ly][k];
+                solidUvSum += sLaneSolidUvSum[lx][ly][k];
+                solidCount += sLaneSolidCount[lx][ly][k];
+                if(sLaneMinRaw[lx][ly][k] < minRawDepth)
+                {
+                    minRawDepth = sLaneMinRaw[lx][ly][k];
+                    minDepthUv = sLaneMinUv[lx][ly][k];
+                }
+                if(sLaneMaxRaw[lx][ly][k] > maxRawDepth)
+                {
+                    maxRawDepth = sLaneMaxRaw[lx][ly][k];
+                    maxDepthUv = sLaneMaxUv[lx][ly][k];
+                }
+            }
+            if(hasSkyU == 0u)
+            {
+                tileMax = min(maxDistance, fogSceneDistanceForDepth(minDepthUv, minRawDepth, cam.projInverse));
+                farUv = minDepthUv;
+            }
+            if(maxRawDepth > 1.0e-5)
+            {
+                tileMin = min(tileMax, fogSceneDistanceForDepth(maxDepthUv, maxRawDepth, cam.projInverse));
+            }
+            else
+            {
+                tileMin = tileMax;
+            }
+        }
+        sTileMaxDist[lx][ly] = tileMax;
+        sTileMinDist[lx][ly] = tileMin;
+        sTileFarUv[lx][ly] = farUv;
+        sTileHasSky[lx][ly] = hasSkyU;
+        sTileSolidCount[lx][ly] = solidCount;
+        sTileSolidCentroid[lx][ly] = (solidCount > 0.5) ? (solidUvSum / solidCount) : centerUv;
+    }
+    barrier();
+
+    {
+        const uint lx = gl_LocalInvocationID.x;
+        const uint ly = gl_LocalInvocationID.y;
+        const uint lz = gl_LocalInvocationID.z;
+        const ivec2 depthSize = textureSize(sceneDepth, 0);
+        const vec2 centerUv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+        float bestScore = -1.0e20;
+        vec2 bestSkyUv = centerUv;
+
+        if(sTileHasSky[lx][ly] != 0u && sTileSolidCount[lx][ly] > 0.5 &&
+           coord.x < size.x && coord.y < size.y && depthSize.x > 1 && depthSize.y > 1)
+        {
+            const vec2 solidCentroid = sTileSolidCentroid[lx][ly];
+            const ivec2 pxMin = clamp(
+                ivec2(floor(vec2(coord.xy) * vec2(depthSize) / vec2(size.xy))),
+                ivec2(0), depthSize - ivec2(1));
+            const ivec2 pxMaxRaw = clamp(
+                ivec2(ceil(vec2(coord.xy + ivec2(1)) * vec2(depthSize) / vec2(size.xy))) - ivec2(1),
+                pxMin, depthSize - ivec2(1));
+            const ivec2 pxMax = min(pxMaxRaw, pxMin + ivec2(7, 7));
+            const int spanX = pxMax.x - pxMin.x + 1;
+            const int totalTaps = spanX * (pxMax.y - pxMin.y + 1);
+            for(int idx = int(lz); idx < totalTaps; idx += 4)
+            {
+                const int dx = idx % spanX;
+                const int dy = idx / spanX;
+                const ivec2 dCoord = pxMin + ivec2(dx, dy);
+                if(texelFetch(sceneDepth, dCoord, 0).r <= 1.0e-5)
+                {
+                    const vec2 snappedUv = (vec2(dCoord) + 0.5) / vec2(depthSize);
+                    const vec2 dSolid = snappedUv - solidCentroid;
+                    const vec2 dCenter = snappedUv - centerUv;
+                    const float score = dot(dSolid, dSolid) - 0.15 * dot(dCenter, dCenter);
+                    if(score > bestScore)
+                    {
+                        bestScore = score;
+                        bestSkyUv = snappedUv;
+                    }
+                }
+            }
+        }
+        sLaneBestSkyScore[lx][ly][lz] = bestScore;
+        sLaneBestSkyUv[lx][ly][lz] = bestSkyUv;
+    }
+    barrier();
+
+    if(gl_LocalInvocationID.z == 0u)
+    {
+        const uint lx = gl_LocalInvocationID.x;
+        const uint ly = gl_LocalInvocationID.y;
+        if(sTileHasSky[lx][ly] != 0u && sTileSolidCount[lx][ly] > 0.5)
+        {
+            float bestScore = -1.0e20;
+            vec2 bestSkyUv = sTileFarUv[lx][ly];
+            for(int k = 0; k < 4; ++k)
+            {
+                if(sLaneBestSkyScore[lx][ly][k] > bestScore)
+                {
+                    bestScore = sLaneBestSkyScore[lx][ly][k];
+                    bestSkyUv = sLaneBestSkyUv[lx][ly][k];
+                }
+            }
+            sTileFarUv[lx][ly] = bestSkyUv;
+        }
+    }
+    barrier();
+#else
     if(gl_LocalInvocationID.z == 0u)
     {
         float tileMax = maxDistance;
@@ -293,6 +498,7 @@ void main()
 #endif
     }
     barrier();
+#endif
 
     if(any(greaterThanEqual(coord, size)))
     {
@@ -305,10 +511,15 @@ void main()
     {
         if(cam.cloudParams7.x >= 0.5 && cam.waterSimState.w == 0u)
         {
+#if FOG_EDGE_GHOST_FIX
+            const float metaSky = float(sTileHasSky[gl_LocalInvocationID.x][gl_LocalInvocationID.y]);
+#else
+            const float metaSky = 0.0;
+#endif
             imageStore(fogFroxelDensity, coord, vec4(
                 sTileMinDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y],
                 sTileMaxDist[gl_LocalInvocationID.x][gl_LocalInvocationID.y],
-                0.0,
+                metaSky,
                 1.0));
         }
         else

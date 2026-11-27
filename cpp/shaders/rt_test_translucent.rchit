@@ -32,6 +32,7 @@ const uint RT_STATE_PROFILE_SHIFT      = 9u;
 // isClearGlassHit()，语义是"这片玻璃当空气"：不染色、不打镜面反射、不加太阳高光，
 // 光直接穿过去。回退走 rgen 侧的 GI_CLEAR_GLASS_AS_AIR=0。
 const uint RT_STATE_CLEAR_GLASS_BIT    = 1u << 12u;
+const uint RT_STATE_K1_LANDING_BIT     = 1u << 21u;
 const uint RT_PURPOSE_CLASSIFY         = 1u;
 // 2026-10-06：rgen 的 RR-6.2 主水反射 guide 射线（RT_PURPOSE_DISTANCE_ONLY）
 // 也会命中本组（玻璃 / voxy-DH LOD 水）。补上同名常量供快速路径识别。
@@ -1455,6 +1456,8 @@ void main()
         return;
     }
 
+    const bool k1LandingRay = (payload.state & RT_STATE_K1_LANDING_BIT) != 0u;
+
     // 2026-10-21 根因修复（同 rt_test.rchit 的说明）：生产模式必须先把命中身份与
     // hitT 播种进 ray payload，否则 resolveHitMaterialGlass() 会拿陈旧身份索引
     // sectionVertexAddressBuffer（无边界检查）⇒ 垃圾指针 ⇒ GPU 挂死。
@@ -1482,6 +1485,18 @@ void main()
             hitOffsetImage,
             ivec2(gl_LaunchIDEXT.xy),
             vec4(g_hitWorldOffset, g_hitOffsetValid ? 1.0 : 0.0));
+    }
+    if(k1LandingRay &&
+       payload.hitDistance >= 0.0 &&
+       ((payload.state >> RT_STATE_HIT_CLASS_SHIFT) & 0x3u) != RT_HIT_TRANSLUCENT)
+    {
+        payload.hitDistance = gl_HitTEXT;
+        payload.normal = vec3(
+            float(gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT),
+            float(gl_PrimitiveID),
+            attribs.x
+        );
+        payload.roughness = attribs.y;
     }
     #ifdef ORION_RT_STAGE_COUNTERS
     rtCntFlushHit();

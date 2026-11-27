@@ -310,6 +310,29 @@ public final class FrameBudget {
         }
     }
 
+    private static final java.util.concurrent.ArrayBlockingQueue<String> ASYNC_LOG_QUEUE =
+            new java.util.concurrent.ArrayBlockingQueue<>(256);
+
+    static {
+        final Thread logThread = new Thread(() -> {
+            while (true) {
+                try {
+                    System.out.println(ASYNC_LOG_QUEUE.take());
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+        }, "orion-framebudget-log");
+        logThread.setDaemon(true);
+        logThread.start();
+    }
+
+    private static void logAsync(String msg) {
+        ASYNC_LOG_QUEUE.offer(msg);
+    }
+
     private FrameBudget() {}
 
     private static boolean onMainThread() {
@@ -523,7 +546,7 @@ public final class FrameBudget {
             }
         }
 
-        lastHeadNanos = now;
+        lastHeadNanos = System.nanoTime();
         lastCaptureHeadMs = 0.0;
         lastCapVoxyMs = 0.0;
         lastCapDhMs = 0.0;
@@ -588,7 +611,7 @@ public final class FrameBudget {
                             + " vis=" + round(lastCapVisMs) + "]"
                     : "";
 
-            System.out.println(
+            logAsync(
                     "[RENDER SPIKE] total=" + round(lastRenderMs)
                             + "ms | preRL=" + round(preRL)
                             + " rlPreLv=" + round(rlPreLv)
@@ -715,82 +738,84 @@ public final class FrameBudget {
         final double avgSim = sumSimMs / inv;
         final double avgFrameTail = sumFrameTailMs / inv;
 
-        System.out.println(
-                "[FRAME BUDGET]"
-                        + " frames=" + frames
-                        + " avgIntervalMs=" + round(avgInterval)
-                        + " avgRenderMs=" + round(avgRender)
-                        + " avgOutsideMs=" + round(avgOutside)
-                        + " maxRenderMs=" + round(maxRenderMs)
-                        // 2026-11-09：把渲染距离写进日志，让"改视距"的 A/B 可自动对齐。
-                        + " rd=" + net.minecraft.client.Minecraft.getInstance()
-                                .options.renderDistance().get()
-                        + " renderPct=" + round(avgInterval <= 0.0
-                                ? 0.0
-                                : 100.0 * avgRender / avgInterval)
-                        + "  判读：Outside 大 ⇒ tick/GC/呈现；Render≈Interval ⇒ 在渲染路径里"
-                        + System.lineSeparator()
-                        + "                [FRAME SPLIT] simMs=" + round(avgSim)
-                        + " renderFrameTailMs=" + round(avgFrameTail)
-                        + " gapMs=" + round(sumGapMs / inv)
-                        + " maxSimMs=" + round(maxSimMs)
-                        + "  (= runTick 拆三段 + 帧间空档；"
-                        + "四者相加应与 avgIntervalMs 同口径，差值 = runTick 内未钩的段)");
-        System.out.println(
-                "                [FRAME SURFACE] acquireMs=" + round(sumAcquireMs / inv)
-                        + " presentMs=" + round(sumPresentMs / inv)
-                        + "  (= frameTail 里交换链的占比；"
-                        + "acquire 阻塞 ⇒ 队列满/FG 排队；present 阻塞 ⇒ 驱动/vsync)");
-        System.out.println(
-                "                [FRAME TAIL SPLIT] renderFrameInnerMs="
-                        + round(sumRenderFrameInnerMs / inv)
-                        + " postRenderFrameMs=" + round(sumPostRenderFrameMs / inv)
-                        + " submitMs=" + round(sumSubmitMs / inv)
-                        + " submitCount=" + sumSubmitCount
-                        + " levelRenderMs=" + round(sumLevelRenderMs / inv)
-                        + " maxLevelRenderMs=" + round(maxLevelRenderMs)
-                        + " captureHeadMs=" + round(sumCaptureHeadMs / inv)
-                        + " maxCaptureHeadMs=" + round(maxCaptureHeadMs)
-                        + " recordFrameMs=" + round(sumRecordFrameMs / inv)
-                        + " MB/f: level=" + round(sumLevelAlloc / inv / 1048576.0)
-                        + " record=" + round(sumRecordAlloc / inv / 1048576.0)
-                        + " capture=" + round(sumCaptureAlloc / inv / 1048576.0)
-                        + " submit=" + round(sumSubmitAlloc / inv / 1048576.0)
-                        + " maxRecordFrameMs=" + round(maxRecordFrameMs)
-                        + " submitEntitiesMs=" + round(sumSubmitEntitiesMs / inv)
-                        + " maxSubmitEntitiesMs=" + round(maxSubmitEntitiesMs)
-                        + "  (= frameTail 拆两段 + 我们自己的 submit 墙钟；"
-                        + "submit≈frameTail ⇒ 队列等待/帧节奏（减 GPU pass 才有 fps）；"
-                        + "levelRenderMs 覆盖 LevelRenderer.render 整段："
-                        + "它≈avgRenderMs ⇒ 卡在 level render 内（我们的 JNI + 原版）；"
-                        + "它远小于 avgRenderMs ⇒ 卡在 render 之外的帧内空档)");
-        System.out.println(
-                "                [FRAME SIM] vanillaTickMs=" + round(sumVanillaTickMs / inv)
-                        + "  (= simMs 里的原版 tick；"
-                        + "simMs − vanillaTickMs = 区块结果消费 + 我们的上传/JNI)");
-        System.out.println(
-                "                [FRAME SIM SPLIT] packetsMs=" + round(sumSimSubMs[0] / inv)
-                        + " extractMs=" + round(sumSimSubMs[1] / inv)
-                        + " soundMs=" + round(sumSimSubMs[2] / inv)
-                        + " mouseMs=" + round(sumSimSubMs[3] / inv)
-                        + "  (= sim 段四路：主线程网络包 / 26.3 区块提取 / 声音 / 鼠标；"
-                        + "sim − vanillaTick − task − JNI三槽 − 本行四项 的残差 ⇒ "
-                        + "advanceGameTime/textureTick/gizmos 等小额项)");
-        System.out.println(
-                "                [FRAME TASKS] runAllTasksMs=" + round(sumTaskPumpMs / inv)
-                        + " taskMs=" + round(sumTaskRunMs / inv)
-                        + " taskCount=" + sumTaskCount
-                        + " maxTaskMs=" + round(maxTaskMaxMs)
-                        + "  (= simMs 里的主线程任务泵：区块编译完成后的消费/上传任务；"
-                        + "taskMs 与 vanillaTickMs 可能重叠——tick 内也会 pump)");
-        System.out.println(
-                "                [FRAME JNI HEAD] beginStreamlineMs="
-                        + round(sumJniHeadMs[0] / inv)
-                        + " maxBeginStreamlineMs=" + round(maxJniHeadMs[0])
-                        + " markSimMs=" + round(sumJniHeadMs[1] / inv)
-                        + " menuMs=" + round(sumJniHeadMs[2] / inv)
-                        + "  (= simMs 里我们自己的三个 JNI；"
-                        + "beginStreamline 大 ⇒ 帧围栏/GPU 等待藏在 sim 段)");
+        final String nl = System.lineSeparator();
+        final StringBuilder sb = new StringBuilder(1024);
+        sb.append("[FRAME BUDGET]")
+                .append(" frames=").append(frames)
+                .append(" avgIntervalMs=").append(round(avgInterval))
+                .append(" avgRenderMs=").append(round(avgRender))
+                .append(" avgOutsideMs=").append(round(avgOutside))
+                .append(" maxRenderMs=").append(round(maxRenderMs))
+                // 2026-11-09：把渲染距离写进日志，让"改视距"的 A/B 可自动对齐。
+                .append(" rd=").append(net.minecraft.client.Minecraft.getInstance()
+                        .options.renderDistance().get())
+                .append(" renderPct=").append(round(avgInterval <= 0.0
+                        ? 0.0
+                        : 100.0 * avgRender / avgInterval))
+                .append("  判读：Outside 大 ⇒ tick/GC/呈现；Render≈Interval ⇒ 在渲染路径里")
+                .append(nl)
+                .append("                [FRAME SPLIT] simMs=").append(round(avgSim))
+                .append(" renderFrameTailMs=").append(round(avgFrameTail))
+                .append(" gapMs=").append(round(sumGapMs / inv))
+                .append(" maxSimMs=").append(round(maxSimMs))
+                .append("  (= runTick 拆三段 + 帧间空档；")
+                .append("四者相加应与 avgIntervalMs 同口径，差值 = runTick 内未钩的段)")
+                .append(nl);
+        sb.append("                [FRAME SURFACE] acquireMs=").append(round(sumAcquireMs / inv))
+                .append(" presentMs=").append(round(sumPresentMs / inv))
+                .append("  (= frameTail 里交换链的占比；")
+                .append("acquire 阻塞 ⇒ 队列满/FG 排队；present 阻塞 ⇒ 驱动/vsync)")
+                .append(nl);
+        sb.append("                [FRAME TAIL SPLIT] renderFrameInnerMs=")
+                .append(round(sumRenderFrameInnerMs / inv))
+                .append(" postRenderFrameMs=").append(round(sumPostRenderFrameMs / inv))
+                .append(" submitMs=").append(round(sumSubmitMs / inv))
+                .append(" submitCount=").append(sumSubmitCount)
+                .append(" levelRenderMs=").append(round(sumLevelRenderMs / inv))
+                .append(" maxLevelRenderMs=").append(round(maxLevelRenderMs))
+                .append(" captureHeadMs=").append(round(sumCaptureHeadMs / inv))
+                .append(" maxCaptureHeadMs=").append(round(maxCaptureHeadMs))
+                .append(" recordFrameMs=").append(round(sumRecordFrameMs / inv))
+                .append(" MB/f: level=").append(round(sumLevelAlloc / inv / 1048576.0))
+                .append(" record=").append(round(sumRecordAlloc / inv / 1048576.0))
+                .append(" capture=").append(round(sumCaptureAlloc / inv / 1048576.0))
+                .append(" submit=").append(round(sumSubmitAlloc / inv / 1048576.0))
+                .append(" maxRecordFrameMs=").append(round(maxRecordFrameMs))
+                .append(" submitEntitiesMs=").append(round(sumSubmitEntitiesMs / inv))
+                .append(" maxSubmitEntitiesMs=").append(round(maxSubmitEntitiesMs))
+                .append("  (= frameTail 拆两段 + 我们自己的 submit 墙钟；")
+                .append("submit≈frameTail ⇒ 队列等待/帧节奏（减 GPU pass 才有 fps）；")
+                .append("levelRenderMs 覆盖 LevelRenderer.render 整段：")
+                .append("它≈avgRenderMs ⇒ 卡在 level render 内（我们的 JNI + 原版）；")
+                .append("它远小于 avgRenderMs ⇒ 卡在 render 之外的帧内空档)")
+                .append(nl);
+        sb.append("                [FRAME SIM] vanillaTickMs=").append(round(sumVanillaTickMs / inv))
+                .append("  (= simMs 里的原版 tick；")
+                .append("simMs − vanillaTickMs = 区块结果消费 + 我们的上传/JNI)")
+                .append(nl);
+        sb.append("                [FRAME SIM SPLIT] packetsMs=").append(round(sumSimSubMs[0] / inv))
+                .append(" extractMs=").append(round(sumSimSubMs[1] / inv))
+                .append(" soundMs=").append(round(sumSimSubMs[2] / inv))
+                .append(" mouseMs=").append(round(sumSimSubMs[3] / inv))
+                .append("  (= sim 段四路：主线程网络包 / 26.3 区块提取 / 声音 / 鼠标；")
+                .append("sim − vanillaTick − task − JNI三槽 − 本行四项 的残差 ⇒ ")
+                .append("advanceGameTime/textureTick/gizmos 等小额项)")
+                .append(nl);
+        sb.append("                [FRAME TASKS] runAllTasksMs=").append(round(sumTaskPumpMs / inv))
+                .append(" taskMs=").append(round(sumTaskRunMs / inv))
+                .append(" taskCount=").append(sumTaskCount)
+                .append(" maxTaskMs=").append(round(maxTaskMaxMs))
+                .append("  (= simMs 里的主线程任务泵：区块编译完成后的消费/上传任务；")
+                .append("taskMs 与 vanillaTickMs 可能重叠——tick 内也会 pump)")
+                .append(nl);
+        sb.append("                [FRAME JNI HEAD] beginStreamlineMs=")
+                .append(round(sumJniHeadMs[0] / inv))
+                .append(" maxBeginStreamlineMs=").append(round(maxJniHeadMs[0]))
+                .append(" markSimMs=").append(round(sumJniHeadMs[1] / inv))
+                .append(" menuMs=").append(round(sumJniHeadMs[2] / inv))
+                .append("  (= simMs 里我们自己的三个 JNI；")
+                .append("beginStreamline 大 ⇒ 帧围栏/GPU 等待藏在 sim 段)")
+                .append(nl);
         long gcTimeMs = 0L;
         long gcCount = 0L;
         for (java.lang.management.GarbageCollectorMXBean bean
@@ -809,12 +834,12 @@ public final class FrameBudget {
         final long gcCountWindow = gcCount - prevGcCount;
         prevGcTimeMs = gcTimeMs;
         prevGcCount = gcCount;
-        System.out.println(
-                "                [FRAME GAP/GC] gcMs=" + gcMsWindow
-                        + " gcCount=" + gcCountWindow
-                        + "  (= 本窗口 GC 墙钟耗时/次数的 MXBean 差分；"
-                        + "gapMs 见 FRAME SPLIT 行，interval−sim−render−frameTail−gap "
-                        + "的残差 ⇒ runTick 内未钩的段)");
+        sb.append("                [FRAME GAP/GC] gcMs=").append(gcMsWindow)
+                .append(" gcCount=").append(gcCountWindow)
+                .append("  (= 本窗口 GC 墙钟耗时/次数的 MXBean 差分；")
+                .append("gapMs 见 FRAME SPLIT 行，interval−sim−render−frameTail−gap ")
+                .append("的残差 ⇒ runTick 内未钩的段)");
+        logAsync(sb.toString());
 
         sumVanillaTickMs = 0.0;
         sumTaskPumpMs = 0.0;

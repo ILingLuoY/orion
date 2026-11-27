@@ -322,10 +322,10 @@ inline constexpr uint64_t PERF_L10_GPU_WINDOW_FRAMES = 60u;
 inline constexpr uint64_t SECTION_REBUILD_MIN_FRAME_INTERVAL = 6u;
 inline constexpr uint64_t SECTION_REBUILD_QUIET_FRAMES = 10u;
 inline constexpr uint64_t SECTION_REBUILD_MAX_DEFERRAL_FRAMES = 60u;
-inline constexpr size_t SECTION_REBUILD_MAX_SECTIONS_PER_BATCH = 24u;
+inline constexpr size_t SECTION_REBUILD_MAX_SECTIONS_PER_BATCH = 20u;
 inline constexpr uint32_t SECTION_REBUILD_FENCE_WAIT_MS = 2u;
-inline constexpr double SECTION_REBUILD_TIME_BUDGET_MS = 5.0;
-inline constexpr double SECTION_REBUILD_TIME_BUDGET_ADAPTIVE_MAX_MS = 12.0;
+inline constexpr double SECTION_REBUILD_TIME_BUDGET_MS = 4.5;
+inline constexpr double SECTION_REBUILD_TIME_BUDGET_ADAPTIVE_MAX_MS = 8.0;
 inline constexpr double SECTION_REBUILD_TIME_BUDGET_GPU_FRACTION = 0.70;
 inline constexpr double SECTION_CAPTURE_LOCK_BUDGET_MS = 2.0;
 inline constexpr uint64_t SECTION_REBUILD_CONTINUE_FRAMES = 3u;
@@ -1008,8 +1008,8 @@ struct RRGuideRelaxPush
     float minRoughness;
     float normalFalloff;
     float farCloudDistance;
-    float padding1;
-    float padding2;
+    float fogMaxDistance;
+    float fogLayers;
 };
 inline constexpr uint32_t SKY_SCATTER_RESOLUTION_X = 256u;
 inline constexpr uint32_t SKY_SCATTER_RESOLUTION_Y = 128u;
@@ -1141,6 +1141,7 @@ inline constexpr uint32_t SECTION_VERTEX_ADDRESS_SLOT_LIMIT = 1u << 18;
 inline constexpr uint32_t SECTION_ROLE_TERRAIN  = 0u;
 inline constexpr uint32_t SECTION_ROLE_VOXY_LOD = 1u;
 inline constexpr uint32_t SECTION_ROLE_DH_FAR   = 2u;
+inline constexpr uint32_t SECTION_ROLE_HAND     = 3u;
 
 // =====================================================
 // Per-chunk-column near-field coverage bitmap (binding 20)
@@ -1863,16 +1864,12 @@ inline constexpr uint64_t SECTION_AS_CLASS_WATER  = 4ull << 60ull;
 inline constexpr uint64_t SECTION_AS_CLASS_ENTITY = 5ull << 60ull;
 inline constexpr uint64_t SECTION_AS_CLASS_LOCAL_PLAYER = 6ull << 60ull;
 inline constexpr uint64_t SECTION_AS_CLASS_PARTICLE = 7ull << 60ull;
-// 2026-11-03：第一人称手部（手臂 + 手持物）独立成层。
-//
-// 它需要一对互相矛盾的可见性：**主相机要看得见**（不然手上什么都没有），
-// 但**次级射线必须打不到**（不然会在世界里投出一截手臂影子 —— 而 viewmodel
-// 本来就不参与世界阴影，且它的坐标是相机相对的，影子会随视角乱飘）。
-// 现有的位组合不出来：0xff 两者都可见、0x02 主相机不可见、0xfb 两者都可见。
-// 所以新开一位 0x04：
-//   instance.mask = 0x04
-//   主相机射线   0x01 -> 0x05   （0x01 | 0x04）
-//   所有次级射线 0xff -> 0xfb   （0xff & ~0x04）
+// 2026-11-26：第一人称手部（手臂 + 手持物）独立成层，使用专属 bit 5 (0x20)：
+//   instance.mask = 0x20
+//   主相机射线   0x01 -> 0x21   （0x01 | 0x20）
+//   所有次级射线 0xef -> 0xcf   （0xef & ~0x20）
+//   动态移动光   0xed -> 0xcd   （0xed & ~0x20）
+// （注意 bit 2 = 0x04 已被 ALPHA 排除位与 DH LOD 占用，不能复用于手部。）
 inline constexpr uint64_t SECTION_AS_CLASS_HAND = 8ull << 60ull;
 // 2026-11-26 (Batch V, Feature 4): Split leaf triangles out of SECTION_AS_CLASS_OMM so leaves
 // keep real OMM cutouts for regular RT rays while emitting a paired solid-cube TLAS instance (0x10)
@@ -1896,6 +1893,7 @@ struct SectionGeometrySplit
     std::vector<Vertex> entity;
     std::vector<Vertex> localPlayer;
     std::vector<Vertex> particle;
+    std::vector<Vertex> hand;
     OmmCutoutInput ommInput;
     bool hasOmmInput = false;
     OmmCutoutInput ommLeavesInput;
@@ -1904,6 +1902,7 @@ struct SectionGeometrySplit
     std::vector<float> entityMotion;
     std::vector<float> localPlayerMotion;
     std::vector<float> particleMotion;
+    std::vector<float> handMotion;
 
     std::vector<SectionVertex> opaquePacked;
     std::vector<SectionVertex> ommCutoutPacked;
@@ -1935,10 +1934,12 @@ struct CaptureArenaSegment
     std::span<const Vertex> entity;
     std::span<const Vertex> localPlayer;
     std::span<const Vertex> particle;
+    std::span<const Vertex> hand;
 
     std::span<const float> entityMotion;
     std::span<const float> localPlayerMotion;
     std::span<const float> particleMotion;
+    std::span<const float> handMotion;
 
     std::span<const SectionVertex> opaquePacked;
     std::span<const SectionVertex> ommCutoutPacked;
@@ -1960,14 +1961,15 @@ struct CaptureArenaSegment
             water.empty() &&
             entity.empty() &&
             localPlayer.empty() &&
-            particle.empty();
+            particle.empty() &&
+            hand.empty();
     }
 
     size_t vertexCount() const
     {
         return opaque.size() + ommCutout.size() + ommLeaves.size() +
             alpha.size() + water.size() + entity.size() +
-            localPlayer.size() + particle.size();
+            localPlayer.size() + particle.size() + hand.size();
     }
 };
 
@@ -2404,7 +2406,7 @@ inline constexpr VkDeviceSize SECTION_MEMORY_POOL_HOST_KEEP_BYTES =
 //    旧 adopt 每建一块大的就销毁一块空闲小的，配合每 2 帧的实体重建在飞
 //    ⇒ 反复 vkAllocateMemory 16/32MB（[PERF L10 ALLOC] 3~5ms/次）。
 inline constexpr bool CPUPERF_STAGING_POOL_KEEP = true;
-inline constexpr size_t CPUPERF_STAGING_POOL_KEEP_SLOTS = 4u;
+inline constexpr size_t CPUPERF_STAGING_POOL_KEEP_SLOTS = 12u;
 // ④ 热路径日志不再逐条 flush（[RT SECTION SLOW]/[RT BLD BREAKDOWN]/
 //    [RT OMM GATE]），RTLogWrite 的时间戳按秒缓存（省掉每行 localtime+put_time）。
 inline constexpr bool CPUPERF_QUIET_HOT_LOGS = true;
@@ -2942,6 +2944,23 @@ void samplePerfL10CpuFrame();
 void finishPerfL10CpuFrame();
 void destroyPerfL10GpuTimestampPool();
 bool ensurePerfL10GpuTimestampPool();
+void initGeomGpuTimestampResources();
+void destroyGeomGpuTimestampResources();
+void resetGeomGpuTimestampWindow();
+uint32_t beginGeomGpuTimestamp(VkCommandBuffer cmd);
+void markGeomGpuTimestamp(VkCommandBuffer cmd, uint32_t slot, uint32_t pointIndex);
+void commitGeomGpuTimestamp(uint32_t slot, uint64_t frameSerial);
+void pollGeomGpuTimestampWindow(
+    double& outAvgTotalMs,
+    double& outMaxTotalMs,
+    double& outAvgOmmMs,
+    double& outAvgBlasMs,
+    double& outAvgTlasMs,
+    double& outMaxOmmMs,
+    double& outMaxBlasMs,
+    double& outMaxTlasMs,
+    uint64_t& outSamples
+);
 float giRayMaxDistanceConfigured();
 bool giRayMaxDistanceAbEnabled();
 float giRayMaxDistanceEffective();
@@ -3495,7 +3514,8 @@ struct BlasCompactedAddressRemap
 };
 bool recordPendingBlasCompactions(
     VkCommandBuffer cmd,
-    std::vector<BlasCompactedAddressRemap>& outRemaps);
+    std::vector<BlasCompactedAddressRemap>& outRemaps,
+    bool heavyBuildFrame = false);
 void destroySectionAS(RTSectionAS& section);
 void retireSectionAS(RTSectionAS& section);
 void parkTlasStorage();
@@ -3536,6 +3556,16 @@ void recordSectionBLASBuild(
     VkCommandBuffer cmd,
     RTSectionAS& section,
     VkDeviceAddress scratchAddress
+);
+void recordSectionOmmBuildBatch(
+    VkCommandBuffer cmd,
+    std::span<RTSectionAS* const> sections
+);
+void recordSectionBLASBuildWave(
+    VkCommandBuffer cmd,
+    std::span<RTSectionAS* const> waveSections,
+    std::span<const VkDeviceSize> waveScratchOffsets,
+    VkDeviceAddress scratchBaseAddress
 );
 void destroySectionVertexAddressBuffer();
 void updateSectionVertexAddressDescriptor();
@@ -4760,6 +4790,9 @@ extern VkImageView g_rrGuideRelaxCachedSpecularAlbedo;
 extern VkImageView g_rrGuideRelaxCachedSpecularHitDistance;
 extern VkImageView g_rrGuideRelaxCachedCloudResolved;
 extern VkImageView g_rrGuideRelaxCachedCloudDepth;
+extern VkImageView g_rrGuideRelaxCachedFogIntegrated;
+extern VkImageView g_rrGuideRelaxCachedFogDensity;
+extern uint64_t g_fogFroxelFrameSerial;
 extern VkImageView g_rrGuideRelaxCachedPrimaryMotion;
 extern VkImageView g_rrGuideRelaxCachedSpecularMotion;
 extern VkBuffer g_rrGuideRelaxCachedCamera;
@@ -5981,6 +6014,7 @@ extern float g_dynamicCaptureCameraZ;
 extern bool g_entityFrameOpen;
 extern bool g_particleFrameOpen;
 extern std::atomic<bool> g_entityRebuildRequested;
+extern std::atomic<bool> g_handRebuildRequested;
 
 // =====================================================
 // 2026-11-12 实例化第 2 步：**每实例变换**。
@@ -6382,6 +6416,8 @@ extern VkPipeline g_k1GlassCompactPipeline;
 extern bool g_k1GlassCompactPipelineFailed;
 extern VkPipeline g_sharcCompactPipeline;
 extern bool g_sharcCompactPipelineFailed;
+extern VkPipeline g_k2MegaCompactPipeline;
+extern bool g_k2MegaCompactPipelineFailed;
 // ④ K2-D 再拆分（默认开，ORION_K2_SPLIT2=0 回退 ③ 两腿）：K2-SUN + K2-LOC
 extern VkPipeline g_k1GlassPipeline;
 extern VkPipeline g_k2sunPipeline;

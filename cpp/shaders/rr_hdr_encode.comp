@@ -1,29 +1,28 @@
 #version 460
-
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 // ============================================================================
-// 2026-11-23：HDR 显示路径补高光肩部压缩 + 打通统一曝光参数
+// 2026-11-26：HDR 显示路径改走与 SDR **同一条**后处理链 + 高光延伸
 //
-// 旧实现的两个问题（"开 HDR 整体过曝"的根因）：
-//   1) 这里只有 exposure → 硬 clamp(10000/203) → PQ，**没有任何 tone mapping**；
-//      而 SDR 路径（rr_sdr_post.comp）有 uchimura 曲线把 >1 的部分压回显示域。
-//      场景的线性白通常不是 1.0（地形白 ≈1、云 5~20、太阳更高），HDR 下这些
-//      像素直接落到 1000~10000 nits，看起来就是整屏爆白。
-//   2) 曝光强度写死 0.6；UI 的"曝光强度"、CG 曝光（manualEV）、色彩增益
-//      （gainR/G/B）在 HDR 下全部无效 —— 用户没有任何旋钮可以压暗。
+// 2026-11-23 版的问题（HDR 观感与 SDR 脱节的根因）：
+//   这里是 `曝光 → 硬软肩 → clamp → Rec2020 → PQ`，完全绕开了 rr_post_common.glsl：
+//     · 色调映射模式 / 对比度 / 饱和度 / gamma / 曝光补偿以外的整条色轮全部不生效；
+//     · 场景线性 >= 1（云、受光白块、雪、自发光、水面太阳耀斑）直接落到
+//       279 ~ 900 nits，而同一点在 SDR 路径上已被 Uchimura / AgX 等压回 232/255
+//       （约 190 ~ 210 nits）。也就是说 HDR 只把高光放大了 1.5 ~ 4 倍，
+//       中间调却和 SDR 一样亮 ⇒ 看起来就是"开 HDR 整体过曝 / 白块刺眼"。
 //
 // 现在：
-//   · 曝光参数改读 push_constant（与 SDR 同一套 128 字节布局，仍然由
-//     display 派发统一推送）。默认值不变：exposureStrength=0.6、manualEV=0、
-//     gain=1，所以不开肩部时与旧版逐位一致。
-//   · 转 Rec2020 / PQ 之前加 soft shoulder：knee 以下（默认 = 1.0 参考白 =
-//     203 nits）完全线性，knee 以上平滑渐近到 HDR_PEAK_NITS（1000 nits，与
-//     applyHdrStaticMetadata() 上报的 maxLuminance 一致）。中间调不变，只压高光。
-//   · -DHDR_SHOULDER_ENABLED=0 可回退旧版行为（编译期 A/B）。
-//   · HDR_REFERENCE_WHITE_NITS 默认 203（BT.2408 的 SDR 白）。若整屏仍偏亮，
-//     改成 120~150 可整体降档（峰值不变，动态范围更大）。
+//   · 中间调与调色：直接复用 rr_post_common.glsl 的 rrPostDisplayColor()
+//     （曝光 → tone map → gamma → 饱和度 → 色轮），再把 gamma 编码逆回显示线性。
+//     HDR 下 0 ~ 参考白这一段与 SDR 逐像素同观感（同样的曲线、同样的色轮）。
+//   · 高光延伸：tone map 已经把高光压平，这里按"曝光后线性值超过
+//     HDR_SHOULDER_KNEE_REL 的量"重新加回显示线性余量，渐近到
+//     HDR_PEAK_NITS / HDR_REFERENCE_WHITE_NITS。中间调不受影响，只有原本
+//     在 SDR 里被压平的高光在 HDR 上重新获得层次。
+//   · -DHDR_SHARED_TONEMAP=0 回退到 2026-11-23 版（编译期 A/B）。
 // ============================================================================
 
 #ifndef HDR_REFERENCE_WHITE_NITS
@@ -34,13 +33,124 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #define HDR_PEAK_NITS 1000.0
 #endif
 
-#ifndef HDR_SHOULDER_ENABLED
-#define HDR_SHOULDER_ENABLED 1
+#ifndef HDR_SHARED_TONEMAP
+#define HDR_SHARED_TONEMAP 1
 #endif
 
 // 相对参考白的肩部起点：1.0 = 超过"SDR 白点"才开始压缩。
 #ifndef HDR_SHOULDER_KNEE_REL
 #define HDR_SHOULDER_KNEE_REL 1.0
+#endif
+
+#ifndef HDR_HIGHLIGHT_EXTENSION
+#define HDR_HIGHLIGHT_EXTENSION 1
+#endif
+
+#if HDR_SHARED_TONEMAP
+#include "rr_post_common.glsl"
+#endif
+
+// 注意 GLSL mat3(vec3, vec3, vec3) 是**按列**构造，下面三行正好是 709→2020
+// 矩阵的三个列向量（与旧版 rr_hdr_encode 逐位一致）。
+const mat3 REC709_TO_REC2020 = mat3(
+    0.6274040, 0.0690970, 0.0163916,
+    0.3292820, 0.9195400, 0.0880132,
+    0.0433136, 0.0113612, 0.8955950
+);
+
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
+const float PQ_PEAK_NITS = 10000.0;
+
+vec3 encodePQ(vec3 linearNits)
+{
+    vec3 y =
+        clamp(
+            linearNits / PQ_PEAK_NITS,
+            vec3(0.0),
+            vec3(1.0)
+        );
+
+    vec3 n =
+        pow(y, vec3(PQ_M1));
+
+    return pow(
+        (vec3(PQ_C1) + PQ_C2 * n) /
+            (vec3(1.0) + PQ_C3 * n),
+        vec3(PQ_M2)
+    );
+}
+
+#if HDR_SHARED_TONEMAP
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(rrOutputImage);
+
+    if(p.x >= size.x || p.y >= size.y)
+    {
+        return;
+    }
+
+    vec4 color = imageLoad(rrOutputImage, p);
+
+    // 1) 与 SDR 完全相同的链路，拿到 gamma 空间的显示色。
+    vec3 exposedLinear;
+    vec3 displayColor = rrPostDisplayColor(color, p, size, exposedLinear);
+
+    displayColor = clamp(displayColor, vec3(0.0), vec3(1.0));
+
+    // 2) 逆 gamma 回到显示线性（0 = 黑，1 = 参考白）。
+    //    SDR 路径的饱和度 / 色轮都是在 gamma 空间做的，逆变换后才是真正的显示线性，
+    //    不能在 gamma 空间上直接乘 nits。
+    vec3 displayLinear =
+        pow(displayColor, vec3(max(postPush.gamma, 1.0e-3)));
+
+#if HDR_HIGHLIGHT_EXTENSION
+    // 3) 高光延伸（逐通道）。
+    //    exposedLinear 是 tone map **之前**的线性值，只有它还保留着高光的相对层次；
+    //    超过 knee 的部分用 Reinhard 型曲线渐近到 (peakRel - 1) 的额外余量。
+    //    base(∞) = 1，extra(∞) = peakRel - 1 ⇒ 合计上限正好是 peakRel。
+    {
+        const float peakRel =
+            HDR_PEAK_NITS / HDR_REFERENCE_WHITE_NITS;
+        const float knee = max(HDR_SHOULDER_KNEE_REL, 1.0e-3);
+        const float span = max(peakRel - knee, 1.0e-3);
+
+        vec3 over = max(exposedLinear - vec3(knee), vec3(0.0));
+        vec3 extra = span * over / (over + vec3(span));
+
+        displayLinear += extra;
+    }
+#endif
+
+    displayLinear =
+        min(
+            displayLinear,
+            vec3(PQ_PEAK_NITS / HDR_REFERENCE_WHITE_NITS)
+        );
+
+    vec3 rec2020 =
+        REC709_TO_REC2020 * displayLinear;
+
+    vec3 encoded =
+        encodePQ(
+            rec2020 * HDR_REFERENCE_WHITE_NITS
+        );
+
+    imageStore(
+        rrOutputImage,
+        p,
+        vec4(encoded, color.a)
+    );
+}
+#else
+
+#ifndef HDR_SHOULDER_ENABLED
+#define HDR_SHOULDER_ENABLED 1
 #endif
 
 #ifndef RR_STABLE_GLASS_RADIANCE
@@ -105,38 +215,6 @@ buffer AeState
 
     float cloudWhite;
 };
-
-const float PQ_M1 = 0.1593017578125;
-const float PQ_M2 = 78.84375;
-const float PQ_C1 = 0.8359375;
-const float PQ_C2 = 18.8515625;
-const float PQ_C3 = 18.6875;
-const float PQ_PEAK_NITS = 10000.0;
-
-const mat3 REC709_TO_REC2020 = mat3(
-    0.6274040, 0.0690970, 0.0163916,
-    0.3292820, 0.9195400, 0.0880132,
-    0.0433136, 0.0113612, 0.8955950
-);
-
-vec3 encodePQ(vec3 linearNits)
-{
-    vec3 y =
-        clamp(
-            linearNits / PQ_PEAK_NITS,
-            vec3(0.0),
-            vec3(1.0)
-        );
-
-    vec3 n =
-        pow(y, vec3(PQ_M1));
-
-    return pow(
-        (vec3(PQ_C1) + PQ_C2 * n) /
-            (vec3(1.0) + PQ_C3 * n),
-        vec3(PQ_M2)
-    );
-}
 
 // 软膝肩部：x <= knee 时输出 x（一阶连续、斜率 1）；
 // x → ∞ 时渐近 peak。用来把"场景线性白 > 1"的部分收进显示域。
@@ -237,3 +315,4 @@ void main()
         vec4(encoded, color.a)
     );
 }
+#endif

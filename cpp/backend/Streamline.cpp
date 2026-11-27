@@ -1103,7 +1103,7 @@ void SampleSlEstimatedVram()
 {
     static uint32_t sampleFrameCounter = 0u;
 
-    if((sampleFrameCounter++ % 120u) != 0u)
+    if((sampleFrameCounter++ % 600u) != 0u)
     {
         return;
     }
@@ -1333,18 +1333,41 @@ bool BeginStreamlineFrame()
         true;
 
 
+    const bool skipReflexSleep =
+        !g_isInWorld ||
+        g_fgFullscreenMenuOpen.load(std::memory_order_relaxed);
+
     const std::chrono::steady_clock::time_point slSleepStart =
         std::chrono::steady_clock::now();
 
-    sl::Result sleepResult =
-        g_slReflexSleep(
+    sl::Result sleepResult = skipReflexSleep
+        ? sl::Result::eOk
+        : g_slReflexSleep(
             *g_currentSLFrameToken
         );
 
-    const double slSleepMs =
-        std::chrono::duration<double, std::milli>(
+    const double slSleepMs = skipReflexSleep
+        ? 0.0
+        : std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - slSleepStart
         ).count();
+
+    if(!skipReflexSleep && slSleepMs >= 25.0)
+    {
+        static uint32_t s_reflexSpikeLogCount = 0u;
+        if(s_reflexSpikeLogCount++ < 30u)
+        {
+            RTLog(
+                "[SL REFLEX SPIKE] frame=" + std::to_string(g_currentSLFrameIndex) +
+                " sleepMs=" + std::to_string(slSleepMs) +
+                " tokenMs=" + std::to_string(slTokenMs) +
+                " inWorld=" + std::to_string(g_isInWorld ? 1 : 0) +
+                " menu=" + std::to_string(g_fgFullscreenMenuOpen.load(std::memory_order_relaxed) ? 1 : 0) +
+                " fgSync=" + std::to_string(g_fgFrameSyncEnabled ? 1 : 0) +
+                " limitHz=" + std::to_string(ResolveFgBaseFrameLimitHz())
+            );
+        }
+    }
 
     // 每 60 帧一条：tokenMs = 取帧令牌；sleepMs = Reflex 限帧器/围栏等待。
     {

@@ -83,6 +83,7 @@ bool orionGlossyStepLodEnabled()
 #define WATER_REFLECT_SUN_OPT_V1 1
 #endif
 
+#ifndef ORION_K2_INDIRECT_TRACE_ONLY
 vec3 tracePrimaryGlossyReflectionRadiance(
     vec3 primarySurfaceOrigin,
     vec3 startOrigin,
@@ -230,11 +231,6 @@ int orionGlossyBounceLimit = mirrorBounceLimit;
 #if GLOSSY_SHARC_CONTINUATION
 float glossyRoughnessPrev = clamp(primarySurfaceRoughness, 0.0, 0.99);
 const bool glossySharcEnabled = sharcQueryActive() && (cam.perfPrimary.z > 0u);
-SharcParameters glossySharcParams;
-if(glossySharcEnabled)
-{
-    glossySharcParams = sharcBuildParameters();
-}
 #endif
 
 
@@ -327,7 +323,7 @@ for(
                 currentDirection,
                 glossyRayMaxDistance,
                 secondaryTraverseFlags(),
-                0xefu,
+                g_secondaryCullMask,
                 pathStep
             );
         }
@@ -340,7 +336,7 @@ for(
             traceRayEXT(
                 topLevelAS,
                 secondaryTraverseFlags(),
-                0xefu,
+                g_secondaryCullMask,
                 0,
                 0,
                 0,
@@ -497,6 +493,7 @@ if(hitMaterialId <= 0.5)
 #if GLOSSY_SHARC_CONTINUATION
     if(!hitIsPureMirror && glossySharcEnabled)
     {
+        SharcParameters glossySharcParams = sharcBuildParameters();
         const uint glossySharcLevel = HashGridGetLevel(
             hitPos, glossySharcParams.hashGridParameters);
         const float glossySharcVoxelSize = HashGridGetVoxelSize(
@@ -535,20 +532,6 @@ if(hitMaterialId <= 0.5)
     // 完整 PBR direct sun
     // =================================================
 
-    vec3 surfaceRadiance =
-        evaluateOpaqueSurfaceRadiance(
-            hitPos,
-            hitNormal,
-            -currentDirection,
-            hitAlbedo,
-            hitRoughness,
-            hitF0Metal,
-            hitEmission,
-            hitPOMSelfShadow,
-            sunDirection
-        );
-
-
     // 2026-10-03 镜厅：**纯镜面**（LabPBR 金属 + 粗糙度 < 0.05）命中：
     //   · 不累加镜面自己的表面辐射（眼睛从镜面只该看到反射像）
     //   · 走确定性镜像续弹（reflect 方向，吞吐 × Fresnel，无随机采样）
@@ -558,6 +541,19 @@ if(hitMaterialId <= 0.5)
     {
         if(mirrorBounceCount >= orionGlossyBounceLimit)
         {
+            const vec3 surfaceRadiance =
+                evaluateOpaqueSurfaceRadiance(
+                    hitPos,
+                    hitNormal,
+                    -currentDirection,
+                    hitAlbedo,
+                    hitRoughness,
+                    hitF0Metal,
+                    hitEmission,
+                    hitPOMSelfShadow,
+                    sunDirection
+                );
+
             accumulatedRadiance +=
                 throughput *
                 surfaceRadiance;
@@ -614,6 +610,19 @@ if(hitMaterialId <= 0.5)
 
         continue;
     }
+
+    vec3 surfaceRadiance =
+        evaluateOpaqueSurfaceRadiance(
+            hitPos,
+            hitNormal,
+            -currentDirection,
+            hitAlbedo,
+            hitRoughness,
+            hitF0Metal,
+            hitEmission,
+            hitPOMSelfShadow,
+            sunDirection
+        );
 
     accumulatedRadiance +=
         throughput *
@@ -1099,6 +1108,7 @@ waterInterfaceStepCount +=
 return
     accumulatedRadiance;
 }
+#endif
 // =====================================================
 // Explicit reflected sunlight from flat water
 //
@@ -1183,7 +1193,7 @@ float traceWaterReflectedSun(
             waterHitQuery,
             topLevelAS,
             gl_RayFlagsNoneEXT,
-            0xefu,
+            0xcfu,
             receiverPos + toWaterDir * 0.001,
             0.02,
             toWaterDir,
@@ -1286,8 +1296,8 @@ float traceWaterReflectedSun(
             glossSunVisQuery,
             topLevelAS,
             gl_RayFlagsTerminateOnFirstHitEXT,
-            0xefu,
-            waterHitPos + sunDirection * 0.001,
+            0xcfu,
+            waterHitPos + geoNormal * 0.02 + sunDirection * 0.001,
             0.02,
             sunDirection,
             10000.0

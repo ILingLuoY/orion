@@ -209,4 +209,50 @@ float fogFbm3D(vec3 p)
     return a * 0.67 + b * 0.33;
 }
 
+#ifndef FOG_EDGE_GHOST_FIX
+#define FOG_EDGE_GHOST_FIX 1
+#endif
+
+// Bidirectional depth weight for 2x2 froxel bilinear lookup:
+// - farValid: rejects foreground tiles whose volume ends before lookupDistance.
+// - nearCompat: when shading solid geometry, strongly suppresses pure background/sky
+//   tiles whose tileMinDist is far behind lookupDistance (stops sky-tile fog bleed).
+float fogScreenTapDepthWeight(
+    float lookupDistance,
+    bool isSolidGeometry,
+    float tileMinDist,
+    float tileMaxDist)
+{
+    const float farValid = smoothstep(
+        lookupDistance * 0.72,
+        lookupDistance * 0.96,
+        tileMaxDist);
+    if(!isSolidGeometry)
+    {
+        return farValid;
+    }
+    const float bgExcess = smoothstep(
+        lookupDistance * 1.15 + 1.0,
+        lookupDistance * 1.55 + 3.5,
+        tileMinDist);
+    const float nearCompat = mix(1.0, 0.05, bgExcess);
+    return farValid * nearCompat;
+}
+
+// Effective single-scattering albedo for DLSS-RR diffuse albedo guide modulation.
+vec3 fogEffectiveGuideAlbedo(vec4 fogOpticsParams)
+{
+    vec3 fogTint = fogOpticsParams.yzw;
+    if(dot(fogTint, fogTint) < 0.01)
+    {
+        fogTint = vec3(1.0);
+    }
+    else
+    {
+        fogTint = clamp(fogTint, vec3(0.5), vec3(1.5));
+    }
+    const float tintLum = max(dot(fogTint, vec3(0.2126, 0.7152, 0.0722)), 0.25);
+    return clamp(fogTint * (0.90 / tintLum), vec3(0.10), vec3(0.96));
+}
+
 #endif

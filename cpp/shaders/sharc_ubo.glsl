@@ -115,9 +115,9 @@ SharcResolveParameters sharcBuildResolveParameters()
 {
     SharcResolveParameters resolveParameters;
     resolveParameters.cameraPositionPrev = cam.prevViewInverse[3].xyz;
-    resolveParameters.accumulationFrameNum = 32u;
+    resolveParameters.accumulationFrameNum = 10u;
     resolveParameters.responsiveFrameNum = 16u;
-    resolveParameters.staleFrameNumMax = 256u;
+    resolveParameters.staleFrameNumMax = 64u;
     resolveParameters.frameIndex = cam.frameCount;
     return resolveParameters;
 }

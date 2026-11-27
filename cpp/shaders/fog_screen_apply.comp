@@ -99,7 +99,11 @@ void main()
 
         vec4 fogSum = vec4(0.0);
         float wSum = 0.0;
+#if FOG_EDGE_GHOST_FIX
+        float bestFallbackScore = -1.0e20;
+#else
         float bestMaxDist = -1.0;
+#endif
         vec4 bestFog = vec4(0.0, 0.0, 0.0, 1.0);
 
         for(int oy = 0; oy <= 1; ++oy)
@@ -115,19 +119,40 @@ void main()
                     (oy == 0 ? 1.0 - fracXy.y : fracXy.y);
                 const vec4 meta = imageLoad(fogDensityMeta, ivec3(cxy, metaZ));
                 const float tileMaxDist = (meta.a > 0.5) ? meta.g : maxDistance;
+#if FOG_EDGE_GHOST_FIX
+                const float tileMinDist = (meta.a > 0.5) ? meta.r : 0.0;
+                const float depthValid = fogScreenTapDepthWeight(
+                    lookupDistance, isSolidGeometry, tileMinDist, tileMaxDist);
+                const float farValid = smoothstep(
+                    lookupDistance * 0.72,
+                    lookupDistance * 0.96,
+                    tileMaxDist);
+                const float fallbackScore = isSolidGeometry
+                    ? (farValid * 1000.0 - abs(tileMinDist - lookupDistance) + bW * 0.1)
+                    : (tileMaxDist + bW * 0.1);
+#else
                 const float depthValid = smoothstep(
                     lookupDistance * 0.72,
                     lookupDistance * 0.96,
                     tileMaxDist);
+#endif
                 const vec2 tapUv = (vec2(cxy) + 0.5) * invFogXy;
                 const vec4 tapFog = textureLod(fogIntegrated, vec3(tapUv, w), 0.0);
                 fogSum += tapFog * (bW * depthValid);
                 wSum += bW * depthValid;
+#if FOG_EDGE_GHOST_FIX
+                if(fallbackScore > bestFallbackScore)
+                {
+                    bestFallbackScore = fallbackScore;
+                    bestFog = tapFog;
+                }
+#else
                 if(tileMaxDist > bestMaxDist)
                 {
                     bestMaxDist = tileMaxDist;
                     bestFog = tapFog;
                 }
+#endif
             }
         }
         fog = (wSum > 1.0e-4) ? (fogSum / wSum) : bestFog;

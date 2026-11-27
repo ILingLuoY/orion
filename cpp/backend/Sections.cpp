@@ -99,7 +99,7 @@ void prewarmVertexStagingPool()
     }
 
     constexpr VkDeviceSize kPrewarmBytes = 32u * 1024u * 1024u;
-    constexpr size_t kPrewarmCount = 2u;
+    constexpr size_t kPrewarmCount = 4u;
     VkBuffer prewarmBuffers[kPrewarmCount]{};
 
     for(size_t i = 0u; i < kPrewarmCount; ++i)
@@ -126,7 +126,100 @@ void prewarmVertexStagingPool()
         g_vertexStagingPool.release(prewarmBuffers[i]);
     }
 
-    RTLog("[STAGING PREWARM] preallocated 2x32MB HOST_VISIBLE staging slots");
+    RTLog("[STAGING PREWARM] preallocated 4x32MB HOST_VISIBLE staging slots");
+
+    constexpr VkDeviceSize kSmallPrewarmBytes = 1024u * 1024u;
+    constexpr size_t kSmallPrewarmCount = 8u;
+    VkBuffer smallPrewarmBuffers[kSmallPrewarmCount]{};
+
+    for(size_t i = 0u; i < kSmallPrewarmCount; ++i)
+    {
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        createBuffer(
+            g_device,
+            g_physicalDevice,
+            kSmallPrewarmBytes,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            buf,
+            mem,
+            true
+        );
+        g_vertexStagingPool.adopt(buf, mem, kSmallPrewarmBytes);
+        smallPrewarmBuffers[i] = buf;
+    }
+
+    for(size_t i = 0u; i < kSmallPrewarmCount; ++i)
+    {
+        g_vertexStagingPool.release(smallPrewarmBuffers[i]);
+    }
+
+    RTLog("[STAGING PREWARM] preallocated 4x32MB + 8x1MB HOST_VISIBLE staging slots");
+
+    if(SECTION_MEMORY_POOL_ENABLED)
+    {
+        VkBuffer probeBuffer = VK_NULL_HANDLE;
+        VkBufferCreateInfo probeInfo{
+            VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+        };
+        probeInfo.size = 65536u;
+        probeInfo.usage =
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            (g_ommNativeEnabled
+                ? VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT
+                : 0u);
+        probeInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if(vkCreateBuffer(g_device, &probeInfo, nullptr, &probeBuffer) == VK_SUCCESS)
+        {
+            VkMemoryRequirements req{};
+            vkGetBufferMemoryRequirements(g_device, probeBuffer, &req);
+            vkDestroyBuffer(g_device, probeBuffer, nullptr);
+            probeBuffer = VK_NULL_HANDLE;
+
+            const uint32_t hostMemoryType = findHostUploadMemoryType(
+                g_physicalDevice,
+                req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+            );
+            const VkDeviceSize align =
+                std::max<VkDeviceSize>(req.alignment, 256u);
+
+            constexpr VkDeviceSize kOmmPrewarmBuckets[3] = {
+                65536u,    // 64 KB chunks -> 32 MB slab (512 chunks)
+                524288u,   // 512 KB chunks -> 64 MB slab (128 chunks)
+                2097152u   // 2 MB chunks -> 64 MB slab (32 chunks)
+            };
+
+            size_t prewarmedCount = 0u;
+            VkDeviceSize prewarmedBytes = 0u;
+            for(VkDeviceSize bucketBytes : kOmmPrewarmBuckets)
+            {
+                uint32_t slabIndex = 0u;
+                if(createSectionMemorySlab(
+                        bucketBytes, align, hostMemoryType, slabIndex))
+                {
+                    const VkDeviceSize slabCap =
+                        g_sectionMemorySlabs[slabIndex].capacity;
+                    prewarmedBytes += slabCap;
+                    g_sectionMemoryPoolKeptBytes += slabCap;
+                    ++prewarmedCount;
+                }
+            }
+
+            RTLog(
+                "[OMM SLAB PREWARM] preallocated " +
+                std::to_string(prewarmedCount) +
+                " host-upload slabs (" +
+                std::to_string(prewarmedBytes / 1048576u) +
+                " MB)"
+            );
+        }
+    }
 }
 void destroyPooledSectionBuildBuffers()
 {
@@ -3593,6 +3686,195 @@ void recordSectionBLASBuild(
         ranges
     );
 }
+void recordSectionOmmBuildBatch(
+    VkCommandBuffer cmd,
+    std::span<RTSectionAS* const> sections
+)
+{
+    if(cmd == VK_NULL_HANDLE || sections.empty())
+    {
+        return;
+    }
+
+    static std::vector<VkMicromapBuildInfoEXT> s_ommBuildInfos;
+    s_ommBuildInfos.clear();
+
+    for(RTSectionAS* section : sections)
+    {
+        if(section == nullptr ||
+           !section->hasOpacityMicromap ||
+           section->opacityMicromap == VK_NULL_HANDLE)
+        {
+            continue;
+        }
+
+        VkMicromapBuildInfoEXT micromapBuild{};
+        micromapBuild.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_INFO_EXT;
+        micromapBuild.type = VK_MICROMAP_TYPE_OPACITY_MICROMAP_EXT;
+        micromapBuild.flags = VK_BUILD_MICROMAP_PREFER_FAST_TRACE_BIT_EXT;
+        micromapBuild.mode = VK_BUILD_MICROMAP_MODE_BUILD_EXT;
+        micromapBuild.dstMicromap = section->opacityMicromap;
+        micromapBuild.usageCountsCount = 1u;
+        micromapBuild.pUsageCounts = &section->ommUsage;
+        micromapBuild.data.deviceAddress = section->ommDataAddress;
+        micromapBuild.scratchData.deviceAddress = section->ommScratchAddress;
+        micromapBuild.triangleArray.deviceAddress = section->ommTriangleAddress;
+        micromapBuild.triangleArrayStride = sizeof(VkMicromapTriangleEXT);
+        s_ommBuildInfos.push_back(micromapBuild);
+    }
+
+    if(s_ommBuildInfos.empty())
+    {
+        return;
+    }
+
+    auto cmdBuildMicromaps = getCmdBuildMicromaps();
+    auto cmdBarrier2 = getCmdPipelineBarrier2Omm();
+    if(!cmdBuildMicromaps || !cmdBarrier2)
+    {
+        throw std::runtime_error("Opacity micromap build functions unavailable");
+    }
+
+    cmdBuildMicromaps(
+        cmd,
+        static_cast<uint32_t>(s_ommBuildInfos.size()),
+        s_ommBuildInfos.data()
+    );
+
+    OmmMemoryBarrier2 micromapBarrier{};
+    micromapBarrier.sType = OMM_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    micromapBarrier.srcStageMask = OMM_STAGE_MICROMAP_BUILD;
+    micromapBarrier.srcAccessMask = OMM_ACCESS_MICROMAP_WRITE;
+    micromapBarrier.dstStageMask = OMM_STAGE_AS_BUILD;
+    micromapBarrier.dstAccessMask = OMM_ACCESS_AS_READ;
+    OmmDependencyInfo dependency{};
+    dependency.sType = OMM_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.memoryBarrierCount = 1u;
+    dependency.pMemoryBarriers = &micromapBarrier;
+    cmdBarrier2(cmd, &dependency);
+}
+void recordSectionBLASBuildWave(
+    VkCommandBuffer cmd,
+    std::span<RTSectionAS* const> waveSections,
+    std::span<const VkDeviceSize> waveScratchOffsets,
+    VkDeviceAddress scratchBaseAddress
+)
+{
+    if(cmd == VK_NULL_HANDLE || waveSections.empty())
+    {
+        return;
+    }
+
+    if(waveSections.size() != waveScratchOffsets.size())
+    {
+        throw std::runtime_error("BLAS wave scratch offset count mismatch");
+    }
+
+    auto cmdBuild = getCmdBuildAccelerationStructures();
+    if(!cmdBuild)
+    {
+        throw std::runtime_error("vkCmdBuildAccelerationStructuresKHR unavailable");
+    }
+
+    const size_t count = waveSections.size();
+    std::vector<VkAccelerationStructureGeometryKHR> geometries(count);
+    std::vector<VkAccelerationStructureTrianglesOpacityMicromapEXT> ommAttachments(count);
+    std::vector<VkAccelerationStructureBuildGeometryInfoKHR> buildInfos(count);
+    std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges(count);
+    std::vector<const VkAccelerationStructureBuildRangeInfoKHR*> rangePtrs(count);
+
+    static constexpr bool kSECTION_BLAS_OPAQUE_FLAG_FIX = true;
+
+    for(size_t i = 0u; i < count; ++i)
+    {
+        RTSectionAS& section = *waveSections[i];
+        const bool updateMode = section.pendingRefit;
+        section.pendingRefit = false;
+
+        VkAccelerationStructureGeometryTrianglesDataKHR triangles{
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR
+        };
+        triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        triangles.vertexData.deviceAddress = section.vertexAddress;
+        triangles.vertexStride = static_cast<VkDeviceSize>(section.vertexStride);
+
+        if(section.indexedGeometry)
+        {
+            triangles.maxVertex =
+                static_cast<uint32_t>(
+                    section.vertexBytes / section.vertexStride) - 1u;
+            triangles.indexType = VK_INDEX_TYPE_UINT16;
+            triangles.indexData.deviceAddress = sectionQuadIndexAddress();
+        }
+        else
+        {
+            triangles.maxVertex = section.triangleCount * 3u - 1u;
+            triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+        }
+
+        if(section.hasOpacityMicromap)
+        {
+            ommAttachments[i].sType =
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT;
+            ommAttachments[i].indexType = VK_INDEX_TYPE_NONE_KHR;
+            ommAttachments[i].baseTriangle = 0u;
+            ommAttachments[i].usageCountsCount = 1u;
+            ommAttachments[i].pUsageCounts = &section.ommUsage;
+            ommAttachments[i].micromap = section.opacityMicromap;
+            triangles.pNext = &ommAttachments[i];
+        }
+
+        geometries[i] = VkAccelerationStructureGeometryKHR{
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR
+        };
+        geometries[i].geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        geometries[i].flags =
+            (kSECTION_BLAS_OPAQUE_FLAG_FIX && section.opaqueGeometry)
+                ? VK_GEOMETRY_OPAQUE_BIT_KHR
+                : 0;
+        geometries[i].geometry.triangles = triangles;
+
+        buildInfos[i] = VkAccelerationStructureBuildGeometryInfoKHR{
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR
+        };
+        buildInfos[i].type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        buildInfos[i].flags =
+            VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+            (section.hasOpacityMicromap
+                ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_EXT
+                : 0) |
+            (section.refitCapable
+                ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR
+                : 0) |
+            (section.compactCapable
+                ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR
+                : 0);
+        buildInfos[i].mode =
+            updateMode
+                ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR
+                : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        buildInfos[i].srcAccelerationStructure =
+            updateMode
+                ? section.blas
+                : VK_NULL_HANDLE;
+        buildInfos[i].dstAccelerationStructure = section.blas;
+        buildInfos[i].geometryCount = 1u;
+        buildInfos[i].pGeometries = &geometries[i];
+        buildInfos[i].scratchData.deviceAddress =
+            scratchBaseAddress + waveScratchOffsets[i];
+
+        ranges[i] = VkAccelerationStructureBuildRangeInfoKHR{};
+        ranges[i].primitiveCount = section.triangleCount;
+        rangePtrs[i] = &ranges[i];
+    }
+
+    cmdBuild(
+        cmd,
+        static_cast<uint32_t>(count),
+        buildInfos.data(),
+        rangePtrs.data()
+    );
+}
 
 
 namespace
@@ -4524,7 +4806,7 @@ void recordSectionTablesSync(VkCommandBuffer cmd)
 namespace
 {
     constexpr uint32_t kBlasCompactPoolSize = 256u;
-    constexpr uint32_t kMaxBlasCompactionsPerFrame = 16u;
+    constexpr uint32_t kMaxBlasCompactionsPerFrame = 12u;
 
     struct PendingBlasCompactQuery
     {
@@ -4627,7 +4909,8 @@ void enqueueBlasCompactionQuery(VkCommandBuffer cmd, RTSectionAS& section)
 
 bool recordPendingBlasCompactions(
     VkCommandBuffer cmd,
-    std::vector<BlasCompactedAddressRemap>& outRemaps)
+    std::vector<BlasCompactedAddressRemap>& outRemaps,
+    bool heavyBuildFrame)
 {
     outRemaps.clear();
     if(cmd == VK_NULL_HANDLE ||
@@ -4645,15 +4928,32 @@ bool recordPendingBlasCompactions(
         return false;
     }
 
+    // Burst-amortize compaction during heavy multi-section terrain rebuilds so we do not
+    // force a full TLAS MODE_BUILD every single flight frame; still drain when >=50% full.
+    if(heavyBuildFrame &&
+       s_pendingBlasCompactions.size() < (kBlasCompactPoolSize / 2u) &&
+       ((g_perfL10FrameSerial & 15u) != 0u || s_pendingBlasCompactions.size() < 16u))
+    {
+        return false;
+    }
+
     std::vector<PendingBlasCompactQuery> remaining;
     remaining.reserve(s_pendingBlasCompactions.size());
     uint32_t compactedThisFrame = 0u;
 
+    const auto compactStart = std::chrono::steady_clock::now();
+
     for(size_t i = 0u; i < s_pendingBlasCompactions.size(); ++i)
     {
         const PendingBlasCompactQuery& entry = s_pendingBlasCompactions[i];
+        const bool budgetExceeded =
+            compactedThisFrame >= 1u &&
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - compactStart
+            ).count() >= 1.5;
         if(g_perfL10FrameSerial < entry.buildFrameSerial + 2u ||
-           compactedThisFrame >= kMaxBlasCompactionsPerFrame)
+           compactedThisFrame >= kMaxBlasCompactionsPerFrame ||
+           budgetExceeded)
         {
             remaining.push_back(entry);
             continue;

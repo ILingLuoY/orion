@@ -327,8 +327,11 @@ float voxyMipShade =
 // ⚠ DH 也必须排除：它的 pad2 是 0.996 / -1（图集 mip+shade 编码，见 VulkanCore.cpp
 // 的 appendDhLodQuads）。漏掉这一项，round(0.996) = 1 会让每个远场 quad 都被
 // 当成"实体纹理槽 1"，整片远场去采 entityAtlases。
+const bool isGlassVertexMaterial =
+    !isVoxyLod && !isDhLod &&
+    materialId >= 1.5 && materialId < 2.5;
 float encodedTextureSlot =
-    (isVoxyLod || isDhLod) ? 0.0 :
+    (isVoxyLod || isDhLod || isGlassVertexMaterial) ? 0.0 :
     (v0.pad2 * barycentrics.x +
      v1.pad2 * barycentrics.y +
      v2.pad2 * barycentrics.z);
@@ -428,27 +431,6 @@ bool isRtWeatherRain =
 
         vec3 fixedNormal =
             geoNormal;
-
-        if(classifyIsWater && abs(geoNormal.y) > 0.5)
-        {
-            vec3 geometricHitPosition =
-                rayOrigin +
-                rayDirection *
-                hitT;
-
-            // 2026-10-06：classify 只需要能量 march 的界面法线，走降本波面
-            //（Seascape 封顶 2 八度）。可见水面着色（完整路径）不受影响。
-            WaterWaveSurface waterWave =
-                evaluateWaterWaveSurfaceClassify(
-                    geometricHitPosition.xz,
-                    geometricHitPosition.y
-                );
-
-            fixedNormal =
-                dot(waterWave.normal, geoNormal) < 0.0
-                    ? -waterWave.normal
-                    : waterWave.normal;
-        }
 
         if(dot(fixedNormal, rayDirection) > 0.0)
         {
@@ -897,6 +879,10 @@ bool isRtWeatherRain =
             getRayPurpose(payload.state), RT_HIT_OPAQUE,
             RT_WATER_NONE, false, false, 0u
         );
+        if(instanceRole == LOD_ROLE_HAND)
+        {
+            payload.state |= RT_STATE_HAND_BIT;
+        }
         // Materials: a metal takes its F0 from the albedo, exactly like the block
         // path's LabPBR decode does for codes >= 230, so the armour texture's own
         // colour tints the reflection (grey iron, yellow gold, orange copper).
@@ -1376,6 +1362,45 @@ vec2 albedoInset = min(0.5 * albedoMipScale * atlasTexel, spriteRawSpan * 0.499)
 vec2 albedoSafeMin = min(spriteMin + albedoInset, spriteCenter);
 vec2 albedoSafeMax = max(spriteMax - albedoInset, spriteCenter);
 
+const bool isGlassSurface = isGlassVertexMaterial;
+const int glassVertexFlags =
+    isGlassSurface
+        ? int(v0.pad2 * barycentrics.x +
+              v1.pad2 * barycentrics.y +
+              v2.pad2 * barycentrics.z + 0.5)
+        : 0;
+const bool isFlatGlassWindow =
+    isGlassSurface && ((glassVertexFlags & 16) != 0);
+const bool isClearGlassSurface =
+    isGlassSurface &&
+    materialId < 2.05 &&
+    glassVertexFactorIsFaceShade(interpColor.rgb);
+
+if(isGlassSurface && hasSpriteBounds && (glassVertexFlags & 15) != 0)
+{
+    const int glassConnectMask = glassVertexFlags & 15;
+    const vec2 glassSpriteTexels = spriteSpan * atlasSize;
+    const vec2 glassOneTexel = 1.0 / max(glassSpriteTexels, vec2(1.0));
+    vec2 glassLocalUv = (texCoord - spriteMin) / spriteSpan;
+    if((glassConnectMask & 1) != 0 && glassLocalUv.x < glassOneTexel.x)
+    {
+        glassLocalUv.x += glassOneTexel.x;
+    }
+    if((glassConnectMask & 2) != 0 && glassLocalUv.x > 1.0 - glassOneTexel.x)
+    {
+        glassLocalUv.x -= glassOneTexel.x;
+    }
+    if((glassConnectMask & 4) != 0 && glassLocalUv.y < glassOneTexel.y)
+    {
+        glassLocalUv.y += glassOneTexel.y;
+    }
+    if((glassConnectMask & 8) != 0 && glassLocalUv.y > 1.0 - glassOneTexel.y)
+    {
+        glassLocalUv.y -= glassOneTexel.y;
+    }
+    texCoord = spriteMin + glassLocalUv * spriteSpan;
+}
+
 // =====================================================
 // POM eligibility
 //
@@ -1542,9 +1567,11 @@ bool useExactVanillaFallbackAlbedo =
 
 bool useExactAlbedo =
     useExactTransparentReceiverAlbedo ||
-    useExactVanillaFallbackAlbedo;
+    useExactVanillaFallbackAlbedo ||
+    isClearGlassSurface;
 
 vec4 albedoColor;
+float glassCutoutSpriteAlpha = 0.0;
 
 if(useExactAlbedo)
 {
@@ -1568,10 +1595,11 @@ if(useExactAlbedo)
     // 2026-11-15 远场降档：bias>0 时改走 textureLod（同纹素中心 UV；lod 0 下与
     // texelFetch 逐位等价 —— 双线性/最近点采样在纹素中心都只取该纹素），
     // lod>0 才开始混 mip。bias=0 走原 texelFetch，主路径行为不变。
-    albedoColor =
+    const vec4 blockAtlasRawSample =
         (cam.perfAblationStage.x == 23u)
-            ? vec4(0.5, 0.5, 0.5, 1.0) * interpColor
-            : (matTexAlbedoLod > 0.0
+            ? vec4(0.5, 0.5, 0.5, 1.0)
+            : ((matTexAlbedoLod > 0.0 &&
+                !(isClearGlassSurface && getRayPurpose(payload.state) == RT_PURPOSE_PRIMARY_SKY))
                 ? textureLod(
                     blockAtlas,
                     hasSpriteBounds
@@ -1583,7 +1611,9 @@ if(useExactAlbedo)
                         : (vec2(albedoTexel) + vec2(0.5)) / vec2(albedoSize),
                     matTexAlbedoLod
                 )
-                : texelFetch(blockAtlas, albedoTexel, 0)) * interpColor;
+                : texelFetch(blockAtlas, albedoTexel, 0));
+    glassCutoutSpriteAlpha = blockAtlasRawSample.a;
+    albedoColor = blockAtlasRawSample * interpColor;
 }
 else
 {
@@ -1660,7 +1690,7 @@ if(!isWaterMaterial)
                 : baseNormalSample;
     }
 }
-bool hasNormalData = hasPBRNormalData;
+bool hasNormalData = hasPBRNormalData && !isFlatGlassWindow;
 
 
 vec3 worldNormal =
@@ -2191,6 +2221,31 @@ payload.albedoPacked = packAlbedoUnorm(
 
 if(t12IsGlass)
 {
+#ifndef VPT_GLASS_CUTOUT_BORDER
+#define VPT_GLASS_CUTOUT_BORDER 1
+#endif
+#ifndef VPT_GLASS_CUTOUT_THRESHOLD
+#define VPT_GLASS_CUTOUT_THRESHOLD 0.85
+#endif
+    const bool glassCutoutBorder =
+        (VPT_GLASS_CUTOUT_BORDER != 0) &&
+        isClearGlassSurface &&
+        (glassCutoutSpriteAlpha >= VPT_GLASS_CUTOUT_THRESHOLD);
+
+    if(glassCutoutBorder)
+    {
+        payload.state = makeHitState(
+            getRayPurpose(payload.state), RT_HIT_OPAQUE,
+            RT_WATER_NONE, false, false, 0u
+        );
+        payload.glassAlpha = 1.0;
+        if(isFlatGlassWindow)
+        {
+            roughness = max(roughness, 0.55);
+        }
+    }
+    else
+    {
     // =====================================================
     // Glass camera-side classification
     //
@@ -2233,6 +2288,7 @@ if(t12IsGlass)
     {
         payload.state |= RT_STATE_CLEAR_GLASS_BIT;
     }
+    }
 }
 else if(t12IsWater)
 {
@@ -2262,6 +2318,10 @@ if(isParticleMaterial)
 {
     payload.state |= RT_STATE_PARTICLE_BIT;
 }
+if(instanceRole == LOD_ROLE_HAND)
+{
+    payload.state |= RT_STATE_HAND_BIT;
+}
 
 // =====================================================
 // 2026-10-05 宏观材质变化（#35）：低频值噪声（9 格格点，XZ + 高度偏移）

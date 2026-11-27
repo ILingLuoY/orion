@@ -1739,6 +1739,10 @@ if(glassCutoutBorder)
         getRayPurpose(payload.state), RT_HIT_OPAQUE,
         RT_WATER_NONE, false, false, 0u);
     payload.glassAlpha = 1.0;
+    if(isFlatGlassWindow)
+    {
+        roughness = max(roughness, 0.55);
+    }
 }
 else
 {
